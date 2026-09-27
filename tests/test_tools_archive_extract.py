@@ -1,0 +1,303 @@
+"""Contract tests for archive_inspect's operation=extract (GAP: 'read'
+already existed but explicitly refuses BINARY_MEMBER, so a sample living
+inside a zip/tar could never be handed to any other tool). Pure, offline,
+no guest/VM involvement -- built directly on zipfile/tarfile's own real
+extraction support, per tools_formats.py's own module comments at the
+extract branch.
+"""
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import shutil
+import tarfile
+import unittest
+import zipfile
+from pathlib import Path
+
+import tools_workspace
+from tools_formats import archive_inspect
+
+_SCRATCH = tools_workspace.WORKSPACE_ROOT / ".pytest_archive_extract_scratch"
+
+
+class _ScratchGuard(unittest.TestCase):
+    def setUp(self):
+        _SCRATCH.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(_SCRATCH, ignore_errors=True)
+
+    def _dest(self, name):
+        return str(_SCRATCH / name)
+
+
+def _make_zip(path, members):
+    with zipfile.ZipFile(str(path), "w") as z:
+        for name, data in members.items():
+            z.writestr(name, data)
+
+
+def _make_zip_traditional_encrypted(path, name, data, password):
+    """Hand-builds a minimal, spec-valid ZIP with ONE STORED, traditional-
+    PKWARE-(ZipCrypto)-encrypted entry -- the scheme stdlib zipfile can
+    actually DECRYPT (unlike AES, which it can only detect, never read).
+    zipfile's own writer (ZipFile.writestr/_open_to_write) has no
+    encrypt-on-write support and actively resets flag_bits/CRC/compress_size
+    when a raw write handle is used (confirmed live: it zeroes
+    zinfo.flag_bits unconditionally in _open_to_write), so producing a real
+    encrypted fixture requires writing the local file header, encrypted
+    data, central directory, and EOCD record directly per the PKZIP
+    APPNOTE layout -- using the same ZipCrypto keystream algorithm
+    CPython's own zipfile._ZipDecrypter implements, referenced (not
+    imported) here so this fixture builder has no dependency on zipfile
+    internals staying stable."""
+    import random
+    import struct
+    import zlib
+
+    def _gen_crc_table():
+        table = []
+        for i in range(256):
+            crc = i
+            for _ in range(8):
+                crc = (crc >> 1) ^ 0xEDB88320 if crc & 1 else crc >> 1
+            table.append(crc)
+        return table
+
+    _CRC_TABLE = _gen_crc_table()
+
+    class _Encrypter:
+        def __init__(self, pwd):
+            self.key0 = 305419896
+            self.key1 = 591751049
+            self.key2 = 878082192
+            for c in pwd:
+                self._update(c)
+
+        def _crc32(self, ch, crc):
+            # NOT the same as zlib.crc32's running-CRC continuation (that
+            # was tried first and measurably does not match -- confirmed
+            # live against zipfile's own decrypter here) -- PKZIP's stream
+            # cipher uses this specific per-byte table update directly,
+            # matching CPython zipfile._ZipDecrypter's own crc32() closure.
+            return (crc >> 8) ^ _CRC_TABLE[(crc ^ ch) & 0xFF]
+
+        def _update(self, c):
+            self.key0 = self._crc32(c, self.key0)
+            self.key1 = (self.key1 + (self.key0 & 0xFF)) & 0xFFFFFFFF
+            self.key1 = (self.key1 * 134775813 + 1) & 0xFFFFFFFF
+            self.key2 = self._crc32((self.key1 >> 24) & 0xFF, self.key2)
+
+        def _crypt_byte(self):
+            temp = self.key2 | 2
+            return ((temp * (temp ^ 1)) >> 8) & 0xFF
+
+        def encrypt(self, c):
+            k = self._crypt_byte()
+            self._update(c)
+            return k ^ c
+
+    raw = data
+    crc = zlib.crc32(raw) & 0xFFFFFFFF
+    enc = _Encrypter(password.encode("utf-8"))
+    header = bytes(random.randint(0, 255) for _ in range(11)) + bytes([(crc >> 24) & 0xFF])
+    encrypted = bytes(enc.encrypt(b) for b in header) + bytes(enc.encrypt(b) for b in raw)
+
+    name_bytes = name.encode("utf-8")
+    flag_bits = 0x1  # bit 0: traditional (ZipCrypto) encryption
+    compress_type = 0  # stored
+    dos_time, dos_date = 0, 0x21  # arbitrary, fixed, valid DOS date (1980-01-01-ish)
+    compressed_size = len(encrypted)
+    uncompressed_size = len(raw)
+
+    local_header = struct.pack(
+        "<IHHHHHIIIHH", 0x04034B50, 20, flag_bits, compress_type, dos_time, dos_date,
+        crc, compressed_size, uncompressed_size, len(name_bytes), 0,
+    )
+    local_offset = 0
+    central_header = struct.pack(
+        "<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, flag_bits, compress_type, dos_time, dos_date,
+        crc, compressed_size, uncompressed_size, len(name_bytes), 0, 0, 0, 0, 0o600 << 16, local_offset,
+    )
+    cd_offset = len(local_header) + len(name_bytes) + len(encrypted)
+    cd_bytes = central_header + name_bytes
+    eocd = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 1, 1, len(cd_bytes), cd_offset, 0)
+
+    with open(str(path), "wb") as f:
+        f.write(local_header)
+        f.write(name_bytes)
+        f.write(encrypted)
+        f.write(cd_bytes)
+        f.write(eocd)
+
+
+class TestZipSlipGuard(_ScratchGuard):
+    def test_traversal_member_name_is_blocked(self):
+        archive = _SCRATCH / "evil.zip"
+        with zipfile.ZipFile(str(archive), "w") as z:
+            zi = zipfile.ZipInfo("../../escaped.txt")
+            z.writestr(zi, b"should never land outside the extraction root")
+        result = json.loads(archive_inspect(str(archive), operation="extract",
+                                             member="../../escaped.txt", dest_path=self._dest("out.txt")))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "PATH_TRAVERSAL_BLOCKED")
+        self.assertFalse((_SCRATCH / "out.txt").exists())
+        self.assertFalse((tools_workspace.WORKSPACE_ROOT / "escaped.txt").exists())
+
+    def test_absolute_member_name_is_blocked(self):
+        archive = _SCRATCH / "evil_abs.zip"
+        with zipfile.ZipFile(str(archive), "w") as z:
+            zi = zipfile.ZipInfo("/etc/passwd")
+            z.writestr(zi, b"nope")
+        result = json.loads(archive_inspect(str(archive), operation="extract",
+                                             member="/etc/passwd", dest_path=self._dest("out.txt")))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "PATH_TRAVERSAL_BLOCKED")
+
+
+class TestExtractOutcomes(_ScratchGuard):
+    def test_dest_path_outside_workspace_is_path_refused(self):
+        archive = _SCRATCH / "a.zip"
+        _make_zip(archive, {"hello.txt": b"hi"})
+        result = json.loads(archive_inspect(str(archive), operation="extract",
+                                             member="hello.txt", dest_path="C:\\Windows\\evil.txt"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "PATH_REFUSED")
+
+    def test_missing_member_is_member_not_found(self):
+        archive = _SCRATCH / "a.zip"
+        _make_zip(archive, {"hello.txt": b"hi"})
+        result = json.loads(archive_inspect(str(archive), operation="extract",
+                                             member="does_not_exist.txt", dest_path=self._dest("out.txt")))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "MEMBER_NOT_FOUND")
+
+    def test_oversized_member_is_capped_without_write(self):
+        import tools_formats
+        archive = _SCRATCH / "big.zip"
+        _make_zip(archive, {"big.bin": b"x" * 1000})
+        dest = self._dest("big.bin")
+        original_cap = tools_formats.MAX_ARCHIVE_MEMBER
+        tools_formats.MAX_ARCHIVE_MEMBER = 100  # lower the cap so a 1000-byte member trips it
+        try:
+            result = json.loads(archive_inspect(str(archive), operation="extract",
+                                                 member="big.bin", dest_path=dest))
+        finally:
+            tools_formats.MAX_ARCHIVE_MEMBER = original_cap
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "MEMBER_TOO_LARGE")
+        self.assertFalse(Path(dest).exists())
+
+    def test_zip_hash_round_trip_and_real_write(self):
+        data = b"a completely ordinary non-executable text sample"
+        archive = _SCRATCH / "sample.zip"
+        _make_zip(archive, {"sample.txt": data})
+        dest = self._dest("sample_out.txt")
+        result = json.loads(archive_inspect(str(archive), operation="extract",
+                                             member="sample.txt", dest_path=dest))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(result["size_bytes"], len(data))
+        self.assertFalse(result["executable_content_detected"])
+        self.assertTrue(Path(dest).is_file())
+        self.assertEqual(Path(dest).read_bytes(), data)
+
+    def test_tar_hash_round_trip_and_real_write(self):
+        data = b"a tar member, also non-executable"
+        archive = _SCRATCH / "sample.tar"
+        with tarfile.open(str(archive), "w") as t:
+            info = tarfile.TarInfo(name="sample.txt")
+            info.size = len(data)
+            t.addfile(info, io.BytesIO(data))
+        dest = self._dest("tar_out.txt")
+        result = json.loads(archive_inspect(str(archive), operation="extract",
+                                             member="sample.txt", dest_path=dest))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertTrue(Path(dest).is_file())
+
+    def test_tar_traversal_member_blocked(self):
+        archive = _SCRATCH / "evil.tar"
+        data = b"escape attempt"
+        with tarfile.open(str(archive), "w") as t:
+            info = tarfile.TarInfo(name="../outside.txt")
+            info.size = len(data)
+            t.addfile(info, io.BytesIO(data))
+        result = json.loads(archive_inspect(str(archive), operation="extract",
+                                             member="../outside.txt", dest_path=self._dest("out.txt")))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "PATH_TRAVERSAL_BLOCKED")
+
+    def test_tar_password_is_rejected_not_supported(self):
+        data = b"tar has no encryption concept"
+        archive = _SCRATCH / "sample2.tar"
+        with tarfile.open(str(archive), "w") as t:
+            info = tarfile.TarInfo(name="sample.txt")
+            info.size = len(data)
+            t.addfile(info, io.BytesIO(data))
+        result = json.loads(archive_inspect(str(archive), operation="extract",
+                                             member="sample.txt", dest_path=self._dest("out.txt"),
+                                             password="whatever"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "PASSWORD_NOT_SUPPORTED_FOR_TAR")
+
+    def test_encrypted_zip_member_without_password_is_password_required(self):
+        archive = _SCRATCH / "enc.zip"
+        _make_zip_traditional_encrypted(archive, "secret.txt", b"the real content", "s3cr3t")
+        result = json.loads(archive_inspect(str(archive), operation="extract",
+                                             member="secret.txt", dest_path=self._dest("out.txt")))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "PASSWORD_REQUIRED")
+
+    def test_encrypted_zip_member_with_wrong_password_is_bad_password(self):
+        archive = _SCRATCH / "enc2.zip"
+        _make_zip_traditional_encrypted(archive, "secret.txt", b"the real content", "s3cr3t")
+        result = json.loads(archive_inspect(str(archive), operation="extract",
+                                             member="secret.txt", dest_path=self._dest("out.txt"),
+                                             password="wrong-password"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "BAD_PASSWORD")
+
+    def test_encrypted_zip_member_with_correct_password_extracts(self):
+        data = b"the real content"
+        archive = _SCRATCH / "enc3.zip"
+        _make_zip_traditional_encrypted(archive, "secret.txt", data, "s3cr3t")
+        dest = self._dest("secret_out.txt")
+        result = json.loads(archive_inspect(str(archive), operation="extract",
+                                             member="secret.txt", dest_path=dest,
+                                             password="s3cr3t"))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertTrue(Path(dest).is_file())
+        self.assertEqual(Path(dest).read_bytes(), data)
+
+    def test_executable_member_refused_by_default(self):
+        data = b"MZ" + b"\x90" * 62
+        archive = _SCRATCH / "withexe.zip"
+        _make_zip(archive, {"payload.exe": data})
+        dest = self._dest("payload.exe")
+        result = json.loads(archive_inspect(str(archive), operation="extract",
+                                             member="payload.exe", dest_path=dest))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "EXECUTABLE_CONTENT_REFUSED")
+        self.assertEqual(result["executable_content_kind"], "PE")
+        self.assertFalse(Path(dest).exists())
+
+    def test_executable_member_extracted_when_explicitly_allowed(self):
+        data = b"MZ" + b"\x90" * 62
+        archive = _SCRATCH / "withexe2.zip"
+        _make_zip(archive, {"payload.exe": data})
+        dest = self._dest("payload_out.exe")
+        result = json.loads(archive_inspect(str(archive), operation="extract",
+                                             member="payload.exe", dest_path=dest,
+                                             allow_executable_content=True))
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["executable_content_detected"])
+        self.assertTrue(Path(dest).is_file())
+        self.assertEqual(Path(dest).read_bytes(), data)
+
+
+if __name__ == "__main__":
+    unittest.main()

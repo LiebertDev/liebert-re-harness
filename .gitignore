@@ -1,0 +1,85 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.venv/
+venv/
+env/
+.tox/
+.nox/
+
+# Test / type / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets and local configuration -- never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+id_rsa
+id_ed25519
+credentials*
+secrets*
+*.local.json
+
+# Analysis samples. Third-party binaries are NOT redistributed here; see
+# docs/CORPUS.md. These patterns exist so a sample fetched for local work cannot
+# be committed by accident.
+samples/
+corpus/
+*.exe
+*.dll
+*.sys
+*.so
+*.dylib
+*.bin
+*.elf
+*.macho
+*.apk
+*.dex
+*.pdb
+*.dmp
+*.core
+
+# Analysis output. It embeds absolute paths, machine names and sample contents.
+out/
+output/
+artifacts/
+evidence/
+runs/
+*.sqlite
+*.sqlite3
+*.db
+
+# Decompiler / disassembler project files
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.rzdb
+ghidra_projects/
+*.gpr
+*.rep/

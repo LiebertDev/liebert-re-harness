@@ -1,0 +1,75 @@
+name: Proposal
+description: A new capability, a format to support, or a change in approach.
+labels: [proposal]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Open one of these **before writing the code** for anything non-trivial —
+        it is the cheapest way to avoid a rejected pull request. Typo and
+        documentation fixes need no issue; just send them.
+
+        Please read the *Out of scope* section of
+        [DISCLAIMER.md](../blob/main/DISCLAIMER.md) first. Some proposals are
+        declined for reasons unrelated to code quality, and it is better to know
+        that now.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to find out about a binary?
+      description: >
+        Describe the analysis question, not the implementation. "I want to know
+        which functions reach a given import" is more useful than "add a graph
+        module".
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: What happens today
+      description: What you tried, and where it stopped being enough.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: >
+        Sketch the API or the analysis. Say what it returns when it **cannot**
+        determine an answer — that part is not optional here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: How would we know it is correct?
+      description: >
+        What test or ground truth would demonstrate it works, and what would
+        demonstrate it fails? Programmatically-built fixtures are preferred over
+        downloaded samples.
+    validations:
+      required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: New dependencies or external tools
+      description: >
+        Each one is a supply-chain surface and a platform-support problem. If the
+        standard library can do it, say so.
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Confirmation
+      options:
+        - label: >
+            This is not circumvention of licensing, DRM, or anti-cheat protection
+            in a real product, an undisclosed write-up of a third party's
+            protection, a weaponised exploit, or malware. I have read the
+            out-of-scope list.
+          required: true

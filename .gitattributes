@@ -1,0 +1,24 @@
+# Normalise line endings in the repository to LF, and let Git check out whatever
+# the contributor's platform expects. Without this, a Windows and a Linux
+# contributor produce whole-file diffs against each other and every review drowns.
+* text=auto eol=lf
+
+# Windows-native scripts must keep CRLF on checkout or cmd.exe mis-parses them.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Never touch these, whatever they contain.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.7z binary
+
+# Keep analysis fixtures byte-exact. A fixture whose bytes Git "helpfully"
+# normalised is a fixture that no longer tests what it was written to test.
+tests/fixtures/** -text
+*.bin -text

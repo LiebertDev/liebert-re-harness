@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "liebert-re-harness"
+version = "0.1.0"
+description = "Reverse-engineering analysis modules and crackme solution write-ups."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+
+dependencies = [
+    "pefile",
+    "capstone",
+    "unicorn",
+    "numpy",
+    "dncil",
+    "dnfile",
+    "ijson",
+    "keystone-engine",
+    "mpmath",
+    "psutil",
+    "PyYAML",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "black"]
+# frida_trace_client.py is the only module that needs it, and it is a client for
+# an isolated-VM tracing setup rather than something the core analysis path uses.
+# Kept out of the required set so a plain install stays small and platform-portable.
+frida = ["frida"]
+
+[project.urls]
+Homepage = "https://github.com/LiebertDev/liebert-re-harness"
+Issues = "https://github.com/LiebertDev/liebert-re-harness/issues"
+
+# pytest configuration deliberately lives in pytest.ini, not here. A pytest.ini
+# present in the same tree silently WINS over [tool.pytest.ini_options], so
+# having both would mean one of them is quietly ignored -- exactly the kind of
+# silent-wrong-answer this project is organised against. One source only.
+
+[tool.setuptools]
+py-modules = [
+    "analysis_findings",
+    "analysis_ir",
+    "asar_parser",
+    "binary_version_diff",
+    "bounded_subprocess",
+    "claim_guard",
+    "claim_index",
+    "codeview_rsds",
+    "constant_at_address_verifier",
+    "cross_binary_relationships",
+    "dotnet_il",
+    "dotnet_relationships",
+    "evidence_index",
+    "evidence_security",
+    "exploit_validation",
+    "frida_trace_client",
+    "lll_exact",
+    "lzma1_range_decoder",
+    "minidump_structural",
+    "msf_pdb",
+    "native_pdb_toolchain",
+    "pe_address",
+    "process_lock",
+    "tools_apimonitor",
+    "tools_binary",
+    "tools_crypto_id",
+    "tools_die",
+    "tools_formats",
+    "tools_lattice",
+    "tools_rizin",
+    "tools_vb6_pcode",
+    "tools_workspace",
+    "tools_yara_x",
+    "vex",
+    "workspace_index",
+]

@@ -1,0 +1,18 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/LiebertDev/liebert-re-harness/security/advisories/new
+    about: >
+      Private advisory. Use this for anything where analysing a file does
+      something worse than producing a wrong answer -- code execution, file
+      write, path traversal, a broken isolation control. Never a public issue.
+  - name: Responsible-use policy and legal notice
+    url: https://github.com/LiebertDev/liebert-re-harness/blob/main/DISCLAIMER.md
+    about: >
+      What this project is for, what is out of scope, and the limitation of
+      liability. Read before opening an issue about a real product's protection.
+  - name: Question or idea
+    url: https://github.com/LiebertDev/liebert-re-harness/discussions
+    about: >
+      For "how do I", "is this the right approach", and anything that is not yet
+      a bug or a concrete proposal.

@@ -1,0 +1,80 @@
+name: Bug report
+description: Something returned a wrong answer, crashed, or hung.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not report security vulnerabilities here.** Use the Security tab →
+        *Report a vulnerability*. See [SECURITY.md](../blob/main/SECURITY.md) for
+        what counts as one — a crash on a malformed file is an ordinary bug and
+        belongs in this form.
+
+        **Do not attach third-party samples.** Identify a file by name and
+        SHA-256 instead, per [docs/CORPUS.md](../blob/main/docs/CORPUS.md).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what you expected instead
+      description: >
+        The wrong answer matters more than the stack trace. If a value was
+        incorrect, say what it was and what it should have been.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: >
+        The exact command or the smallest code snippet. If it needs an input
+        file, give its name and SHA-256, or describe the structure that triggers
+        it — ideally as a fixture we can build in a test.
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output or traceback
+      description: Paste the full text. Redact absolute paths and machine names.
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: "0.1.0, or the commit SHA you are on"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Python and OS
+      placeholder: "Python 3.12.3, Windows 11 23H2 / Ubuntu 24.04"
+    validations:
+      required: true
+
+  - type: textarea
+    id: external-tools
+    attributes:
+      label: External analysis tools involved, if any
+      description: >
+        Name and version of any external engine the failing path uses. If the
+        bug is in one of those rather than here, we still want to know so we can
+        gate around it.
+
+  - type: checkboxes
+    id: authorisation
+    attributes:
+      label: Confirmation
+      options:
+        - label: >
+            I have the right to analyse the file this report concerns, and I have
+            read the responsible-use policy in DISCLAIMER.md.
+          required: true

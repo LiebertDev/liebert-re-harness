@@ -1,0 +1,29 @@
+Liebert Reverse Engineering Harness
+Copyright 2026 LiebertDev and contributors
+
+This product includes software developed by LiebertDev and the contributors to
+the Liebert Reverse Engineering Harness project.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+---
+
+Third-party components and data
+
+This repository intentionally does not redistribute third-party binaries.
+Analysis write-ups that discuss a publicly distributed challenge binary
+reference it by name and cryptographic hash rather than including the file, so
+that the original author's distribution terms remain the only ones that apply to
+it. See docs/CORPUS.md for how to obtain the samples a write-up refers to.
+
+Where a module implements a published file format or algorithm, the
+specification it follows is cited in that module's docstring.
