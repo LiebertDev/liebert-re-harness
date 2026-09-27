@@ -144,7 +144,9 @@ than glossed:
    grandchild survives a timeout, so "bounded" is not currently true there.
 
 Everything else passes on Linux (181 passed, 42 skipped). Both defects are tracked
-as issues and are good first contributions; the Linux CI leg is marked non-blocking
+as issues ([#1](https://github.com/LiebertDev/liebert-re-harness/issues/1),
+[#2](https://github.com/LiebertDev/liebert-re-harness/issues/2)) and are good first
+contributions; the Linux CI leg is marked non-blocking
 while they are open so its result stays visible without reddening the whole build.
 
 A Linux contributor should also expect Windows-shaped test data in places, and should

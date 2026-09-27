@@ -26,7 +26,7 @@ jobs:
     # Linux is REPORTED, not yet REQUIRED, and the reason is two named defects
     # rather than vagueness: the workspace sandbox does not refuse an out-of-tree
     # destination on POSIX paths, and bounded_subprocess's process-tree teardown
-    # leaves an orphaned grandchild alive. Both are tracked as issues; both are
+    # leaves an orphaned grandchild alive. Tracked as issues #1 and #2; both are
     # real bugs in this package, not CI noise. Marking the leg non-blocking keeps
     # its result visible while it is being fixed, instead of either hiding it or
     # leaving the whole build permanently red. When both issues close, delete this.

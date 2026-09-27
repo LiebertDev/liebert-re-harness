@@ -311,7 +311,9 @@ noise — so they are named here instead of being softened:
    (`tests/test_bounded_subprocess_orphan_timeout.py`), so the module's bounded-
    execution contract is not met there.
 
-Both are tracked as issues and are good first contributions. The Linux CI leg is
+Both are tracked as issues ([#1](https://github.com/LiebertDev/liebert-re-harness/issues/1),
+[#2](https://github.com/LiebertDev/liebert-re-harness/issues/2)) and are good first
+contributions. The Linux CI leg is
 marked non-blocking so its result stays visible while they are open — not hidden, and
 not left to redden the whole build indefinitely. Everything else passes on Linux:
 181 passed, 42 skipped.
