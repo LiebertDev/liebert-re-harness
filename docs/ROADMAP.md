@@ -1,0 +1,194 @@
+# Roadmap and known gaps
+
+This project is not under active development right now. This document exists so
+that someone who wants to pick it back up knows where to start, what is genuinely
+missing, and what has already been tried and abandoned as too hard for a casual
+contribution. It is a map, not a promise — nobody is committed to working through
+it on a schedule.
+
+Contributions against anything below are welcome. The one rule that governs all
+of them lives in [CONTRIBUTING.md](../CONTRIBUTING.md): never return a
+confidently wrong answer. Read that file before opening a pull request; almost
+everything else follows from it.
+
+## Start here
+
+Small, self-contained, and each closable without touching more than one or two
+files.
+
+1. **`crackme_solutions/scripts_mutated_crackme5_serial.py` does not run.** Its
+   `run()` function imports `tools_emulate_range`, a bounded-emulation module that
+   lives in the upstream tree and was never published here (see the README's
+   "deliberately not in this repository" list). The write-up and the recovered
+   algorithm are correct and worth keeping; the entry point just cannot execute
+   as shipped. Either rewrite it against a minimal emulation path built from what
+   is already in this repository (Capstone for decode, Unicorn is already a
+   dependency — see `pyproject.toml`), or replace the emulation-dependent step
+   with a documented manual trace and keep the rest of the script runnable.
+2. **`tools_vb6_pcode.py`'s `program_strings` operation raises `ImportError`.**
+   It reaches for a module that is not part of this package. Every other
+   operation in that file works and is covered by tests; this one path needs
+   either a self-contained reimplementation or a clean "not available in this
+   package" result instead of an uncaught exception — the latter is a smaller
+   change and a legitimate first PR on its own, with the former as a follow-up.
+3. **Lint coverage is narrow on purpose, and widening it is real, bounded work.**
+   `ruff` is currently scoped to `E9,F` (syntax errors, undefined names, unused
+   imports, redefinitions) because the wider default rule set reports hundreds
+   of findings that are just this codebase's dense `if not x: return y` style,
+   and fixing that in bulk would bury every real diff. Picking one additional
+   rule family (`B` for bug-prone patterns, or `SIM` for simplifiable code) and
+   fixing it file-by-file, with the formatting change in its own PR separate
+   from any behaviour change, is exactly the shape of contribution this project
+   wants. Do not turn on the whole default set in one pass.
+4. **Test fixtures should be generated, not fetched.** [CORPUS.md](CORPUS.md)
+   already states the rule: build the smallest PE/ELF/archive that exercises a
+   code path programmatically, inside the test suite, instead of depending on a
+   sample the contributor has to download. Several tests already do this; a good
+   contribution is finding a test that still skips or depends on an external
+   sample and converting it to a generated fixture.
+5. **Docstrings should state the "cannot determine" contract, and many do not
+   yet.** The project's central rule — never return a confidently wrong answer —
+   only works if a caller can read a function's docstring and learn what it
+   returns when it fails, not just what it returns when it succeeds. Measured on
+   `tools_binary.py` as of this writing: of its 12 public (non-underscore)
+   top-level functions, **11 have no docstring at all**. Auditing a module,
+   writing docstrings that state the failure contract explicitly (what comes
+   back on missing data, on a malformed field, on a missing external tool), and
+   sending that as its own PR is welcome and does not require touching any
+   function body.
+
+## Bigger pieces
+
+Capabilities that exist in the private working tree this repository was cut from
+but were deliberately left out of the public package — not because they are
+secret, but because they are specific to the upstream tree's own plumbing or
+large enough to need their own design discussion. Each is a real gap here, not a
+hidden feature.
+
+- **Bounded emulation** (Unicorn-based range emulation, execution traces, a
+  backward slicer, per-instruction snapshots and register capture). This is the
+  single most useful missing piece, because several things in this repository
+  currently degrade to "documentation only" without it — see item 1 above. Start
+  by defining the narrowest useful surface: emulate a bounded instruction range
+  starting from a known register state and return a trace, before attempting
+  anything like slicing.
+- **IDA and Ghidra wrappers** (headless decompilation, cross-references,
+  callers/callees, answers normalised across engines so a caller does not need to
+  know which one ran). `docs/INSTALL.md` is explicit that this package drives
+  rizin, Detect It Easy, YARA-X and API Monitor only. A Ghidra wrapper is the more
+  approachable half of this, since `analyzeHeadless` is scriptable and free to
+  install; an IDA wrapper needs a licensed copy to test against and is a bigger
+  commitment.
+- **Function-boundary recovery from exception-directory unwind data**, with
+  prologue scanning and cross-checking against whatever a disassembly engine
+  already found. Valuable specifically for stripped or partially-obfuscated x64
+  binaries where a linear sweep alone under- or over-counts functions. Start from
+  the PE exception directory parsing that already exists for other purposes in
+  this repository and extend it into a boundary recoverer.
+- **Crash symbolisation.** Minidump *parsing* is already here
+  (`minidump_structural.py`); turning a raw address recovered from a dump into a
+  symbol is not. This is a natural extension of the existing PDB/CodeView work
+  (`msf_pdb.py`, `codeview_rsds.py`) rather than a new subsystem.
+- **Delay-import, TLS, relocation, and rich-header parsing.** The PE support here
+  covers headers, sections, imports, exports and resources; these four
+  directories are not implemented. Each is a bounded, well-specified parsing task
+  with public documentation, and any one of the four is a reasonable
+  self-contained PR.
+- **Page-based sliding-window entropy.** What exists today is whole-file and
+  per-section entropy, which is enough for coarse triage but not for locating a
+  small encrypted or packed region inside an otherwise-normal section. Worth
+  doing once someone needs to find where inside a section, not just whether one
+  is suspicious.
+
+## Hard problems, honestly hard
+
+These are real and known gaps, named so nobody rediscovers them by surprise. They
+are explicitly **not** good first contributions — each is a research problem on
+its own, not a bounded task, and starting here is the most common way for a
+contribution to stall.
+
+- **Virtualised / VM-based protections.** When a packer replaces native code with
+  its own bytecode interpreter, static disassembly of that region produces
+  nothing usable, and there is no devirtualiser in this project. On the hardest
+  real target this tooling has been measured against, roughly 87% of the file
+  sat behind such a region and stayed opaque. This is the largest single gap in
+  the whole project.
+- **Control-flow flattening.** There is no unflattening pass. A flattened
+  function is recovered today as a dispatch loop — technically an accurate
+  description, practically useless to a reader.
+- **Interprocedural taint analysis / whole-program dataflow.** Nothing in this
+  project answers "does attacker-controlled input reach this sink" across
+  function boundaries. A backward slicer that works inside a single emulation
+  trace across a bounded number of hops exists in the upstream tree, is not
+  published here, and is not whole-program taint analysis either — it answers a
+  much narrower question.
+- **Symbolic or concolic execution.** There is no such engine anywhere in this
+  project. A constant that is computed at runtime rather than written as an
+  immediate typically comes back `UNKNOWN`, which is an honest answer and not a
+  useful one.
+- **Mobile targets (APK/DEX, Android-specific obfuscators).** No support exists,
+  and there is no near-term plan to add it — this class of target only makes
+  sense to pick up after the native/desktop gaps above are addressed, not before.
+- **Encrypted-at-rest sections.** Where a section is encrypted on disk and only
+  decrypted in memory at runtime, there is no static path to its contents. This
+  is a real closed door encountered on a real target, not a theoretical gap.
+
+## Lessons from the unpublished core
+
+Four things this project actually got wrong while building the parts that are
+not in this repository, written generally because the lesson generalises well
+beyond this codebase. No line references are given below — the code involved is
+in the upstream tree, not here.
+
+**A dependency graph that was built but never consumed.** A planning component
+computed a full dependency ordering for a set of steps — a real, correct DAG —
+but the function that would have walked that ordering to decide execution
+sequence was never called from anywhere. Everything downstream assumed the plan
+was driving execution, when in fact a much simpler, unordered path was. The
+general lesson: verifying that a plan is followed means finding and reading the
+call site that consumes it, not reading the code that produces it. A DAG sitting
+in a variable that nothing iterates over is indistinguishable, from the producing
+code alone, from one that governs everything.
+
+**A silent `except: pass` around the code that records state.** An error raised
+while writing a result to durable storage was being swallowed rather than
+surfaced. The practical effect was not a crash — it was quiet, undetected
+divergence between what the system believed had happened and what had actually
+been persisted, discovered only much later when the two disagreed. The general
+lesson: the path that records what happened is the one place in a system where a
+swallowed exception is least affordable, because there is no downstream
+consumer positioned to notice the gap.
+
+**One logical operation persisted through three separate atomic writes.** Each
+individual write was safe on its own, but a crash between the first and the
+third left the overall operation in a state that was neither "not started" nor
+"complete" — a state nothing else in the system had been designed to reconcile.
+Giving each record a content-derived identity prevented a duplicate record from
+being created on retry, but a content-addressed identity solves duplicate
+*records*, not duplicate or partial *executions*; those are different problems
+and require different guarantees.
+
+**A guard that existed, was tested, and was never wired into the path it was
+meant to protect.** The check itself was correct in isolation and had its own
+passing unit test — but nothing on the live execution path ever imported or
+called it, so it protected nothing in practice. This is a specifically dangerous
+shape of bug, worse than a guard that was never written at all, because
+everyone reviewing the code who sees the guard's definition and its passing test
+reasonably assumes it is active. The general lesson: confirm a guard is load-
+bearing by finding where it is imported and invoked on the real path, not by
+finding where it is defined and tested.
+
+## How to contribute
+
+Open an issue describing what you want to do before writing anything
+non-trivial — see [CONTRIBUTING.md](../CONTRIBUTING.md) for what "non-trivial"
+means here and what a good pull request looks like. Small, typo-level and
+documentation fixes can go straight to a pull request without an issue first.
+
+[DISCLAIMER.md](../DISCLAIMER.md)'s "Out of scope" list still applies in full:
+no ready-to-use circumvention of licensing, activation, DRM, or anti-cheat
+protection in real, currently distributed products; no undisclosed findings
+about a specific third party's protection mechanism; no working exploits or
+weaponised payloads; no malware; no third-party binaries or credentials. A
+contribution that sits close to one of those lines should start as an issue
+describing intent, not as finished code.

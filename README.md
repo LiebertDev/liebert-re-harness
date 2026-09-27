@@ -383,10 +383,21 @@ and how to build test fixtures in code instead of committing binaries.
 
 ## Contributing
 
-Genuinely wanted — that is why this repository exists. Start with
-[CONTRIBUTING.md](CONTRIBUTING.md), which is mostly about the one rule above, and
-with the gap list, which is where the interesting work is. Open a proposal issue
-before writing anything substantial; small fixes can come straight in.
+Genuinely wanted — that is why this repository exists. **This project is not under
+active development**, so the documents that matter most if you want to pick it up are:
+
+- **[docs/ROADMAP.md](docs/ROADMAP.md)** — known gaps, and five "start here" items
+  small enough to close in one or two files. Also the honestly-hard problems, marked
+  as such so nobody burns a week rediscovering that they are research projects.
+- **[docs/ARCHITECTURE_NOTES.md](docs/ARCHITECTURE_NOTES.md)** — why the code is
+  shaped this way: the one rule and what it costs, why evidence and claims are
+  separate object kinds, why the workspace sandbox is a guardrail rather than a
+  boundary, and why there is no framework.
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — the one rule, and what a good pull
+  request looks like here.
+
+Open a proposal issue before writing anything substantial; small fixes can come
+straight in.
 
 By contributing you agree your work is licensed under Apache-2.0. There is no CLA.
 
