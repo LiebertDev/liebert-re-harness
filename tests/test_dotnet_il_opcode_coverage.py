@@ -29,7 +29,6 @@ CrackMeV1.exe returns unsupported_opcodes=100 out of the 54-method sample's
 348 total UNSUPPORTED_OPCODE events across 55 distinct opcodes) and pass
 against the fix (0 UNSUPPORTED_OPCODE events across the same 54 methods).
 """
-import json
 import unittest
 from pathlib import Path
 

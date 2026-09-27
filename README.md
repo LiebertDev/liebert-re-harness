@@ -294,11 +294,27 @@ installed**, the measured result is `190 passed, 35 skipped`, zero failures, in
 about 11 seconds — across 35 test files. The skips are guards for tests needing a
 sample binary this package does not ship.
 
-That measurement is **on Windows**, which is where this code was developed and where
-the analysis focus (PE/COFF, VB6, .NET on Windows) points. CI runs the same suite on
-Linux as well, and four modules do carry Windows-conditional paths — so treat the
-Linux column as a check that is now running rather than a result already claimed. If
-it comes back red, that is a bug to fix, not a caveat to explain away.
+That measurement is **on Windows** (3.10 and 3.12), which is where this code was
+developed and where the analysis focus points.
+
+**Linux does not fully pass yet, and the first CI run is how we found out.** Two
+tests fail on `ubuntu-latest`, and both are real bugs in this package rather than CI
+noise — so they are named here instead of being softened:
+
+1. **The workspace sandbox does not hold on POSIX paths.** A destination outside the
+   workspace root is supposed to be refused and is not
+   (`tests/test_tools_archive_extract.py::test_dest_path_outside_workspace_is_path_refused`).
+   This is the containment control described below and in `docs/INSTALL.md`, so on
+   Linux you should treat it as absent until this is fixed.
+2. **`bounded_subprocess` does not tear down a process tree on Linux.** An orphaned
+   grandchild holding a pipe open survives the timeout instead of being killed
+   (`tests/test_bounded_subprocess_orphan_timeout.py`), so the module's bounded-
+   execution contract is not met there.
+
+Both are tracked as issues and are good first contributions. The Linux CI leg is
+marked non-blocking so its result stays visible while they are open — not hidden, and
+not left to redden the whole build indefinitely. Everything else passes on Linux:
+181 passed, 42 skipped.
 
 Every external engine is **optional**; nothing here ships or requires a licensed
 tool, and the IDA and Ghidra wrappers are not part of this package at all. **[docs/INSTALL.md](docs/INSTALL.md)** lists exactly

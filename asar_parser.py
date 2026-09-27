@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path, PurePosixPath
 
 MAX_ASAR_BYTES = 64 * 1024 * 1024

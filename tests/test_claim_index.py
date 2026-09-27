@@ -223,7 +223,10 @@ class ContradictionDetectionTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root, evidence_index, claims = _make_indices(Path(tmp))
             evidence_index.refresh()
-            first = claims.create_claim("TBM", "address", "1000", "root_cause", "A", status="CANDIDATE")
+            # The first claim has to exist for the assertions below to mean
+            # anything -- it is the thing `second` could have conflicted with --
+            # but nothing reads it back, so the call stays and the binding goes.
+            claims.create_claim("TBM", "address", "1000", "root_cause", "A", status="CANDIDATE")
             second = claims.create_claim("TBM", "address", "2000", "root_cause", "B", status="CANDIDATE")
             self.assertEqual(second["conflicts_with"], [])
             self.assertEqual(second["uncomparable_with"], [])

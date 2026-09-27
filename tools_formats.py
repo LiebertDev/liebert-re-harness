@@ -6,7 +6,7 @@ from collections import Counter
 from datetime import datetime,timezone
 from pathlib import Path,PurePosixPath
 from urllib.parse import urlsplit
-from tools_workspace import WORKSPACE,safe_path,relative,skipped,text_of
+from tools_workspace import safe_path,relative,skipped,text_of
 
 MAX_IDENTITY_HASH_BYTES=512_000_000; MAX_STRUCTURED_BYTES=64_000_000; MAX_ARCHIVE_MEMBERS=500
 MAX_ARCHIVE_TOTAL=512_000_000; MAX_ARCHIVE_MEMBER=8_000_000; MAX_RETURN_CHARS=60_000
@@ -450,7 +450,10 @@ def _har_stream(p,operation,query,index,max_results):
 def har_inspect(path,operation='summary',query='',index=0,max_results=100):
     p=safe_path(path)
     if p.stat().st_size>MAX_STRUCTURED_BYTES:
-        try:import ijson
+        # Availability probe, not a use: _har_stream imports ijson itself. The
+        # point is to fail with a named, actionable status instead of an
+        # ImportError traceback from three frames deeper.
+        try:import ijson  # noqa: F401
         except ImportError:return _json({'ok':False,'status':'ANALYSIS_LIMITED','error':'HAR_TOO_LARGE','limitations':['ijson (streaming JSON parser) is not installed; falling back to the bounded whole-file limit']})
         return _har_stream(p,operation,query,index,max(1,min(int(max_results),5000)))
     try:har=json.loads(text_of(p)); log=har.get('log',{}); entries=log.get('entries',[])

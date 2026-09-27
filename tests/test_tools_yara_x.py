@@ -245,7 +245,6 @@ class YaraXRulesTextIsThrowawayTests(unittest.TestCase):
 
     def test_inline_rules_text_temp_file_is_removed_after_the_call(self):
         captured_paths = []
-        real_run = None
 
         def _spy(cmd, **kwargs):
             captured_paths.append(cmd[-2])  # rules_arg is second-to-last positional

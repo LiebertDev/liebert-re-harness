@@ -7,6 +7,7 @@ embedding model dependency.
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
 import json
 import os
@@ -15,7 +16,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from process_lock import DurableLock, LockTimeout
+from process_lock import DurableLock
 
 APP = Path(__file__).resolve().parent
 INDEX_ROOT = APP / "dataset" / "metadata" / "workspace_indexes"
@@ -264,12 +265,28 @@ class WorkspaceIndex:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
 
+    @contextlib.contextmanager
     def connect(self):
+        # `with sqlite3.connect(...) as db` commits (or rolls back) but does NOT
+        # close the connection -- a long-standing Python gotcha. Every caller here
+        # used that form, so every call leaked an open handle plus its WAL
+        # sidecars. Harmless-looking until it is not: on Windows an open handle
+        # makes the file undeletable, which is how this surfaced (three tests
+        # failing on 3.12 with WinError 32 while a TemporaryDirectory tried to
+        # clean up index.sqlite).
+        #
+        # This wrapper keeps the exact transaction semantics callers already rely
+        # on -- `with connection` commits on success and rolls back on an
+        # exception -- and adds the close that was missing.
         connection = sqlite3.connect(self.db_path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA journal_mode=WAL")
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _write_guard(self):
         # sqlite's own `timeout=30` busy-wait (see connect()) cannot tell a
@@ -324,7 +341,9 @@ class WorkspaceIndex:
         if not self.db_path.exists():
             return False
         try:
-            with sqlite3.connect(self.db_path, timeout=5) as probe:
+            # closing() for the same reason as connect() above: the `with`
+            # statement on a connection does not close it.
+            with contextlib.closing(sqlite3.connect(self.db_path, timeout=5)) as probe:
                 row = probe.execute(
                     "SELECT value FROM meta WHERE key='schema_version'"
                 ).fetchone()

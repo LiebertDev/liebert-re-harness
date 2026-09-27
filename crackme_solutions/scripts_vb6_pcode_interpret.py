@@ -782,7 +782,6 @@ def _step(vm, instr, kind, kind_by_index=None, depth=0):
         # algorithm this module cares about never reads -- is not modelled.
         return None
 
-    calls_runtime = instr.get("calls_runtime")
     direct_call = instr.get("calls")
     semantics = instr.get("semantics")
 

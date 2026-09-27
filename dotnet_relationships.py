@@ -7,7 +7,6 @@ explicitly UNKNOWN rather than being guessed.
 """
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Any, Iterable
 import json
 

@@ -56,7 +56,7 @@ import time
 
 import numpy as np
 
-from scripts_keygenme3_siphash_attack import KEY_SERIAL, MASK64, name_target
+from scripts_keygenme3_siphash_attack import KEY_SERIAL, MASK64
 
 N_FULL_POSITIONS = 3   # positions fully enumerated (0..255) per MITM group
 GROUP_BASE = 256 ** N_FULL_POSITIONS  # 16,777,216

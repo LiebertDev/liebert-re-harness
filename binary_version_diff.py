@@ -11,7 +11,6 @@ from collections import defaultdict
 import hashlib
 import json
 from typing import Any, Iterable
-import json
 
 from analysis_ir import UNKNOWN, stable_id
 

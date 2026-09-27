@@ -128,9 +128,25 @@ combining with it.
 
 ## Platform notes
 
-Development and measurement have been on **Windows x64**, and the analysis focus —
-PE/COFF, Windows kernel driver structures, VB6, .NET on Windows — reflects that.
-The test suite is run in CI on both Linux and Windows, so the pure-Python paths
-work on both, but a Linux contributor should expect Windows-shaped test data and
-should say so in a pull request if something is genuinely platform-broken rather
-than merely untested.
+Development and measurement have been on **Windows x64** (Python 3.10 and 3.12,
+both green: 190 passed, 35 skipped), and the analysis focus — PE/COFF, VB6, .NET on
+Windows — reflects that.
+
+**On Linux, two tests fail, and both are genuine defects in this package.** CI runs
+the suite on `ubuntu-latest` and found them on the first run; they are named rather
+than glossed:
+
+1. **The workspace sandbox above does not hold on POSIX paths.** An out-of-tree
+   destination is not refused. So on Linux, **do not rely on the containment
+   described in the previous section** — analyse untrusted input in a disposable VM,
+   which you should be doing regardless.
+2. **`bounded_subprocess` does not kill a process tree on Linux.** An orphaned
+   grandchild survives a timeout, so "bounded" is not currently true there.
+
+Everything else passes on Linux (181 passed, 42 skipped). Both defects are tracked
+as issues and are good first contributions; the Linux CI leg is marked non-blocking
+while they are open so its result stays visible without reddening the whole build.
+
+A Linux contributor should also expect Windows-shaped test data in places, and should
+say so in a pull request when something is genuinely platform-broken rather than
+merely untested.

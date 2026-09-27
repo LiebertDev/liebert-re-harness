@@ -131,7 +131,7 @@ def build_owned_native_pdb(*, timeout_seconds: int = 90) -> dict:
     if tool.get("vcvars64"):
         lines.append(f'call "{tool["vcvars64"]}"')
     lines.append(f'"{tool["cl"]}" /nologo /c /Zi /Od /W3 /DWIN32 /Fo"{obj.name}" "{SOURCE.name}"')
-    lines.append(f'if errorlevel 1 exit /b 1')
+    lines.append('if errorlevel 1 exit /b 1')
     lines.append(f'"{tool["link"]}" /nologo /DEBUG /INCREMENTAL:NO /OUT:"{exe.name}" /PDB:"{pdb.name}" "{obj.name}"')
     script.write_text("\r\n".join(lines) + "\r\n", encoding="ascii")
     try:

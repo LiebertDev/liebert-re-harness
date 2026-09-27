@@ -40,6 +40,28 @@ Issues = "https://github.com/LiebertDev/liebert-re-harness/issues"
 # having both would mean one of them is quietly ignored -- exactly the kind of
 # silent-wrong-answer this project is organised against. One source only.
 
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+# Scoped to the rules that find BUGS, not the ones that find style.
+#
+# Ruff's wider default set reports 481 findings here, and 469 of them are E701 /
+# E702 -- the dense `if not x: return y` one-line style this codebase is written
+# in throughout. "Fixing" those would mean reformatting 35 files wholesale, which
+# is precisely the drive-by reformatting CONTRIBUTING.md tells contributors not to
+# do, and it would bury every real diff for a year. The style is not the problem.
+#
+# So: E9 (syntax and IO errors) and F (Pyflakes -- undefined names, unused
+# imports, redefinitions, unused locals). Those 12 findings were real and were
+# fixed rather than ignored. This gate stays honest because it can actually fail:
+# an undefined name in a new contribution will stop CI.
+#
+# Widening this list is welcome as its own pull request, one rule family at a
+# time, with the reformatting kept separate from any behavioural change.
+select = ["E9", "F"]
+
 [tool.setuptools]
 py-modules = [
     "analysis_findings",
