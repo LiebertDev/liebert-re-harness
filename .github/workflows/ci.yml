@@ -23,14 +23,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         python-version: ['3.10', '3.12']
-    # Linux is REPORTED, not yet REQUIRED, and the reason is two named defects
-    # rather than vagueness: the workspace sandbox does not refuse an out-of-tree
-    # destination on POSIX paths, and bounded_subprocess's process-tree teardown
-    # leaves an orphaned grandchild alive. Tracked as issues #1 and #2; both are
-    # real bugs in this package, not CI noise. Marking the leg non-blocking keeps
-    # its result visible while it is being fixed, instead of either hiding it or
-    # leaving the whole build permanently red. When both issues close, delete this.
-    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
+    # Every leg is required. The Linux legs were briefly non-blocking while issues
+    # #1 (POSIX path refusal) and #2 (POSIX process-group teardown) were open; both
+    # are fixed and all four legs pass, so the flag is gone as promised rather than
+    # left behind to quietly excuse a future failure.
 
     steps:
       - uses: actions/checkout@v4
