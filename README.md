@@ -297,26 +297,33 @@ sample binary this package does not ship.
 That measurement is **on Windows** (3.10 and 3.12), which is where this code was
 developed and where the analysis focus points.
 
-**Linux does not fully pass yet, and the first CI run is how we found out.** Two
-tests fail on `ubuntu-latest`, and both are real bugs in this package rather than CI
-noise — so they are named here instead of being softened:
+**The first CI run on Linux found two real bugs** ([#1](https://github.com/LiebertDev/liebert-re-harness/issues/1),
+[#2](https://github.com/LiebertDev/liebert-re-harness/issues/2)), both now fixed. They
+are described here rather than quietly closed, because the *shape* of each one is
+worth knowing:
 
-1. **The workspace sandbox does not hold on POSIX paths.** A destination outside the
-   workspace root is supposed to be refused and is not
-   (`tests/test_tools_archive_extract.py::test_dest_path_outside_workspace_is_path_refused`).
-   This is the containment control described below and in `docs/INSTALL.md`, so on
-   Linux you should treat it as absent until this is fixed.
-2. **`bounded_subprocess` does not tear down a process tree on Linux.** An orphaned
-   grandchild holding a pipe open survives the timeout instead of being killed
-   (`tests/test_bounded_subprocess_orphan_timeout.py`), so the module's bounded-
-   execution contract is not met there.
+1. **A Windows-style absolute path was silently accepted on POSIX instead of being
+   refused.** `safe_path()` decided containment with `pathlib.Path.is_absolute()`, and
+   on POSIX a backslash is not a separator — so `C:\Windows\evil.txt` parses as a
+   single ordinary *filename*, gets joined inside the workspace, and passes the
+   containment check without raising. **Correction to an earlier version of this
+   README:** this was not a sandbox escape. The write still landed inside the
+   workspace root; what failed was refusing an obviously foreign path, which is a
+   predictability bug rather than a containment breach. Fixed with a pure,
+   platform-independent syntax check applied only when `os.name != "nt"`, so the
+   Windows path is a structural no-op. Symlink escape was checked at the same time and
+   was already handled correctly (`resolve()` runs before the containment test); it now
+   has a regression test.
+2. **`bounded_subprocess` really did leak a process on Linux.** The POSIX
+   `os.killpg` teardown — the one mechanism immune to re-parenting — sat behind an
+   early `return` that triggered once the direct child had exited, which is exactly
+   the failing scenario. The remaining path walked recorded parent PIDs, and POSIX
+   re-parents an orphan the moment its parent dies, so nothing reached the grandchild.
+   Now the process group is torn down unconditionally on POSIX: `SIGTERM`, a bounded
+   wait, then `SIGKILL`. Windows's `taskkill /T /F` path is untouched.
 
-Both are tracked as issues ([#1](https://github.com/LiebertDev/liebert-re-harness/issues/1),
-[#2](https://github.com/LiebertDev/liebert-re-harness/issues/2)) and are good first
-contributions. The Linux CI leg is
-marked non-blocking so its result stays visible while they are open — not hidden, and
-not left to redden the whole build indefinitely. Everything else passes on Linux:
-181 passed, 42 skipped.
+Both fixes ship with tests that run on Windows — the containment logic was extracted
+into pure functions specifically so it could be proven without a Linux box.
 
 Every external engine is **optional**; nothing here ships or requires a licensed
 tool, and the IDA and Ghidra wrappers are not part of this package at all. **[docs/INSTALL.md](docs/INSTALL.md)** lists exactly

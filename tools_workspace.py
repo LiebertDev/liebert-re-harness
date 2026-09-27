@@ -90,8 +90,42 @@ MAX_READ_LINES = 500
 MAX_SEARCH_RESULTS = 250
 MAX_FIND_RESULTS = 400
 
+def _looks_like_windows_absolute_path(raw: str) -> bool:
+    """Pure string check for Windows absolute-path syntax: a drive letter
+    (``C:\\x`` / ``C:/x``) or a UNC/bare-rooted path (``\\\\server\\share``
+    / ``\\x``). Deliberately platform-independent (no filesystem access,
+    no ``os.name`` check) so it is directly unit-testable on any host --
+    see ``tests/test_tools_workspace_safe_path.py`` for the isolated proof
+    this exists to make possible without waiting on a Linux CI run.
+    """
+    if raw[:1] == "\\":
+        return True
+    return len(raw) >= 3 and raw[0].isalpha() and raw[1] == ":" and raw[2] in "\\/"
+
+
 def safe_path(path="."):
-    p = Path(str(path or ".").strip())
+    raw = str(path or ".").strip()
+    # POSIX-only guard, checked BEFORE any Path parsing. Root cause
+    # (measured live -- see tests/test_tools_archive_extract.py::
+    # TestExtractOutcomes::test_dest_path_outside_workspace_is_path_refused,
+    # which failed only on Linux CI): backslash is not a path separator on
+    # POSIX, so e.g. Path("C:\\Windows\\evil.txt") is neither absolute nor
+    # traversal there -- pathlib treats the whole string as ONE ordinary,
+    # oddly-named RELATIVE path component. That gets silently joined
+    # *inside* WORKSPACE below (containment technically still holds -- the
+    # write lands under WORKSPACE, not on the real /Windows -- but the
+    # caller's plainly-foreign path is accepted instead of refused, which
+    # is not the fail-closed contract this function promises). On native
+    # Windows this exact same syntax is already absolute per
+    # ``Path.is_absolute()`` (drive-letter case) or already resolves
+    # outside WORKSPACE via the existing drive-substituting join (bare
+    # ``\\...`` case -- see ``_looks_like_windows_absolute_path``'s
+    # docstring), so this guard is a deliberate no-op there and must never
+    # fire for an ordinary Windows path already inside WORKSPACE (whose
+    # own root is itself a drive letter).
+    if os.name != "nt" and _looks_like_windows_absolute_path(raw):
+        raise PermissionError("Access outside the workspace root is denied.")
+    p = Path(raw)
     target = p.resolve() if p.is_absolute() else (WORKSPACE / p).resolve()
     try:
         target.relative_to(WORKSPACE)

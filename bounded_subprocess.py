@@ -198,6 +198,61 @@ def _snapshot_descendant_pids(pid: int) -> set[int]:
         return set()
 
 
+def _terminate_process_group_posix(pgid: int, *, grace_seconds: float) -> bool:
+    """POSIX-only group kill: SIGTERM the whole process group first, then
+    escalate to SIGKILL only if it is still around after ``grace_seconds``
+    -- never straight to SIGKILL, and never an unbounded wait either.
+
+    This is the mechanism that actually closes the Linux-only defect
+    ``_child_pids_by_ppid_scan`` cannot: that scan (and the Windows
+    ``taskkill /T`` path below) both identify descendants by walking
+    ``ppid`` links, which is reliable on Windows (a dead parent's recorded
+    ppid is never rewritten there -- see that function's own docstring)
+    but NOT on POSIX/Linux, where the kernel reparents an orphaned
+    descendant to the nearest subreaper/init the moment its immediate
+    parent exits -- exactly the shape of this module's own regression (a
+    direct child that exits before the grandchild it spawned does; see
+    ``tests/test_bounded_subprocess_orphan_timeout.py``). Reparenting only
+    ever rewrites ``ppid``; it never moves a process out of its process
+    GROUP. ``run_bounded_process`` spawns every POSIX child with
+    ``start_new_session=True`` (``setsid()``), which makes that child's own
+    pid its process group id by construction -- so ``pgid`` here is always
+    just ``process.pid``, valid to use directly with no ``os.getpgid()``
+    lookup (which would itself require the original process to still be
+    alive/unreaped to succeed). ``killpg`` reaches every member of that
+    group regardless of which process now shows as its parent.
+
+    Must be called even when the group leader itself has already exited:
+    a process group persists as long as any member is still alive, and
+    ``killpg`` only needs a valid ``pgid``, never a live leader.
+    """
+    delivered = False
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+            delivered = True
+        except ProcessLookupError:
+            break  # group has no live member left -- nothing further to escalate to
+        except OSError:
+            break
+        if sig is signal.SIGKILL:
+            break
+        # Bounded grace period between SIGTERM and the SIGKILL escalation,
+        # polled via a signal-0 liveness probe (no extra dependency, no
+        # unbounded wait): stop early the moment the group is confirmed
+        # gone instead of always sleeping the full grace_seconds.
+        deadline = time.monotonic() + max(0.1, grace_seconds)
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return delivered
+            except OSError:
+                return delivered
+            time.sleep(0.05)
+    return delivered
+
+
 def terminate_process_tree(
     process: subprocess.Popen[str], *, grace_seconds: float = 2.0,
     known_descendant_pids: "set[int] | None" = None,
@@ -219,6 +274,15 @@ def terminate_process_tree(
     real, indefinite hang in ``_bounded_drain`` (not bounded by
     ``grace_seconds`` at all), which is now the fixed regression covered by
     ``tests/test_bounded_subprocess_orphan_timeout.py``.
+
+    On POSIX, the ppid-walk orphan scan above is Windows-reliable only
+    (see ``_terminate_process_group_posix``'s docstring): Linux reparents
+    an orphan the instant its direct parent exits, which is precisely the
+    scenario that regression test exercises, so the ppid walk alone is not
+    trustworthy there. ``_terminate_process_group_posix`` is therefore run
+    UNCONDITIONALLY on POSIX (also before the ``process.poll()`` check
+    below, for the same "direct child may already be gone" reason), as a
+    second, independent mechanism that does not depend on ppid at all.
     """
     _unregister_active(process)
     orphan_pids = set(_child_pids_by_ppid_scan(process.pid))
@@ -226,6 +290,9 @@ def terminate_process_tree(
     orphans_killed = False
     for pid in orphan_pids:
         if _kill_pid_tree_by_pid(pid):
+            orphans_killed = True
+    if os.name != "nt":
+        if _terminate_process_group_posix(process.pid, grace_seconds=grace_seconds):
             orphans_killed = True
     if process.poll() is not None:
         return orphans_killed
@@ -241,13 +308,10 @@ def terminate_process_tree(
             tree_signal_succeeded = killed.returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             tree_signal_succeeded = False
-    else:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            tree_signal_succeeded = False
+    # POSIX: no separate branch needed here -- _terminate_process_group_posix
+    # above already delivered SIGTERM/SIGKILL to the whole group
+    # unconditionally, regardless of whether the direct child was still
+    # alive at that point.
     try:
         process.wait(timeout=max(0.1, grace_seconds))
     except subprocess.TimeoutExpired:

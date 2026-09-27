@@ -129,26 +129,31 @@ combining with it.
 ## Platform notes
 
 Development and measurement have been on **Windows x64** (Python 3.10 and 3.12,
-both green: 190 passed, 35 skipped), and the analysis focus — PE/COFF, VB6, .NET on
+both green: 201 passed, 35 skipped), and the analysis focus — PE/COFF, VB6, .NET on
 Windows — reflects that.
 
-**On Linux, two tests fail, and both are genuine defects in this package.** CI runs
-the suite on `ubuntu-latest` and found them on the first run; they are named rather
-than glossed:
+The first Linux CI run found two real defects, both now fixed
+([#1](https://github.com/LiebertDev/liebert-re-harness/issues/1),
+[#2](https://github.com/LiebertDev/liebert-re-harness/issues/2)). The one that
+concerns the sandbox above is worth stating precisely, because an earlier version of
+this page overstated it:
 
-1. **The workspace sandbox above does not hold on POSIX paths.** An out-of-tree
-   destination is not refused. So on Linux, **do not rely on the containment
-   described in the previous section** — analyse untrusted input in a disposable VM,
-   which you should be doing regardless.
-2. **`bounded_subprocess` does not kill a process tree on Linux.** An orphaned
-   grandchild survives a timeout, so "bounded" is not currently true there.
+- **What was broken:** `safe_path()` tested containment with
+  `pathlib.Path.is_absolute()`. On POSIX a backslash is not a separator, so
+  `C:\Windows\evil.txt` parses as one ordinary *filename*, is joined inside the
+  workspace root, and passes the containment check without raising.
+- **What was NOT broken:** containment itself. The write still landed inside the
+  workspace. The bug was failing to *refuse* an obviously foreign path — wrong and
+  worth fixing, but not an escape. The earlier "do not rely on the containment"
+  wording was too strong and is withdrawn.
+- **Symlinks** were checked at the same time and were already correct: `resolve()`
+  follows the link before containment is tested, so a link inside the workspace
+  pointing outside it was already refused. It now has a regression test.
 
-Everything else passes on Linux (181 passed, 42 skipped). Both defects are tracked
-as issues ([#1](https://github.com/LiebertDev/liebert-re-harness/issues/1),
-[#2](https://github.com/LiebertDev/liebert-re-harness/issues/2)) and are good first
-contributions; the Linux CI leg is marked non-blocking
-while they are open so its result stays visible without reddening the whole build.
+None of that changes the standing advice: analyse untrusted input in a disposable VM.
+The sandbox is a guardrail against mistakes, not a containment boundary for hostile
+code, and that was true before these fixes too.
 
-A Linux contributor should also expect Windows-shaped test data in places, and should
-say so in a pull request when something is genuinely platform-broken rather than
-merely untested.
+A Linux contributor should expect Windows-shaped test data in places, and should say
+so in a pull request when something is genuinely platform-broken rather than merely
+untested.

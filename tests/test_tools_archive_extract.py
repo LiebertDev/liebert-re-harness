@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import shutil
 import tarfile
 import unittest
@@ -20,6 +21,30 @@ import tools_workspace
 from tools_formats import archive_inspect
 
 _SCRATCH = tools_workspace.WORKSPACE_ROOT / ".pytest_archive_extract_scratch"
+
+
+def _symlinks_are_creatable() -> bool:
+    """Best-effort capability probe, never a platform guess: some Windows
+    hosts allow unprivileged symlink creation (Developer Mode / the right
+    group policy), most don't without admin. Skip cleanly instead of
+    silently skipping without saying why -- see the test below."""
+    probe_dir = _SCRATCH.parent / ".pytest_symlink_probe"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    link = probe_dir / "link"
+    target = probe_dir / "target"
+    try:
+        target.mkdir(exist_ok=True)
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        os.symlink(str(target), str(link), target_is_directory=True)
+        return True
+    except OSError:
+        return False
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+
+
+_CAN_SYMLINK = _symlinks_are_creatable()
 
 
 class _ScratchGuard(unittest.TestCase):
@@ -165,6 +190,47 @@ class TestExtractOutcomes(_ScratchGuard):
                                              member="hello.txt", dest_path="C:\\Windows\\evil.txt"))
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], "PATH_REFUSED")
+
+    @unittest.skipUnless(
+        _CAN_SYMLINK,
+        "unprivileged symlink creation is not available on this host (Windows "
+        "without Developer Mode/admin) -- containment behavior for a "
+        "workspace-internal symlink pointing outside the workspace cannot be "
+        "exercised here; this is exactly the case tests/"
+        "test_tools_workspace_safe_path.py's platform-independent tests cover "
+        "for the underlying guard logic without needing a real symlink.",
+    )
+    def test_dest_path_through_workspace_internal_symlink_escaping_outside_is_refused(self):
+        # A symlink that LIVES inside the workspace but points OUTSIDE it
+        # (e.g. crafted by something that ran before this call, or a
+        # decompression step that itself created one) must not let a
+        # later dest_path through that symlink land outside the workspace.
+        # safe_path() resolves the full path (Path.resolve() follows
+        # symlinks) before the containment check, so this is expected to
+        # already be refused by the SAME code path as the outside-path
+        # regression above -- this test exists to make that a checked
+        # guarantee, not an assumption.
+        import tempfile
+
+        # Deliberately OUTSIDE the workspace tree (system temp dir, e.g.
+        # /tmp or %LOCALAPPDATA%\Temp) -- a directory under _SCRATCH's own
+        # parent would still be inside WORKSPACE_ROOT and would not
+        # exercise the escape this test is for.
+        with tempfile.TemporaryDirectory() as outside_root_str:
+            outside_root = Path(outside_root_str).resolve()
+            self.assertRaises(ValueError, outside_root.relative_to, tools_workspace.WORKSPACE_ROOT)
+            link_dir = _SCRATCH / "escape_link"
+            if link_dir.exists() or link_dir.is_symlink():
+                link_dir.unlink()
+            os.symlink(str(outside_root), str(link_dir), target_is_directory=True)
+            archive = _SCRATCH / "a.zip"
+            _make_zip(archive, {"hello.txt": b"hi"})
+            dest = str(link_dir / "escaped.txt")
+            result = json.loads(archive_inspect(str(archive), operation="extract",
+                                                 member="hello.txt", dest_path=dest))
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "PATH_REFUSED")
+            self.assertFalse((outside_root / "escaped.txt").exists())
 
     def test_missing_member_is_member_not_found(self):
         archive = _SCRATCH / "a.zip"
