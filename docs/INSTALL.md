@@ -5,7 +5,8 @@
 Only what you need to run and develop the analysis code. Concretely:
 
 - **35 Python modules** at the repository root — the analysis code itself.
-- **34 test files** plus `conftest.py` in `tests/`.
+- **35 test files** in `tests/`, plus `conftest.py` and an empty `__init__.py`
+  (the latter is required so the flat top-level modules resolve on `sys.path`).
 - **11 standalone challenge-solution scripts** in `crackme_solutions/`.
 - Documentation, licence, CI configuration, and issue templates.
 

@@ -84,19 +84,51 @@ of the repository being public.
 
 ## What it can do today
 
-| Area | What works |
-|---|---|
-| **PE / COFF** | Header, section, and directory parsing, including the case where the section table and the real exception directory disagree. Import and export recovery, delay imports, TLS, relocations, resources, rich header. |
-| **Function recovery** | Function boundaries from exception-directory unwind data, prologue scanning, and engine cross-check — with the boundary count and its source reported separately rather than merged into one number. |
-| **Symbols and debug data** | CodeView / RSDS records, PDB association, build-id and provenance extraction. |
-| **Disassembly and decompilation** | Capstone for linear and targeted disassembly; wrappers that drive IDA and Ghidra headless for decompilation, cross-references, and callers/callees, with results normalised across engines. |
-| **Emulation** | Bounded range emulation on Unicorn, with an execution trace, a backward slicer that answers "what produced this value", per-instruction byte snapshots so a self-modifying region cannot silently corrupt a decode, and register capture at execution time. |
-| **.NET** | IL method recovery, metadata and inline-constant extraction for managed assemblies. |
-| **Entropy and packing** | Sliding-window entropy per section and per page, used to separate "encrypted" from "compressed" from "ordinary code" rather than reporting one number per file. |
-| **Crypto attacks** | Working implementations used to solve real challenges: LLL lattice reduction and a Lagarias–Odlyzko subset-sum attack, a SipHash key-recovery attack, meet-in-the-middle search. |
-| **Legacy formats** | A VB6 P-Code interpreter, and a VEX-based emulation path. |
-| **Crash and memory artefacts** | Minidump parsing, crash symbolisation. |
-| **Evidence layer** | Content-hash-keyed result storage, claim-to-measurement linking, and provenance records that survive being summarised. |
+This table describes **what is in this repository**, module by module — not the
+wider tree it came from. What is *not* here is listed immediately after it.
+
+| Area | What works | Module |
+|---|---|---|
+| **PE / COFF** | Headers, sections with per-section entropy, imports, exports, resource enumeration and extraction, Authenticode signature inspection (Windows), raw byte search, string extraction, hashing | `tools_binary.py` |
+| **Disassembly** | Capstone-based disassembly of a PE range | `tools_binary.py` |
+| **Symbols and debug data** | CodeView / RSDS record parsing and correlation to a module; MSF/PDB container parsing; detection, build and validation of a PDB toolchain for binaries you own | `codeview_rsds.py`, `msf_pdb.py`, `native_pdb_toolchain.py` |
+| **Addressing** | RVA / VA / file-offset normalisation and form resolution — the conversion people get wrong by hand | `pe_address.py` |
+| **.NET** | Metadata and IL method-body parsing, inline constants, and relationship extraction across managed assemblies | `dotnet_il.py`, `dotnet_relationships.py` |
+| **Crash and memory artefacts** | Minidump parsing and reading memory at a virtual address out of a dump | `minidump_structural.py` |
+| **Crypto identification and attacks** | Constant identification for 21 algorithms in both endiannesses, re-derived from the algorithms rather than copied from a signature list; exact LLL lattice reduction and short-vector enumeration; lattice helpers used by the subset-sum attack | `tools_crypto_id.py`, `lll_exact.py`, `tools_lattice.py` |
+| **Legacy and niche formats** | VB6 P-Code decoding; an LZMA1 range decoder; ASAR archive parsing; archive, HAR, log, SQLite and general file-identity inspection | `tools_vb6_pcode.py`, `lzma1_range_decoder.py`, `asar_parser.py`, `tools_formats.py` |
+| **Instruction-level correctness** | A measured study of VEX/AVX decoding, including the case where a VEX instruction is silently executed as its legacy SSE equivalent and the answer is simply wrong | `vex.py` |
+| **Comparison and verification** | Version diffing between two builds; cross-binary relationship building; verifying that a named constant really is at a claimed address | `binary_version_diff.py`, `cross_binary_relationships.py`, `constant_at_address_verifier.py` |
+| **Findings and IR** | A stable analysis IR with stable ids, security-hypothesis construction, counter-evidence verification, finding validation and rendering, and validation planning | `analysis_ir.py`, `analysis_findings.py`, `exploit_validation.py` |
+| **Evidence layer** | Content-hash-keyed result storage, claim indexing, a guard against claims unsupported by evidence, provenance records, and workspace indexing | `evidence_index.py`, `evidence_security.py`, `claim_index.py`, `claim_guard.py`, `workspace_index.py` |
+| **Engine wrappers that ship here** | rizin (disassembly listings, patch planning and application, closed-form CRC-32 correction), Detect It Easy, YARA-X, API Monitor catalogue | `tools_rizin.py`, `tools_die.py`, `tools_yara_x.py`, `tools_apimonitor.py` |
+| **Execution plumbing** | Bounded subprocess execution with process-tree teardown, cross-process locking, and the workspace sandbox that confines file access | `bounded_subprocess.py`, `process_lock.py`, `tools_workspace.py` |
+
+### In the wider tree, deliberately **not** in this repository
+
+Named explicitly, because a capability list that quietly includes things you cannot
+import is the exact failure this project is organised against:
+
+- **Bounded emulation** (Unicorn-based range emulation, execution traces, the
+  backward slicer, per-instruction byte snapshots, register capture). Not here. This
+  is why `crackme_solutions/scripts_mutated_crackme5_serial.py` is
+  documentation-only.
+- **IDA and Ghidra wrappers** (headless decompilation, cross-references,
+  callers/callees, normalised across engines). Not here — `docs/INSTALL.md` is the
+  authority on which engines this package can actually drive, and it lists rizin,
+  Detect It Easy, YARA-X and API Monitor.
+- **Function-boundary recovery from exception-directory unwind data**, prologue
+  scanning, and engine cross-check. Not here.
+- **Crash symbolisation.** Minidump *parsing* is here; turning an address into a
+  symbol is not.
+- **Delay imports, TLS, relocation and rich-header parsing.** The PE work here
+  covers headers, sections, imports, exports and resources; those four directories
+  are not implemented.
+- **Sliding-window entropy** per page. What ships is whole-file and per-section
+  entropy, which is enough for triage and is not the same thing.
+
+Several of these are good contributions, and the first two are large enough to be
+somebody's main one.
 
 ## What it cannot do — read this before proposing work
 
@@ -110,9 +142,11 @@ Stated plainly, because a capability list without this section is marketing:
 - **Control-flow flattening.** No unflattening pass. Flattened functions are
   recovered as a dispatch loop, which is technically correct and practically
   useless.
-- **Interprocedural taint / full dataflow.** The backward slicer works inside a
-  trace and across a bounded set of hops. There is no whole-program taint, so
-  "does attacker input reach this sink" is answered by hand today.
+- **Interprocedural taint / full dataflow.** There is no whole-program taint
+  analysis anywhere in the project, so "does attacker input reach this sink" is
+  answered by hand today. (The wider tree has a backward slicer that works inside
+  an emulation trace across a bounded set of hops; it is not in this repository, and
+  it is not whole-program taint either.)
 - **Symbolic execution.** No symbolic or concolic engine. Constants that are
   computed rather than written as immediates frequently come back `UNKNOWN`, which
   is honest but is not an answer.
@@ -255,13 +289,19 @@ pip install -e ".[dev]"
 pytest -q
 ```
 
-Python 3.10 or newer. Expected on a clean checkout with **no external analysis tool
-installed**: `190 passed, 35 skipped`, zero failures. The skips are guards for
-tests needing a sample binary this package does not ship. CI enforces this on Linux
-and Windows.
+Python 3.10 or newer. On a clean checkout with **no external analysis tool
+installed**, the measured result is `190 passed, 35 skipped`, zero failures, in
+about 11 seconds — across 35 test files. The skips are guards for tests needing a
+sample binary this package does not ship.
 
-Every external engine is **optional**, including IDA and Ghidra; nothing here ships
-or requires a licensed tool. **[docs/INSTALL.md](docs/INSTALL.md)** lists exactly
+That measurement is **on Windows**, which is where this code was developed and where
+the analysis focus (PE/COFF, VB6, .NET on Windows) points. CI runs the same suite on
+Linux as well, and four modules do carry Windows-conditional paths — so treat the
+Linux column as a check that is now running rather than a result already claimed. If
+it comes back red, that is a bug to fix, not a caveat to explain away.
+
+Every external engine is **optional**; nothing here ships or requires a licensed
+tool, and the IDA and Ghidra wrappers are not part of this package at all. **[docs/INSTALL.md](docs/INSTALL.md)** lists exactly
 what each one unlocks, the environment variable that locates it, what is *not* in
 this repository and why, and the workspace sandbox you will meet on your first call.
 

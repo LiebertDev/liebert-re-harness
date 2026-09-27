@@ -125,8 +125,16 @@ subset *of*:
 
 ## External engines: which are really wired
 
-Distinguishing "we drive it" from "we mention it", because that distinction is
-usually where tool inventories lie.
+**Scope warning, so this table is not misread.** It describes the **wider private
+working tree**, not this package. This repository ships wrappers for **rizin,
+Detect It Easy, YARA-X and API Monitor only** — the IDA, Ghidra, capa, FLOSS,
+pe-sieve and Frida integrations listed below are *not* in it.
+[INSTALL.md](INSTALL.md) is the authority on what this package can actually drive,
+and the README lists what is deliberately excluded.
+
+The table is kept because it answers a different and still-useful question: which
+integrations are real work and which are a name in a planning document. That
+distinction is usually where tool inventories lie.
 
 | Engine | Integration |
 |---|---|
