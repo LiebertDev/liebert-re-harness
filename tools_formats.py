@@ -218,7 +218,9 @@ def archive_inspect(path,operation='summary',query='',member='',max_results=200,
             if hit['size']>MAX_ARCHIVE_MEMBER:return _json({**base,'ok':False,'error':'MEMBER_TOO_LARGE','member':member})
             raw=obj.read(member) if kind=='zip' else obj.extractfile(next(x for x in obj.getmembers() if x.name==member)).read()
             if b'\x00' in raw[:4096]:return _json({**base,'ok':False,'error':'BINARY_MEMBER','member':member,'size':len(raw)})
-            text=raw.decode('utf-8',errors='replace'); base.update(member=member,content=text[:max_chars],truncated=len(text)>max_chars); return _json(base)
+            try:text=raw.decode('utf-8')
+            except UnicodeDecodeError as e:return _json({**base,'ok':False,'error':'BINARY_MEMBER','member':member,'size':len(raw),'first_invalid_utf8_offset':e.start})
+            base.update(member=member,content=text[:max_chars],truncated=len(text)>max_chars); return _json(base)
         if operation=='extract':
             # First-class extraction (GAP: 'read' above refuses BINARY_MEMBER
             # outright, so a sample inside an archive could be listed but

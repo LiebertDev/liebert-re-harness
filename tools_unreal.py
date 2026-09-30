@@ -13,7 +13,7 @@ entries (zlib, in fixed-size blocks) are reported honestly as
 COMPRESSION_NOT_SUPPORTED rather than guessed at."""
 from __future__ import annotations
 import hashlib,json,struct
-from tools_workspace import safe_path,relative
+from tools_workspace import safe_path,relative,member_content
 
 def _j(x):return json.dumps(x,ensure_ascii=False,indent=2,default=str)
 
@@ -101,7 +101,8 @@ def unreal_asset_analyzer(path,operation='summary',member='',max_results=300,max
         rec,data_start=_read_record(data,hit['offset'],parsed['version'])
         content=data[data_start:data_start+hit['uncompressed_size']]
         sha1_actual=hashlib.sha1(content).hexdigest()
-        text=content.decode('utf-8',errors='replace')
-        return _j({**base,'filename':member,'content':text[:max_chars],'truncated':len(text)>max_chars,
+        # Lossless or refused: text only when the member is valid UTF-8, otherwise
+        # content_kind='binary' with its hash, never U+FFFD-mangled "content".
+        return _j({**base,'filename':member,**member_content(content,max_chars),
                    'byte_size':len(content),'sha1_matches_index':sha1_actual==hit['sha1']})
     return _j({**base,'ok':False,'error':'UNSUPPORTED_PAK_OPERATION'})

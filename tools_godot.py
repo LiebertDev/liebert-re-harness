@@ -7,7 +7,7 @@ source actually documents); GDScript bytecode inside script resources is not
 decoded -- only container-level file listing/extraction."""
 from __future__ import annotations
 import struct
-from tools_workspace import safe_path,relative
+from tools_workspace import safe_path,relative,member_content
 import json
 
 def _j(x):return json.dumps(x,ensure_ascii=False,indent=2,default=str)
@@ -75,6 +75,7 @@ def godot_asset_analyzer(path,operation='summary',member='',max_results=300,max_
         if hit is None:return _j({**base,'ok':False,'error':'MEMBER_NOT_FOUND'})
         start=h['file_base']+hit['offset'] if h['rel_filebase'] else hit['offset']
         content=data[start:start+hit['size']]
-        text=content.decode('utf-8',errors='replace')
-        return _j({**base,'member':member,'content':text[:max_chars],'truncated':len(text)>max_chars,'byte_size':hit['size']})
+        # Lossless or refused: text only when the member is valid UTF-8, otherwise
+        # content_kind='binary' with its hash, never U+FFFD-mangled "content".
+        return _j({**base,'member':member,**member_content(content,max_chars),'byte_size':hit['size']})
     return _j({**base,'ok':False,'error':'UNSUPPORTED_GODOT_OPERATION'})

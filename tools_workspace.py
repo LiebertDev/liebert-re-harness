@@ -1,4 +1,5 @@
 ﻿import fnmatch
+import hashlib
 import json
 import os
 from datetime import datetime
@@ -156,6 +157,20 @@ def text_of(path):
         except UnicodeDecodeError:
             pass
     return data.decode("utf-8", errors="replace")
+
+def member_content(raw, max_chars):
+    """Describe raw member bytes honestly: text only if they are valid UTF-8.
+
+    Returns {'content_kind':'text','content','truncated'} for a member that
+    decodes cleanly, else {'content_kind':'binary','sha256','first_invalid_utf8_offset'}
+    with NO 'content' key. Never substitutes U+FFFD: a lossy string presented as
+    content would be corrupted data reported as success."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return {"content_kind": "binary", "sha256": hashlib.sha256(raw).hexdigest(),
+                "first_invalid_utf8_offset": exc.start}
+    return {"content_kind": "text", "content": text[:max_chars], "truncated": len(text) > max_chars}
 
 def list_directory(path=".", recursive=False, max_depth=2):
     target = safe_path(path)
