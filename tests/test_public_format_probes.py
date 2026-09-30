@@ -136,6 +136,24 @@ class FormatProbeNotThisFormatTests(unittest.TestCase):
         bad = _j(rar_7z(str(corrupt_gz), "read"))
         self.assertFalse(bad["ok"])
 
+        # bz2 and xz were imported here and never exercised, so the comment
+        # above promised three codecs and the test covered one. The capability
+        # table claims all three, which makes the gap worth closing rather than
+        # deleting the imports to quiet the linter.
+        for suffix, compress in (
+            (".bz2", bz2.compress), (".xz", lzma_mod.compress),
+        ):
+            good = self.root / f"note.txt{suffix}"
+            good.write_bytes(compress(b"hello from " + suffix.encode()))
+            got = _j(rar_7z(str(good), "read"))
+            self.assertTrue(got["ok"], got)
+            self.assertIn("hello from", got["content"])
+
+            broken = self.root / f"corrupt{suffix}"
+            broken.write_bytes(compress(b"hello")[:6] + b"\xff\xff\xff\xff")
+            refused = _j(rar_7z(str(broken), "read"))
+            self.assertFalse(refused["ok"], refused)
+
     def test_rar_7z_reports_a_structured_error_for_a_corrupt_7z_body(self):
         # py7zr is an optional dependency (not in the published package's
         # required set). Forging the real 7Z magic with a junk body reaches

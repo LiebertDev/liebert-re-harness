@@ -6,7 +6,6 @@ via archive_inspect. Resources.arsc string/style resolution and signature
 verification depth are not implemented -- only presence/identity."""
 from __future__ import annotations
 import json
-from pathlib import Path
 from tools_workspace import safe_path,relative
 
 _ANDROID_NS='{http://schemas.android.com/apk/res/android}'

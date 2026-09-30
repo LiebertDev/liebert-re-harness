@@ -54,12 +54,12 @@ def symbolize_rva(
     if pe_rsds is None:
         result["status"] = "NO_RSDS"
         result["confidence"] = "LOW"
-        return result
+        return _confidence_describes_the_symbol(result)
     if not pdb_path:
         result["status"] = "PDB_NOT_FOUND"
         result["identity"] = {"status": "PDB_NOT_FOUND"}
         result["confidence"] = "LOW"
-        return result
+        return _confidence_describes_the_symbol(result)
     parsed = parse_pdb(pdb_path)
     info = parsed.get("info_stream") or {}
     identity = correlate_pe_pdb_identity(pe_rsds, info)
@@ -67,35 +67,57 @@ def symbolize_rva(
     if not parsed.get("ok") or not info.get("ok"):
         result["status"] = "UNSUPPORTED"
         result["confidence"] = "LOW"
-        return result
+        return _confidence_describes_the_symbol(result)
     if not identity.get("identity_match"):
         result["status"] = "MISMATCH" if identity.get("status") == "MISMATCH" else identity.get("status") or "WRONG_PDB"
         result["confidence"] = "HIGH"
-        return result
+        return _confidence_describes_the_symbol(result)
     symbols = (parsed.get("public_symbols") or {}).get("symbols") or []
     if not symbols:
         result["status"] = "NO_PUBLIC_SYMBOLS"
         result["confidence"] = "MEDIUM"
-        return result
+        return _confidence_describes_the_symbol(result)
     lookup = lookup_symbol_by_rva(symbols, int(rva), sections=pe_sections)
     match = lookup.get("match")
     result["lookup_status"] = lookup.get("status")
     if lookup.get("status") == "SECTION_MAP_REQUIRED":
         result["status"] = "SECTION_MAP_REQUIRED"
         result["confidence"] = "HIGH"
-        return result
+        return _confidence_describes_the_symbol(result)
     if lookup.get("status") == "BEFORE_FIRST" or match is None:
         result["status"] = "BEFORE_FIRST"
         result["confidence"] = "MEDIUM"
-        return result
+        return _confidence_describes_the_symbol(result)
     symbol_rva = int(match.get("rva") or 0)
     result["symbol"] = match.get("name")
     result["symbol_rva"] = symbol_rva
     result["offset_from_symbol"] = int(rva) - symbol_rva
     result["status"] = "MATCH"
     result["confidence"] = "HIGH" if lookup.get("status") == "EXACT" else "MEDIUM"
-    return result
+    return _confidence_describes_the_symbol(result)
 
+
+def _confidence_describes_the_symbol(result: dict) -> dict:
+    """`confidence` rates the returned symbol, so it cannot outrank having one.
+
+    The field is initialised to UNKNOWN beside `symbol: None`, and the match
+    branch is the only place that earns HIGH (an EXACT lookup). Three earlier
+    branches contradicted that by hand: a PDB whose identity does not match the
+    crashing module returned `confidence: "HIGH"` with `symbol: None`, and so did
+    SECTION_MAP_REQUIRED, while NO_PUBLIC_SYMBOLS and BEFORE_FIRST returned
+    MEDIUM with no symbol either. A caller ranking results by confidence would
+    have put a wrong-PDB answer above a real, merely non-exact one -- and the
+    wrong-PDB case is exactly the one the documentation warns about.
+
+    HIGH on a mismatch was not meaningless, it was the wrong field: the verdict
+    "this PDB definitely does not belong to this module" is indeed certain. That
+    certainty lives in `status` and `identity`, which say so precisely. This
+    function keeps `confidence` answering one question only, and a no-symbol
+    result is never allowed to claim more than LOW.
+    """
+    if result.get("symbol") is None and result.get("confidence") in {"HIGH", "MEDIUM"}:
+        result["confidence"] = "LOW"
+    return result
 
 def crash_symbolize(
     module: str,

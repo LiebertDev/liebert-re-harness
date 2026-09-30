@@ -11,7 +11,7 @@ from pathlib import Path
 import tool_families
 import tools_workspace
 from minidump_analyzer import _module_containing_address, analyze_minidump, minidump_analyzer
-from minidump_structural import parse_minidump, read_memory_at_va
+from minidump_structural import read_memory_at_va
 from msf_pdb import write_synthetic_pdb
 
 # NOTE: intentionally NOT importing helpers from tests.test_codeview_rsds via

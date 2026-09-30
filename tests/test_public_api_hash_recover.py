@@ -12,7 +12,6 @@ uses elsewhere for a real-system-file dependency
 (tests/test_binary_patch.py's kernel32.dll skipUnless)."""
 from __future__ import annotations
 
-import struct
 import unittest
 import zlib
 from pathlib import Path

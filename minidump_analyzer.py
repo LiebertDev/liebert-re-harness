@@ -16,7 +16,6 @@ This module never claims more than what is proven:
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from crash_symbolize import symbolize_rva
 from minidump_structural import MAX_MEMORY_READ_BYTES, parse_minidump, read_memory_at_va

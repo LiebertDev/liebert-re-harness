@@ -7,7 +7,6 @@ scope."""
 from __future__ import annotations
 
 import json
-import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -79,3 +78,36 @@ class CrashSymbolizeToolWrapperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfidenceDescribesTheSymbolTests(unittest.TestCase):
+    """`confidence` rates the returned symbol, so a result without one cannot
+    claim HIGH. Three branches contradicted that by hand -- a PDB whose identity
+    does not match the crashing module returned HIGH with `symbol: None`, which
+    is the one case the documentation warns about, and a caller ranking results
+    by confidence would have put it above a real but non-exact match."""
+
+    def test_no_symbol_never_claims_high_or_medium(self):
+        from crash_symbolize import _confidence_describes_the_symbol
+        for claimed in ("HIGH", "MEDIUM"):
+            got = _confidence_describes_the_symbol(
+                {"symbol": None, "confidence": claimed, "status": "MISMATCH"})
+            self.assertEqual(got["confidence"], "LOW", claimed)
+
+    def test_a_real_symbol_keeps_the_confidence_it_earned(self):
+        from crash_symbolize import _confidence_describes_the_symbol
+        for claimed in ("HIGH", "MEDIUM", "LOW"):
+            got = _confidence_describes_the_symbol(
+                {"symbol": "DriverEntry", "confidence": claimed, "status": "MATCH"})
+            self.assertEqual(got["confidence"], claimed)
+
+    def test_the_certainty_of_a_mismatch_verdict_is_still_reported(self):
+        # The rule removes a misleading confidence, not the information: a
+        # mismatch is still stated exactly, in the fields that mean it.
+        from crash_symbolize import _confidence_describes_the_symbol
+        got = _confidence_describes_the_symbol({
+            "symbol": None, "confidence": "HIGH", "status": "MISMATCH",
+            "identity": {"status": "MISMATCH", "identity_match": False},
+        })
+        self.assertEqual(got["status"], "MISMATCH")
+        self.assertFalse(got["identity"]["identity_match"])
