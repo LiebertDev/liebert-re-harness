@@ -13,6 +13,18 @@ WORKSPACE_ROOT = Path(os.getenv("TEACHER_WORKSPACE", str(Path.cwd()))).expanduse
 # analysis tools intentionally remain sandboxed to WORKSPACE_ROOT.
 WORKSPACE = WORKSPACE_ROOT
 EXCLUDED_DIRS = {".git", ".venv", "__pycache__", "node_modules", ".vs", "dataset"}
+TEXT_LOCAL_CODEPAGE_ENV = "TEACHER_TEXT_LOCAL_CODEPAGE"
+
+_POSIX_LANDMARK_DIRS = (
+    "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/var", "/opt", "/boot",
+    "/dev", "/proc", "/sys", "/root", "/home", "/tmp", "/srv", "/mnt", "/media",
+    "/Users", "/Library", "/System", "/Applications", "/Volumes",
+)
+
+
+def _host_is_posix() -> bool:
+    return os.name != "nt"
+
 
 
 def _broad_scope_landmarks() -> set:
@@ -44,6 +56,21 @@ def _broad_scope_landmarks() -> set:
                 node = node.parent
         except Exception:
             pass
+    if _host_is_posix():
+        # The Windows set above is built from Windows-only environment
+        # variables, so on POSIX it would collapse to just the home
+        # directory. These are the POSIX equivalents of the Windows dir /
+        # Program Files / user-profile root: system config and binaries,
+        # every user's home, and the shared scratch/mount points. Guarding
+        # against the same thing -- a workspace ROOT set to a system-wide
+        # directory turning "inside the workspace" into "anywhere on the
+        # machine". Only the directory itself is refused; a project beneath
+        # one (e.g. /home/me/target) is still a legitimate root.
+        for name in _POSIX_LANDMARK_DIRS:
+            try:
+                landmarks.add(Path(name).resolve())
+            except Exception:
+                pass
     return landmarks
 
 
@@ -151,10 +178,21 @@ def text_of(path):
     data = path.read_bytes()
     if b"\x00" in data[:4096]:
         raise UnicodeError("binary")
-    for enc in ("utf-8", "utf-8-sig", "cp1254", "cp1252"):
+    # Order is deliberate. cp1252 is the general Western legacy default; a
+    # machine-specific codepage (e.g. cp1254, Turkish) must NOT outrank it:
+    # cp1254 accepts nearly every byte cp1252 does, so placed first it would
+    # silently mis-decode other text (0xF0 is "ð" in cp1252 but "ğ" in
+    # cp1254) and a second entry behind it is unreachable. An operator whose
+    # files really use a local codepage opts in explicitly.
+    local = os.environ.get(TEXT_LOCAL_CODEPAGE_ENV, "").strip()
+    encodings = ["utf-8", "utf-8-sig"]
+    if local:
+        encodings.append(local)
+    encodings.append("cp1252")
+    for enc in encodings:
         try:
             return data.decode(enc)
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, LookupError):
             pass
     return data.decode("utf-8", errors="replace")
 

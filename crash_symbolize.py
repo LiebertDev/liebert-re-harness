@@ -34,23 +34,53 @@ def symbolize_rva(
     }
     pe_rsds = None
     pe_sections = None
+    # Upper bounds (exclusive) for a valid RVA, from whichever sources exist.
+    range_bounds: dict[str, int] = {}
+    if int(rva) < 0:
+        return _refuse_rva(result, range_bounds, "RVA is negative")
     if pe_path:
         pe_report = extract_pe_rsds(pe_path)
         pe_rsds = pe_report.get("rsds") if pe_report.get("ok") else None
         section_report = extract_pe_section_map(pe_path)
         pe_sections = section_report.get("sections") if section_report.get("ok") else []
         result["pe_section_map_status"] = section_report.get("status")
+        if section_report.get("ok") and section_report.get("size_of_image"):
+            range_bounds["pe_size_of_image"] = int(section_report["size_of_image"])
         if pe_rsds is None and not pe_report.get("ok"):
             result["pe_rsds_error"] = pe_report.get("error")
     if minidump_path:
         dump = parse_minidump(minidump_path)
         result["minidump_ok"] = dump.get("ok")
-        for item in ((dump.get("modules") or {}).get("items") or []):
-            if module_basename_match(item.get("name", ""), module):
-                cv = (item.get("codeview") or {}).get("rsds")
-                if cv and cv.get("ok"):
-                    pe_rsds = cv
-                break
+        candidates = [
+            item for item in ((dump.get("modules") or {}).get("items") or [])
+            if module_basename_match(item.get("name", ""), module)
+        ]
+        # Basename equality is a candidate filter, not an identity: two loaded
+        # modules can share a file name from different directories. The PDB
+        # GUID/age check below is what proves a PDB belongs to the module, but
+        # it cannot tell which same-named module the caller MEANT, so narrow by
+        # full path when the caller gave one and refuse when still ambiguous.
+        if len(candidates) > 1 and _has_directory(module):
+            wanted = _norm_path(module)
+            narrowed = [c for c in candidates if _norm_path(c.get("name", "")) == wanted]
+            if narrowed:
+                candidates = narrowed
+        if len(candidates) > 1:
+            result["ok"] = False
+            result["status"] = "AMBIGUOUS_MODULE"
+            result["confidence"] = "LOW"
+            result["candidates"] = [c.get("name", "") for c in candidates]
+            return _confidence_describes_the_symbol(result)
+        if candidates:
+            item = candidates[0]
+            cv = (item.get("codeview") or {}).get("rsds")
+            if cv and cv.get("ok"):
+                pe_rsds = cv
+            if item.get("image_size"):
+                range_bounds["minidump_image_size"] = int(item["image_size"])
+    over = {k: v for k, v in range_bounds.items() if int(rva) >= v}
+    if over:
+        return _refuse_rva(result, range_bounds, "RVA is outside the module's image")
     if pe_rsds is None:
         result["status"] = "NO_RSDS"
         result["confidence"] = "LOW"
@@ -94,6 +124,24 @@ def symbolize_rva(
     result["offset_from_symbol"] = int(rva) - symbol_rva
     result["status"] = "MATCH"
     result["confidence"] = "HIGH" if lookup.get("status") == "EXACT" else "MEDIUM"
+    return _confidence_describes_the_symbol(result)
+
+
+def _has_directory(name: str) -> bool:
+    return "/" in str(name) or "\\" in str(name)
+
+
+def _norm_path(name: str) -> str:
+    return str(name).replace("\\", "/").casefold()
+
+
+def _refuse_rva(result: dict, bounds: dict, reason: str) -> dict:
+    """A caller error, refused by name -- never symbolised against the nearest symbol."""
+    result["ok"] = False
+    result["status"] = "RVA_OUT_OF_MODULE_RANGE"
+    result["confidence"] = "LOW"
+    result["error"] = reason
+    result["module_rva_upper_bounds"] = dict(bounds)
     return _confidence_describes_the_symbol(result)
 
 

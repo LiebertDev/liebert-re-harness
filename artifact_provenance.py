@@ -81,21 +81,46 @@ def safe_model_identifier(model: str | None) -> str:
     return value
 
 
+ABSENT = "ABSENT"
+
+
 def trajectory_provenance(workspace: str | Path, teacher_model: str | None) -> dict:
+    """Provenance record for a trajectory.
+
+    Every required input is hashed; one that is missing from this checkout
+    (the published tree ships none of the prompt/registry/router/planner/
+    verifier inputs) is recorded as the explicit string ``ABSENT`` in its hash
+    field, never as a silent null, and is listed in ``absent_inputs``.
+    ``provenance_valid`` is False whenever anything is absent. The record is
+    still returned rather than raising: teacher logging calls this on every
+    run and must not die on a checkout that lacks the inputs; consumers that
+    need real provenance gate on ``provenance_valid``.
+    """
     prompt = APP / "prompts" / "teacher_system.md"
     registry = APP / "tool_registry.json"
     router = _component("file_router", APP / "file_router.py")
     planner = _component("deterministic_planner", APP / "deterministic_planner.py")
     verifier = _component("claim_verifier", APP / "claim_verifier.py")
+    prompt_hash = sha256_file(prompt)
+    registry_hash = sha256_file(registry)
+    absent = [name for name, value in (
+        ("system_prompt", prompt_hash), ("tool_registry", registry_hash),
+        ("file_router", router["sha256"]), ("deterministic_planner", planner["sha256"]),
+        ("claim_verifier", verifier["sha256"]),
+    ) if value is None]
+    for comp in (router, planner, verifier):
+        comp["sha256"] = comp["sha256"] or ABSENT
     return {
+        "provenance_valid": not absent,
+        "absent_inputs": absent,
         "schema_version": DATASET_SCHEMA_VERSION,
         "producer_version": PRODUCER_VERSION,
         "created_at": utc_now(),
         "teacher_model": safe_model_identifier(teacher_model),
         "teacher_model_identifier": safe_model_identifier(teacher_model),
         "teacher_model_version": "runtime-configured",
-        "system_prompt_sha256": sha256_file(prompt),
-        "tool_registry_hash": sha256_file(registry),
+        "system_prompt_sha256": prompt_hash or ABSENT,
+        "tool_registry_hash": registry_hash or ABSENT,
         "tool_registry_version": PRODUCER_VERSION,
         "router_hash": router["sha256"], "router_version": router["version"],
         "planner_hash": planner["sha256"], "planner_version": planner["version"],

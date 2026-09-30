@@ -24,6 +24,11 @@ answer):
     with ``callback_array_address: null`` and ``note`` explaining why, NOT
     as an error and NOT silently indistinguishable from "we failed to read
     it".
+  ``UNSUPPORTED_ARCHITECTURE`` -- a TLS directory exists but the machine
+    type is not one this module was verified on (i386, amd64); refused
+    rather than guessing a pointer width. ``UNSUPPORTED_OPTIONAL_HEADER`` /
+    ``PE_HEADER_INCONSISTENT`` -- magic is not PE32/PE32+, or disagrees with
+    the machine type. Pointer width comes from the optional-header magic.
   ``TOOL_MISSING`` -- ``pefile`` not importable.
   ``NOT_A_PE`` / ``NOT_FOUND`` / ``PATH_REFUSED`` -- as every other tool in
     this codebase.
@@ -38,6 +43,9 @@ from tools_workspace import safe_path, relative
 
 _MAX_CALLBACKS = 256  # runaway/corrupt-data guard, not a real-world limit
 _FIRST_BYTES_LEN = 16
+_MAGIC_PTR_SIZE = {0x10B: 4, 0x20B: 8}  # PE32, PE32+
+# Machine types this module has been exercised on -> (name, expected magic).
+_SUPPORTED_MACHINES = {0x14C: ("i386", 0x10B), 0x8664: ("amd64", 0x20B)}
 
 
 def _j(payload: dict) -> str:
@@ -90,6 +98,16 @@ def analyze_tls_directory(path):
         return _j({"ok": False, "tool": "analyze_tls_directory", "status": "NOT_A_PE", "error": f"{type(exc).__name__}: {exc}"})
 
     try:
+        # Checked before the directory lookup: with an unrecognised magic
+        # pefile parses no data directories, so "no TLS directory" would be a
+        # confident wrong answer.
+        if int(pe.OPTIONAL_HEADER.Magic) not in _MAGIC_PTR_SIZE:
+            return _j({
+                "ok": False, "tool": "analyze_tls_directory", "status": "UNSUPPORTED_OPTIONAL_HEADER",
+                "path": relative(p), "machine": hex(int(pe.FILE_HEADER.Machine)),
+                "optional_header_magic": hex(int(pe.OPTIONAL_HEADER.Magic)),
+                "error": "optional-header magic is neither PE32 (0x10b) nor PE32+ (0x20b)",
+            })
         tls = getattr(pe, "DIRECTORY_ENTRY_TLS", None)
         if tls is None:
             return _j({
@@ -99,9 +117,25 @@ def analyze_tls_directory(path):
 
         s = tls.struct
         image_base = pe.OPTIONAL_HEADER.ImageBase
-        is64 = pe.FILE_HEADER.Machine == 0x8664
-        ptr_size = 8 if is64 else 4
-        ptr_fmt = "<Q" if is64 else "<I"
+        machine = int(pe.FILE_HEADER.Machine)
+        magic = int(pe.OPTIONAL_HEADER.Magic)
+        if machine not in _SUPPORTED_MACHINES:
+            return _j({
+                "ok": False, "tool": "analyze_tls_directory", "status": "UNSUPPORTED_ARCHITECTURE",
+                "path": relative(p), "machine": hex(machine), "optional_header_magic": hex(magic),
+                "supported_machines": {hex(m): n for m, (n, _) in _SUPPORTED_MACHINES.items()},
+                "error": "callback-array width is only verified for the listed machine types",
+            })
+        if magic != _SUPPORTED_MACHINES[machine][1]:
+            return _j({
+                "ok": False, "tool": "analyze_tls_directory", "status": "PE_HEADER_INCONSISTENT",
+                "path": relative(p), "machine": hex(machine), "optional_header_magic": hex(magic),
+                "error": "machine type and optional-header magic disagree about pointer width",
+            })
+        # The PE format defines pointer width by the optional-header magic
+        # (PE32 = 4 bytes, PE32+ = 8), not by the machine field.
+        ptr_size = _MAGIC_PTR_SIZE[magic]
+        ptr_fmt = "<Q" if ptr_size == 8 else "<I"
 
         cb_va = int(s.AddressOfCallBacks)
         directory = {

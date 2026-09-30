@@ -38,7 +38,7 @@ def _container_name(o):
     af=getattr(o,'assets_file',None)
     return getattr(af,'name',None) or str(af)
 
-def unity_asset_analyzer(path,operation='summary',path_id=0,container='',max_items=300):
+def unity_asset_analyzer(path,operation='summary',path_id=None,container='',max_items=300):
     p=safe_path(path);max_items=max(1,min(int(max_items),5000))
     try:
         import UnityPy
@@ -70,7 +70,8 @@ def unity_asset_analyzer(path,operation='summary',path_id=0,container='',max_ite
             rows.append(row)
         return _j({**base,'objects':rows,'truncated':len(objects)>max_items})
     if operation=='read':
-        if not path_id:return _j({**base,'ok':False,'error':'PATH_ID_REQUIRED'})
+        # 0 is a legal Unity path_id, so only None/'' mean "not specified".
+        if path_id is None or path_id=='':return _j({**base,'ok':False,'error':'PATH_ID_REQUIRED'})
         candidates=[o for o in objects if o.path_id==int(path_id)]
         if container:
             candidates=[o for o in candidates if _container_name(o)==container]

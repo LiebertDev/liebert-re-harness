@@ -68,28 +68,81 @@ class BoundedProcessResult:
 
 
 def _process_tree_rss_bytes(pid: int) -> int | None:
+    """Resident bytes of ``pid`` and its descendants, or None when the ROOT's
+    memory cannot be measured at all (psutil missing, or access denied on a
+    non-elevated host).
+
+    None means "could not measure" and NEVER "over the limit"; callers must
+    keep those two outcomes on separate branches (``resource_limit_unavailable``
+    vs ``memory_exceeded``). A descendant that vanishes or denies access is
+    skipped rather than failing the whole read: the sum then undercounts that
+    one process, which is the honest limit of what an unprivileged host can
+    observe, and is preferable to killing a healthy tree over one opaque child.
+    """
     try:
         import psutil
     except ImportError:
         return None
     try:
         root = psutil.Process(pid)
-        processes = [root, *root.children(recursive=True)]
-        return sum(proc.memory_info().rss for proc in processes if proc.is_running())
+        total = root.memory_info().rss
+        children = root.children(recursive=True)
     except psutil.NoSuchProcess:
         return 0
     except (psutil.Error, OSError):
         return None
+    for proc in children:
+        try:
+            total += proc.memory_info().rss
+        except (psutil.Error, OSError):
+            continue
+    return total
+
+
+def _memory_monitor_usable() -> bool:
+    """Preflight, before any child is spawned: can this host measure process
+    memory at all? Probed on our own pid; if it is unreadable a child's will
+    be too. Lets a memory-bounded call be REFUSED up front with the named
+    ``resource_limit_unavailable`` status instead of launching a child only to
+    kill it, and instead of running it with a bound that is not enforced
+    (this module is the base for untrusted-tool execution, so an unenforceable
+    bound fails closed)."""
+    return _process_tree_rss_bytes(os.getpid()) is not None
 
 
 def _limit_text(value: str, maximum: int | None) -> tuple[str, bool, str]:
+    """Bound a captured stream, keeping BOTH ends.
+
+    Head-only truncation destroys exactly the part that matters for a
+    streamed event log: a CLI worker's final answer is the last event, so
+    when a chatty tool loop pushes the stream past the cap, dropping the
+    tail silently deletes the model's whole result and leaves only its
+    opening narration. That was observed live: an OpenCode call whose
+    stream reached 1,013,043 chars came back with 127 chars of "I'll start
+    by reading the ground-truth files" and no answer at all, because every
+    later event -- including the answer -- was past the cut.
+
+    So the middle is dropped instead, and the marker records where. The
+    tail gets the larger share because finality lives there; the head is
+    kept because it carries the invocation's own preamble.
+    """
     value = value or ""
     digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
     if maximum is None or len(value) <= maximum:
         return value, False, digest
-    marker = f"\n[OUTPUT_TRUNCATED original_chars={len(value)} sha256={digest}]"
-    keep = max(0, int(maximum) - len(marker))
-    return value[:keep] + marker, True, digest
+    maximum = max(0, int(maximum))
+    marker_template = "\n[OUTPUT_TRUNCATED original_chars={n} omitted_chars={omitted} kept_head={head} kept_tail={tail} sha256={sha}]\n"
+    # Two passes: the marker's own length depends on the numbers inside it.
+    head = tail = 0
+    for _ in range(2):
+        marker = marker_template.format(n=len(value), omitted=len(value) - head - tail, head=head, tail=tail, sha=digest)
+        budget = max(0, maximum - len(marker))
+        head = budget * 2 // 5
+        tail = budget - head
+    marker = marker_template.format(n=len(value), omitted=len(value) - head - tail, head=head, tail=tail, sha=digest)
+    if head + tail <= 0:
+        return marker[:maximum], True, digest
+    return value[:head] + marker + (value[len(value) - tail:] if tail else ""), True, digest
 
 
 def _child_pids_by_ppid_scan(parent_pid: int) -> list[int]:
@@ -376,6 +429,8 @@ def run_bounded_process(
     """Run an owned process group and stop its exact tree on timeout/cancellation."""
     if bool(getattr(cancellation_token, "cancelled", False)):
         return BoundedProcessResult(None, "", "", cancelled=True)
+    if max_memory_bytes is not None and not _memory_monitor_usable():
+        return BoundedProcessResult(None, "", "", resource_limit_unavailable=True)
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     process = subprocess.Popen(
         list(command),

@@ -911,12 +911,16 @@ def _executable_ranges(image):
     """Every ``(start_va, end_va)`` range this image's own PE section table
     actually flags executable (``IMAGE_SCN_MEM_EXECUTE``) -- not a hardcoded
     ``.text`` name lookup, so a differently-named executable section (or a
-    binary with more than one) is still honoured. This is the exact
-    ground-truth boundary a real vtable's slot run was hand-verified to
-    respect on 7 real vtables across both bitnesses (see the module
-    docstring's Phase 3 section): a slot value that does not fall in any of
-    these ranges is not a virtual-method pointer, it is the end of the
-    table."""
+    binary with more than one) is still honoured. The range is the section's
+    declared ``VirtualSize`` from its VA -- deliberately NOT rounded up to
+    ``SectionAlignment``: the bytes between VirtualSize and the aligned end
+    are loader zero padding, never code, so rounding up would widen the range
+    to include addresses no function can start at. (When a linker writes
+    VirtualSize == 0 the loader falls back to SizeOfRawData, and so does this.)
+    The boundary a real vtable's slot run was hand-verified to respect on 7
+    real vtables across both bitnesses (see the module docstring's Phase 3
+    section): a slot value outside these ranges is taken to be the end of the
+    table. It is a tight code-extent bound, not a proof of function starts."""
     ranges = []
     try:
         sections = image.pe.sections
@@ -925,7 +929,8 @@ def _executable_ranges(image):
     for section in sections:
         if section.Characteristics & IMAGE_SCN_MEM_EXECUTE:
             start = image.base + section.VirtualAddress
-            end = start + section.Misc_VirtualSize
+            extent = section.Misc_VirtualSize or section.SizeOfRawData
+            end = start + extent
             ranges.append((start, end))
     return ranges
 

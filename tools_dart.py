@@ -11,6 +11,7 @@ _MAGIC = 0xDCDCF5F5
 _MAGIC_BYTES = struct.pack("<I", _MAGIC)
 _HEADER_SIZE = 20
 _KIND_NAMES = {0: "kFull", 1: "kFullJIT", 2: "kFullAOT", 3: "kModule", 4: "kInvalid"}
+_KIND_INVALID = 4
 
 
 def _scan_headers(data, max_matches):
@@ -23,12 +24,16 @@ def _scan_headers(data, max_matches):
         pos = idx + 1
         length_field, kind_raw = struct.unpack_from("<qq", data, idx + 4)
         large_length = length_field + 4
-        valid_kind = kind_raw in _KIND_NAMES
+        # kInvalid is snapshot.h's sentinel, not a kind a real snapshot carries,
+        # so it is named in the output but never counts as a valid kind.
+        valid_kind = kind_raw in _KIND_NAMES and kind_raw != _KIND_INVALID
         # declared_length is the snapshot's own size within its containing
         # binary, not bounded by the (possibly truncated) scanned buffer --
-        # so plausibility only checks the value is a sane positive size,
-        # it does not require the full snapshot to be present in `data`.
-        plausible_length = 0 < large_length <= (1 << 31)
+        # so plausibility only checks the value is positive; the format
+        # documents no upper bound (int64 length), and an invented ceiling
+        # here would reject genuine large snapshots. The 4-byte magic plus the
+        # kind check carry the identification.
+        plausible_length = large_length > 0
         matches.append({
             "offset": idx,
             "declared_length": large_length,

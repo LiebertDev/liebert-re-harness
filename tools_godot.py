@@ -19,16 +19,18 @@ _PACK_SPARSE_BUNDLE=1<<2
 def _header(data):
     if data[:4]!=b'GDPC':raise ValueError('NOT_GODOT_PCK')
     version,vmaj,vmin,vpat,flags=struct.unpack_from('<IIIII',data,4)
+    # Closed allowlist on purpose: versions 0/1 (Godot 2.x/3.x) have a different,
+    # flag-less header this parser does not implement, and versions above 4 have
+    # not been seen. Guessing a layout would yield a confident wrong file table,
+    # so every version outside 2/3/4 is refused by name. Everything below is
+    # therefore only ever reached with version in {2,3,4}.
     if version not in (2,3,4):raise ValueError(f'UNSUPPORTED_PCK_VERSION_{version}')
     file_base,=struct.unpack_from('<Q',data,24)
     pos=32
-    if version>=2:
-        dir_offset,=struct.unpack_from('<Q',data,pos);pos+=8
-        pos+=16*4
-        if version>=4 and (flags&_PACK_SPARSE_BUNDLE) and (flags&_PACK_DIR_ENCRYPTED):
-            raise ValueError('ENCRYPTED_SPARSE_DIRECTORY_NOT_SUPPORTED')
-    else:
-        pos+=16*4;dir_offset=pos
+    dir_offset,=struct.unpack_from('<Q',data,pos);pos+=8
+    pos+=16*4
+    if version>=4 and (flags&_PACK_SPARSE_BUNDLE) and (flags&_PACK_DIR_ENCRYPTED):
+        raise ValueError('ENCRYPTED_SPARSE_DIRECTORY_NOT_SUPPORTED')
     if flags&_PACK_DIR_ENCRYPTED:raise ValueError('ENCRYPTED_DIRECTORY_NOT_SUPPORTED')
     return {'version':version,'engine_version':f'{vmaj}.{vmin}.{vpat}','flags':flags,
             'rel_filebase':bool(flags&_PACK_REL_FILEBASE),'sparse_bundle':bool(flags&_PACK_SPARSE_BUNDLE),

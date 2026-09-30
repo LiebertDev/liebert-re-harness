@@ -73,9 +73,14 @@ def extract_pe_section_map(path: str | Path) -> dict:
             "raw_size": raw_size,
             "raw_offset": raw_offset,
         })
+    # SizeOfImage sits at optional-header offset 56 in both PE32 and PE32+.
+    size_of_image = None
+    if optional_size >= 60 and coff + 20 + 60 <= len(data):
+        size_of_image = struct.unpack_from("<I", data, coff + 20 + 56)[0]
     return {
         "ok": True,
         "status": "PROVEN",
+        "size_of_image": size_of_image,
         "sections": sections,
         "section_count": len(sections),
         "execution_performed": False,

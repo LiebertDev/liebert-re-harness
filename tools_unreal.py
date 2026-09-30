@@ -75,6 +75,9 @@ def unreal_asset_analyzer(path,operation='summary',member='',max_results=300,max
     data=p.read_bytes()
     try:parsed=_parse(data)
     except Exception as e:
+        # Closed version allowlist (the set the parser's branches were written for): a named refusal, not a generic parse error.
+        if str(e).startswith('UNSUPPORTED_PAK_VERSION_'):
+            return _j({'ok':False,'tool':'unreal_asset_analyzer','path':relative(p),'operation':operation,'error':str(e)})
         return _j({'ok':False,'tool':'unreal_asset_analyzer','path':relative(p),'operation':operation,'error':f'PAK_PARSE_ERROR: {e}'})
     base={'ok':True,'tool':'unreal_asset_analyzer','format':'UNREAL_PAK','path':relative(p),'operation':operation,
           'pak_version':parsed['version'],'mount_point':parsed['mount_point'],'entry_count':len(parsed['entries'])}
