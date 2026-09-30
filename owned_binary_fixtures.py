@@ -96,6 +96,39 @@ def build_owned_pe_with_rsds(path: Path, rsds: bytes | None = None) -> Path:
     return path
 
 
+def build_owned_pe_with_code(path: Path, code: bytes) -> Path:
+    """Minimal PE32+ (x86-64) with one executable ``.text`` section holding
+    ``code`` verbatim at RVA 0x1000 (entry point there), raw data at file
+    offset 0x200. Built from scratch here; no third-party binary involved."""
+    raw_size = max(0x200, (len(code) + 0x1FF) & ~0x1FF)
+    dos = bytearray(64)
+    dos[0:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, 64)
+    coff = struct.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, 240, 0x0022)
+    optional = bytearray(240)
+    struct.pack_into("<H", optional, 0, 0x20B)
+    struct.pack_into("<I", optional, 4, len(code))            # SizeOfCode
+    struct.pack_into("<I", optional, 16, 0x1000)              # entry point
+    struct.pack_into("<I", optional, 20, 0x1000)              # BaseOfCode
+    struct.pack_into("<Q", optional, 24, 0x140000000)         # ImageBase
+    struct.pack_into("<I", optional, 32, 0x1000)              # SectionAlignment
+    struct.pack_into("<I", optional, 36, 0x200)               # FileAlignment
+    struct.pack_into("<I", optional, 56, 0x1000 + ((raw_size + 0xFFF) & ~0xFFF))  # SizeOfImage
+    struct.pack_into("<I", optional, 60, 0x200)               # SizeOfHeaders
+    struct.pack_into("<H", optional, 68, 3)                   # subsystem
+    struct.pack_into("<I", optional, 108, 16)                 # NumberOfRvaAndSizes
+    section = bytearray(40)
+    section[0:5] = b".text"
+    struct.pack_into("<IIIIIIHHI", section, 8, len(code), 0x1000, raw_size, 0x200, 0, 0, 0, 0, 0x60000020)
+    headers = bytes(dos) + b"PE\0\0" + coff + bytes(optional) + bytes(section)
+    file_data = bytearray(0x200 + raw_size)
+    file_data[:len(headers)] = headers
+    file_data[0x200:0x200 + len(code)] = code
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(file_data))
+    return path
+
+
 def ensure_owned_fixtures() -> dict[str, Path]:
     FIXTURE_DIR.mkdir(parents=True, exist_ok=True)
     paths = {

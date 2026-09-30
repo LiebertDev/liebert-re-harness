@@ -190,6 +190,10 @@ def dotnet_metadata(path,max_types=300):
     except Exception as e:return f".NET metadata incomplete or failed: {e}"
     return "\n".join(out) if out else ".NET assembly parsed, but TypeDef table is empty."
 
+# Bytes handed to a single capstone disasm() call (module-level so a test can
+# shrink it to exercise chunk seams). Same default the sweep modules use.
+_DISASM_CHUNK_BYTES=1_000_000
+
 def disassemble_pe(path,section=None,start_offset=0,max_instructions=250,va=None):
     # `va` (Tier2 remediation roadmap Priority 3, Problem B; additive,
     # default None -- zero behavior change for every existing caller):
@@ -258,10 +262,36 @@ def disassemble_pe(path,section=None,start_offset=0,max_instructions=250,va=None
     if chosen is None:return "Section not found."
     data=chosen.get_data(); start_offset=max(0,min(int(start_offset),len(data)))
     base=pe.OPTIONAL_HEADER.ImageBase+chosen.VirtualAddress+start_offset
-    out=[]
-    for ins in md.disasm(data[start_offset:],base):
-        out.append(f"0x{ins.address:X}: {ins.mnemonic} {ins.op_str}".rstrip())
-        if len(out)>=max_instructions:break
+    out=[]; more_at=None
+    # md.disasm() is ONE native cs_disasm() call that allocates for its whole
+    # input before yielding anything (~248 bytes of native heap per input
+    # byte; see code_sweep_chunking's docstring), so a `break` after the
+    # generator exists bounds the returned list, not the allocation. Feed it
+    # one chunk at a time instead and stop as soon as the cap is reached.
+    # CALLING CONVENTION (deliberate): pass the SECTION bytes with
+    # file_offset=start_offset, not the whole file. Reason: the old code
+    # handed capstone exactly data[start_offset:], so an instruction cut by
+    # the end of the section came out as a truncated ".byte" line; reading the
+    # tail overlap of the next section would decode it as a real instruction
+    # and change that last line. The cost is that the final chunk has no tail
+    # context past the section end, which is exactly the old behaviour.
+    # `base` (va_base) is unchanged and chunk offsets are relative to it.
+    from code_sweep_chunking import chunk_boundaries,disasm_chunk
+    size=len(data)-start_offset
+    cap=max(1,int(max_instructions))  # old loop always emitted at least one
+    for t0,t1 in chunk_boundaries(size,_DISASM_CHUNK_BYTES):
+        for ins,credited in disasm_chunk(md,data,start_offset,base,t0,t1):
+            if not credited:continue
+            if len(out)>=cap:more_at=ins.address;break  # peek: more code exists
+            out.append(f"0x{ins.address:X}: {ins.mnemonic} {ins.op_str}".rstrip())
+        if more_at is not None:break
+    # Cap visibility: this function returns plain text that callers compare
+    # and parse line by line, so the return type stays str. A capped listing
+    # ends with one trailing marker line (same ANALYSIS_LIMITED vocabulary as
+    # tools_rizin); it is emitted only when more decodable code really
+    # follows, so a listing that ends exactly at the cap is left unmarked.
+    if more_at is not None and out:
+        out.append(f"[ANALYSIS_LIMITED: stopped after max_instructions={cap}; more code follows at 0x{more_at:X}]")
     return "\n".join(out) if out else "No instruction could be decoded."
 
 def search_binary_bytes(path,pattern,max_results=100):
