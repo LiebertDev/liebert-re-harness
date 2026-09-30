@@ -8,6 +8,12 @@ import json
 import unittest
 from unittest import mock
 
+import pytest
+
+# importorskip skips only when mpmath is absent but lets a genuinely broken install
+# (ImportError raised inside it) propagate; a bare checkout must skip, not fail.
+mpmath = pytest.importorskip("mpmath")
+
 import lll_exact
 import tools_lattice
 from tools_lattice import MAX_BASIS_ENTRY_BITS, MAX_DIMENSION, lattice_reduce

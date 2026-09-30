@@ -23,6 +23,12 @@ verifies from first principles:
 """
 from __future__ import annotations
 
+import pytest
+
+# importorskip skips only when mpmath is absent but lets a genuinely broken install
+# (ImportError raised inside it) propagate; a bare checkout must skip, not fail.
+mpmath = pytest.importorskip("mpmath")
+
 import itertools
 import random
 import unittest

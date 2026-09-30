@@ -39,7 +39,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev,lattice]"
 
       # The suite must pass on a clean checkout with no external analysis engine
       # installed. Anything that needs one has to skip cleanly and say what is

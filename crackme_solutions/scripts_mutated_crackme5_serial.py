@@ -52,7 +52,14 @@ GATE3_HASH = 0x5AC3     # 0x140016739: 16-bit hash over the whole serial
 
 def run(code, path=None, max_instructions=40_000_000, timeout_seconds=240):
     """Feed one candidate to the program's own check and return what it prints."""
-    from tools_emulate_range import emulate_range
+    try:
+        from tools_emulate_range import emulate_range
+    except ImportError as exc:
+        raise RuntimeError(
+            "This solution script documents an analysis that used a harness component "
+            "(tools_emulate_range) which is not part of the public release, so run() "
+            "cannot execute here as-is. The recovered algorithm in this file is the "
+            "documentation; the entry point is not runnable.") from exc
 
     stdin = (code + "\r\n").encode("ascii", "replace").hex()
     result = json.loads(emulate_range(

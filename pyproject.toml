@@ -19,7 +19,6 @@ dependencies = [
     "dnfile",
     "ijson",
     "keystone-engine",
-    "mpmath",
     "psutil",
     "PyYAML",
 ]
@@ -30,6 +29,10 @@ dev = ["pytest", "ruff", "black"]
 # an isolated-VM tracing setup rather than something the core analysis path uses.
 # Kept out of the required set so a plain install stays small and platform-portable.
 frida = ["frida"]
+# tools_lattice.py / lll_exact.py need it for high-precision Gram-Schmidt. tools_lattice
+# fails closed with a structured TOOL_MISSING result when it is absent, so it is
+# an extra rather than a required dependency. CI installs it so those tests run.
+lattice = ["mpmath"]
 
 [project.urls]
 Homepage = "https://github.com/LiebertDev/liebert-re-harness"

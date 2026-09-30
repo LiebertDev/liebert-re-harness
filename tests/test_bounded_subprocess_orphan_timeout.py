@@ -10,8 +10,8 @@ later `stream.close()` on a pipe whose background reader thread is still
 blocked inside a blocking read deadlocks forever (the reader thread holds
 the stream's internal buffer lock for the whole blocking read). This test
 is intentionally fast (a 2s inner timeout, generous outer ceiling) so it
-stays in the default/non-heavy suite -- unlike tests/test_bounded_subprocess.py
-(module-marked heavy), this is exactly the fast-suite regression that must
+stays in the default/non-heavy suite -- unlike the module-marked-heavy
+tests, this is exactly the fast-suite regression that must
 catch a reintroduced silent-hang defect.
 """
 from __future__ import annotations

@@ -285,17 +285,23 @@ cd liebert-re-harness
 python -m venv .venv
 # Windows:        .venv\Scripts\activate
 # Linux / macOS:  source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,lattice]"
 pytest -q
 ```
 
-Python 3.10 or newer. On a clean checkout with **no external analysis tool
-installed**, the measured result is `190 passed, 35 skipped`, zero failures, in
-about 11 seconds — across 35 test files. The skips are guards for tests needing a
-sample binary this package does not ship.
+Python 3.10 or newer. Install first (the `lattice` extra brings `mpmath`, which the
+lattice tests need), then run the tests. Success is `pytest -q` exiting 0; some tests
+skip unless optional dependencies or sample binaries are present, and the skip
+messages say what is missing. Without the `lattice` extra the two lattice test
+modules skip rather than fail.
 
-That measurement is **on Windows** (3.10 and 3.12), which is where this code was
-developed and where the analysis focus points.
+Not everything runs by default: `pytest.ini` sets `addopts = -m "not heavy"`, and 9
+test files are module-marked `heavy` (they drive a real external engine or a
+bounded subprocess). Run everything with `pytest -m ""`, or only the heavy tier with
+`pytest -m heavy`. `pytest -rs` lists every skip and its reason.
+
+The code was developed **on Windows** (3.10 and 3.12), which is also where the
+analysis focus points.
 
 **The first CI run on Linux found two real bugs** ([#1](https://github.com/LiebertDev/liebert-re-harness/issues/1),
 [#2](https://github.com/LiebertDev/liebert-re-harness/issues/2)), both now fixed. They
@@ -373,7 +379,7 @@ The first vector is short and its last coordinate is `0` — which, for a subset
 key check, is the answer falling out of the lattice rather than out of a search.
 
 **One thing to know before your first call on a real file:** file access is confined
-to a workspace root (`TEACHER_WORKSPACE`, defaulting to the repository directory),
+to a workspace root (`TEACHER_WORKSPACE`, defaulting to the current working directory),
 and paths outside it are refused. That is deliberate for code that reads hostile
 input; [docs/INSTALL.md](docs/INSTALL.md) explains how to point it at your samples.
 

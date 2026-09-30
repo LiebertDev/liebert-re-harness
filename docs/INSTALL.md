@@ -5,7 +5,7 @@
 Only what you need to run and develop the analysis code. Concretely:
 
 - **35 Python modules** at the repository root — the analysis code itself.
-- **35 test files** in `tests/`, plus `conftest.py` and an empty `__init__.py`
+- **36 test files** in `tests/`, plus `conftest.py` and an empty `__init__.py`
   (the latter is required so the flat top-level modules resolve on `sys.path`).
 - **11 standalone challenge-solution scripts** in `crackme_solutions/`.
 - Documentation, licence, CI configuration, and issue templates.
@@ -34,28 +34,27 @@ cd liebert-re-harness
 python -m venv .venv
 # Windows:        .venv\Scripts\activate
 # Linux / macOS:  source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,lattice]"
 pytest -q
 ```
 
 Python **3.10 or newer**.
 
-Expected result on a clean checkout with **no external analysis tool installed**:
-
-```
-190 passed, 35 skipped
-```
-
-The 35 skips are `skipUnless` guards for tests that need a sample binary this
-package correctly does not ship. **Zero failures is the expected state** — if you
-see a failure on a fresh clone, that is a bug worth reporting.
+Expected result: `pytest -q` exits 0. Some tests skip unless optional dependencies
+(such as the `lattice` extra) or sample binaries are present; `pytest -rs` lists each
+skip and its reason. No pass/skip tally is promised. The default run also excludes
+tests marked `heavy` (`pytest.ini` sets `addopts = -m "not heavy"`; 9 test files are
+module-marked `heavy`). Run everything with `pytest -m ""`. If `pytest -q` fails on a
+fresh clone after the install step, that is a bug worth reporting.
 
 ### Python dependencies
 
 Installed automatically: `pefile`, `capstone`, `unicorn`, `keystone-engine`,
-`numpy`, `mpmath`, `dnfile`, `dncil`, `ijson`, `psutil`, `PyYAML`.
+`numpy`, `dnfile`, `dncil`, `ijson`, `psutil`, `PyYAML`.
 
-One optional extra: `pip install -e ".[frida]"` — needed only by
+Optional extras: `pip install -e ".[lattice]"` adds `mpmath` (needed by
+`tools_lattice.py` / `lll_exact.py`; without it `tools_lattice` returns a structured
+`TOOL_MISSING` result and its tests skip). `pip install -e ".[frida]"` — needed only by
 `frida_trace_client.py`, which is a client for an isolated-VM tracing setup and is
 not on the core analysis path.
 
@@ -99,8 +98,8 @@ Anything outside it is refused with a `PermissionError`, including absolute path
 to system files. This is deliberate: analysis code is pointed at hostile input for
 a living, and the default should not be "can open anything on the machine".
 
-The root is the value of **`TEACHER_WORKSPACE`** if set, otherwise the repository
-directory. (The variable name is a legacy of the upstream project's earlier name
+The root is the value of **`TEACHER_WORKSPACE`** if set, otherwise the current working
+directory (`Path.cwd()`). (The variable name is a legacy of the upstream project's earlier name
 and is kept for compatibility.) So:
 
 ```bash
