@@ -45,7 +45,8 @@ FAMILIES = {
     # This family also carries every guest_*/procmon_*/windbg live-debug/
     # x64dbg live-debug/API-Monitor tool: all of them execute, attach to, or
     # otherwise touch a live process, and per this project's blanket policy
-    # (tools_windbg.py/tools_x64dbg.py module docstrings) no such tool is
+    # (tools_windbg.py/tools_x64dbg.py module docstrings -- both upstream-only; not part of the published package)
+    # no such tool is
     # ever auto-invoked by file routing -- they only ever reach the model via
     # this keyword/state-driven family, never via artifact classification.
     "dynamic": {"dynamic_owned_process_scan", "dynamic_owned_process_diff_scan", "isolated_dynamic_validate", "tool_missing",

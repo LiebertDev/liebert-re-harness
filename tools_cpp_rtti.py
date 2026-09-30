@@ -714,7 +714,7 @@ def _build_reference_index(image, is64):
     occurs -- turning the O(candidates) repeated whole-image
     ``bytes.find()`` scans in ``_scan`` and ``_vtable_header_vas_for_col``
     (previously ~74% of this tool's wall-clock on a large real DLL, see
-    ``docs/PROJECT_STATE.md``) into a single O(image_size) pass followed by
+    ``docs/PROJECT_STATE.md``, upstream-only; not part of the published package) into a single O(image_size) pass followed by
     O(1) dict lookups.
 
     Two independent indices, because the two callers search for

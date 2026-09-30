@@ -25,12 +25,14 @@ files.
    is already in this repository (Capstone for decode, Unicorn is already a
    dependency — see `pyproject.toml`), or replace the emulation-dependent step
    with a documented manual trace and keep the rest of the script runnable.
-2. **`tools_vb6_pcode.py`'s `program_strings` operation raises `ImportError`.**
-   It reaches for a module that is not part of this package. Every other
-   operation in that file works and is covered by tests; this one path needs
-   either a self-contained reimplementation or a clean "not available in this
-   package" result instead of an uncaught exception — the latter is a smaller
-   change and a legitimate first PR on its own, with the former as a follow-up.
+2. ~~`tools_vb6_pcode.py`'s `program_strings` operation raises `ImportError`.~~
+   **No longer true — verified closed.** `tools_vb6_pcode.py` is fully published
+   in this package; `program_strings` only imports `pefile` and `capstone`
+   (both shipped dependencies), and calling it returns a normal structured
+   result (e.g. `FILE_NOT_FOUND` for a missing path), not an `ImportError`.
+   `from tools_vb6 import vb6_inspect` also resolves cleanly. This item is kept,
+   struck through, so a reader who remembers the old defect can see it was
+   checked rather than silently dropped.
 3. **Lint coverage is narrow on purpose, and widening it is real, bounded work.**
    `ruff` is currently scoped to `E9,F` (syntax errors, undefined names, unused
    imports, redefinitions) because the wider default rule set reports hundreds

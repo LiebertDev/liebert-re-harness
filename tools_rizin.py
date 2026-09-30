@@ -1,5 +1,5 @@
 """rizin headless static-analysis adapter -- a third, independent decompiler
-engine alongside IDA (tools_ida.py) and Ghidra (tools_decompiler.py).
+engine alongside IDA (tools_ida.py (upstream-only; not part of the published package)) and Ghidra (tools_decompiler.py (upstream-only; not part of the published package)).
 
 Why this exists: on a real packed corpus binary
 (benchmarks/windows_native_ladder/corpus/tier2/decryption_key1/elevenpack.exe)
@@ -18,7 +18,7 @@ rizin 0.9.1 (LGPL-3.0, https://rizin.re) is expected either on PATH or at
 the directory named by the ``RIZIN_HOME`` environment variable, e.g. a
 portable install such as ``C:\tools\rizin-portable\bin\rizin.exe``.
 
-Deliberately narrow, matching tools_ida.py's shape: locate the binary
+Deliberately narrow, matching tools_ida.py's shape (upstream-only; not part of the published package): locate the binary
 (env override -> PATH -> known install dir, TOOL_MISSING if absent, never
 raise/guess), run ONE headless rizin process per query (`aaa; aflj; iIj` --
 rizin's own JSON, never scraped human-readable text; the trailing `iIj` is
@@ -27,7 +27,7 @@ whether it did or not), bound it with a timeout and an output-size cap, and
 return the repo's usual JSON status vocabulary (OK / TOOL_MISSING /
 TIMEOUT / CANCELLED / ANALYSIS_LIMITED / RESULT_PARSE_FAILED /
 NOT_RECOVERABLE / NOT_FOUND / PATH_REFUSED) so capability-gap
-classification (capability_gap.py) can read it like any other tool.
+classification (capability_gap.py (upstream-only; not part of the published package)) can read it like any other tool.
 
 NOT_RECOVERABLE is load-bearing and distinct from every "no" above: it
 means the question could not be answered on this call (rizin returned an
@@ -59,7 +59,7 @@ except Exception:  # pragma: no cover - an indexing dependency must never block 
         return {"ok": False, "error": "EVIDENCE_INDEX_UNAVAILABLE"}
 
 APP = Path(__file__).resolve().parent
-# Same convention tools_binary.py/tools_decompiler.py use (module-level
+# Same convention tools_binary.py/tools_decompiler.py (upstream-only; not part of the published package) use (module-level
 # attribute deliberately named EVIDENCE): tests/conftest.py's per-test
 # isolation guard auto-discovers every imported module's EVIDENCE attribute
 # by this exact name and redirects it to a scratch directory for the test's
@@ -268,7 +268,7 @@ def _address_form(path: str, va_hex: str) -> dict:
     falls outside every real PE section. Every address this module reports
     (an instruction's own location, a branch target, a patch site) goes
     through this one call, so the listing and the patch planner return the
-    identical shape the IDA-engine path (tools_ida.py) also returns."""
+    identical shape the IDA-engine path (tools_ida.py (upstream-only; not part of the published package)) also returns."""
     form, err = resolve_address_form(path, va_hex, "va")
     if form is None:
         return {"resolved": False, "error": err.get("error")}
@@ -321,7 +321,7 @@ def _pdj(exe: str, path: str, resolved: dict, count: int, timeout_seconds, cance
 
 def _instruction_entry(path: str, ins: dict) -> dict:
     """One rizin `pdj` instruction normalized into the flat four-address-
-    form contract this module and the IDA path (tools_ida.py) both return,
+    form contract this module and the IDA path (tools_ida.py (upstream-only; not part of the published package)) both return,
     so a caller can switch engines without changing how it reads results."""
     opcode = str(ins.get("opcode") or ins.get("disasm") or "").strip()
     parts = opcode.split(None, 1)

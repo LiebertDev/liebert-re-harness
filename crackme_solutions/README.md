@@ -14,8 +14,8 @@ is not a solution to that challenge.
 
 ## What runs, and what does not
 
-Stated up front rather than left for you to discover, since two of these have real
-dependency gaps in this packaging:
+Stated up front rather than left for you to discover, since one of these has a
+real dependency gap in this packaging:
 
 | Script | Status |
 |---|---|
@@ -31,15 +31,15 @@ dependency gaps in this packaging:
 | `scripts_find_decryption_key2_unpack.py` | Runs; uses this repo's modules |
 | `scripts_mutated_crackme5_serial.py` | **Documentation only — will not run here.** Its `run()` imports `tools_emulate_range`, which is part of the upstream tree and is not shipped in this package. The reasoning and the recovered algorithm are the value; the entry point is not executable as-is. |
 
-One related gap in the same class: `tools_vb6_pcode.py`'s
-`operation="program_strings"` path imports a module that is not shipped here and
-will raise `ImportError` if you call it. Every other operation in that module
-works and is covered by tests. Both gaps are listed rather than patched over,
-because a script that half-runs and reports a plausible wrong answer would be
-worse than one that fails loudly — see the one rule in
+`tools_vb6_pcode.py`'s `operation="program_strings"` path was previously
+believed to import a module not shipped here; verified false — it only imports
+`pefile` and `capstone`, both shipped dependencies, and runs. The one real gap
+above (`scripts_mutated_crackme5_serial.py`) is listed rather than patched
+over, because a script that half-runs and reports a plausible wrong answer
+would be worse than one that fails loudly — see the one rule in
 [../CONTRIBUTING.md](../CONTRIBUTING.md).
 
-Closing either gap is a good first contribution.
+Closing that gap is a good first contribution.
 
 ## Highlights
 

@@ -15,7 +15,7 @@ queries never corrupts the database, and a stable ``dataset/metadata/
 indexes/`` already is.
 
 Corpus shape (measured directly against the real corpus, see
-``docs/PROJECT_STATE.md`` evidence-index entry for the numbers):
+``docs/PROJECT_STATE.md`` (upstream-only; not part of the published package) evidence-index entry for the numbers):
   - The large majority of files are flat, tool-written JSON envelopes
     directly under ``dataset/evidence/`` named
     ``{target}_{idhash}_{operation}_{suffix}.json`` (idhash/suffix are
@@ -34,7 +34,8 @@ Corpus shape (measured directly against the real corpus, see
     array, joined by content_ref/evidence_id, and is intentionally OUT of
     this module's scope: that is a different corpus with its own
     already-working lookup path (``research_state.evidence_ledger_v2``,
-    ``ResearchState``), not an unindexed one).  This index still records
+    ``ResearchState`` -- both in ``research_state.py``, upstream-only; not part of the published package), not an
+    unindexed one).  This index still records
     these files (path/size/mtime, bounded content excerpt) so a raw-token
     search does not silently miss them, but does not attempt to parse
     target/tool out of their filename (``EV-<hash>.txt`` carries none).
@@ -47,7 +48,7 @@ Corpus shape (measured directly against the real corpus, see
 No existing on-disk index or catalogue over this corpus was found (checked
 for an evidence-ID index/manifest/ledger convention before adding this;
 ``research_state.py``'s ``evidence_ledger_v2`` and the ``EV-``/``TR-``
-schemes it and ``tool_result_store.py`` use are SESSION-scoped citation
+schemes it and ``tool_result_store.py`` use (upstream-only; not part of the published package) are SESSION-scoped citation
 registries over an in-memory/active store, not a persistent index over the
 physical corpus files on disk -- this module is additive, not a competing
 second index).
@@ -1001,7 +1002,7 @@ def _like_escape(value):
 # knows exactly which one file it just wrote can index that ONE file in
 # milliseconds via EvidenceIndex.index_one(), without walking anything.
 # ``record_write`` below is the hookable one-line entry point for that --
-# see e.g. ``research_state.add_tool_result``'s call to it right after it
+# see e.g. ``research_state.add_tool_result``'s (upstream-only; not part of the published package) call to it right after it
 # writes a ledger evidence file. refresh() remains the repair mechanism
 # (also the only path that can discover a DELETED file) and stays exactly
 # as it was.

@@ -1,7 +1,7 @@
 """VirusTotal YARA-X (github.com/VirusTotal/yara-x, Apache-2.0/BSD dual,
 official Rust reimplementation of YARA) pattern-scan wrapper -- closes the
 other half of this turn's "installed tool is not yet a capability" gap
-(capa_analyze/floss_analyze in tools_capability_extract.py already answer
+(capa_analyze/floss_analyze in tools_capability_extract.py (upstream-only; not part of the published package) already answer
 "what does this binary DO"; this answers "does this specific byte/string
 pattern or published signature EXIST in this binary", the question a real
 engagement asks when it already has a rule -- a vendor's public detection
@@ -9,7 +9,7 @@ rule, a community YARA-Forge pack, a hand-written IOC for one sample family
 -- and needs to know whether THIS target matches it).
 
 Matches this repo's other external console-tool wrappers (tools_die.py /
-tools_capability_extract.py's capa_analyze): TOOL_MISSING (never a raised
+tools_capability_extract.py's capa_analyze (upstream-only; not part of the published package): TOOL_MISSING (never a raised
 exception) when the yr.exe binary is absent, run_bounded_process for the
 subprocess with an explicit timeout, structured JSON evidence with the full
 unmodified tool output always saved to disk first, and no fabricated
@@ -26,9 +26,9 @@ exactly one scan, never persisted into the repo), or select a locally
 PROVISIONED public rule pack by name (`ruleset`, e.g. `"yara_forge_core"`)
 so a caller never has to spell out a full filesystem path to reach a rule
 set this repo already acquired via tool_provision_acquire (see
-`config/dependencies.manifest.json`'s `YARA-Forge Core` entry and
+`config/dependencies.manifest.json`'s `YARA-Forge Core` entry (upstream-only; not part of the published package) and
 `_KNOWN_RULESETS` below). The ruleset registry only ever names a LOCAL path
-already verified+published by tool_provisioning.py's digest-checked
+already verified+published by tool_provisioning.py's (upstream-only; not part of the published package) digest-checked
 acquisition path -- this module still never downloads, reimplements, or
 embeds rule text itself.
 
@@ -74,7 +74,7 @@ _KNOWN_INSTALL = Path(r"C:\Tools\yara-x\yr.exe")
 _DEFAULT_TIMEOUT_SECONDS = 60
 _MIN_TIMEOUT_SECONDS = 5
 _MAX_TIMEOUT_SECONDS = 300
-# Same reasoning as capa_analyze/floss_analyze in tools_capability_extract.py:
+# Same reasoning as capa_analyze/floss_analyze in tools_capability_extract.py (upstream-only; not part of the published package):
 # a large ruleset (e.g. a full YARA-Forge pack) against one binary can emit a
 # match list well past run_bounded_process's 128 KiB default capture cap, and
 # truncating mid-JSON breaks parsing entirely -- bounded generously, not left
@@ -82,7 +82,7 @@ _MAX_TIMEOUT_SECONDS = 300
 _MAX_OUTPUT_CHARS = 16 * 1024 * 1024
 # Bounded excerpt shown inline; the FULL normalized match list is always
 # written to EVIDENCE first (never lost), same content_offset paging
-# contract ghidra_decompile/decompile_dotnet use (tools_decompiler.py).
+# contract ghidra_decompile/decompile_dotnet use (tools_decompiler.py (upstream-only; not part of the published package)).
 _DEFAULT_INLINE_CHARS = 8000
 _MAX_INLINE_CHARS = 120000
 
@@ -113,8 +113,9 @@ def _yara_x_binary():
 # `ruleset` parameter instead of a caller having to spell out a filesystem
 # path. Every entry here is acquired through this repo's OWN existing
 # manifest-driven acquisition path (tool_provisioning.acquire_from_manifest_
-# entry against config/dependencies.manifest.json's `detected_but_not_
-# required_adapters` array), never downloaded or embedded by this module
+# entry, and config/dependencies.manifest.json's `detected_but_not_
+# required_adapters` array -- both upstream-only, not part of the published
+# package), never downloaded or embedded by this module
 # itself -- this dict only records WHERE an already-verified+published rule
 # file is expected to live, same resolution shape as _yara_x_binary above
 # (an explicit env var override first, then a known default install path
@@ -128,8 +129,8 @@ def _yara_x_binary():
 # (quality-filtered by YARA-Forge's own build process), chosen here over
 # "extended"/"full" precisely because a false positive on a client's real
 # binary is a worse failure for this product than a missed detection (see
-# config/dependencies.manifest.json's `YARA-Forge Core` entry for the
-# pinned release tag/digest). It includes real packer/protector/obfuscator
+# config/dependencies.manifest.json's `YARA-Forge Core` entry (upstream-only;
+# not part of the published package) for the pinned release tag/digest). It includes real packer/protector/obfuscator
 # detection rules directly on point for this repo's own job -- e.g.
 # COD3NYM_SUSP_OBF_NET_Confuserex_Packer_Jan24 and CAPE_Themida -- not a
 # generic malware-family pack repurposed for this.
@@ -244,7 +245,7 @@ def yara_x_scan(
 
     The response's `content` field is a bounded, content_offset-pageable
     excerpt of the full normalized findings (same contract as
-    ghidra_decompile/decompile_dotnet in tools_decompiler.py); the complete
+    ghidra_decompile/decompile_dotnet in tools_decompiler.py (upstream-only; not part of the published package)); the complete
     unmodified yr JSON is always saved to EVIDENCE first regardless of this
     bound, retrievable via `internal_evidence_name`.
     """
@@ -310,7 +311,7 @@ def yara_x_scan(
                         f"ruleset {ruleset!r} is a known name but is not provisioned on this "
                         f"machine (expected at {_rulesets_home() / _RULESETS[ruleset]}) -- "
                         "acquire it via tool_provision_acquire against its "
-                        "config/dependencies.manifest.json entry first."
+                        "config/dependencies.manifest.json entry first (upstream-only; not runnable from this published package)."
                     ),
                 })
             rules_arg = str(resolved)

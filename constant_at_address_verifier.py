@@ -1,13 +1,14 @@
 """Deterministic ground-truth verifier for ``constant_at_address`` claims.
 
-GAP-061 step 1-2 (see docs/PROJECT_STATE.md): a finding whose claim is "this
-constant value is used in a comparison at this instruction address" (the
-exact shape of the harness's own proven ``ioctl_code_recovery`` capability --
-see ``tests/test_ioctl_recovery.py``, which recovered
+GAP-061 step 1-2 (see docs/PROJECT_STATE.md, upstream-only; not part of the published package): a finding whose claim is
+"this constant value is used in a comparison at this instruction address"
+(the exact shape of the harness's own proven ``ioctl_code_recovery``
+capability -- see ``tests/test_ioctl_recovery.py`` (upstream-only; not part of the published package, and this test file
+itself does not exist in this package either), which recovered
 ``IOCTL_KBFILTR_SEND_INPUT = 0xb2408`` from ``kbldfltr.sys``'s
 ``FUN_1c0007220`` at VA ``0x1c0007264``) was previously trusted purely
 because its cited ``evidence_id`` existed in the run's own ledger --
-``assessment_run.py``'s ``_bind_findings_to_run`` never checked whether that
+``assessment_run.py``'s (upstream-only; not part of the published package) ``_bind_findings_to_run`` never checked whether that
 evidence actually *supported* the claim. This module closes that gap for
 exactly one claim type, end to end: it never trusts the model's own
 argument. Given a real file, a real address (in any representation

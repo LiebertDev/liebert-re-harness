@@ -19,7 +19,7 @@ internally self-consistent and its target/content have not drifted since it
 was written".  The one property in this codebase that *does* resist
 deliberate forgery is binding an evidence record to a ``result_id`` a live
 ``ToolResultStore`` actually produced during this process's own tool
-dispatch (see ``research_state.evidence_ledger_v2``); that binding, not this
+dispatch (see ``research_state.evidence_ledger_v2``, upstream-only; not part of the published package); that binding, not this
 module's checksum, is what should be cited as the anti-forgery property.
 """
 from __future__ import annotations

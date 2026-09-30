@@ -1,10 +1,10 @@
 """Deterministic RVA / VA / file-offset normalization for PE binaries.
 
-GAP-061 step 1 (see docs/PROJECT_STATE.md): evidence records produced by this
+GAP-061 step 1 (see docs/PROJECT_STATE.md, upstream-only; not part of the published package): evidence records produced by this
 harness's own tools store addresses in mixed representations -- some as an
-RVA (``tools_stackstring.py``'s ``extract_data_blob``), some as a VA
+RVA (``tools_stackstring.py``'s ``extract_data_blob``, upstream-only; not part of the published package), some as a VA
 (``tools_binary.disassemble_pe``'s ``va`` parameter, ``ioctl_recovery.py``'s
-function addresses). Before any deterministic verifier can go re-read real
+(upstream-only; not part of the published package) function addresses). Before any deterministic verifier can go re-read real
 bytes at a claimed address, it needs one small, independently-tested piece
 that converts between representations *without* silently landing on the
 wrong byte -- this module is that piece, used by
@@ -13,7 +13,7 @@ wrong byte -- this module is that piece, used by
 Every entry point here takes a real file path and a real address, opens the
 PE with ``pefile`` (from owned bytes -- never ``pefile.PE(str(path))`` --
 so no Windows file handle is retained after the call returns, same
-convention ``tools_stackstring.py`` and ``tools_binary.py`` already use),
+convention ``tools_stackstring.py`` (upstream-only; not part of the published package) and ``tools_binary.py`` already use),
 and returns a structured result: ``{"ok": True, ...}`` with all three
 representations plus the containing section, or ``{"ok": False, "error":
 ...}`` with a specific reason. It never raises for a malformed or
@@ -33,8 +33,8 @@ ADDRESS_KINDS = frozenset({"va", "rva", "file_offset"})
 @dataclass(frozen=True)
 class AddressForm:
     """The one shared address-form contract every engine adapter (rizin's
-    ``tools_rizin.py``, IDA's ``tools_ida.py``/``ida_scripts/query_program.py``,
-    and any future engine) returns for EVERY address it reports -- an
+    ``tools_rizin.py``, IDA's ``tools_ida.py``/``ida_scripts/query_program.py``
+    (upstream-only; not part of the published package), and any future engine) returns for EVERY address it reports -- an
     instruction's own location, a resolved branch target, or a patch site
     alike.
 

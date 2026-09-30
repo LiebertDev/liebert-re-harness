@@ -113,6 +113,8 @@ wider tree it came from. What is *not* here is listed immediately after it.
 
 Every entry point that takes a file path from you routes it through the workspace sandbox, with one deliberate exception: `api_hash_recover.py` reads a *local system* DLL's export table as a read-only reference dictionary (`ntoskrnl.exe` by default), which by definition lives outside any workspace. It never reads the binary under analysis — you pass it a hash constant another tool already extracted, not a path to your sample. The exemption is stated in that module's own source at the point of use.
 
+Five modules also persist their raw engine output to a module-level `dataset/evidence/<tool_name>/` directory, which is inside the repository but outside the sandboxed workspace root, and is git-ignored: `tools_binary.py` (`pe_resources`), `tools_die.py`, `tools_yara_x.py`, `tools_rizin.py` (`binary_patch`) and `tools_upx.py`. The *input* path you give each of these is still confined by the sandbox as normal, and the output filename is a regex-sanitised, content-hash- or UUID-keyed name — this is an evidence store for the tool's own findings, not a path traversal, and not configurable per call.
+
 ### In the wider tree, deliberately **not** in this repository
 
 Named explicitly, because a capability list that quietly includes things you cannot

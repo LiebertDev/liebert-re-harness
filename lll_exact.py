@@ -63,7 +63,7 @@ def _require_mpmath():
     enumeration routines. It is an optional dependency, so rather than
     letting an ``AttributeError`` escape from ``mpmath.workdps`` -- or an
     ``ImportError`` crash the whole harness at import time (this module is
-    eager-imported through ``tools_lattice`` at ``teacher.py`` startup) --
+    eager-imported through ``tools_lattice`` at ``teacher.py`` (upstream-only; not part of the published package) startup) --
     the routines that need it raise a typed, self-describing ``LLLError``
     that callers already handle, and ``tools_lattice`` maps to a structured
     ``TOOL_MISSING`` result.

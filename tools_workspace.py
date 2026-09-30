@@ -71,14 +71,17 @@ if _WORKSPACE_OVER_BROAD and not _WORKSPACE_BROAD_ACK:
         "system-wide directory such as the Windows folder, user profile, or Program Files). "
         "Static-analysis tools gate solely on containment inside this root, so an over-broad "
         "root would let them read the entire drive. Narrow TEACHER_WORKSPACE (or teacher.py "
-        f"--target-root) to the actual analysis target, or set {WORKSPACE_ACK_BROAD_ENV}=1 to "
+        "--target-root, upstream-only and not part of the published package) to the actual "
+        "analysis "
+        f"target, or set {WORKSPACE_ACK_BROAD_ENV}=1 to "
         "explicitly acknowledge broad access."
     )
 
 
 def workspace_scope() -> dict:
     """Effective static-analysis scope for this process, for callers (CLI banners,
-    environment_manifest.py) that need to record what a run was actually gated to."""
+    environment_manifest.py -- upstream-only, not part of the published package) that
+    need to record what a run was actually gated to."""
     return {
         "root": str(WORKSPACE_ROOT),
         "source": "env" if _WORKSPACE_FROM_ENV else "cwd_default",

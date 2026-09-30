@@ -125,6 +125,16 @@ system temp directory is outside the workspace unless you repoint the root, and
 one test file in the upstream tree failed for exactly that reason until it was
 fixed.
 
+Five modules write their own output *outside* this workspace root on purpose:
+`tools_binary.py` (`pe_resources`), `tools_die.py`, `tools_yara_x.py`,
+`tools_rizin.py` (`binary_patch`) and `tools_upx.py` each persist their raw
+engine output under a module-level `dataset/evidence/<tool_name>/` directory
+inside the repository itself, which is git-ignored. The *input* file you pass
+in is still confined by `safe_path()` exactly as above; only each tool's own
+result is deposited there, under a sanitised, content-hash- or UUID-derived
+filename you do not control. See the README's capability table for the same
+note next to each tool.
+
 ## The heavy test tier
 
 `pytest.ini` excludes tests marked `heavy` by default. Those invoke a real

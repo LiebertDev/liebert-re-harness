@@ -97,13 +97,61 @@ def pe_sections(path):
                         "characteristics":hex(s.Characteristics),
                         "entropy":round(float(s.get_entropy()),4)} for s in pe.sections],indent=2)
 
+# Structured status vocabulary for the two text-returning directory readers below,
+# in the spirit of pe_resources' RESOURCE_NOT_FOUND / RESOURCE_DATA_MALFORMED codes:
+# the return type stays text (callers compare against the "... tablosu yok." /
+# "No matches." strings), but an unreadable directory now starts with a
+# machine-matchable code and can never be mistaken for a genuine absence.
+IMPORT_DIRECTORY_UNREADABLE="IMPORT_DIRECTORY_UNREADABLE"
+IMPORT_DIRECTORY_PARTIAL="IMPORT_DIRECTORY_PARTIAL"
+EXPORT_DIRECTORY_UNREADABLE="EXPORT_DIRECTORY_UNREADABLE"
+EXPORT_DIRECTORY_PARTIAL="EXPORT_DIRECTORY_PARTIAL"
+
+def _parse_directories(pe):
+    """Run pefile's directory parse; return None on success, else a short error string.
+
+    Only pefile's own format error and struct.error (a truncated header read) are
+    caught -- anything else is a bug in this tool and must surface, not be
+    reported as "no imports"."""
+    import struct, pefile
+    try:
+        pe.parse_data_directories()
+    except (pefile.PEFormatError,struct.error) as e:
+        return f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+    return None
+
+def _directory_problem(pe,parse_error,index,attr,keyword):
+    """Explain why a directory that yielded nothing (or little) may not be genuinely absent.
+
+    pefile does NOT normally raise on a corrupt directory: it swallows the error,
+    records it in pe.get_warnings(), and leaves DIRECTORY_ENTRY_* unset -- which a
+    getattr() default turns into the same answer a binary with no directory gets.
+    So besides a raised error, look at (a) whether the data-directory slot is
+    declared non-empty while no entries came out, and (b) pefile's own warnings."""
+    notes=[]
+    if parse_error:notes.append(f"parse error: {parse_error}")
+    try:
+        d=pe.OPTIONAL_HEADER.DATA_DIRECTORY[index]
+        if (d.VirtualAddress or d.Size) and not getattr(pe,attr,None):
+            notes.append(f"directory declared (rva={hex(d.VirtualAddress)}, size={d.Size}) but no entries could be parsed")
+    except (AttributeError,IndexError):pass
+    gw=getattr(pe,"get_warnings",None)
+    if gw:
+        seen=[]
+        for w in gw():
+            if keyword in w.lower() and w not in seen:seen.append(w)
+        if seen:notes.append("pefile warnings: "+" | ".join(seen[:3]))
+    return "; ".join(notes)
+
 def pe_imports(path,filter_text=None,max_results=500):
     pe=_pe(safe_path(path))
-    try:pe.parse_data_directories()
-    except:pass
+    problem=_directory_problem(pe,_parse_directories(pe),1,"DIRECTORY_ENTRY_IMPORT","import")
     entries=getattr(pe,"DIRECTORY_ENTRY_IMPORT",None)
-    if not entries:return "Import tablosu yok."
+    if not entries:
+        if problem:return f"{IMPORT_DIRECTORY_UNREADABLE}: {problem}. This is NOT the same as a binary with no imports."
+        return "Import tablosu yok."
     out=[]; flt=filter_text.lower() if filter_text else None
+    tail=f"\n[{IMPORT_DIRECTORY_PARTIAL}: {problem}]" if problem else ""
     for d in entries:
         dn=d.dll.decode(errors="replace") if d.dll else "?"
         for x in d.imports:
@@ -111,19 +159,21 @@ def pe_imports(path,filter_text=None,max_results=500):
             line=f"{dn}!{name} @IAT {hex(x.address)}"
             if flt and flt not in line.lower():continue
             out.append(line)
-            if len(out)>=max_results:return "\n".join(out)+f"\n[limit:{max_results}]"
-    return "\n".join(out) if out else "No matches."
+            if len(out)>=max_results:return "\n".join(out)+f"\n[limit:{max_results}]"+tail
+    return "\n".join(out)+tail if out else "No matches."+tail
 
 def pe_exports(path,max_results=500):
     pe=_pe(safe_path(path))
-    try:pe.parse_data_directories()
-    except:pass
+    problem=_directory_problem(pe,_parse_directories(pe),0,"DIRECTORY_ENTRY_EXPORT","export")
     ex=getattr(pe,"DIRECTORY_ENTRY_EXPORT",None)
-    if not ex:return "Export tablosu yok."
+    if not ex:
+        if problem:return f"{EXPORT_DIRECTORY_UNREADABLE}: {problem}. This is NOT the same as a binary with no exports."
+        return "Export tablosu yok."
     out=[]
     for s in ex.symbols[:max_results]:
         n=s.name.decode(errors="replace") if s.name else f"ordinal:{s.ordinal}"
         out.append(f"{n} RVA={hex(s.address)} ordinal={s.ordinal}")
+    if problem:out.append(f"[{EXPORT_DIRECTORY_PARTIAL}: {problem}]")
     return "\n".join(out)
 
 def dotnet_metadata(path,max_types=300):
@@ -154,7 +204,7 @@ def disassemble_pe(path,section=None,start_offset=0,max_instructions=250,va=None
     from capstone import Cs,CS_ARCH_X86,CS_MODE_32,CS_MODE_64,CS_ARCH_ARM64,CS_MODE_ARM
     p=safe_path(path)
     # Matches this function's own established contract (relied on verbatim by
-    # ioctl_recovery.py's _parse_disassembly_lines docstring: "disassemble_pe
+    # ioctl_recovery.py's (upstream-only; not part of the published package) _parse_disassembly_lines docstring: "disassemble_pe
     # returns a plain human-readable error string ... on any failure ...
     # never raises") -- every other failure path in this function already
     # returns a plain string instead of raising, so a non-PE/corrupt input
@@ -181,7 +231,8 @@ def disassemble_pe(path,section=None,start_offset=0,max_instructions=250,va=None
     # and no indication real code continues past the gap. skipdata makes
     # capstone emit one ".byte 0xNN" pseudo-instruction per undecodable byte
     # instead (already a harmless, standard line shape for this function's
-    # plain-text output -- ioctl_recovery._parse_disassembly_lines simply
+    # plain-text output -- ioctl_recovery._parse_disassembly_lines (upstream-only;
+    # not part of the published package) simply
     # never matches it against any known mnemonic) and keeps decoding past
     # it, so a caller sees BOTH sides of the gap rather than a truncated,
     # falsely-complete-looking list. ARM64 is unaffected (not exercised by

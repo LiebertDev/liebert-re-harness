@@ -1,6 +1,6 @@
 """API Monitor v2 (rohitab.com, "Portable Edition" r13) adapter -- matches
 this repo's other external console-tool contract (tools_windbg.py /
-tools_x64dbg.py / tools_die.py): TOOL_MISSING (never a raised exception) when
+tools_x64dbg.py / tools_die.py: the first two upstream-only; not part of the published package): TOOL_MISSING (never a raised exception) when
 the toolchain is absent, run_bounded_process for every subprocess, structured
 JSON evidence, and no fabricated confidence score.
 
@@ -55,7 +55,7 @@ overrides it):
     deciding what to look for once a live capture (via the GUI, or via a
     future properly-driven automation path) is available.
 
-Security boundary (same posture as tools_windbg.py/tools_x64dbg.py, reused
+Security boundary (same posture as tools_windbg.py/tools_x64dbg.py (upstream-only; not part of the published package), reused
 rather than reinvented): this module has NO operation that launches or
 attaches to a live target process at all right now -- ``live_trace`` is a
 permanent, unconditional ``NOT_SUPPORTED`` refusal (no CLI/automation surface
@@ -78,7 +78,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # bounded_subprocess.run_bounded_process is this repo's standard subprocess
-# wrapper (used by tools_windbg.py/tools_x64dbg.py); imported here even
+# wrapper (used by tools_windbg.py/tools_x64dbg.py, both upstream-only; not part of the published package); imported here even
 # though no operation in this module currently calls it, so the dependency
 # is visible and ready the moment a real, verified automation path exists
 # (see live_trace's docstring for why none exists yet -- it is an
@@ -93,7 +93,8 @@ EVIDENCE.mkdir(parents=True, exist_ok=True)
 # Verified-installed location on this host (API Monitor v2-r13, Portable
 # Edition) -- same "known install" fallback pattern as tools_die.py's
 # _KNOWN_INSTALL / tools_windbg.py's _KNOWN_DEBUGGERS_DIR /
-# tools_x64dbg.py's _KNOWN_INSTALL_ROOT. APIMONITOR_HOME overrides it.
+# tools_x64dbg.py's _KNOWN_INSTALL_ROOT (both upstream-only, not part of the
+# published package). APIMONITOR_HOME overrides it.
 _KNOWN_INSTALL_ROOT = Path(r"C:\Tools\APIMonitor\API Monitor (rohitab.com)")
 
 _MIN_TIMEOUT_SECONDS = 5
@@ -343,8 +344,8 @@ def live_trace(*_args, **_kwargs):
         ),
         "remediation": (
             "Use tools_windbg.py's user_mode_live_debug or tools_x64dbg.py's script_run for "
-            "isolated, scriptable live inspection of the same target instead; both have a real "
-            "command-line/scripting automation surface this tool lacks. If GUI automation for API "
+            "isolated, scriptable live inspection of the same target instead (both upstream-only; not part of the published package); both have "
+            "a real command-line/scripting automation surface this tool lacks. If GUI automation for API "
             "Monitor is added later, it must reuse the same isolated_context_confirmed + operator-env "
             "double-gate those two modules use."
         ),

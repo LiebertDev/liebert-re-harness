@@ -4,7 +4,7 @@ target, with automatic contradiction detection. Built because of a real,
 named failure: four successive claims about one target (trybypassme/TBM.exe)
 were each refuted by later evidence and none of them was marked superseded
 anywhere automatically -- one ("the kernel process-kill was defeated and the
-process survives 240s+") sat in ``docs/PROJECT_STATE.md`` as fact for three
+process survives 240s+") sat in ``docs/PROJECT_STATE.md`` (upstream-only; not part of the published package) as fact for three
 weeks after evidence contradicted it, corrected only by a human pass. See
 ``tests/test_claim_index.py``'s ``RealCaseValidationTests`` for that exact
 chain re-encoded and proven to land as ``CONTRADICTED`` automatically.
