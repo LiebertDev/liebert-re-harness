@@ -137,9 +137,13 @@ note next to each tool.
 
 ## The heavy test tier
 
-`pytest.ini` excludes tests marked `heavy` by default. Those invoke a real
-external engine or a virtual machine, take minutes rather than seconds, and can
-hang if the tool itself misbehaves. Once you have engines configured:
+`pytest.ini` excludes tests marked `heavy` by default. In this package those are
+the rizin, Detect It Easy, YARA-X and API Monitor wrapper tests (real-tool cases
+skip when the tool is absent), Unicorn/Capstone emulation tests, tests that need
+corpus files this repository does not ship (they skip when absent), the
+`frida_trace_client` tests, and one long pure-Python unpacking test. Some take
+minutes rather than seconds. No IDA, Ghidra, angr or virtual-machine test ships
+here. Once you have the tools configured:
 
 ```bash
 pytest -m heavy

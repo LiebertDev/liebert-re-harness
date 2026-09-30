@@ -68,7 +68,10 @@ large enough to need their own design discussion. Each is a real gap here, not a
 hidden feature.
 
 - **Bounded emulation** (Unicorn-based range emulation, execution traces, a
-  backward slicer, per-instruction snapshots and register capture). This is the
+  backward slicer, per-instruction snapshots and register capture). **Still
+  open.** `vex.py` ships, but it only corrects how AVX (VEX-encoded)
+  instructions execute inside an emulation session; it is not range emulation,
+  tracing or slicing. This is the
   single most useful missing piece, because several things in this repository
   currently degrade to "documentation only" without it — see item 1 above. Start
   by defining the narrowest useful surface: emulate a bounded instruction range
@@ -84,18 +87,32 @@ hidden feature.
 - **Function-boundary recovery from exception-directory unwind data**, with
   prologue scanning and cross-checking against whatever a disassembly engine
   already found. Valuable specifically for stripped or partially-obfuscated x64
-  binaries where a linear sweep alone under- or over-counts functions. Start from
-  the PE exception directory parsing that already exists for other purposes in
-  this repository and extend it into a boundary recoverer.
-- **Crash symbolisation.** Minidump *parsing* is already here
+  binaries where a linear sweep alone under- or over-counts functions. **Still
+  open.** ~~Start from the PE exception directory parsing that already exists for
+  other purposes in this repository and extend it into a boundary recoverer.~~
+  Correction: no exception-directory (`.pdata` / unwind data) parser ships in this
+  package — a search for one finds nothing — so the parser has to be written
+  first; there is no existing code to extend.
+- **Crash symbolisation.** ~~Minidump *parsing* is already here
   (`minidump_structural.py`); turning a raw address recovered from a dump into a
-  symbol is not. This is a natural extension of the existing PDB/CodeView work
-  (`msf_pdb.py`, `codeview_rsds.py`) rather than a new subsystem.
+  symbol is not.~~ **Closed for its stated scope.** `minidump_analyzer.py` maps
+  an address recovered from a dump to its module, and `crash_symbolize.py`
+  turns module plus RVA into the nearest public symbol, built on the PDB/CodeView
+  work (`msf_pdb.py`, `codeview_rsds.py`). What remains open: it needs a PDB whose
+  identity matches the crashing module (otherwise the answer is `UNKNOWN`), it
+  resolves public symbols only (no source lines), and there is no stack
+  unwinding — the stack scan in `minidump_analyzer.py` is a heuristic pointer
+  scan, explicitly not a proven call stack.
 - **Delay-import, TLS, relocation, and rich-header parsing.** The PE support here
-  covers headers, sections, imports, exports and resources; these four
-  directories are not implemented. Each is a bounded, well-specified parsing task
-  with public documentation, and any one of the four is a reasonable
-  self-contained PR.
+  covers headers, sections, imports, exports and resources; ~~these four
+  directories are not implemented~~. **Partly closed.** TLS is closed:
+  `tools_tls_directory.py` (`analyze_tls_directory`) parses the TLS directory and
+  its callback array. **Still open:** delay-import, base-relocation and
+  rich-header parsing. (`tools_cpp_rtti.py` reads the base-relocation directory
+  internally as a validity check for vtable scanning, but that is a private
+  helper, not a relocation parser.) Each remaining one is a bounded,
+  well-specified parsing task with public documentation, and any one of the
+  three is a reasonable self-contained PR.
 - **Page-based sliding-window entropy.** What exists today is whole-file and
   per-section entropy, which is enough for coarse triage but not for locating a
   small encrypted or packed region inside an otherwise-normal section. Worth
@@ -109,10 +126,16 @@ are explicitly **not** good first contributions — each is a research problem o
 its own, not a bounded task, and starting here is the most common way for a
 contribution to stall.
 
+A note on the figures below: the measurements quoted in this section came from
+real targets in the upstream tree's private corpus. That corpus is not shipped
+here and the targets are not named, so those numbers describe what was observed
+upstream; they cannot be reproduced from this repository.
+
 - **Virtualised / VM-based protections.** When a packer replaces native code with
   its own bytecode interpreter, static disassembly of that region produces
   nothing usable, and there is no devirtualiser in this project. On the hardest
-  real target this tooling has been measured against, roughly 87% of the file
+  real target this tooling has been measured against (a private-corpus file, not
+  included in this repository), roughly 87% of the file
   sat behind such a region and stayed opaque. This is the largest single gap in
   the whole project.
 - **Control-flow flattening.** There is no unflattening pass. A flattened
@@ -128,12 +151,22 @@ contribution to stall.
   project. A constant that is computed at runtime rather than written as an
   immediate typically comes back `UNKNOWN`, which is an honest answer and not a
   useful one.
-- **Mobile targets (APK/DEX, Android-specific obfuscators).** No support exists,
-  and there is no near-term plan to add it — this class of target only makes
-  sense to pick up after the native/desktop gaps above are addressed, not before.
+- **Mobile targets (APK/DEX, Android-specific obfuscators).** ~~No support exists,
+  and there is no near-term plan to add it.~~ **Partly closed.** Structural
+  support now ships: `tools_dex.py` (DEX header, class and string-pool parse),
+  `tools_android.py` (manifest, permission and component inspection of an APK or
+  raw AXML, via the undeclared `androguard` dependency — see `docs/INSTALL.md`)
+  and `tools_jvm.py` (JVM `.class` / `.jar`). Decompiling one named class needs
+  the optional JADX tool. **Still open:** none of these disassembles Dalvik
+  method bytecode itself, `tools_android.py` does not implement resource-table
+  (`resources.arsc`) resolution or signature verification depth (presence and
+  identity only), and there is nothing for Android-specific obfuscators. That
+  last part remains a hard problem and only makes sense after the
+  native/desktop gaps above are addressed.
 - **Encrypted-at-rest sections.** Where a section is encrypted on disk and only
   decrypted in memory at runtime, there is no static path to its contents. This
-  is a real closed door encountered on a real target, not a theoretical gap.
+  is a real closed door encountered on a real target (again a private-corpus
+  file not shipped here), not a theoretical gap.
 
 ## Lessons from the unpublished core
 
