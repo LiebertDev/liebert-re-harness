@@ -4,8 +4,8 @@
 
 Only what you need to run and develop the analysis code. Concretely:
 
-- **35 Python modules** at the repository root — the analysis code itself.
-- **36 test files** in `tests/`, plus `conftest.py` and an empty `__init__.py`
+- **64 Python modules** at the repository root — the analysis code itself.
+- **47 test files** in `tests/`, plus `conftest.py` and an empty `__init__.py`
   (the latter is required so the flat top-level modules resolve on `sys.path`).
 - **11 standalone challenge-solution scripts** in `crackme_solutions/`.
 - Documentation, licence, CI configuration, and issue templates.
@@ -58,6 +58,13 @@ Optional extras: `pip install -e ".[lattice]"` adds `mpmath` (needed by
 `frida_trace_client.py`, which is a client for an isolated-VM tracing setup and is
 not on the core analysis path.
 
+Some modules import a Python package the repository does **not** declare, neither as
+a dependency nor as an extra. Install one yourself if you want the operation it
+backs; without it the call returns an error containing the import failure rather
+than doing anything: `androguard` (`tools_android.py`), `UnityPy` (`tools_unity.py`),
+`dpkt` (`tools_pcap.py`), `py7zr`, `rarfile` and `backports.zstd`
+(`tools_archive2.py`).
+
 ## External applications — all optional
 
 **None of these are required.** The core analysis (PE parsing, function inventory,
@@ -71,7 +78,10 @@ naming it — it does not silently degrade or guess.
 | **rizin** (or radare2) | Disassembly listings, patch planning and application, CRC-32 correction | `RIZIN_HOME` environment variable, else `rizin` on `PATH` |
 | **Detect It Easy** | Packer and compiler identification (`diec.exe -j`) | `DIE_HOME`, else `diec` on `PATH` |
 | **YARA-X** | Rule-based scanning | `YARA_X_EXE` or `YARA_X_HOME`; rule sets via `YARA_RULESETS_HOME` |
-| **API Monitor** | API catalogue lookups (live tracing is **not** wired up — see the gap list in the README) | `APIMONITOR_HOME` |
+| **API Monitor** | API catalogue lookups (live tracing and trace parsing are both **not** wired up and return `NOT_SUPPORTED` — see the gap list in the README) | `APIMONITOR_HOME` |
+| **JADX** | Decompiling one named class from a DEX, APK-derived DEX or JVM `.class` / `.jar` (`tools_dex.py`, `tools_jvm.py`); structural listing works without it and the decompile operation returns `JADX_TOOL_MISSING` | `JADX_EXE`, else `jadx` on `PATH`, else a `teacher-tools/jadx/bin/jadx.bat` under the user's home directory |
+| **Il2CppDumper** | Unity IL2CPP type and method name to address mapping (`tools_il2cpp.py`); every operation returns `IL2CPPDUMPER_TOOL_MISSING` without it | `IL2CPPDUMPER_EXE`, else a `teacher-tools/il2cppdumper/Il2CppDumper.exe` under the user's home directory |
+| **UPX** | Static UPX unpacking with `upx -d` on a copy of the input (`tools_upx.py`); returns `TOOL_MISSING` without it | `UPX_HOME`, else `upx` on `PATH`, else a `teacher-tools/upx/upx.exe` under the user's home directory |
 | **IDA / Ghidra** | Decompilation, cross-references, callers and callees | Wrappers for these live in the upstream tree; this package does not ship them |
 
 Set an environment variable to the tool's install directory, for example:
@@ -86,9 +96,12 @@ export RIZIN_HOME=/opt/rizin
 export DIE_HOME=/opt/die
 ```
 
-There are no hardcoded fallback paths. If a variable is unset and the tool is not
-on `PATH`, the operation reports the tool as missing rather than trying a guessed
-location — a guessed path that happens to exist on somebody else's machine is
+For rizin, Detect It Easy, YARA-X and API Monitor there are no hardcoded fallback
+paths. JADX, Il2CppDumper and UPX are the exception: after their variable and
+`PATH`, they also look in one fixed `teacher-tools` folder under your home
+directory, and use it if it exists. For the four tools without that fallback, if a
+variable is unset and the tool is not on `PATH`, the operation reports the tool as
+missing rather than trying a guessed location — a guessed path that happens to exist on somebody else's machine is
 exactly the class of silent wrong answer this project refuses.
 
 ## The workspace sandbox — read this before your first call
@@ -128,7 +141,7 @@ combining with it.
 ## Platform notes
 
 Development and measurement have been on **Windows x64** (Python 3.10 and 3.12,
-both green: 201 passed, 35 skipped), and the analysis focus — PE/COFF, VB6, .NET on
+both run in CI, on Linux and Windows), and the analysis focus — PE/COFF, VB6, .NET on
 Windows — reflects that.
 
 The first Linux CI run found two real defects, both now fixed

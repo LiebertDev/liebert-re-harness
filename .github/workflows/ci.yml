@@ -63,7 +63,7 @@ jobs:
       # bug-finding rules (E9, F) rather than style; the reasoning is in that file.
       - run: ruff check .
       # `black --check` is deliberately NOT a gate. This code is written in a dense
-      # one-line style throughout, so black would rewrite 35 files at once -- the
+      # one-line style throughout, so black would rewrite the whole tree at once -- the
       # drive-by reformatting CONTRIBUTING.md asks contributors to avoid, and it
       # would bury every real diff. Adopting a formatter is welcome as its own pull
       # request: the formatting commit first, no behaviour change mixed into it.

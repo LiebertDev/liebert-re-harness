@@ -89,20 +89,29 @@ wider tree it came from. What is *not* here is listed immediately after it.
 
 | Area | What works | Module |
 |---|---|---|
-| **PE / COFF** | Headers, sections with per-section entropy, imports, exports, resource enumeration and extraction, Authenticode signature inspection (Windows), raw byte search, string extraction, hashing | `tools_binary.py` |
+| **PE / COFF** | Headers, sections with per-section entropy, imports, exports, resource enumeration and extraction, Authenticode signature inspection (Windows), raw byte search, string extraction, hashing; TLS directory and callback-array parsing (needs `pefile`, a required dependency; a PE with no TLS directory is reported as `NO_TLS_DIRECTORY`, not as an empty list) | `tools_binary.py`, `tools_tls_directory.py` |
 | **Disassembly** | Capstone-based disassembly of a PE range | `tools_binary.py` |
 | **Symbols and debug data** | CodeView / RSDS record parsing and correlation to a module; MSF/PDB container parsing; detection, build and validation of a PDB toolchain for binaries you own | `codeview_rsds.py`, `msf_pdb.py`, `native_pdb_toolchain.py` |
 | **Addressing** | RVA / VA / file-offset normalisation and form resolution — the conversion people get wrong by hand | `pe_address.py` |
 | **.NET** | Metadata and IL method-body parsing, inline constants, and relationship extraction across managed assemblies | `dotnet_il.py`, `dotnet_relationships.py` |
-| **Crash and memory artefacts** | Minidump parsing and reading memory at a virtual address out of a dump | `minidump_structural.py` |
+| **Crash and memory artefacts** | Minidump parsing and reading memory at a virtual address out of a dump; a minidump analyzer that adds a stack scan, which is a heuristic pointer scan over captured stack bytes and explicitly not an unwind, so expect false positives; the scan only runs on x86_64 dumps (any other architecture reports `SKIPPED_UNSUPPORTED_ARCHITECTURE` per thread and yields zero candidates) and reads at most 64 KiB of each thread's captured stack; offline crash symbolisation of one module + RVA to the nearest public symbol, reported only when a supplied PDB's identity matches the crashing module; a result with no symbol (no PDB, wrong PDB, no public symbols, before-first-symbol, etc.) always reports confidence `LOW`, with the mismatch itself stated in `status`/`identity` (no stack unwinding, no source lines) | `minidump_structural.py`, `minidump_analyzer.py`, `crash_symbolize.py` |
 | **Crypto identification and attacks** | Constant identification for 21 algorithms in both endiannesses, re-derived from the algorithms rather than copied from a signature list; exact LLL lattice reduction and short-vector enumeration; lattice helpers used by the subset-sum attack | `tools_crypto_id.py`, `lll_exact.py`, `tools_lattice.py` |
 | **Legacy and niche formats** | VB6 P-Code decoding; an LZMA1 range decoder; ASAR archive parsing; archive, HAR, log, SQLite and general file-identity inspection | `tools_vb6_pcode.py`, `lzma1_range_decoder.py`, `asar_parser.py`, `tools_formats.py` |
 | **Instruction-level correctness** | A measured study of VEX/AVX decoding, including the case where a VEX instruction is silently executed as its legacy SSE equivalent and the answer is simply wrong | `vex.py` |
 | **Comparison and verification** | Version diffing between two builds; cross-binary relationship building; verifying that a named constant really is at a claimed address | `binary_version_diff.py`, `cross_binary_relationships.py`, `constant_at_address_verifier.py` |
 | **Findings and IR** | A stable analysis IR with stable ids, security-hypothesis construction, counter-evidence verification, finding validation and rendering, and validation planning | `analysis_ir.py`, `analysis_findings.py`, `exploit_validation.py` |
 | **Evidence layer** | Content-hash-keyed result storage, claim indexing, a guard against claims unsupported by evidence, provenance records, and workspace indexing | `evidence_index.py`, `evidence_security.py`, `claim_index.py`, `claim_guard.py`, `workspace_index.py` |
-| **Engine wrappers that ship here** | rizin (disassembly listings, patch planning and application, closed-form CRC-32 correction), Detect It Easy, YARA-X, API Monitor catalogue | `tools_rizin.py`, `tools_die.py`, `tools_yara_x.py`, `tools_apimonitor.py` |
+| **Engine wrappers that ship here** | rizin (disassembly listings, patch planning and application, closed-form CRC-32 correction), Detect It Easy, YARA-X, and the API Monitor catalogue (only `status` and `api_catalog` do real work; live tracing and trace parsing are both unconditional `NOT_SUPPORTED` refusals) | `tools_rizin.py`, `tools_die.py`, `tools_yara_x.py`, `tools_apimonitor.py` |
 | **Execution plumbing** | Bounded subprocess execution with process-tree teardown, cross-process locking, and the workspace sandbox that confines file access | `bounded_subprocess.py`, `process_lock.py`, `tools_workspace.py` |
+| **Managed and mobile runtimes** | DEX header, class and string-pool parsing in pure Python; `decompile_class` for DEX and for JVM `.class` / `.jar` shells out to JADX (`JADX_EXE`, else `jadx` on `PATH`, else a fixed `teacher-tools` folder under your home directory if present — see `docs/INSTALL.md`) and returns `JADX_TOOL_MISSING` without it, while class and string listing keeps working; Android manifest, permissions and components from an APK or raw AXML through `androguard`, which the repo does not declare, so without it the call returns an `ANDROID_MANIFEST_PARSE_ERROR` carrying the import error rather than a named tool-missing status (signing is reported as present or absent, never verified; `resources.arsc` is not resolved) | `tools_dex.py`, `tools_jvm.py`, `tools_android.py` |
+| **Game asset containers** | Godot `.pck` header and directory listing and member read (pack versions 2, 3 and 4; an encrypted directory's named error surfaces directly rather than being wrapped in a generic parse-error status; GDScript bytecode is not decoded); Unreal classic `.pak` index listing (compressed entries return `COMPRESSION_NOT_SUPPORTED`; encrypted entries return `ENCRYPTED_ENTRY_NOT_SUPPORTED` only for pack versions 3/4/7 — versions 1/2 never populate the encrypted flag at all, so an encrypted entry in one of those is silently read back as plain, wrong bytes instead of being refused; IoStore `.utoc` / `.ucas` is not covered); member content returned by Godot's and Unreal's `read`/`extract` is decoded as UTF-8 text with `errors='replace'` before truncation, so a binary member comes back as lossy text, not the raw bytes; Unity serialised-asset object listing and bounded field reads through `UnityPy`, which the repo does not declare, so without it the call reports `NOT_UNITY_ASSET_OR_LOAD_ERROR` with the import error inside it, and objects whose type tree cannot be read come back reporting `TYPETREE_READ_FAILED` on both the `list` path (a per-row `name_error`) and the `read` path (the top-level `error`); Unity IL2CPP *method*-name to address mapping — not type name, despite the tool's name: `search_methods` matches only a method's own `Name` field, so a type-name query returns zero hits with `ok:true` — by shelling out to Il2CppDumper (`IL2CPPDUMPER_EXE`, else a fixed `teacher-tools` folder under your home directory if present — see `docs/INSTALL.md`; `IL2CPPDUMPER_TOOL_MISSING` without either), which needs a `GameAssembly` and `global-metadata.dat` pair and reports addresses exactly as Il2CppDumper emits them, without re-verifying them | `tools_godot.py`, `tools_unreal.py`, `tools_unity.py`, `tools_il2cpp.py` |
+| **Native language-runtime structure** | Delphi class recovery from a 32-bit PE by VMT self-pointer signature (no method-table parsing, no decompilation); native VB6 header chain, project objects and method names (structure only, P-Code bodies are not interpreted here); MSVC C++ RTTI class hierarchy for 32-bit and 64-bit images; Dart VM snapshot header scan reporting magic, declared length and snapshot kind, and nothing past the header. The three PE tools need `pefile` and return `TOOL_MISSING` without it | `tools_delphi.py`, `tools_vb6.py`, `tools_cpp_rtti.py`, `tools_dart.py` |
+| **Unpacking helpers** | Static UPX unpacking by running `upx -d` on a copy of the input (`UPX_HOME`, else `upx` on `PATH`, else a fixed `teacher-tools` folder under your home directory if present — see `docs/INSTALL.md`; `TOOL_MISSING` without any of those; the unpacked copy is written under `dataset/evidence/` in the repository, which is git-ignored); a bounded wrapper over the from-scratch LZMA1 decoder (standard top-level stream only; the caller supplies offset, `lc` / `lp` / `pb` and the expected output size); RVA / file-offset / live-VA correlation for a dumped PE, which is arithmetic over one file with `pefile` and never touches a process | `tools_upx.py`, `tools_lzma1_decode.py`, `tools_image_map.py` |
+| **Network, plist and archive formats** | Offline PCAP / PCAPNG conversation inspection through `dpkt` (Ethernet link type only, other link types are refused; without `dpkt` the call returns `PCAP_PARSE_ERROR` carrying the import error); Apple plist inspection, binary or XML, from the standard library; 7z listing and member extraction through `py7zr`, where only the *returned text* is bounded by `max_chars` — the member is fully decompressed to a temp file and read into memory first, so a decompression-bomb member still fully expands before anything is cut; RAR listing only, through `rarfile` (RAR extraction is refused with `RAR_EXTRACTION_REQUIRES_EXTERNAL_UNRAR_TOOL`); gzip, bzip2, xz and zstd decompression, of which zstd needs `backports.zstd`. None of `dpkt`, `py7zr`, `rarfile` or `backports.zstd` is declared by the repo, and a missing one surfaces as the raw import error in the result | `tools_pcap.py`, `tools_plist.py`, `tools_archive2.py` |
+| **Source inspection** | Bounded source-file and project inspection with parser-to-regex fallback, a cross-file graph, and a JVM class constant-pool inventory (no bytecode decompilation in this module); standard library only | `tools_source.py` |
+| **API hash recovery** | Given one or more 32-bit constants (a wider value is masked to its low 32 bits; 64-bit hashes are not supported), tries seven common API-hash algorithms against the export names of a local PE, in three case variants with and without a trailing null, and reports every (algorithm, case variant, null-terminator) combination that reproduces the constant — one export can appear several times, so `match_count` counts these tuples, not distinct exports; no match is reported as zero matches; needs `pefile`; the default DLL path is a Windows one (`ntoskrnl.exe`), so on any other system pass `dll_path` | `api_hash_recover.py` |
+
+Every entry point that takes a file path from you routes it through the workspace sandbox, with one deliberate exception: `api_hash_recover.py` reads a *local system* DLL's export table as a read-only reference dictionary (`ntoskrnl.exe` by default), which by definition lives outside any workspace. It never reads the binary under analysis — you pass it a hash constant another tool already extracted, not a path to your sample. The exemption is stated in that module's own source at the point of use.
 
 ### In the wider tree, deliberately **not** in this repository
 
@@ -119,11 +128,22 @@ import is the exact failure this project is organised against:
   Detect It Easy, YARA-X and API Monitor.
 - **Function-boundary recovery from exception-directory unwind data**, prologue
   scanning, and engine cross-check. Not here.
-- **Crash symbolisation.** Minidump *parsing* is here; turning an address into a
-  symbol is not.
-- **Delay imports, TLS, relocation and rich-header parsing.** The PE work here
-  covers headers, sections, imports, exports and resources; those four directories
-  are not implemented.
+- **Crash-stack unwinding and source lines.** Minidump parsing and offline
+  symbolisation of a single module + RVA to the nearest public symbol are here
+  (`minidump_analyzer.py`, `crash_symbolize.py`); a real unwound call stack and
+  source-line mapping are not. The analyzer's stack scan is a heuristic, not an
+  unwind.
+- **Delay-import, base-relocation and rich-header parsing.** The PE work here
+  covers headers, sections, imports, exports, resources and the TLS directory
+  (`tools_tls_directory.py`); no module reports the delay-import table, the
+  relocation table or the rich header. (`tools_cpp_rtti.py` reads the relocation
+  directory internally to validate vtable candidates, but does not expose it.)
+- **`frida_trace_client.py` is shipped but is not a supported capability of this
+  repository.** It is a command-line launcher built to run inside an isolated
+  guest VM, and it needs the `frida` extra, a caller-supplied JavaScript agent
+  and an instrumented target. The host-side modules that generate its command
+  lines and read its output are not here, so nothing in this repository drives it
+  end to end.
 - **Sliding-window entropy** per page. What ships is whole-file and per-section
   entropy, which is enough for triage and is not the same thing.
 
@@ -259,8 +279,12 @@ For context on what the open subset is a subset *of*: the private working tree h
 **196** callable analysis operations across **205** registered tool entries (128
 `READY`, 70 `PARTIAL`, 6 with the external tool missing), and **2,933** tests in the
 default tier plus 2,423 more marked `heavy` because they invoke a real engine or a
-VM. The last completed full run was **2,909 passed / 6 failed / 18 skipped** —
-stated with the failures included, because the previous entry in this file said "0
+VM. Two different "last full run" results are recorded for that private tree and
+they disagree: **2,909 passed / 6 failed / 18 skipped** here, and **2,672 passed /
+6 failed / 9 skipped** in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Both say 6
+failed; the 2,909 figure sums to the 2,933-test default tier and the 2,672 one
+does not, but that does not establish which is the more recent, so neither is
+endorsed. The failures are stated either way, because an earlier entry said "0
 failed, projected" and the projection turned out to be wrong.
 
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) also lists defects found in *our own*

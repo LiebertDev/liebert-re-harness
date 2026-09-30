@@ -82,7 +82,7 @@ skip cleanly when it is absent, with a message naming what is missing.
   only** (`E9`, `F` — syntax errors, undefined names, unused imports, redefinitions),
   not style: ruff's wider default set reports 481 findings here and 469 of them are
   the dense one-line `if not x: return y` style this codebase is written in
-  throughout. The style is not the problem; rewriting 35 files would bury every real
+  throughout. The style is not the problem; rewriting every file would bury every real
   diff.
 - **There is no formatter gate.** `black --check` is deliberately not run, for the
   same reason. Match the surrounding code instead. Adopting a formatter is welcome as

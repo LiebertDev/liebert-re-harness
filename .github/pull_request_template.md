@@ -27,7 +27,8 @@ right one.
       which parts of the format are **not** handled.
 - [ ] The diff contains only my own changes — no drive-by reformatting, import
       re-sorting, or unrelated tidying.
-- [ ] `pytest -q`, `ruff check .` and `black --check .` all pass locally.
+- [ ] `pytest -q` and `ruff check .` pass locally. (`black --check` is deliberately
+      not a gate here; see `CONTRIBUTING.md` — do not reformat code you did not change.)
 - [ ] No new required dependency (or it was discussed in an issue first).
 - [ ] No third-party binary, sample, credential, or absolute local path is
       committed. Samples are referenced by name and SHA-256 per

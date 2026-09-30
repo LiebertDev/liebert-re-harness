@@ -117,7 +117,10 @@ subset *of*:
   1 deferred legacy.
 - **2,933** tests collected in the default tier (a further 2,423 deselected as
   `heavy` — meaning they invoke a real external engine or a VM). Last completed
-  full run: **2,672 passed, 6 failed, 9 skipped**, 636 subtests, in 4,960 s. The
+  full run recorded here: **2,672 passed, 6 failed, 9 skipped**, 636 subtests, in
+  4,960 s. The README records a *different* last full run for the same tree
+  (2,909 passed, 6 failed, 18 skipped); the two disagree and this file cannot tell
+  which is the more recent, so treat both as unreconciled. The
   six failures were traced to one shared-fixture defect (a module-level tool-budget
   singleton shared across the pytest process) and fixed; **a clean zero-failure
   result is a projection until a full run confirms it**, and saying otherwise would
@@ -146,12 +149,18 @@ distinction is usually where tool inventories lie.
 | FLOSS | **Real** — bundled binary; upstream's own 16 MB cap is surfaced rather than hidden |
 | Detect It Easy | **Real** — `diec.exe -j` |
 | pe-sieve, hollows_hunter, Frida | Real, **but isolated-VM only** by policy — never invoked on the host |
-| API Monitor | **Partial** — catalogue works, live trace is an unwired stub |
+| API Monitor | **Partial** — catalogue works; live trace and trace parsing are both unconditional `NOT_SUPPORTED` refusals |
 | Scylla, System Informer, Process Monitor, ExtremeDumper, DriverView, PE-bear, Cutter | **Not implemented** — named in planning docs, no code |
 
 ## Measured capability results
 
-Individual numbers worth quoting because each came from a real file, not a fixture:
+Individual numbers worth quoting because each came from a real file, not a fixture.
+
+**Scope warning:** these were measured in the wider private working tree, on binaries
+that are not in this repository (see [CORPUS.md](CORPUS.md)). The code behind some
+of them ships here (`tools_vb6_pcode.py`, `tools_crypto_id.py`, `tools_delphi.py`);
+the emulation-assisted unpacking does not. You cannot reproduce any figure below from
+this repository alone, because the target files are not part of it.
 
 - **VB6 P-Code decoding: 99.8% / 99.6% / 89.5%** opcode coverage on three real
   challenge binaries. The opcode table was derived from a real `MSVBVM60.DLL` on
@@ -161,7 +170,8 @@ Individual numbers worth quoting because each came from a real file, not a fixtu
 - **Cryptographic constant identification: 21 algorithms**, both endiannesses,
   re-derived from the algorithms themselves rather than copied from a signature
   list.
-- **Native Delphi:** 48 classes and 47 parent links recovered from one real binary.
+- **Native Delphi:** 48 classes and 47 parent links recovered from one real binary
+  (a target that is not shipped here; the recovery code is `tools_delphi.py`).
   VMT method-table parsing is still absent — so this is `PARTIAL`, and labelled so.
 
 ## Bugs found in our own tooling
