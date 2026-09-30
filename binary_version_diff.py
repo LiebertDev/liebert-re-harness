@@ -3,7 +3,10 @@
 The matcher deliberately never treats RVA equality as cross-version identity.
 It prefers unique semantic names, then exact structural fingerprints, and only
 then a conservative feature-similarity match.  It does not read or execute raw
-binaries.
+binaries: both inputs are already-built Analysis IR documents the caller
+supplies.  This package contains no tool that extracts an Analysis IR from a
+binary; see ``analysis_ir.py`` for the node types and the ``AnalysisIR.add()``/
+``.validate()``/``.to_dict()`` methods used to build and serialize one by hand.
 """
 from __future__ import annotations
 

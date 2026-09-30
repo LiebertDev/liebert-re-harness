@@ -10,12 +10,28 @@ Keyword signals remain only as a fallback for rounds that have not yet produced
 an artifact classification.  The ``.dll`` extension alone never selects the
 ``dotnet`` family: a PE is ``dotnet`` only when its metadata shows a CLR
 directory, and ``native`` otherwise.
+
+FAMILIES ITSELF IS AN UPSTREAM ROUTING MANIFEST, NOT A LIST OF THIS PACKAGE'S
+CAPABILITIES.  It records how tool routing works across the full private
+working tree this project is developed in, which is far larger than what is
+published here (see README.md, "What is in this repository, and what is
+not"). Most names below are not implemented anywhere in this published
+package -- ``"windows-kernel"`` is the extreme case: of its 15 named tools,
+only the generic ``tool_missing`` sentinel is actually defined here, so this
+package cannot analyse a kernel driver even though the family exists and
+routes for one. Do not read membership in a ``FAMILIES[...]`` set as "this
+package can do that."  Call :func:`published_tools` for the subset of a
+family this package can actually dispatch (a real, locally-defined function),
+computed by introspection so it can never silently drift from reality the
+way a hand-maintained "is this shipped" list would.
 """
 
 from __future__ import annotations
 
+import functools
+import re
+from pathlib import Path
 from typing import Any
-
 
 FAMILIES = {
     "workspace": {"list_directory", "find_files", "read_file", "search_text", "get_file_info", "workspace_index", "hybrid_retrieve", "evidence_index", "claim_index", "find_binaries", "get_tool_result_page", "hybrid_rag_retrieve", "project_rag_refresh", "read_files", "security_rag_search"},
@@ -77,6 +93,55 @@ FAMILIES = {
                   "emulation_unpack",
                   "emulate_range_status", "tool_missing"},
 }
+
+
+@functools.lru_cache(maxsize=1)
+def _locally_defined_tool_names() -> frozenset[str]:
+    """Every top-level function this package's own ``.py`` files define.
+
+    This is the ground truth for "is a FAMILIES name actually callable
+    here" -- computed by scanning source text for ``def <name>(`` in every
+    sibling module (excluding this module and tests), not by importing those
+    modules (several have optional native dependencies -- pefile, capstone,
+    yara-x, androguard, ... -- that need not be installed just to answer
+    this question) and not by a hand-maintained list (see the NATIVE_CORE_
+    TOOLS/NATIVE_DEEP_TOOLS comment above for what happened the one time
+    this project tried that: a hand-maintained tuple silently stopped
+    tracking FAMILIES and 27 registered tools went unreachable for months).
+    """
+    names: set[str] = set()
+    pattern = re.compile(r"^(?:async )?def ([A-Za-z_][A-Za-z0-9_]*)\(", re.MULTILINE)
+    package_dir = Path(__file__).resolve().parent
+    for path in sorted(package_dir.glob("*.py")):
+        if path.name == Path(__file__).name or path.stem.startswith("test_"):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        names.update(pattern.findall(text))
+    return frozenset(names)
+
+
+def published_tools(family: str) -> frozenset[str]:
+    """Subset of ``FAMILIES[family]`` this package can actually dispatch.
+
+    ``FAMILIES`` records upstream routing across a much larger private tree
+    (see the module docstring); most of its names have no implementation in
+    this published package. This returns only the names that do -- a
+    top-level function of that name is defined somewhere in this repo.
+    """
+    return frozenset(FAMILIES[family]) & _locally_defined_tool_names()
+
+
+def published_family_report() -> dict[str, tuple[int, int]]:
+    """``{family: (named_count, published_count)}`` for every family.
+
+    A diagnostic/documentation helper: how much of each routing family this
+    published package can actually reach, versus how much it merely names.
+    """
+    return {name: (len(tools), len(published_tools(name))) for name, tools in FAMILIES.items()}
+
 
 BASE_FAMILIES = ("workspace", "identity", "source")
 

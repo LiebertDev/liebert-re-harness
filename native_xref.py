@@ -1,9 +1,15 @@
 """Deterministic native cross-reference resolution for Analysis IR v1.
 
 This module does not disassemble bytes.  It consumes the normalized facts
-produced by :mod:`native_function_analysis` (plus optional, explicitly
-proven decoder observations) and resolves only endpoints supported by those
-facts.  Indirect or ambiguous targets remain ``UNKNOWN``.
+produced by :mod:`native_function_analysis` (upstream-only; not part of the
+published package) -- or any other complete Analysis IR document a caller
+supplies -- plus optional, explicitly proven decoder observations, and
+resolves only endpoints supported by those facts.  Indirect or ambiguous
+targets remain ``UNKNOWN``.  This package itself contains no tool that
+extracts an Analysis IR from a binary; see ``analysis_ir.py`` for the node
+types (``Artifact``, ``Module``, ``Function``, ``Import``, ...) and the
+``AnalysisIR.add()``/``.validate()``/``.to_dict()`` methods a caller uses to
+build and serialize one by hand.
 """
 from __future__ import annotations
 

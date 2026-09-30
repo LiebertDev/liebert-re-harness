@@ -1,4 +1,11 @@
-"""Static, evidence-bounded relationships across multiple Analysis IRs."""
+"""Static, evidence-bounded relationships across multiple Analysis IRs.
+
+Every input here is an already-built Analysis IR document the caller
+supplies; this package contains no tool that extracts an Analysis IR from a
+binary. See ``analysis_ir.py`` for the node types and the ``AnalysisIR.add()``/
+``.validate()``/``.to_dict()`` methods used to build and serialize one by
+hand.
+"""
 from __future__ import annotations
 
 from pathlib import PurePath

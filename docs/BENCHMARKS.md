@@ -23,7 +23,12 @@ was enforced against our own work.
 
 ## Windows Native Ladder — current state
 
-Live count of `benchmarks/windows_native_ladder/manifests/` in the working tree:
+Live count of `benchmarks/windows_native_ladder/manifests/` in the private
+working tree this project is developed in. **That directory is not part of
+this published repository** — it is not the `crackme_solutions/` folder
+shipped here, and there is nothing at this path in this repo to re-run the
+count against. The number below is reported as-is from its source tree, not
+re-derived from anything checkable in this repository:
 
 | State | Count |
 |---|---|
