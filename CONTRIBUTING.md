@@ -46,11 +46,12 @@ cd liebert-re-harness
 python -m venv .venv
 # Windows:        .venv\Scripts\activate
 # Linux / macOS:  source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,lattice]"
 pytest -q
 ```
 
-Python 3.10 or newer. The test suite must pass on a clean checkout with no
+Python 3.10 or newer. The `lattice` extra brings `mpmath`; without it the two
+lattice test modules skip instead of running. The test suite must pass on a clean checkout with no
 external analysis tools installed — anything that needs an external engine must
 skip cleanly when it is absent, with a message naming what is missing.
 
@@ -90,8 +91,9 @@ skip cleanly when it is absent, with a message naming what is missing.
 - Comments should explain *why*, not restate the code. A comment naming the
   specification section a magic number comes from is worth ten that describe
   syntax.
-- No `print` in library code. Return data or use the project logger; the caller
-  decides what to display.
+- No `print` in library code. Return data and let the caller decide what to
+  display (no module under `liebert_re/` uses `logging`; the CLI in
+  `liebert_re/cli.py` is the one place that writes to stdout).
 
 ## Working with samples
 

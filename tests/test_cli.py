@@ -138,3 +138,91 @@ def test_capabilities_reports_a_nonempty_family_set():
     assert r.returncode == 0, r.stderr
     result = json.loads(r.stdout)["families"]
     assert result and sum(published for _named, published in result.values()) > 0
+
+
+# --- unclassifiable text, structured failures, and the workspace choice ---
+
+def test_unrecognised_failure_text_does_not_exit_zero(monkeypatch, capsys):
+    from liebert_re.tools import binary
+    monkeypatch.setattr(binary, "pe_imports", lambda path: "Something went badly wrong in some new way.")
+    code = cli.main(["pe", str(ROOT / "pyproject.toml"), "--imports"])
+    body = json.loads(capsys.readouterr().out)
+    assert code == 1 and body["status"] == "FAILED" and body["error"] == "UNCLASSIFIED_OUTPUT"
+
+
+def test_known_text_answers_still_exit_zero(monkeypatch, capsys):
+    from liebert_re.tools import binary
+    monkeypatch.setattr(binary, "pe_imports", lambda path: "No import table.")
+    assert cli.main(["pe", str(ROOT / "pyproject.toml"), "--imports"]) == 0
+    capsys.readouterr()
+
+
+def test_structured_disasm_failure_is_a_refusal_with_english_message(tmp_path):
+    f = tmp_path / "notpe.bin"
+    f.write_bytes(b"this is not a PE file at all")
+    r = subprocess.run([sys.executable, "-m", "liebert_re", "disasm", str(f), "--va", "0x1000"],
+                       cwd=tmp_path, capture_output=True, text=True, env=_env())
+    body = json.loads(r.stdout)
+    assert r.returncode == 3
+    assert body["ok"] is False and body["error"] == "INVALID_PE" and body["status"] == "ANALYSIS_LIMITED"
+    assert body["message"].startswith("Invalid or corrupt PE file")
+
+
+def _env():
+    import os
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("TEACHER")}
+    env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    return env
+
+
+def _run_in(cwd, *args):
+    return subprocess.run([sys.executable, "-m", "liebert_re", *args], cwd=cwd, capture_output=True, text=True, env=_env())
+
+
+def test_file_outside_cwd_is_analysed_and_workspace_is_reported(tmp_path):
+    here, there = tmp_path / "here", tmp_path / "there"
+    here.mkdir()
+    there.mkdir()
+    f = there / "sample.txt"
+    f.write_text("hello")
+    r = _run_in(here, "identify", str(f))
+    body = json.loads(r.stdout)
+    assert r.returncode == 0, r.stdout
+    assert body["workspace"] == {"root": str(there.resolve()), "source": "target_parent"}
+
+
+def test_file_inside_cwd_keeps_cwd_as_workspace(tmp_path):
+    (tmp_path / "a.txt").write_text("x")
+    r = _run_in(tmp_path, "identify", "a.txt")
+    assert r.returncode == 0, r.stdout
+    assert json.loads(r.stdout)["workspace"] == {"root": str(tmp_path.resolve()), "source": "default"}
+
+
+def test_explicit_workspace_is_honoured(tmp_path):
+    ws, other = tmp_path / "ws", tmp_path / "other"
+    ws.mkdir()
+    other.mkdir()
+    (ws / "in.txt").write_text("x")
+    r = _run_in(other, "--workspace", str(ws), "identify", str(ws / "in.txt"))
+    assert r.returncode == 0, r.stdout
+    assert json.loads(r.stdout)["workspace"] == {"root": str(ws.resolve()), "source": "--workspace"}
+
+
+def test_traversal_out_of_explicit_workspace_is_still_refused(tmp_path):
+    ws, other = tmp_path / "ws", tmp_path / "other"
+    ws.mkdir()
+    other.mkdir()
+    (other / "secret.txt").write_text("x")
+    escape = str(ws / ".." / "other" / "secret.txt")
+    r = _run_in(tmp_path, "--workspace", str(ws), "identify", escape)
+    body = json.loads(r.stdout)
+    assert r.returncode == 3 and body["status"] == "PATH_REFUSED"
+    assert body["workspace"]["source"] == "--workspace"
+
+
+def test_dotdot_relative_path_is_refused_inside_workspace_sandbox(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (tmp_path / "secret.txt").write_text("x")
+    r = _run_in(ws, "--workspace", str(ws), "identify", "../secret.txt")
+    assert r.returncode == 3 and json.loads(r.stdout)["status"] == "PATH_REFUSED"

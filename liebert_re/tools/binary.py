@@ -98,7 +98,7 @@ def pe_sections(path):
 
 # Structured status vocabulary for the two text-returning directory readers below,
 # in the spirit of pe_resources' RESOURCE_NOT_FOUND / RESOURCE_DATA_MALFORMED codes:
-# the return type stays text (callers compare against the "... tablosu yok." /
+# the return type stays text (callers compare against the "No import table." /
 # "No matches." strings), but an unreadable directory now starts with a
 # machine-matchable code and can never be mistaken for a genuine absence.
 IMPORT_DIRECTORY_UNREADABLE="IMPORT_DIRECTORY_UNREADABLE"
@@ -148,7 +148,7 @@ def pe_imports(path,filter_text=None,max_results=500):
     entries=getattr(pe,"DIRECTORY_ENTRY_IMPORT",None)
     if not entries:
         if problem:return f"{IMPORT_DIRECTORY_UNREADABLE}: {problem}. This is NOT the same as a binary with no imports."
-        return "Import tablosu yok."
+        return "No import table."
     out=[]; flt=filter_text.lower() if filter_text else None
     tail=f"\n[{IMPORT_DIRECTORY_PARTIAL}: {problem}]" if problem else ""
     for d in entries:
@@ -167,7 +167,7 @@ def pe_exports(path,max_results=500):
     ex=getattr(pe,"DIRECTORY_ENTRY_EXPORT",None)
     if not ex:
         if problem:return f"{EXPORT_DIRECTORY_UNREADABLE}: {problem}. This is NOT the same as a binary with no exports."
-        return "Export tablosu yok."
+        return "No export table."
     out=[]
     for s in ex.symbols[:max_results]:
         n=s.name.decode(errors="replace") if s.name else f"ordinal:{s.ordinal}"
@@ -193,6 +193,11 @@ def dotnet_metadata(path,max_types=300):
 # shrink it to exercise chunk seams). Same default the sweep modules use.
 _DISASM_CHUNK_BYTES=1_000_000
 
+def _failure(error,status,message):
+    """Structured failure result: ``status`` is from the package's status vocabulary
+    (generic_static_probe.ALLOWED_STATUSES), ``error`` is a stable machine code."""
+    return {"ok":False,"status":status,"error":error,"message":message}
+
 def disassemble_pe(path,section=None,start_offset=0,max_instructions=250,va=None):
     # `va` (Tier2 remediation roadmap Priority 3, Problem B; additive,
     # default None -- zero behavior change for every existing caller):
@@ -206,25 +211,18 @@ def disassemble_pe(path,section=None,start_offset=0,max_instructions=250,va=None
     # containing section and correct in-section offset internally.
     from capstone import Cs,CS_ARCH_X86,CS_MODE_32,CS_MODE_64,CS_ARCH_ARM64,CS_MODE_ARM
     p=safe_path(path)
-    # Matches this function's own established contract (relied on verbatim by
-    # ioctl_recovery.py's (upstream-only; not part of the published package) _parse_disassembly_lines docstring: "disassemble_pe
-    # returns a plain human-readable error string ... on any failure ...
-    # never raises") -- every other failure path in this function already
-    # returns a plain string instead of raising, so a non-PE/corrupt input
-    # (pefile.PEFormatError, or any other parse failure) must too, not an
-    # uncaught exception. dotnet_inspect (tools_dotnet.py) handles the
-    # identical bad-input case cleanly via its own JSON error vocabulary;
-    # this function's vocabulary is plain text, so it stays plain text here
-    # rather than switching shapes mid-function.
+    # Success is a plain-text listing; every FAILURE is a structured dict
+    # (see _failure) so callers branch on `ok`/`error`, never on prose. A
+    # non-PE or corrupt input returns INVALID_PE rather than raising.
     try:
         pe=_pe(p)
     except Exception as e:
-        return f"Gecersiz veya bozuk PE dosyasi ({type(e).__name__}): {e}"
+        return _failure("INVALID_PE","ANALYSIS_LIMITED",f"Invalid or corrupt PE file ({type(e).__name__}): {e}")
     mach=pe.FILE_HEADER.Machine
     if mach==0x14c:md=Cs(CS_ARCH_X86,CS_MODE_32)
     elif mach==0x8664:md=Cs(CS_ARCH_X86,CS_MODE_64)
     elif mach==0xaa64:md=Cs(CS_ARCH_ARM64,CS_MODE_ARM)
-    else:return f"Desteklenmeyen machine {hex(mach)}"
+    else:return _failure("UNSUPPORTED_MACHINE","UNSUPPORTED",f"Unsupported machine type {hex(mach)}")
     # x86/x64 sections routinely have data-in-code (jump tables, alignment
     # padding, literal pools) before max_instructions/section end. Without
     # skipdata, Cs.disasm() (one native cs_disasm() call) STOPS the moment it
@@ -244,12 +242,12 @@ def disassemble_pe(path,section=None,start_offset=0,max_instructions=250,va=None
     chosen=None
     if va not in (None,""):
         try:va_int=int(str(va),0)
-        except ValueError:return f"Gecersiz va: {va!r}"
+        except ValueError:return _failure("INVALID_VA","ANALYSIS_LIMITED",f"Invalid va: {va!r}")
         rva=va_int-pe.OPTIONAL_HEADER.ImageBase
         for s in pe.sections:
             if s.VirtualAddress<=rva<s.VirtualAddress+max(s.Misc_VirtualSize,s.SizeOfRawData):
                 chosen=s;start_offset=rva-s.VirtualAddress;break
-        if chosen is None:return f"va {hex(va_int)} (RVA {hex(rva)}) herhangi bir section icinde bulunamadi."
+        if chosen is None:return _failure("VA_NOT_IN_SECTION","ANALYSIS_LIMITED",f"va {hex(va_int)} (RVA {hex(rva)}) was not found inside any section.")
     elif section:
         for s in pe.sections:
             if s.Name.rstrip(b"\x00").decode(errors="replace").lower()==section.lower():chosen=s;break
@@ -258,7 +256,7 @@ def disassemble_pe(path,section=None,start_offset=0,max_instructions=250,va=None
         for s in pe.sections:
             if s.VirtualAddress<=ep<s.VirtualAddress+max(s.Misc_VirtualSize,s.SizeOfRawData):
                 chosen=s;start_offset=max(int(start_offset),ep-s.VirtualAddress);break
-    if chosen is None:return "Section not found."
+    if chosen is None:return _failure("SECTION_NOT_FOUND","ANALYSIS_LIMITED","Section not found.")
     data=chosen.get_data(); start_offset=max(0,min(int(start_offset),len(data)))
     base=pe.OPTIONAL_HEADER.ImageBase+chosen.VirtualAddress+start_offset
     out=[]; more_at=None

@@ -4,17 +4,21 @@ Git is the safety net. Nothing here needs a tool beyond git.
 
 ## Porting rule
 
-- One capability family per commit. Never squash.
-- A commit touches only the files it introduces, plus the registry and
-  `py-modules` lines it needs. Nothing else rides along.
-- `tests/test_repo_discipline.py` enforces part of this in CI: every module is
-  in `py-modules`, every module has a test reference, no artifacts or
+- One group of related modules per commit (below, `<family>` is just the name
+  given to such a group). Never squash.
+- A commit touches only the files it introduces, plus any test that covers
+  them. Nothing else rides along.
+- `tests/test_repo_discipline.py` enforces part of this in CI: the package
+  declaration in `pyproject.toml` is `[tool.setuptools.packages.find]` with
+  `include = ["liebert_re*"]`, so a new module is picked up by being inside
+  `liebert_re/`; every module has a test reference; no artifacts or
   user-specific paths are tracked.
 
 ## Tags
 
-- `port-baseline` marks the state before any porting began. It is a local tag
-  (not on the remote), so its commit is also recorded here:
+- `port-baseline` marks the state before any porting began. It is pushed to the
+  remote, so a fresh clone has it (`git ls-remote --tags origin` lists it) and can
+  follow the steps below. Its commit is also recorded here:
   `bfd748c80558aa3918f9fbaf0d2ddbde8c2137b3`. If the tag is missing, recreate it
   with `git tag -a port-baseline -m "before porting" bfd748c80558aa3918f9fbaf0d2ddbde8c2137b3`.
 - Before each family lands, tag `port-<family>-pre`:

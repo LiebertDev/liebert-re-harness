@@ -16,21 +16,21 @@ everything else follows from it.
 Small, self-contained, and each closable without touching more than one or two
 files.
 
-1. **`crackme_solutions/scripts_mutated_crackme5_serial.py` does not run.** Its
-   `run()` function imports `tools_emulate_range`, a bounded-emulation module that
-   lives in the upstream tree and was never published here (see the README's
-   "deliberately not in this repository" list). The write-up and the recovered
-   algorithm are correct and worth keeping; the entry point just cannot execute
-   as shipped. Either rewrite it against a minimal emulation path built from what
-   is already in this repository (Capstone for decode, Unicorn is already a
-   dependency — see `pyproject.toml`), or replace the emulation-dependent step
-   with a documented manual trace and keep the rest of the script runnable.
-2. ~~`tools_vb6_pcode.py`'s `program_strings` operation raises `ImportError`.~~
-   **No longer true — verified closed.** `tools_vb6_pcode.py` is fully published
+1. **The mutated-crackme-5 serial solver is not runnable from this tree.** Its
+   script was moved to the `archive/crackme-solutions` branch (see
+   [SOLVED_INDEX.md](../SOLVED_INDEX.md)); its emulation step depended on a
+   bounded-emulation module from the upstream tree that was never published here
+   (see the README's "deliberately not in this repository" list). The write-up
+   and the recovered algorithm are correct and worth keeping. A useful
+   contribution is a minimal emulation path built from what is already in this
+   repository (Capstone for decode, Unicorn is already a dependency — see
+   `pyproject.toml`), or a documented manual trace of that step.
+2. ~~`liebert_re/tools/vb6_pcode.py`'s `program_strings` operation raises `ImportError`.~~
+   **No longer true — verified closed.** `liebert_re/tools/vb6_pcode.py` is fully published
    in this package; `program_strings` only imports `pefile` and `capstone`
    (both shipped dependencies), and calling it returns a normal structured
    result (e.g. `FILE_NOT_FOUND` for a missing path), not an `ImportError`.
-   `from tools_vb6 import vb6_inspect` also resolves cleanly. This item is kept,
+   `from liebert_re.tools.vb6 import vb6_inspect` also resolves cleanly. This item is kept,
    struck through, so a reader who remembers the old defect can see it was
    checked rather than silently dropped.
 3. **Lint coverage is narrow on purpose, and widening it is real, bounded work.**
@@ -52,7 +52,7 @@ files.
    yet.** The project's central rule — never return a confidently wrong answer —
    only works if a caller can read a function's docstring and learn what it
    returns when it fails, not just what it returns when it succeeds. Measured on
-   `tools_binary.py` as of this writing: of its 12 public (non-underscore)
+   `liebert_re/tools/binary.py` as of this writing: of its 12 public (non-underscore)
    top-level functions, **11 have no docstring at all**. Auditing a module,
    writing docstrings that state the failure contract explicitly (what comes
    back on missing data, on a malformed field, on a missing external tool), and
@@ -69,7 +69,7 @@ hidden feature.
 
 - **Bounded emulation** (Unicorn-based range emulation, execution traces, a
   backward slicer, per-instruction snapshots and register capture). **Still
-  open.** `vex.py` ships, but it only corrects how AVX (VEX-encoded)
+  open.** `liebert_re/recover/vex.py` ships, but it only corrects how AVX (VEX-encoded)
   instructions execute inside an emulation session; it is not range emulation,
   tracing or slicing. This is the
   single most useful missing piece, because several things in this repository
@@ -79,8 +79,9 @@ hidden feature.
   anything like slicing.
 - **IDA and Ghidra wrappers** (headless decompilation, cross-references,
   callers/callees, answers normalised across engines so a caller does not need to
-  know which one ran). `docs/INSTALL.md` is explicit that this package drives
-  rizin, Detect It Easy, YARA-X and API Monitor only. A Ghidra wrapper is the more
+  know which one ran). The README section "External tools are your responsibility" lists what this
+  package drives (rizin, Detect It Easy, YARA-X, API Monitor, UPX, JADX,
+  Il2CppDumper); IDA and Ghidra are not among them. A Ghidra wrapper is the more
   approachable half of this, since `analyzeHeadless` is scriptable and free to
   install; an IDA wrapper needs a licensed copy to test against and is a bigger
   commitment.
@@ -94,21 +95,21 @@ hidden feature.
   package — a search for one finds nothing — so the parser has to be written
   first; there is no existing code to extend.
 - **Crash symbolisation.** ~~Minidump *parsing* is already here
-  (`minidump_structural.py`); turning a raw address recovered from a dump into a
-  symbol is not.~~ **Closed for its stated scope.** `minidump_analyzer.py` maps
-  an address recovered from a dump to its module, and `crash_symbolize.py`
+  (`liebert_re/recover/minidump_structural.py`); turning a raw address recovered from a dump into a
+  symbol is not.~~ **Closed for its stated scope.** `liebert_re/recover/minidump_analyzer.py` maps
+  an address recovered from a dump to its module, and `liebert_re/recover/crash_symbolize.py`
   turns module plus RVA into the nearest public symbol, built on the PDB/CodeView
-  work (`msf_pdb.py`, `codeview_rsds.py`). What remains open: it needs a PDB whose
+  work (`liebert_re/recover/msf_pdb.py`, `liebert_re/recover/codeview_rsds.py`). What remains open: it needs a PDB whose
   identity matches the crashing module (otherwise the answer is `UNKNOWN`), it
   resolves public symbols only (no source lines), and there is no stack
-  unwinding — the stack scan in `minidump_analyzer.py` is a heuristic pointer
+  unwinding — the stack scan in `liebert_re/recover/minidump_analyzer.py` is a heuristic pointer
   scan, explicitly not a proven call stack.
 - **Delay-import, TLS, relocation, and rich-header parsing.** The PE support here
   covers headers, sections, imports, exports and resources; ~~these four
   directories are not implemented~~. **Partly closed.** TLS is closed:
-  `tools_tls_directory.py` (`analyze_tls_directory`) parses the TLS directory and
+  `liebert_re/tools/tls_directory.py` (`analyze_tls_directory`) parses the TLS directory and
   its callback array. **Still open:** delay-import, base-relocation and
-  rich-header parsing. (`tools_cpp_rtti.py` reads the base-relocation directory
+  rich-header parsing. (`liebert_re/tools/cpp_rtti.py` reads the base-relocation directory
   internally as a validity check for vtable scanning, but that is a private
   helper, not a relocation parser.) Each remaining one is a bounded,
   well-specified parsing task with public documentation, and any one of the
@@ -153,12 +154,12 @@ upstream; they cannot be reproduced from this repository.
   useful one.
 - **Mobile targets (APK/DEX, Android-specific obfuscators).** ~~No support exists,
   and there is no near-term plan to add it.~~ **Partly closed.** Structural
-  support now ships: `tools_dex.py` (DEX header, class and string-pool parse),
-  `tools_android.py` (manifest, permission and component inspection of an APK or
+  support now ships: `liebert_re/tools/dex.py` (DEX header, class and string-pool parse),
+  `liebert_re/tools/android.py` (manifest, permission and component inspection of an APK or
   raw AXML, via the undeclared `androguard` dependency — see `docs/INSTALL.md`)
-  and `tools_jvm.py` (JVM `.class` / `.jar`). Decompiling one named class needs
+  and `liebert_re/tools/jvm.py` (JVM `.class` / `.jar`). Decompiling one named class needs
   the optional JADX tool. **Still open:** none of these disassembles Dalvik
-  method bytecode itself, `tools_android.py` does not implement resource-table
+  method bytecode itself, `liebert_re/tools/android.py` does not implement resource-table
   (`resources.arsc`) resolution or signature verification depth (presence and
   identity only), and there is nothing for Android-specific obfuscators. That
   last part remains a hard problem and only makes sense after the

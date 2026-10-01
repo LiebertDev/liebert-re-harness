@@ -4,10 +4,10 @@
 
 Only what you need to run and develop the analysis code. Concretely:
 
-- **64 Python modules** at the repository root — the analysis code itself.
-- **47 test files** in `tests/`, plus `conftest.py` and an empty `__init__.py`
+- **66 Python modules** in the `liebert_re/` package — the analysis code itself.
+- **65 test files** in `tests/`, plus `conftest.py` and an empty `__init__.py`
   (the latter is required so the flat top-level modules resolve on `sys.path`).
-- **11 standalone challenge-solution scripts** in `crackme_solutions/`.
+- No challenge-solution scripts: they were moved to the `archive/crackme-solutions` branch (see [SOLVED_INDEX.md](../SOLVED_INDEX.md)).
 - Documentation, licence, CI configuration, and issue templates.
 
 **Deliberately not here**, so you are not cloning several gigabytes of someone
@@ -53,23 +53,25 @@ Installed automatically: `pefile`, `capstone`, `unicorn`, `keystone-engine`,
 `numpy`, `dnfile`, `dncil`, `ijson`, `psutil`, `PyYAML`.
 
 Optional extras: `pip install -e ".[lattice]"` adds `mpmath` (needed by
-`tools_lattice.py` / `lll_exact.py`; without it `tools_lattice` returns a structured
+`liebert_re/tools/lattice.py` / `liebert_re/recover/lll_exact.py`; without it `liebert_re.tools.lattice` returns a structured
 `TOOL_MISSING` result and its tests skip). `pip install -e ".[frida]"` — needed only by
-`frida_trace_client.py`, which is a client for an isolated-VM tracing setup and is
+`liebert_re/dynamic/frida_trace_client.py`, which is a client for an isolated-VM tracing setup and is
 not on the core analysis path.
 
 Some modules import a Python package the repository does **not** declare, neither as
 a dependency nor as an extra. Install one yourself if you want the operation it
 backs; without it the call returns an error containing the import failure rather
-than doing anything: `androguard` (`tools_android.py`), `UnityPy` (`tools_unity.py`),
-`dpkt` (`tools_pcap.py`), `py7zr`, `rarfile` and `backports.zstd`
-(`tools_archive2.py`).
+than doing anything: `androguard` (`liebert_re/tools/android.py`), `UnityPy` (`liebert_re/tools/unity.py`),
+`dpkt` (`liebert_re/tools/pcap.py`), `py7zr`, `rarfile` and `backports.zstd`
+(`liebert_re/tools/archive2.py`).
 
 ## External applications — all optional
 
-**None of these are required.** The core analysis (PE parsing, function inventory,
-entropy, .NET IL, emulation, the crypto attacks, the crackme scripts) runs on the
-Python dependencies alone. Each external tool unlocks additional operations, and
+**None of these are required.** The core analysis (PE parsing,
+entropy, .NET IL, the crypto attacks) runs on the
+Python dependencies alone. Function inventory (`rizin_functions`) needs rizin, and no
+range emulation ships — Unicorn is imported only by the VEX self-check in
+`liebert_re/recover/vex.py`. Each external tool unlocks additional operations, and
 when one is absent the relevant call returns an explicit "tool missing" result
 naming it — it does not silently degrade or guess.
 
@@ -79,9 +81,9 @@ naming it — it does not silently degrade or guess.
 | **Detect It Easy** | Packer and compiler identification (`diec.exe -j`) | `DIE_HOME`, else `diec` on `PATH` |
 | **YARA-X** | Rule-based scanning | `YARA_X_EXE` or `YARA_X_HOME`; rule sets via `YARA_RULESETS_HOME` |
 | **API Monitor** | API catalogue lookups (live tracing and trace parsing are both **not** wired up and return `NOT_SUPPORTED` — see the gap list in the README) | `APIMONITOR_HOME` |
-| **JADX** | Decompiling one named class from a DEX, APK-derived DEX or JVM `.class` / `.jar` (`tools_dex.py`, `tools_jvm.py`); structural listing works without it and the decompile operation returns `JADX_TOOL_MISSING` | `JADX_EXE`, else `jadx` on `PATH`, else a `teacher-tools/jadx/bin/jadx.bat` under the user's home directory |
-| **Il2CppDumper** | Unity IL2CPP type and method name to address mapping (`tools_il2cpp.py`); every operation returns `IL2CPPDUMPER_TOOL_MISSING` without it | `IL2CPPDUMPER_EXE`, else a `teacher-tools/il2cppdumper/Il2CppDumper.exe` under the user's home directory |
-| **UPX** | Static UPX unpacking with `upx -d` on a copy of the input (`tools_upx.py`); returns `TOOL_MISSING` without it | `UPX_HOME`, else `upx` on `PATH`, else a `teacher-tools/upx/upx.exe` under the user's home directory |
+| **JADX** | Decompiling one named class from a DEX, APK-derived DEX or JVM `.class` / `.jar` (`liebert_re/tools/dex.py`, `liebert_re/tools/jvm.py`); structural listing works without it and the decompile operation returns `JADX_TOOL_MISSING` | `JADX_EXE`, else `jadx` on `PATH`, else a `teacher-tools/jadx/bin/jadx.bat` under the user's home directory |
+| **Il2CppDumper** | Unity IL2CPP type and method name to address mapping (`liebert_re/tools/il2cpp.py`); every operation returns `IL2CPPDUMPER_TOOL_MISSING` without it | `IL2CPPDUMPER_EXE`, else a `teacher-tools/il2cppdumper/Il2CppDumper.exe` under the user's home directory |
+| **UPX** | Static UPX unpacking with `upx -d` on a copy of the input (`liebert_re/tools/upx.py`); returns `TOOL_MISSING` without it | `UPX_HOME`, else `upx` on `PATH`, else a `teacher-tools/upx/upx.exe` under the user's home directory |
 | **IDA / Ghidra** | Decompilation, cross-references, callers and callees | Wrappers for these live in the upstream tree; this package does not ship them |
 
 Set an environment variable to the tool's install directory, for example:
@@ -106,7 +108,7 @@ exactly the class of silent wrong answer this project refuses.
 
 ## The workspace sandbox — read this before your first call
 
-`tools_workspace.safe_path()` confines file access to a single workspace root.
+`liebert_re.workspace.safe_path()` confines file access to a single workspace root.
 Anything outside it is refused with a `PermissionError`, including absolute paths
 to system files. This is deliberate: analysis code is pointed at hostile input for
 a living, and the default should not be "can open anything on the machine".
@@ -126,8 +128,8 @@ one test file in the upstream tree failed for exactly that reason until it was
 fixed.
 
 Five modules write their own output *outside* this workspace root on purpose:
-`tools_binary.py` (`pe_resources`), `tools_die.py`, `tools_yara_x.py`,
-`tools_rizin.py` (`binary_patch`) and `tools_upx.py` each persist their raw
+`liebert_re/tools/binary.py` (`pe_resources`), `liebert_re/tools/die.py`, `liebert_re/tools/yara_x.py`,
+`liebert_re/tools/rizin.py` (`binary_patch`) and `liebert_re/tools/upx.py` each persist their raw
 engine output under a module-level `dataset/evidence/<tool_name>/` directory
 inside the repository itself, which is git-ignored. The *input* file you pass
 in is still confined by `safe_path()` exactly as above; only each tool's own

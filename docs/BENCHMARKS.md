@@ -21,13 +21,13 @@ accepts, and showing that a deliberately wrong input is rejected, is a solve.
 Several entries below sit at `PARTIAL_SOLVE` precisely because that distinction
 was enforced against our own work.
 
-## Windows Native Ladder — current state
+## Challenge ladder — current state
 
-Live count of `benchmarks/windows_native_ladder/manifests/` in the private
-working tree this project is developed in. **That directory is not part of
-this published repository** — it is not the `crackme_solutions/` folder
-shipped here, and there is nothing at this path in this repo to re-run the
-count against. The number below is reported as-is from its source tree, not
+Live count of the project's challenge manifests (one per challenge) in the private
+working tree this project is developed in. **That manifest set and its corpus are
+not part of this published repository** — they are not the solution scripts (kept on the
+`archive/crackme-solutions` branch), and there is nothing in this repo to re-run the count
+against. These results are not reproducible from this repository. The number below is reported as-is from its source tree, not
 re-derived from anything checkable in this repository:
 
 | State | Count |
@@ -45,27 +45,28 @@ binary is executed to produce a static solve.
 
 ### Notable entries, with what made each one hard
 
-- **`WNL-T2-079` — "son_crackme_cubed"** by *SoN* — `VERIFIED_SOLVE`. The serial
+- **"son_crackme_cubed"** by *SoN* — `VERIFIED_SOLVE`. The serial
   is not present in any string table or literal pool; it is assembled at runtime
   from immediates inside VB6 P-Code. A decoy MD5-shaped string *is* in the literal
   table and was shown to be unreachable. Solving it required decoding P-Code, not
   searching strings.
-- **`WNL-T2-091` — "son_crackme_3"** by *son* — `PARTIAL_SOLVE`, and the honest
+- **"son_crackme_3"** by *son* — `PARTIAL_SOLVE`, and the honest
   label matters. The binary is Upack-packed; emulation-assisted unpacking
   recovered a readable P-Code program (section entropy **7.476 → 5.754**, 99.1%
   bytecode coverage). The intended serial was still not independently derived, so
   it is not a solve. Unpacking succeeded; the challenge did not fall.
-- **`WNL-T2-002` — "mutated crackme 5/10"** by *0xbabe* — `VERIFIED_SOLVE`.
-- **`WNL-T2-023` — "niko's crack me"** by *niko122* — `ANALYZED` only, kept as a
+- **"mutated crackme 5/10"** by *0xbabe* — `VERIFIED_SOLVE`.
+- **"niko's crack me"** by *niko122* — `ANALYZED` only, kept as a
   deliberately *unpacked* negative control for entropy triage. A corpus with no
   negative controls measures nothing.
-- **`WNL-T2-089` — "son_crackme_q"** by *son* — `BLOCKED`.
+- **"son_crackme_q"** by *son* — `BLOCKED`.
 
 ## Standalone challenges
 
 Each of these was fetched from its author's own page. **The binaries are not
-redistributed here** — see [CORPUS.md](CORPUS.md). `crackme_solutions/` holds the
-standalone attack scripts.
+redistributed here** — see [CORPUS.md](CORPUS.md). The
+standalone attack scripts are on the `archive/crackme-solutions` branch; see
+[SOLVED_INDEX.md](../SOLVED_INDEX.md).
 
 | Challenge | Author | Source | Status |
 |---|---|---|---|
@@ -134,11 +135,13 @@ subset *of*:
 ## External engines: which are really wired
 
 **Scope warning, so this table is not misread.** It describes the **wider private
-working tree**, not this package. This repository ships wrappers for **rizin,
-Detect It Easy, YARA-X and API Monitor only** — the IDA, Ghidra, capa, FLOSS,
-pe-sieve and Frida integrations listed below are *not* in it.
-[INSTALL.md](INSTALL.md) is the authority on what this package can actually drive,
-and the README lists what is deliberately excluded.
+working tree**, not this package. This package drives **rizin, Detect It Easy,
+YARA-X, API Monitor, UPX, JADX and Il2CppDumper** (plus a detect-only MSVC PDB
+toolchain probe); see the README section "External tools are your responsibility".
+The IDA, Ghidra, capa, FLOSS, pe-sieve, angr and Frida integrations listed below
+are *not* in this package, and **this package does not contain or redistribute a
+capa or FLOSS binary** — it has no driver for either. The README lists what is
+deliberately excluded.
 
 The table is kept because it answers a different and still-useful question: which
 integrations are real work and which are a name in a planning document. That
@@ -148,10 +151,11 @@ distinction is usually where tool inventories lie.
 |---|---|
 | IDA (Professional) | **Real** — `idat.exe -A -S` batch, content-hash-keyed database cache |
 | Ghidra | **Real** — `analyzeHeadless`, session-scoped project |
-| rizin / radare2 | **Real** — bounded subprocess wrapper |
-| Capstone, Unicorn, angr | **Real** — in-process imports |
-| capa | **Real** — bundled binary, plus an IDA backend path |
-| FLOSS | **Real** — bundled binary; upstream's own 16 MB cap is surfaced rather than hidden |
+| rizin / radare2 | **Real** (rizin wrapper only in this package; no radare2 driver) — bounded subprocess wrapper |
+| Capstone, Unicorn | **Real** — in-process imports (Unicorn only for the VEX self-check in `recover/vex.py`; no range emulation ships) |
+| angr | **Not in this package** — nothing imports it |
+| capa | Real in the private tree only, where it is a separately obtained binary. **Not part of this package: no driver, nothing bundled** |
+| FLOSS | Real in the private tree only, where it is a separately obtained binary. **Not part of this package: no driver, nothing bundled** |
 | Detect It Easy | **Real** — `diec.exe -j` |
 | pe-sieve, hollows_hunter, Frida | Real, **but isolated-VM only** by policy — never invoked on the host |
 | API Monitor | **Partial** — catalogue works; live trace and trace parsing are both unconditional `NOT_SUPPORTED` refusals |
@@ -163,7 +167,7 @@ Individual numbers worth quoting because each came from a real file, not a fixtu
 
 **Scope warning:** these were measured in the wider private working tree, on binaries
 that are not in this repository (see [CORPUS.md](CORPUS.md)). The code behind some
-of them ships here (`tools_vb6_pcode.py`, `tools_crypto_id.py`, `tools_delphi.py`);
+of them ships here (`liebert_re/tools/vb6_pcode.py`, `liebert_re/tools/crypto_id.py`, `liebert_re/tools/delphi.py`);
 the emulation-assisted unpacking does not. You cannot reproduce any figure below from
 this repository alone, because the target files are not part of it.
 
@@ -176,7 +180,7 @@ this repository alone, because the target files are not part of it.
   re-derived from the algorithms themselves rather than copied from a signature
   list.
 - **Native Delphi:** 48 classes and 47 parent links recovered from one real binary
-  (a target that is not shipped here; the recovery code is `tools_delphi.py`).
+  (a target that is not shipped here; the recovery code is `liebert_re/tools/delphi.py`).
   VMT method-table parsing is still absent — so this is `PARTIAL`, and labelled so.
 
 ## Bugs found in our own tooling

@@ -61,7 +61,11 @@ class DisassemblePeVaResolutionTests(unittest.TestCase):
 
     def test_va_outside_any_section_fails_gracefully_not_an_exception(self):
         result = disassemble_pe(str(FIXTURE_EXE), va="0xdeadbeef", max_instructions=5)
-        self.assertIn("bulunamadi", result)
+        self.assertIsInstance(result, dict)
+        self.assertIs(result["ok"], False)
+        self.assertEqual(result["error"], "VA_NOT_IN_SECTION")
+        self.assertEqual(result["status"], "ANALYSIS_LIMITED")
+        self.assertIn("not found", result["message"])
 
     def test_va_takes_precedence_over_stale_section_start_offset_args(self):
         # A caller passing both va and a leftover section/start_offset from
@@ -94,23 +98,25 @@ class DisassemblePeNonPeInputTests(unittest.TestCase):
     def tearDown(self):
         self.zip_path.unlink(missing_ok=True)
 
-    def test_zip_input_never_raises_and_returns_a_plain_error_string(self):
+    def test_zip_input_never_raises_and_returns_a_structured_failure(self):
         # Must not raise pefile.PEFormatError -- previously uncaught.
         result = disassemble_pe(str(self.zip_path))
-        self.assertIsInstance(result, str)
-        self.assertNotIn("Traceback", result)
+        self.assertIsInstance(result, dict)
+        self.assertIs(result["ok"], False)
+        self.assertEqual(result["error"], "INVALID_PE")
+        self.assertNotIn("Traceback", result["message"])
 
     def test_zip_input_error_text_names_the_real_cause(self):
         result = disassemble_pe(str(self.zip_path))
-        self.assertIn("PE", result)
+        self.assertIn("PE", result["message"])
 
     def test_truncated_pe_header_also_fails_gracefully(self):
         truncated = SCRATCH_DIR / "__truncated__.exe"
         truncated.write_bytes(b"MZ" + b"\x00" * 10)
         try:
             result = disassemble_pe(str(truncated))
-            self.assertIsInstance(result, str)
-            self.assertNotIn("Traceback", result)
+            self.assertIsInstance(result, dict)
+            self.assertEqual(result["error"], "INVALID_PE")
         finally:
             truncated.unlink(missing_ok=True)
 

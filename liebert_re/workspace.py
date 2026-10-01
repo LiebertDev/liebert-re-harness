@@ -266,7 +266,7 @@ def read_file(path, start_line=1, end_line=None):
     if p.stat().st_size>MAX_FILE_BYTES:
         return f"File too large ({p.stat().st_size} bytes). Use search_text instead."
     try: lines=text_of(p).splitlines()
-    except UnicodeError: return "Binary dosya; binary/decompiler tool kullan."
+    except UnicodeError: return "Binary file; use a binary/decompiler tool."
     total=len(lines); start=max(1,int(start_line or 1))
     end=int(end_line) if end_line is not None else start+MAX_READ_LINES-1
     end=min(end,start+MAX_READ_LINES-1,total)

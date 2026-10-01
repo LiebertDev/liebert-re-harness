@@ -386,7 +386,7 @@ def test_new_patterns_are_purgeable_and_keep_still_wins(rel):
     assert cp.classify(rel) == "purge"
     for keepdir in ("knowledge", "keep"):
         assert cp.classify(f"{keepdir}/{rel}") == "keep"
-    assert cp.classify(f"ida/lessons.writeup.md") == "keep"
+    assert cp.classify("ida/lessons.writeup.md") == "keep"
 
 
 def test_forbidden_extensions_are_not_in_the_new_pattern_set():

@@ -5,6 +5,10 @@ stronger claim than the payload carries. The wrapper in this file may only ADD a
 ``command`` key to what a module returned; it never rewrites, upgrades or drops
 one, so a module's PARTIAL or TOOL_MISSING stays exactly that.
 
+Workspace: ``--workspace DIR`` sets the sandbox root. Without it the root is the current
+directory, or the target file's own directory when the target lies outside it; the
+choice is echoed under the ``workspace`` key.
+
 Exit codes
   0  the command answered (a true negative, e.g. "not packed", is an answer)
   3  structured refusal: the question is answerable, but not by this install
@@ -22,7 +26,9 @@ import argparse
 import importlib
 import json
 import os
+import re
 import sys
+from pathlib import Path
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_REFUSED = 0, 1, 2, 3
 
@@ -36,25 +42,37 @@ _MODULE_REFUSALS = frozenset({"NOT_FOUND", "UPX_UNPACK_FAILED"})
 _MODULE_USAGE = frozenset({"RULES_MISSING"})
 _REFUSAL_ERRORS = frozenset({"FILE_NOT_FOUND", "FILE_NOT_ACCESSIBLE"})
 
-# Plain-text failure markers the text-returning pe/disasm functions use.
-_TEXT_LIMITED_PREFIXES = (
-    "IMPORT_DIRECTORY_UNREADABLE", "EXPORT_DIRECTORY_UNREADABLE",
-    "Gecersiz", "Desteklenmeyen", "Section not found.", "va ",
-)
+# The text-returning pe/disasm functions answer with a listing. A failure either is
+# a structured dict (disassemble_pe) or starts with a stable machine code; the CLI
+# never matches prose. Anything else must fit the command's known listing shape,
+# otherwise it is an unclassifiable answer and exits 1 (see _decode).
+_TEXT_LIMITED_PREFIXES = ("IMPORT_DIRECTORY_UNREADABLE", "EXPORT_DIRECTORY_UNREADABLE")
 _TEXT_UNSUPPORTED_PREFIXES = ("Authenticode verification requires Windows",)
+_MARKER = r"\[(?:limit:\d+|[A-Z_]+: .*)\]"
+# command/mode -> regex every line of a successful text answer must match.
+_TEXT_SHAPES = {
+    "imports": re.compile(rf"(?:\S+!.+ @IAT 0x[0-9a-f]+|No import table\.|No matches\.|{_MARKER})"),
+    "exports": re.compile(rf"(?:.+ RVA=0x[0-9a-f]+ ordinal=\d+|No export table\.|{_MARKER})"),
+    "disasm": re.compile(rf"(?:0x[0-9A-F]+: .+|No instruction could be decoded\.|{_MARKER})"),
+}
 
 
-def _envelope(command, payload):
-    """Add ``command``; never touch a key the module returned."""
+def _envelope(command, payload, workspace=None):
+    """Add ``command`` (and the chosen ``workspace``); never touch a key the module returned."""
+    extra = {"workspace": workspace} if workspace else {}
     if isinstance(payload, dict):
-        if "command" in payload:
-            return {"command": command, "module_result": payload}
-        return {"command": command, **payload}
-    return {"command": command, "result": payload}
+        if "command" in payload or "workspace" in payload:
+            return {"command": command, **extra, "module_result": payload}
+        return {"command": command, **extra, **payload}
+    return {"command": command, **extra, "result": payload}
 
 
-def _decode(raw):
-    """Module return value -> JSON-able. Text that is not JSON is carried verbatim."""
+def _decode(raw, shape=None):
+    """Module return value -> JSON-able. Text that is not JSON is carried verbatim.
+
+    Text is an answer only if it carries a known failure code or every line fits
+    ``shape``; otherwise it is an unclassifiable result and becomes a FAILED
+    payload (exit 1), never a silent success."""
     if not isinstance(raw, str):
         return raw
     try:
@@ -66,6 +84,9 @@ def _decode(raw):
         out["status"] = "UNSUPPORTED"
     elif raw.startswith(_TEXT_LIMITED_PREFIXES):
         out["status"] = "ANALYSIS_LIMITED"
+    elif shape is None or not all(shape.fullmatch(line) for line in raw.splitlines() if line):
+        out.update(ok=False, status="FAILED", error="UNCLASSIFIED_OUTPUT",
+                   message="The command returned text the CLI cannot classify as an answer or a known failure.")
     return out
 
 
@@ -82,13 +103,13 @@ def _exit_code(payload):
     return EXIT_OK
 
 
-def _emit(command, payload):
-    sys.stdout.write(json.dumps(_envelope(command, payload), indent=2, default=str) + "\n")
+def _emit(command, payload, workspace=None):
+    sys.stdout.write(json.dumps(_envelope(command, payload, workspace), indent=2, default=str) + "\n")
     return _exit_code(payload)
 
 
-def _fail(command, status, exc):
-    body = {"command": command, "ok": False, "status": status,
+def _fail(command, status, exc, workspace=None):
+    body = {"command": command, **({"workspace": workspace} if workspace else {}), "ok": False, "status": status,
             "error_type": type(exc).__name__, "error": str(exc)}
     sys.stdout.write(json.dumps(body, indent=2, default=str) + "\n")
     return EXIT_REFUSED if status in REFUSAL_STATUSES else EXIT_FAILED
@@ -136,16 +157,80 @@ def _capabilities(a):
     return {"families": _load("liebert_re.report.tool_families", "published_family_report")()}
 
 
+def _shape(a):
+    return _TEXT_SHAPES.get(a.mode) if a.command == "pe" else _TEXT_SHAPES.get(a.command)
+
+
+def _current_root():
+    """The workspace root this process would use by default, or None if that root is
+    refused as over-broad (the library fails closed on it at import)."""
+    try:
+        return importlib.import_module("liebert_re.workspace").WORKSPACE_ROOT
+    except PermissionError:
+        return None
+
+
+def _select_workspace(args):
+    """Return (root, source, absolute_target_or_None) for this invocation.
+
+    ``--workspace`` wins. Otherwise the library's own default root is kept when it
+    contains the target; if it does not (or that root is over-broad), the root
+    becomes the target file's own parent directory, so containment still applies
+    but a file on another drive is usable. The caller reports the choice."""
+    if args.workspace:
+        return Path(args.workspace).expanduser().resolve(), "--workspace", None
+    current = _current_root()
+    target = Path(args.path).expanduser()
+    target = (target if target.is_absolute() else Path.cwd() / target).resolve()
+    if current is not None:
+        try:
+            target.relative_to(current)
+            return current, "default", None
+        except ValueError:
+            pass
+    return target.parent, "target_parent", str(target)
+
+
+def _apply_workspace(root):
+    """Point the sandbox at ``root``; return an undo callable. Same over-broad rule as at import."""
+    if not root.is_dir():
+        raise NotADirectoryError(f"workspace is not a directory: {root}")
+    if "liebert_re.workspace" not in sys.modules:
+        # First import reads the cwd: import from inside the chosen root so an
+        # over-broad cwd cannot make the library refuse before the choice applies.
+        here = os.getcwd()
+        os.chdir(root)
+        try:
+            importlib.import_module("liebert_re.workspace")
+        finally:
+            os.chdir(here)
+    ws = sys.modules["liebert_re.workspace"]
+    if ws.WORKSPACE_ROOT == root:
+        return lambda: None
+    if ws._is_over_broad_root(root) and not ws._acknowledged_broad():
+        raise PermissionError(f"Workspace root '{root}' is over-broad; choose a narrower --workspace "
+                              f"or set {ws.WORKSPACE_ACK_BROAD_ENV}=1 to acknowledge broad access.")
+    prev = (ws.WORKSPACE_ROOT, ws.WORKSPACE)
+    ws.WORKSPACE_ROOT = ws.WORKSPACE = root
+
+    def undo():
+        ws.WORKSPACE_ROOT, ws.WORKSPACE = prev
+    return undo
+
+
 def _build_parser():
     from liebert_re import __version__
     p = argparse.ArgumentParser(prog="liebert-re", description="Static reverse-engineering analysis. JSON output only.")
     p.add_argument("--version", action="version", version=f"liebert-re {__version__}")
+    p.add_argument("--workspace", metavar="DIR", default=None,
+                   help="workspace root for this invocation (default: the current directory, or the "
+                        "target file's own directory when the target lies outside it)")
     sub = p.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     def add(name, fn, help_, path=True):
         sp = sub.add_parser(name, help=help_, description=help_)
         if path:
-            sp.add_argument("path", help="file to analyse (must be inside the workspace root, default: current directory)")
+            sp.add_argument("path", help="file to analyse (must be inside the workspace root; see --workspace)")
         sp.set_defaults(handler=fn, needs_file=path)
         return sp
 
@@ -171,15 +256,26 @@ def _build_parser():
 def main(argv=None):
     args = _build_parser().parse_args(argv)
     command = args.command
+    info = None
     try:
         if args.needs_file and not os.path.exists(args.path):
             return _emit(command, {"ok": False, "status": "PATH_REFUSED", "error": "FILE_NOT_FOUND", "path": args.path})
-        return _emit(command, _decode(args.handler(args)))
+        undo = (lambda: None)
+        if args.needs_file:
+            root, source, new_path = _select_workspace(args)
+            info = {"root": str(root), "source": source}
+            if new_path:
+                args.path = new_path
+            undo = _apply_workspace(root)
+        try:
+            return _emit(command, _decode(args.handler(args), _shape(args)), info)
+        finally:
+            undo()
     except PermissionError as exc:
-        return _fail(command, "PATH_REFUSED", exc)
+        return _fail(command, "PATH_REFUSED", exc, info)
     except ImportError as exc:
-        return _fail(command, "TOOL_MISSING", exc)
+        return _fail(command, "TOOL_MISSING", exc, info)
     except Exception as exc:  # noqa: BLE001 - a CLI must answer in JSON, never a traceback
         if type(exc).__name__ == "PEFormatError":
-            return _fail(command, "ANALYSIS_LIMITED", exc)
-        return _fail(command, "FAILED", exc)
+            return _fail(command, "ANALYSIS_LIMITED", exc, info)
+        return _fail(command, "FAILED", exc, info)

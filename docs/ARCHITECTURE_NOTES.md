@@ -12,7 +12,7 @@ around: never return a confidently wrong answer. In code, that rule shows up as
 a small number of concrete, repeated patterns rather than as a comment anyone
 has to remember to apply:
 
-- **Explicit absence over a default.** `tools_formats.file_identity()` returns
+- **Explicit absence over a default.** `liebert_re.tools.formats.file_identity()` returns
   `architecture: null` and `endianness: null` for a text file — not `"unknown"`
   as a string, not `"x86"` because that happens to be the common case, `null`.
   The same function returns a structured `{"ok": false, "error":
@@ -25,7 +25,7 @@ has to remember to apply:
   and a slower or heuristic one, the result carries a field naming which path
   actually produced it. A caller — model or human — should never have to guess
   whether a number was measured or approximated by reading the value alone.
-- **`UNKNOWN` is a real return value, not an absence of one.** `analysis_ir.py`
+- **`UNKNOWN` is a real return value, not an absence of one.** `liebert_re/recover/analysis_ir.py`
   defines `UNKNOWN` as one of exactly four confidence levels
   (`SYMBOL_PROVEN`, `METADATA_PROVEN`, `HEURISTIC`, `UNKNOWN`), so "we don't
   know" is representable in the schema on the same footing as "we measured it
@@ -48,13 +48,13 @@ object on purpose, because a sentence a model writes and a byte a parser read
 are not the same thing, and treating them as interchangeable is exactly how a
 plausible-sounding wrong answer survives to become a "finding".
 
-- **`evidence_index.py`** is the read side over the evidence corpus a session
+- **`liebert_re/evidence/index.py`** is the read side over the evidence corpus a session
   accumulates: tool-output records, indexed by content, joined by a stable
   `evidence_uid` derived from the file's own hash so it survives a full
   rebuild-from-scratch. The module treats the corpus as append-only and
   immutable — it never writes, renames, or mutates an evidence file; the
   index itself is disposable and reconstructible.
-- **`evidence_security.py`** computes an integrity checksum
+- **`liebert_re/evidence/security.py`** computes an integrity checksum
   (`sha256(canonical_json(record))`) over an evidence record and is explicit,
   in its own module docstring, about what that does and does not prove: it
   catches accidental corruption (truncation, a stale copy, a bit flip), and it
@@ -64,7 +64,7 @@ plausible-sounding wrong answer survives to become a "finding".
   that actually resists deliberate forgery is binding a record to a
   `result_id` that a live tool dispatcher produced during the process's own
   run, which lives upstream (see §6), not in this checksum.
-- **`claim_index.py`** turns evidence into structured, comparable assertions —
+- **`liebert_re/evidence/claim_index.py`** turns evidence into structured, comparable assertions —
   `(target_identity, subject_kind, subject_value, predicate) -> asserted_value`
   — specifically so that "do these two claims answer the same question with a
   different answer" is a mechanical string comparison, not a judgment call.
@@ -79,7 +79,7 @@ plausible-sounding wrong answer survives to become a "finding".
   forward. That is deliberate: the failure this module answers was a missing
   mechanical check, not a missing human reviewer, so the fix is mechanical
   too.
-- **`claim_guard.py`** is the last, cheapest check before a piece of model
+- **`liebert_re/evidence/claim_guard.py`** is the last, cheapest check before a piece of model
   output is accepted as evidence-backed: every `0x...`-shaped hex reference
   and every `line N` reference in an answer must appear literally in the
   evidence text it is supposedly grounded in, or it is flagged. It also
@@ -101,7 +101,7 @@ address it cannot find verbatim in the cited evidence.
 
 ## 3. The workspace sandbox is a guardrail, not a boundary
 
-`tools_workspace.py` confines every file-access call — `safe_path()` and
+`liebert_re/workspace.py` confines every file-access call — `safe_path()` and
 everything built on it (`read_file`, `list_directory`, `search_text`, ...) —
 to a single root: `TEACHER_WORKSPACE` if set, otherwise the current directory.
 An absolute path outside that root, including an absolute path to a system
@@ -142,7 +142,7 @@ host rather than trusted by inspection.
 
 ## 4. Bounded execution
 
-`bounded_subprocess.py` is the single place every external engine call in this
+`liebert_re/bounded_subprocess.py` is the single place every external engine call in this
 project goes through (`rizin`, `diec`, `yara-x`, and anything else that shells
 out). Every call is wrapped with a time bound and an output-size bound, and
 every process it starts is one this module can find and kill by its own
@@ -186,37 +186,40 @@ period rather than either an instant hard kill or an unbounded wait. Both
 mechanisms are platform-specific; the `BoundedProcessResult` they both feed is
 not — a caller never needs to know which teardown path actually fired.
 
-## 5. Why flat modules and no framework
+## 5. Layout, and why no framework
 
-The repository root is one flat directory of Python modules — `tools_binary.py`,
-`tools_workspace.py`, `evidence_index.py`, `pe_address.py`, and so on — not a
-package tree, and there is no dependency-injection container, no plugin
-registry, and no framework the modules register themselves into. This is a
-choice, not an oversight, and it is made for reasons specific to this project
-rather than as a general recommendation:
+The code is one installable package, `liebert_re/`, split into five subpackages by
+what a module does (`tools/`, `recover/`, `dynamic/`, `evidence/`, `report/`) plus
+four top-level modules (`workspace.py`, `bounded_subprocess.py`, `cli.py`,
+`__main__.py`). The README has the map. Until version 0.1.0 the same code was a flat
+directory of `tools_*.py` / `evidence_*.py` modules at the repository root; the
+prefixes were dropped when it became a package (`tools_rizin.py` is now
+`liebert_re/tools/rizin.py`). That is a structural change only: no module gained
+a registry or a base class.
+
+There is still no dependency-injection container, no plugin registry, and no
+framework the modules register themselves into. That is a choice, made for reasons
+specific to this project:
 
 - **A small team maintains this.** A framework earns its cost when enough
-  people need a stable extension point that nobody remembers by hand; a flat
-  module layout costs nothing to reason about for a team small enough to just
-  know where things are.
-- **A single module should be importable and runnable on its own.** `python -c
-  "import pe_address"` or a single test file exercising `tools_workspace.py`
-  in isolation has no framework to bootstrap first. That property is worth
-  more here than the convenience a plugin system would add, because
-  isolating exactly which module produced a wrong answer is a recurring
-  need, not a rare one.
+  people need a stable extension point that nobody remembers by hand; plain
+  modules cost nothing to reason about for a team small enough to just know where
+  things are.
+- **A single module should be importable and runnable on its own.**
+  `python -c "import liebert_re.recover.pe_address"` or a single test file
+  exercising `liebert_re/workspace.py` in isolation has no framework to
+  bootstrap first. That property is worth more here than the convenience a plugin
+  system would add, because isolating exactly which module produced a wrong answer
+  is a recurring need, not a rare one.
 - **`CONTRIBUTING.md`'s style section says the same thing from the other
   direction**: match the surrounding code rather than importing conventions
   from elsewhere, and a formatter or restructuring pass is its own pull
   request with no behaviour change mixed in, specifically so it never buries
   a real diff.
 
-If a contribution wants to introduce a package structure, a DI layer, or a
-plugin system, that is a proposal-issue conversation first (per
-`CONTRIBUTING.md`), not a pull request — not because the idea is necessarily
-wrong, but because it is a structural change to how every module in the
-repository is found, imported, and tested, and that is exactly the kind of
-change this document exists to make people stop and discuss before writing.
+If a contribution wants to introduce a DI layer or a plugin system, that is a
+proposal-issue conversation first (per `CONTRIBUTING.md`), not a pull request,
+because it changes how every module is found, imported, and tested.
 
 ## 6. What the upstream tree adds, and the one lesson from it
 
@@ -249,10 +252,12 @@ wire it up — it is not evidence that they did.
 ## 7. If you are picking this up
 
 1. **Run the tests first.** `pytest -q` on a clean checkout, no external
-   engine installed, is expected to be green with the skip count
-   `docs/INSTALL.md` states — if it isn't, that is a bug worth reporting
+   engine installed, is expected to exit 0 (some tests skip when an optional
+   dependency or tool is absent; `docs/INSTALL.md` makes no promise about the
+   skip count) — if it doesn't, that is a bug worth reporting
    before you build on top of it.
-2. **Read one script in `crackme_solutions/`** before reading the analysis
+2. **Read one script from the `archive/crackme-solutions` branch** (indexed in
+   `SOLVED_INDEX.md`) before reading the analysis
    modules it uses. They are written to be self-contained and are the
    fastest way to see how the toolkit's typed operations actually compose
    into an attack, rather than reading a module's docstring in isolation.

@@ -66,7 +66,6 @@ KNOWN_PRIVATE_REFS = {
     "README.md": ({"TEACHER_"}, _DOC),
     "docs/ARCHITECTURE_NOTES.md": ({"TEACHER_"}, _DOC),
     "docs/INSTALL.md": ({"TEACHER_"}, _DOC),
-    "docs/ROADMAP.md": ({"tools_emulate_range"}, _DOC),
     "liebert_re/evidence/artifact_provenance.py": ({"TEACHER_"}, "teacher_* identifiers (e.g. prompts/teacher_system.md, teacher_model); surfaced by the case-insensitive scan"),
     "liebert_re/evidence/index.py": ({"research_state"}, _DEAD),
     "liebert_re/evidence/security.py": ({"TEACHER_", "research_state"}, _DEAD + "; lowercase teacher_runtime_tool_dispatch string"),
@@ -379,12 +378,12 @@ def test_allowlists_have_not_grown():
     assert hashlib.sha256(repr(PRIVATE_IDS).encode()).hexdigest().startswith("d51a752750a0f2a7")
     assert set(KNOWN_UNREFERENCED) == {"liebert_re.tools.asar_parser", "liebert_re.evidence.process_lock"}
     assert set(KNOWN_USER_PATHS) == {"tests/test_public_provenance_and_fixtures.py", "liebert_re/workspace.py"}
-    assert len(KNOWN_PRIVATE_REFS) == 31
-    assert sum(len(ids) for ids, _ in KNOWN_PRIVATE_REFS.values()) == 49
+    assert len(KNOWN_PRIVATE_REFS) == 30
+    assert sum(len(ids) for ids, _ in KNOWN_PRIVATE_REFS.values()) == 48
     # Fingerprint of every (path, identifiers) pair: swapping an entry, not only
     # adding one, changes it. Update it only when REMOVING entries.
     digest = hashlib.sha256(repr(sorted((f, sorted(i)) for f, (i, _) in KNOWN_PRIVATE_REFS.items())).encode()).hexdigest()
-    assert digest.startswith("091268ee58f967ef")
+    assert digest.startswith("5f0196ac135629fc")
     assert all(reason for _, reason in KNOWN_PRIVATE_REFS.values())
 
 

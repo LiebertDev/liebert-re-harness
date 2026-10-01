@@ -5,7 +5,7 @@ Review this notice before using the repository.
 ## What this project is
 
 Liebert Reverse Engineering Harness is software-analysis tooling: it parses executable files,
-reconstructs their structure and control flow, emulates fragments of them, and
+reconstructs their structure, disassembles and decodes parts of them, and
 records what it measured together with the evidence for each claim. It is built
 for people who analyse software they are permitted to analyse — security
 researchers, capture-the-flag and crackme participants, malware analysts,
