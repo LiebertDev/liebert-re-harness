@@ -138,7 +138,33 @@ def _disasm(a):
 
 
 def _packer(a):
-    return _load("liebert_re.tools.die", "die_identify")(a.path, timeout_seconds=a.timeout)
+    # Scan depth is off unless asked for: the default call stays the cheap,
+    # reproducible baseline, and the result echoes whichever switches were used
+    # (a detection without its invocation is not reproducible).
+    return _load("liebert_re.tools.die", "die_identify")(
+        a.path, timeout_seconds=a.timeout,
+        deep=a.deep, heuristic=a.heuristic, aggressive=a.aggressive,
+        all_types=a.all_types, verbose=a.verbose, hide_unknown=a.hide_unknown,
+        profiling=a.profiling, database=a.database or None,
+        extra_database=a.extra_database or None, custom_database=a.custom_database or None,
+    )
+
+
+def _die(a):
+    name = {"entropy": "die_entropy", "info": "die_file_info",
+            "format_check": "die_format_check", "hashes": "die_hashes",
+            "structs": "die_structures", "struct": "die_struct_raw",
+            "sigdb": "die_database_info"}[a.mode]
+    fn = _load("liebert_re.tools.die", name)
+    if a.mode == "hashes":
+        return fn(a.path, algorithm=a.algorithm or None, timeout_seconds=a.timeout)
+    if a.mode == "struct":
+        return fn(a.path, a.name, timeout_seconds=a.timeout)
+    return fn(a.path, timeout_seconds=a.timeout)
+
+
+def _die_status(a):
+    return _load("liebert_re.tools.die", "die_status")()
 
 
 def _unpack(a):
@@ -243,7 +269,43 @@ def _build_parser():
     sp = add("disasm", _disasm, "disassemble a PE at a virtual address")
     sp.add_argument("--va", required=True, help="virtual address, decimal or 0x-hex")
     sp.add_argument("--count", type=int, default=250, help="maximum instructions")
-    add("packer", _packer, "identify packers/protectors (Detect It Easy)").add_argument("--timeout", type=int, default=60)
+    sp = add("packer", _packer, "identify packers/protectors (Detect It Easy)")
+    sp.add_argument("--timeout", type=int, default=60)
+    # Scan-depth switches, straight through to diec. --heuristic is the one that
+    # can flag a packer with no signature of its own, the common case for an
+    # in-house protector.
+    for flag, dest, helptext in (
+        ("--deep", "deep", "diec -d: thorough analysis"),
+        ("--heuristic", "heuristic", "diec -u: heuristic scan; finds unsignatured packers"),
+        ("--aggressive", "aggressive", "diec -g: aggressive scan"),
+        ("--all-types", "all_types", "diec -a: do not stop at the primary file type"),
+        ("--verbose", "verbose", "diec -b: detailed per-match information"),
+        ("--hide-unknown", "hide_unknown", "diec -U: omit unknown file types"),
+        ("--profiling", "profiling", "diec -l: profile signatures during the scan"),
+    ):
+        sp.add_argument(flag, dest=dest, action="store_true", help=helptext)
+    for flag, dest, helptext in (
+        ("--database", "database", "diec -D: main signature database path"),
+        ("--extra-database", "extra_database", "diec -E: extra signature database path"),
+        ("--custom-database", "custom_database", "diec -C: custom signature database path"),
+    ):
+        sp.add_argument(flag, dest=dest, default="", metavar="DIR", help=helptext)
+    sp = add("die", _die, "the rest of Detect It Easy's file readers (choose exactly one mode)")
+    sp.add_argument("--timeout", type=int, default=60)
+    sp.add_argument("--algorithm", default="", metavar="ALGO", help="--hashes only: one of DIE's names (MD5, SHA256, ...) instead of all")
+    sp.add_argument("--name", default="", metavar="STRUCT", help="--struct only: a structure name as --structs lists it")
+    g = sp.add_mutually_exclusive_group(required=True)
+    for flag, mode, helptext in (
+        ("--entropy", "entropy", "per-section entropy with DIE's own packed verdict"),
+        ("--info", "info", "DIE's file identity block"),
+        ("--format-check", "format_check", "format-anomaly warnings (a protector tell)"),
+        ("--hashes", "hashes", "whole-file cryptographic hashes"),
+        ("--structs", "structs", "which special structures this file supports"),
+        ("--struct", "struct", "one structure by name, unparsed (needs --name)"),
+        ("--sigdb", "sigdb", "which signature database answered, and its size"),
+    ):
+        g.add_argument(flag, dest="mode", action="store_const", const=mode, help=helptext)
+    add("diestatus", _die_status, "report whether Detect It Easy is reachable, from where, and its version", path=False)
     add("unpack", _unpack, "statically unpack a UPX-packed PE (output goes to the evidence cache)").add_argument("--timeout", type=int, default=60)
     add("scan", _scan, "scan with YARA-X rules").add_argument("--rules", required=True, help="rules file")
     sp = add("minidump", _minidump, "analyse a Windows minidump")

@@ -46,7 +46,14 @@ def test_exactly_the_six_evidence_owners_resolve_under_the_real_ledger():
 def test_published_tool_name_set_is_unchanged():
     # Must stay identical across the package move. A change is only legitimate
     # when public functions are deliberately added or removed.
+    #
+    # Updated once since: liebert_re/tools/die.py gained the rest of what diec.exe
+    # exposes (die_entropy, die_file_info, die_format_check, die_hashes,
+    # die_structures, die_struct_raw, die_database_info, die_status) alongside the
+    # existing die_identify, which previously used one flag (-j) of the tool's real
+    # surface. All eight are registered in tool_families.FAMILIES["native"], and cli.py gained
+    # the `die`/`diestatus` commands that reach them.
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "f20bd6725bae80b255ec5d9bef7422146f7d79eb95ec7120884c899489d26b3a"
+    assert digest == "0707bac651d49fdaf111aadc43703cfbc2a66ad28984d58ab5fa4146f80ddf9e"
