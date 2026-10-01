@@ -7,9 +7,9 @@ import shutil
 import subprocess
 from pathlib import Path
 
-APP = Path(__file__).resolve().parent
-SOURCE = APP / "benchmarks" / "qwen8b_safe_fixtures" / "owned_native" / "owned_native.c"
-OUT_DIR = APP / "benchmarks" / "qwen8b_safe_fixtures" / "owned_native"
+from tools_workspace import PROJECT_ROOT as APP
+SOURCE = APP / "dataset" / "runtime" / "qwen8b_safe_fixtures" / "owned_native" / "owned_native.c"
+OUT_DIR = APP / "dataset" / "runtime" / "qwen8b_safe_fixtures" / "owned_native"
 VSWHERE = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
 
 

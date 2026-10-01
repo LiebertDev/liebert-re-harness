@@ -10,8 +10,8 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
-APP = Path(__file__).resolve().parent
-FIXTURE_DIR = APP / "benchmarks" / "qwen8b_safe_fixtures"
+from tools_workspace import PROJECT_ROOT as APP
+FIXTURE_DIR = APP / "dataset" / "runtime" / "qwen8b_safe_fixtures"
 
 GUID_LE = struct.pack("<IHH", 0x8F11D2A0, 0x41B7, 0x4B0D) + bytes.fromhex("9E42112233445566")
 AGE = 7

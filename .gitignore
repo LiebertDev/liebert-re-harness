@@ -59,6 +59,7 @@ corpus/
 *.dex
 *.pdb
 *.dmp
+*.mdmp
 *.core
 
 # Analysis output. It embeds absolute paths, machine names and sample contents.

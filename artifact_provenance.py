@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-APP = Path(__file__).resolve().parent
+from tools_workspace import PROJECT_ROOT as APP
 PRODUCER_VERSION = "p0.5.0"
 DATASET_SCHEMA_VERSION = 3
 TRAJECTORY_COMPILER_VERSION = "2.1.0"

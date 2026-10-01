@@ -148,7 +148,7 @@ from pathlib import Path
 from evidence_index import EvidenceIndex, _normalize_anchor_value
 from process_lock import DurableLock
 
-APP = Path(__file__).resolve().parent
+from tools_workspace import PROJECT_ROOT as APP
 EVENTS_ROOT_DEFAULT = APP / "dataset" / "claims"
 CLAIM_INDEX_ROOT = APP / "dataset" / "metadata" / "claim_indexes"
 

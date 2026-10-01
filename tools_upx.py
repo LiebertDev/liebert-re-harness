@@ -22,9 +22,9 @@ import os
 import shutil
 from pathlib import Path
 from bounded_subprocess import run_bounded_process
-from tools_workspace import safe_path, relative
+from tools_workspace import PROJECT_ROOT, safe_path, relative
 
-EVIDENCE = Path(__file__).resolve().parent / "dataset" / "evidence" / "upx_unpacked"
+EVIDENCE = PROJECT_ROOT / "dataset" / "evidence" / "upx_unpacked"
 EVIDENCE.mkdir(parents=True, exist_ok=True)
 
 

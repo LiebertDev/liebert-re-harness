@@ -1,5 +1,4 @@
 import hashlib, json, math, os, re
-from pathlib import Path
 from bounded_subprocess import run_bounded_process
 from tools_workspace import safe_path, relative, skipped
 
@@ -9,7 +8,7 @@ except Exception:  # pragma: no cover - an indexing dependency must never block 
     def _evidence_index_record_write(*_args, **_kwargs):
         return {"ok": False, "error": "EVIDENCE_INDEX_UNAVAILABLE"}
 
-APP=Path(__file__).resolve().parent
+from tools_workspace import PROJECT_ROOT as APP
 # Module-level attribute deliberately named EVIDENCE (not e.g.
 # _RESOURCE_EVIDENCE): tests/conftest.py's per-test isolation guard
 # auto-discovers every imported module's EVIDENCE attribute by this exact

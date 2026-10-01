@@ -18,7 +18,7 @@ from pathlib import Path
 
 from process_lock import DurableLock
 
-APP = Path(__file__).resolve().parent
+from tools_workspace import PROJECT_ROOT as APP
 INDEX_ROOT = APP / "dataset" / "metadata" / "workspace_indexes"
 # Basename-level, unconditional exclusions: dependency/tool/vendor install
 # trees that are never useful for self-analysis retrieval, regardless of

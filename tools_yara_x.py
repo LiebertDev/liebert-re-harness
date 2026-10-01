@@ -66,7 +66,7 @@ except Exception:  # pragma: no cover - an indexing dependency must never block 
     def _evidence_index_record_write(*_args, **_kwargs):
         return {"ok": False, "error": "EVIDENCE_INDEX_UNAVAILABLE"}
 
-APP_DIR = Path(__file__).resolve().parent
+from tools_workspace import PROJECT_ROOT as APP_DIR
 EVIDENCE = APP_DIR / "dataset" / "evidence" / "yara_x_scan"
 EVIDENCE.mkdir(parents=True, exist_ok=True)
 

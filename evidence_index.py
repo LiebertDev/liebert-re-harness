@@ -101,7 +101,7 @@ from pathlib import Path
 
 from process_lock import DurableLock
 
-APP = Path(__file__).resolve().parent
+from tools_workspace import PROJECT_ROOT as APP
 EVIDENCE_ROOT_DEFAULT = APP / "dataset" / "evidence"
 INDEX_ROOT = APP / "dataset" / "metadata" / "evidence_indexes"
 

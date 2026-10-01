@@ -86,7 +86,7 @@ from pathlib import Path
 from bounded_subprocess import run_bounded_process  # noqa: F401
 from tools_workspace import safe_path, relative  # noqa: F401
 
-APP_DIR = Path(__file__).resolve().parent
+from tools_workspace import PROJECT_ROOT as APP_DIR
 EVIDENCE = APP_DIR / "dataset" / "evidence" / "apimonitor"
 EVIDENCE.mkdir(parents=True, exist_ok=True)
 
