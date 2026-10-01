@@ -132,8 +132,9 @@ jobs:
           assert not any(os.path.abspath(p or ".") == repo for p in sys.path), sys.path
           mods = sorted(m.name for m in pkgutil.walk_packages(liebert_re.__path__, "liebert_re.") if not m.ispkg)
           # Deliberate count: what the wheel ships cannot change without a
-          # reviewed edit here. 66 = 64 library modules + cli + __main__.
-          assert len(mods) == 66, (len(mods), mods)
+          # reviewed edit here. 67 = 65 library modules + cli + __main__.
+          # (+1 over 66: liebert_re/tools/capa.py, the capa wrapper.)
+          assert len(mods) == 67, (len(mods), mods)
           failed = []
           for m in mods:
               try:

@@ -167,6 +167,19 @@ def _die_status(a):
     return _load("liebert_re.tools.die", "die_status")()
 
 
+def _capa(a):
+    return _load("liebert_re.tools.capa", "capa_analyze")(
+        a.path, backend=a.backend or None, file_format=a.format or None,
+        os_name=a.os or None, rules=a.rules or None, signatures=a.signatures or None,
+        tag=a.tag or None, restrict_to_functions=a.functions or None,
+        timeout_seconds=a.timeout,
+    )
+
+
+def _capa_status(a):
+    return _load("liebert_re.tools.capa", "capa_status")()
+
+
 def _unpack(a):
     return _load("liebert_re.tools.upx", "upx_unpack")(a.path, timeout_seconds=a.timeout)
 
@@ -306,6 +319,18 @@ def _build_parser():
     ):
         g.add_argument(flag, dest="mode", action="store_const", const=mode, help=helptext)
     add("diestatus", _die_status, "report whether Detect It Easy is reachable, from where, and its version", path=False)
+    # capa's default backend takes MINUTES (measured 3m48s for a 1.2 MB PE), so the
+    # default timeout is minutes too; --functions is how to bound a run instead.
+    sp = add("capa", _capa, "identify capabilities, ATT&CK techniques and MBC behaviours (capa)")
+    sp.add_argument("--timeout", type=int, default=600, help="seconds; capa's default backend needs minutes")
+    sp.add_argument("--backend", default="", metavar="NAME", help="capa -b; 'ida' needs a licensed IDA, 'pefile' is broken on capa 9.4.0")
+    sp.add_argument("--format", default="", metavar="FMT", help="capa -f")
+    sp.add_argument("--os", default="", metavar="OS", help="capa --os")
+    sp.add_argument("--rules", default="", metavar="PATH", help="capa -r: rule file or directory instead of the embedded set")
+    sp.add_argument("--signatures", default="", metavar="PATH", help="capa -s: .sig/.pat library-function signatures")
+    sp.add_argument("--tag", default="", metavar="TAG", help="capa -t: filter on a rule meta field value")
+    sp.add_argument("--functions", default="", metavar="VAS", help="capa --restrict-to-functions: comma-separated VAs, to bound the run")
+    add("capastatus", _capa_status, "report whether capa is reachable, from where, its version and which backends it accepts", path=False)
     add("unpack", _unpack, "statically unpack a UPX-packed PE (output goes to the evidence cache)").add_argument("--timeout", type=int, default=60)
     add("scan", _scan, "scan with YARA-X rules").add_argument("--rules", required=True, help="rules file")
     sp = add("minidump", _minidump, "analyse a Windows minidump")

@@ -13,13 +13,19 @@ from tests import conftest
 
 import liebert_re.report.tool_families as tool_families
 
+# Every module that owns an EVIDENCE directory. The set is the pin: adding a
+# module here is the reviewed edit that says conftest is expected to redirect
+# it during tests. The count is deliberately not in the test name -- the set
+# below is what must be read and edited, and a number in the name only
+# duplicates it.
 EVIDENCE_OWNERS = {
-    "liebert_re.dynamic.apimonitor", "liebert_re.tools.binary", "liebert_re.tools.die",
-    "liebert_re.tools.rizin", "liebert_re.tools.upx", "liebert_re.tools.yara_x",
+    "liebert_re.dynamic.apimonitor", "liebert_re.tools.binary", "liebert_re.tools.capa",
+    "liebert_re.tools.die", "liebert_re.tools.rizin", "liebert_re.tools.upx",
+    "liebert_re.tools.yara_x",
 }
 
 
-def test_exactly_the_six_evidence_owners_resolve_under_the_real_ledger():
+def test_exactly_the_declared_evidence_owners_resolve_under_the_real_ledger():
     # If a module's EVIDENCE stopped resolving under <repo>/dataset/evidence,
     # conftest would stop redirecting it per test and tests would write against
     # the real ledger with no failure. Uses conftest's own classifier.
@@ -53,7 +59,11 @@ def test_published_tool_name_set_is_unchanged():
     # existing die_identify, which previously used one flag (-j) of the tool's real
     # surface. All eight are registered in tool_families.FAMILIES["native"], and cli.py gained
     # the `die`/`diestatus` commands that reach them.
+    #
+    # Updated again: liebert_re/tools/capa.py wraps capa (capa_analyze was already
+    # a FAMILIES name with no implementation here; capa_status is new), reached from
+    # the CLI as `capa` and `capastatus`.
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "0707bac651d49fdaf111aadc43703cfbc2a66ad28984d58ab5fa4146f80ddf9e"
+    assert digest == "c607e9beb3671f636dd3a657a3b6b092bddab5ea2c71a15d45ee7d8d27efaa14"
