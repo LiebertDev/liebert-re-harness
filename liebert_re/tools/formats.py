@@ -381,7 +381,9 @@ def _load_structured(p):
     if ext in {'.yaml','.yml'}:
         import yaml; return yaml.safe_load(text)
     if ext=='.toml':
-        import tomllib; return tomllib.loads(text)
+        try:import tomllib as _t
+        except ImportError:import tomli as _t
+        return _t.loads(text)
     if ext in {'.ini','.cfg'}:
         c=configparser.ConfigParser(); c.read_string(text); return {s:dict(c[s]) for s in c.sections()}
     if ext=='.csv':
@@ -399,6 +401,9 @@ def structured_inspect(path,operation='summary',query='',max_results=100):
     try:data=_load_structured(p)
     except Exception as e:return _json({'ok':False,'tool':'structured_inspect','path':relative(p),'error':str(e)})
     out={'ok':True,'tool':'structured_inspect','path':relative(p),'format':p.suffix.lower(),'shape':_shape(data),'truncated':False}
+    if out['format']=='.toml':
+        try:import tomllib as _t;out['toml_parser']=_t.__name__
+        except ImportError:out['toml_parser']='tomli (fallback: tomllib unavailable)'
     if operation=='search':
         hits=[]
         def walk(v,loc='$'):

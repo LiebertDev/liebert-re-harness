@@ -7,7 +7,9 @@ the assertion has no target here. Every other test in this file exercises
 ``tools_formats.structured_inspect`` itself and is unaffected.
 """
 import json
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -85,6 +87,36 @@ class StructuredConfigSchemaTests(unittest.TestCase):
         search = self.parse(structured_inspect(str(path), "search", "Token"))
         self.assertTrue(summary["ok"])
         self.assertTrue(search["hits"])
+
+    def test_toml_uses_tomllib_and_reports_parser(self):
+        path = self.root / "a.toml"
+        path.write_text("[tool]\nname = 'x'\n", encoding="utf-8")
+        try:
+            import tomllib  # noqa: F401
+        except ImportError:
+            self.skipTest("tomllib unavailable (Python < 3.11)")
+        result = self.parse(structured_inspect(str(path), "search", "name"))
+        self.assertTrue(result["ok"])
+        self.assertEqual("tomllib", result["toml_parser"])
+        self.assertTrue(result["hits"])
+
+    def test_toml_falls_back_to_tomli_and_says_so(self):
+        path = self.root / "b.toml"
+        path.write_text("[tool]\nname = 'x'\n", encoding="utf-8")
+        fake = types.ModuleType("tomli")
+        fake.loads = lambda text: {"tool": {"name": "x"}}
+        with mock.patch.dict(sys.modules, {"tomllib": None, "tomli": fake}):
+            result = self.parse(structured_inspect(str(path), "search", "name"))
+        self.assertTrue(result["ok"])
+        self.assertIn("fallback", result["toml_parser"])
+        self.assertTrue(result["hits"])
+
+    def test_toml_without_any_parser_is_an_error_not_a_guess(self):
+        path = self.root / "c.toml"
+        path.write_text("a = 1\n", encoding="utf-8")
+        with mock.patch.dict(sys.modules, {"tomllib": None, "tomli": None}):
+            result = self.parse(structured_inspect(str(path)))
+        self.assertFalse(result["ok"])
 
 if __name__ == "__main__":
     unittest.main()
