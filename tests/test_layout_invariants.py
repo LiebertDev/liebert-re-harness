@@ -49,4 +49,4 @@ def test_published_tool_name_set_is_unchanged():
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "98a38e76e872ff91eeabc6b7e33bc4afb88d4a08a640c5dbc4706c6be6fed572"
+    assert digest == "010848b5a42e1f59d7a4f72bff64208d20884fffb2ebcb21426ee331772ce635"

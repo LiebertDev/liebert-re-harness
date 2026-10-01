@@ -58,6 +58,11 @@ def _encoding(sample: bytes) -> str | None:
         return None
 
 
+# The status vocabulary tool results are normalised against. Module level so the
+# CLI can share it instead of keeping a second copy that could drift.
+ALLOWED_STATUSES = frozenset({"READY", "PARTIAL", "TOOL_MISSING", "NOT_TESTED", "UNSUPPORTED", "ANALYSIS_LIMITED", "FAILED", "TIMEOUT", "TRUNCATED", "UNKNOWN"})
+
+
 def normalize_tool_result(result, *, tool: str, target: str, file_type: str = "UNKNOWN",
                           capability_status: str = "UNKNOWN", reliability: str = "LOW") -> dict:
     """Normalize bounded tool output without converting failure kinds into UNSUPPORTED."""
@@ -69,7 +74,7 @@ def normalize_tool_result(result, *, tool: str, target: str, file_type: str = "U
     else:
         payload = dict(result or {})
     raw_status = str(payload.get("status") or ("READY" if payload.get("ok", True) else "FAILED")).upper()
-    allowed = {"READY", "PARTIAL", "TOOL_MISSING", "NOT_TESTED", "UNSUPPORTED", "ANALYSIS_LIMITED", "FAILED", "TIMEOUT", "TRUNCATED", "UNKNOWN"}
+    allowed = ALLOWED_STATUSES
     status = raw_status if raw_status in allowed else "READY" if raw_status in {"PASS", "OK"} else "FAILED"
     return {
         "status": status,

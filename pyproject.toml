@@ -63,6 +63,9 @@ frida = ["frida"]
 # an extra rather than a required dependency. CI installs it so those tests run.
 lattice = ["mpmath"]
 
+[project.scripts]
+liebert-re = "liebert_re.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/LiebertDev/liebert-re-harness"
 Issues = "https://github.com/LiebertDev/liebert-re-harness/issues"
