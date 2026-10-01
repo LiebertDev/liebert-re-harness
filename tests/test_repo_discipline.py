@@ -114,7 +114,7 @@ ARTIFACT = re.compile(
 # anything that is not whitespace, a quote or a path separator, so non-ASCII names match.
 _NAME = r"[^\s\"'\\/:*?<>|]+"
 USER_PATH = re.compile(rf"[A-Za-z]:(?:\\+|/)Users(?:\\+|/){_NAME}", re.I)
-# POSIX home-style path: /Users/x, /home/x, /root/x, also with JSON-escaped slashes.
+# POSIX home-style path (macOS /Users, Linux /home, root's home), also with JSON-escaped slashes.
 # Case-sensitive. Shared/Public are system directories, exempt only as WHOLE names (a
 # lookahead, not \b, which would also fire before the hyphen of "Public-foo").
 _SEP = r"\\?/"
@@ -275,7 +275,7 @@ def test_user_path_pattern_is_not_vacuous():
     # Samples are concatenated so this file does not itself contain a user path.
     pre = "C:" + "/Us" + "ers/"
     for sample in (f"C:{bs}Users{bs}Name", f"C:{bs}{bs}Users{bs}{bs}Name", pre + "Name",
-                   f"C:{bs * 5}Users{bs * 5}Name", "D:" + "/Users/Name", pre + "\u00c7a\u011fr\u0131",
+                   f"C:{bs * 5}Users{bs * 5}Name", "D:" + "/Us" + "ers/Name", pre + "\u00c7a\u011fr\u0131",
                    f'"C:{bs}{bs}Users{bs}{bs}Bob{bs}{bs}x"'):
         assert USER_PATH.search(sample), sample
     for sample in (f"C:{bs}Program Files{bs}x", "C:/Windows/System32", "C:/Use" + "rs", "C:/Users/",
@@ -322,7 +322,7 @@ def test_scan_reaches_planted_files(tmp_path):
     assert sorted(files) == ["blob.bin", "clean.txt", "notes.txt", "posix.txt", "utf16.txt"]
     user, priv = scan_repo(tmp_path, files)
     assert sorted(user) == ["notes.txt", "posix.txt", "utf16.txt"]  # UTF-16 decoded; genuine binary still skipped
-    assert priv == {"notes.txt": {private, PRIVATE_IDS[0]}}  # TEACHER_AGENT also contains the first id
+    assert priv == {"notes.txt": {private, PRIVATE_IDS[0]}}  # the upper-case, underscore-joined form of that identifier also contains the first id
 
 
 def test_no_private_tree_identifiers_in_public_package():
