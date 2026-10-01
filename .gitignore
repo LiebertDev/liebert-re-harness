@@ -88,3 +88,26 @@ ghidra_projects/
 # Runtime and test scratch written by the harness itself. Nothing here is source.
 dataset/
 .pytest_evidence_scratch/
+
+# Case artifacts (see scripts/case_purge.py). Scratch output stays untracked; only the
+# report, knowledge and the case marker are trackable. The purge quarantine lives
+# under the OS temp dir, outside the repo, so it needs no entry here.
+cases/**
+!cases/*/
+!cases/*/REPORT.md
+!cases/*/knowledge/
+!cases/*/knowledge/**
+!cases/*/.liebert-case
+
+# Operator's private operating rules. Deliberately NOT published: these two files are
+# local working rules for the operator and must stay untracked so they can never be
+# pushed to the public remote. Do not force-add them.
+/CLAUDE.md
+/CASE_POLICY.md
+
+# Stray test temp dirs. conftest redirects these into .pytest_evidence_scratch/ above, but a
+# kill or timeout in an older checkout (or a tool run from the repo root) can still leave
+# random-named directories in the root; they must never be committable.
+/tmp*/
+/rizin_fab_*/
+/pid_*/

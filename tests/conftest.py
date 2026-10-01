@@ -39,6 +39,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -155,6 +156,115 @@ _TEST_EVIDENCE_SCRATCH_ROOT = (
 )
 
 
+# --- Temp dirs requested INSIDE the repo are redirected into one ignored scratch root --------------
+# About 25 tests ask for ``tempfile.TemporaryDirectory(dir=<repo root>)`` (or ``mkdtemp(dir=...)``)
+# because safe_path() refuses the OS temp dir (see the NOTE above). Those directories used to land
+# in the repo root with random, un-ignored names (``tmpab12cd/``, ``rizin_fab_*``): a normal run
+# cleans them up, but a kill / Ctrl-C / timeout leaves them behind, and ``git add -A`` would commit
+# them. Now every such request is rewritten to live under this process's own
+# ``.pytest_evidence_scratch/pid_<n>/`` (gitignored, still inside the workspace sandbox), and the
+# next pytest session deletes every ``pid_*`` directory whose process is gone.
+_TEMPFILE_REDIRECT_DIR = _TEST_EVIDENCE_SCRATCH_ROOT / "__tempfile_redirect"
+_SCRATCH_PARENT = _TEST_EVIDENCE_SCRATCH_ROOT.parent
+
+
+def _norm_dir(p) -> str:
+    return os.path.normcase(os.path.realpath(os.fspath(p)))
+
+
+def _redirect_repo_root_dir(dir):
+    """Return the scratch redirect for ``dir`` when it IS the repo root / workspace root / cwd,
+    else ``dir`` unchanged. Subdirectories (e.g. dataset/runtime/...) and the OS temp dir pass
+    through untouched."""
+    if dir is None:
+        return dir
+    try:
+        requested = _norm_dir(dir)
+        roots = {_norm_dir(REPO_ROOT), _norm_dir(tools_workspace.WORKSPACE_ROOT), _norm_dir(os.getcwd())}
+    except (OSError, ValueError, TypeError):
+        return dir
+    if requested not in roots:
+        return dir
+    _TEMPFILE_REDIRECT_DIR.mkdir(parents=True, exist_ok=True)
+    return str(_TEMPFILE_REDIRECT_DIR)
+
+
+def _wrap_redirecting(original):
+    def wrapper(*args, **kwargs):
+        # signatures: mkdtemp(suffix, prefix, dir) / mkstemp(suffix, prefix, dir, text)
+        if "dir" in kwargs:
+            kwargs["dir"] = _redirect_repo_root_dir(kwargs["dir"])
+        elif len(args) >= 3:
+            args = (*args[:2], _redirect_repo_root_dir(args[2]), *args[3:])
+        return original(*args, **kwargs)
+    wrapper.__wrapped__ = original
+    wrapper._liebert_redirect = True
+    return wrapper
+
+
+for _name in ("mkdtemp", "mkstemp"):
+    if not getattr(getattr(tempfile, _name), "_liebert_redirect", False):
+        setattr(tempfile, _name, _wrap_redirecting(getattr(tempfile, _name)))
+# TemporaryDirectory.__init__ resolves ``mkdtemp`` from the tempfile module globals at call time,
+# so the patch above covers it; NamedTemporaryFile/TemporaryFile go through ``_mkstemp_inner``
+# and are redirected explicitly here.
+for _name in ("NamedTemporaryFile", "TemporaryFile"):
+    _orig = getattr(tempfile, _name)
+    if not getattr(_orig, "_liebert_redirect", False):
+        def _make(orig):
+            def wrapper(*args, **kwargs):
+                if "dir" in kwargs:
+                    kwargs["dir"] = _redirect_repo_root_dir(kwargs["dir"])
+                return orig(*args, **kwargs)
+            wrapper._liebert_redirect = True
+            return wrapper
+        setattr(tempfile, _name, _make(_orig))
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this pid exists. Errs toward True (never sweep a possibly-live dir)."""
+    try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except ImportError:
+        pass
+    if os.name == "nt":
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return ctypes.windll.kernel32.GetLastError() != 87  # ERROR_INVALID_PARAMETER == no such pid
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def sweep_dead_scratch_dirs(parent: Path = _SCRATCH_PARENT, own_pid: int | None = None) -> list[str]:
+    """Delete ``parent/pid_<n>`` directories whose process no longer exists. Never touches this
+    process's own directory, a live process's directory, or anything not named ``pid_<digits>``."""
+    own_pid = os.getpid() if own_pid is None else own_pid
+    removed = []
+    try:
+        entries = list(parent.iterdir())
+    except OSError:
+        return removed
+    for entry in entries:
+        name = entry.name
+        if not (name.startswith("pid_") and name[4:].isdigit()) or entry.is_symlink() or not entry.is_dir():
+            continue
+        pid = int(name[4:])
+        if pid == own_pid or _pid_alive(pid):
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        removed.append(name)
+    return removed
+
+
 def _is_repo_owned_module(module) -> bool:
     """True only for modules that are actually part of this repo (the
     ``tools_*.py`` adapters, ``research_state.py``, etc.) -- never a
@@ -260,6 +370,7 @@ def _clean_evidence_scratch_root_around_the_session():
     ran) before the session starts, and once more after it ends. The actual
     isolation guarantee lives in ``_redirect_tool_evidence_dirs_away_from_the_real_ledger``
     below, per test -- this fixture only tidies its scratch directory."""
+    sweep_dead_scratch_dirs()
     shutil.rmtree(_TEST_EVIDENCE_SCRATCH_ROOT, ignore_errors=True)
     yield
     shutil.rmtree(_TEST_EVIDENCE_SCRATCH_ROOT, ignore_errors=True)
