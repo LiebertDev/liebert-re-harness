@@ -14,8 +14,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-import tools_die as td
-from evidence_index import EvidenceIndex, record_write as _evidence_index_record_write_real
+import liebert_re.tools.die as td
+from liebert_re.evidence.index import EvidenceIndex, record_write as _evidence_index_record_write_real
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TBM_EXE = REPO_ROOT / "benchmarks/real_corpora/trybypassme/TBM.exe"
@@ -81,7 +81,7 @@ class DieMissingTests(unittest.TestCase):
 class DieNotFoundTests(unittest.TestCase):
     def test_nonexistent_path_returns_not_found_before_any_subprocess_call(self):
         with mock.patch.object(td, "_die_binary", return_value="C:/fake/diec.exe"), \
-             mock.patch("tools_die.run_bounded_process") as mocked_run:
+             mock.patch("liebert_re.tools.die.run_bounded_process") as mocked_run:
             out = td.die_identify(str(REPO_ROOT / "benchmarks" / "does_not_exist_at_all.exe"))
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -99,8 +99,8 @@ class DieParsingTests(unittest.TestCase):
         fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=0,
                                  stdout=REAL_DIE_JSON_UPX, stderr="", output_truncated=False)
         with mock.patch.object(td, "_die_binary", return_value="C:/fake/diec.exe"), \
-             mock.patch("tools_die.safe_path", return_value=UPX_KEYGENME), \
-             mock.patch("tools_die.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.die.safe_path", return_value=UPX_KEYGENME), \
+             mock.patch("liebert_re.tools.die.run_bounded_process", return_value=fake_result):
             out = td.die_identify(str(UPX_KEYGENME))
         data = json.loads(out)
         self.assertTrue(data["ok"], data)
@@ -126,8 +126,8 @@ class DieParsingTests(unittest.TestCase):
         fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=0,
                                  stdout=REAL_DIE_JSON_UNPROTECTED, stderr="", output_truncated=False)
         with mock.patch.object(td, "_die_binary", return_value="C:/fake/diec.exe"), \
-             mock.patch("tools_die.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_die.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.die.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.die.run_bounded_process", return_value=fake_result):
             out = td.die_identify(str(TBM_EXE))
         data = json.loads(out)
         self.assertTrue(data["ok"], data)
@@ -142,8 +142,8 @@ class DieTimeoutTests(unittest.TestCase):
         fake_result = mock.Mock(cancelled=False, timed_out=True, returncode=None,
                                  stdout="", stderr="", output_truncated=False)
         with mock.patch.object(td, "_die_binary", return_value="C:/fake/diec.exe"), \
-             mock.patch("tools_die.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_die.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.die.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.die.run_bounded_process", return_value=fake_result):
             out = td.die_identify(str(TBM_EXE), timeout_seconds=10)
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -153,8 +153,8 @@ class DieTimeoutTests(unittest.TestCase):
         fake_result = mock.Mock(cancelled=True, timed_out=False, returncode=None,
                                  stdout="", stderr="", output_truncated=False)
         with mock.patch.object(td, "_die_binary", return_value="C:/fake/diec.exe"), \
-             mock.patch("tools_die.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_die.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.die.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.die.run_bounded_process", return_value=fake_result):
             out = td.die_identify(str(TBM_EXE), timeout_seconds=10)
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -166,8 +166,8 @@ class DieMalformedOutputTests(unittest.TestCase):
         fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=0,
                                  stdout="no braces here", stderr="", output_truncated=False)
         with mock.patch.object(td, "_die_binary", return_value="C:/fake/diec.exe"), \
-             mock.patch("tools_die.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_die.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.die.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.die.run_bounded_process", return_value=fake_result):
             out = td.die_identify(str(TBM_EXE))
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -177,8 +177,8 @@ class DieMalformedOutputTests(unittest.TestCase):
         fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=0,
                                  stdout="{not valid json,,,}", stderr="", output_truncated=False)
         with mock.patch.object(td, "_die_binary", return_value="C:/fake/diec.exe"), \
-             mock.patch("tools_die.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_die.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.die.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.die.run_bounded_process", return_value=fake_result):
             out = td.die_identify(str(TBM_EXE))
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -188,8 +188,8 @@ class DieMalformedOutputTests(unittest.TestCase):
         fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=1,
                                  stdout="", stderr="diec: cannot open file", output_truncated=False)
         with mock.patch.object(td, "_die_binary", return_value="C:/fake/diec.exe"), \
-             mock.patch("tools_die.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_die.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.die.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.die.run_bounded_process", return_value=fake_result):
             out = td.die_identify(str(TBM_EXE))
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -240,8 +240,8 @@ class EvidenceIndexWriteTimeHookTests(unittest.TestCase):
                 return _evidence_index_record_write_real(path, root=td.EVIDENCE, db_path=db_path)
 
             with mock.patch.object(td, "_die_binary", return_value="C:/fake/diec.exe"), \
-                 mock.patch("tools_die.safe_path", return_value=UPX_KEYGENME), \
-                 mock.patch("tools_die.run_bounded_process", return_value=fake_result), \
+                 mock.patch("liebert_re.tools.die.safe_path", return_value=UPX_KEYGENME), \
+                 mock.patch("liebert_re.tools.die.run_bounded_process", return_value=fake_result), \
                  mock.patch.object(td, "_evidence_index_record_write", _redirected):
                 out = td.die_identify(str(UPX_KEYGENME))
 
@@ -263,8 +263,8 @@ class EvidenceIndexWriteTimeHookTests(unittest.TestCase):
             raise RuntimeError("index unavailable")
 
         with mock.patch.object(td, "_die_binary", return_value="C:/fake/diec.exe"), \
-             mock.patch("tools_die.safe_path", return_value=UPX_KEYGENME), \
-             mock.patch("tools_die.run_bounded_process", return_value=fake_result), \
+             mock.patch("liebert_re.tools.die.safe_path", return_value=UPX_KEYGENME), \
+             mock.patch("liebert_re.tools.die.run_bounded_process", return_value=fake_result), \
              mock.patch.object(td, "_evidence_index_record_write", _boom):
             out = td.die_identify(str(UPX_KEYGENME))
 

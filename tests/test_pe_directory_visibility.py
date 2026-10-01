@@ -9,9 +9,9 @@ import struct
 import unittest
 from pathlib import Path
 
-import tools_workspace
-from owned_binary_fixtures import build_owned_pe_with_rsds
-from tools_binary import pe_exports, pe_imports
+import liebert_re.workspace as tools_workspace
+from liebert_re.recover.owned_binary_fixtures import build_owned_pe_with_rsds
+from liebert_re.tools.binary import pe_exports, pe_imports
 
 # Data directories start at optional-header offset 112; the optional header starts
 # at file offset 88 (64-byte DOS stub + "PE\0\0" + 20-byte COFF header).

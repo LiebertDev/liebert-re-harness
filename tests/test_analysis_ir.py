@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from analysis_ir import (
+from liebert_re.recover.analysis_ir import (
     UNKNOWN,
     AnalysisIR,
     AnalysisIRValidationError,

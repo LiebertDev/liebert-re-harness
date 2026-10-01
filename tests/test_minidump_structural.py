@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from minidump_structural import MAX_STREAMS, parse_minidump
+from liebert_re.recover.minidump_structural import MAX_STREAMS, parse_minidump
 
 
 def _utf16(value: str) -> bytes:

@@ -12,9 +12,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import tools_formats
-import tools_workspace
-from tools_formats import structured_inspect
+import liebert_re.tools.formats as tools_formats
+import liebert_re.workspace as tools_workspace
+from liebert_re.tools.formats import structured_inspect
 
 
 class StructuredConfigSchemaTests(unittest.TestCase):

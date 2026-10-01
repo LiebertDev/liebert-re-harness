@@ -13,11 +13,11 @@ from __future__ import annotations
 import json
 import unittest
 
-from analysis_ir import (
+from liebert_re.recover.analysis_ir import (
     UNKNOWN, AnalysisIR, Artifact, Call, Evidence, Function, Import, Module,
     StringLiteral, Symbol, artifact_id, function_id, module_id, stable_id,
 )
-from native_xref import (
+from liebert_re.recover.native_xref import (
     analysis_ir_graph_relationships, native_xref_analyze, resolve_native_xrefs,
     resolve_rva_to_function, resolve_symbol_to_function,
 )

@@ -24,7 +24,7 @@ class PathIdZero(unittest.TestCase):
         fake = types.ModuleType("UnityPy")
         fake.load = lambda _p: types.SimpleNamespace(objects=[_Obj(0), _Obj(6)])
         with mock.patch.dict(sys.modules, {"UnityPy": fake}):
-            from tools_unity import unity_asset_analyzer
+            from liebert_re.tools.unity import unity_asset_analyzer
             return json.loads(unity_asset_analyzer("nothing.assets", "read", **kw))
 
     def test_omitted_path_id_is_required(self):

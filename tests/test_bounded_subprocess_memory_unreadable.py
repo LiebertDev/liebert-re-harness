@@ -11,8 +11,8 @@ from unittest import mock
 
 import psutil
 
-import bounded_subprocess
-from bounded_subprocess import run_bounded_process
+import liebert_re.bounded_subprocess as bounded_subprocess
+from liebert_re.bounded_subprocess import run_bounded_process
 
 _SLEEP = [sys.executable, "-c", "import time; time.sleep(0.5); print('done')"]
 _BIG = 10 * 1024 ** 3

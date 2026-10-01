@@ -20,7 +20,7 @@ from __future__ import annotations
 import pathlib
 import unittest
 
-from tools_workspace import _looks_like_windows_absolute_path
+from liebert_re.workspace import _looks_like_windows_absolute_path
 
 
 class WindowsAbsoluteSyntaxDetectionTests(unittest.TestCase):

@@ -17,7 +17,7 @@ import os
 import struct
 import unittest
 
-import tools_vb6_pcode as pcode
+import liebert_re.tools.vb6_pcode as pcode
 
 TARGET = os.path.join(
     "benchmarks", "windows_native_ladder", "corpus", "tier2", "son_console2_revised",

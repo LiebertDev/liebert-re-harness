@@ -14,8 +14,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import tools_workspace
-from tools_source import java_class_inspect, project_inspect, source_inspect
+import liebert_re.workspace as tools_workspace
+from liebert_re.tools.source import java_class_inspect, project_inspect, source_inspect
 
 
 def _j(raw):

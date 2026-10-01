@@ -27,8 +27,8 @@ import unittest
 from decimal import Decimal, getcontext
 from pathlib import Path
 
-import tools_crypto_id
-from tools_crypto_id import _SIGNATURES, crypto_constant_scan
+import liebert_re.tools.crypto_id as tools_crypto_id
+from liebert_re.tools.crypto_id import _SIGNATURES, crypto_constant_scan
 
 
 def _primes(n):

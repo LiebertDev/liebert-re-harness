@@ -42,7 +42,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from lll_exact import lll_reduce
+from liebert_re.recover.lll_exact import lll_reduce
 
 PUBLIC_DAT_PATH = "benchmarks/windows_native_ladder/corpus/tier2/knapsack_decodeme_blueowl/extracted/inner/public.dat"
 TARGET_HEX = "B75B63369A52F5F30CFE5E642"  # from the author's own readme.txt

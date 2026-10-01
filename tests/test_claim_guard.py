@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import unittest
 
-from claim_guard import claim_guard_issues
+from liebert_re.evidence.claim_guard import claim_guard_issues
 
 
 class ClaimGuardCanonicalTests(unittest.TestCase):

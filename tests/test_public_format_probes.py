@@ -24,19 +24,19 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import tools_workspace
-from tools_android import android_resource_analyzer
-from tools_archive2 import rar_7z
-from tools_dart import dart_aot_recovery
-from tools_dex import dex_decompiler
-from tools_godot import godot_asset_analyzer
-from tools_il2cpp import il2cpp_mapper
-from tools_jvm import jvm_decompiler
-from tools_pcap import pcap_analyzer
-from tools_plist import plist_inspect
-from tools_unity import unity_asset_analyzer
-from tools_unreal import unreal_asset_analyzer
-from tools_upx import upx_unpack
+import liebert_re.workspace as tools_workspace
+from liebert_re.tools.android import android_resource_analyzer
+from liebert_re.tools.archive2 import rar_7z
+from liebert_re.tools.dart import dart_aot_recovery
+from liebert_re.tools.dex import dex_decompiler
+from liebert_re.tools.godot import godot_asset_analyzer
+from liebert_re.tools.il2cpp import il2cpp_mapper
+from liebert_re.tools.jvm import jvm_decompiler
+from liebert_re.tools.pcap import pcap_analyzer
+from liebert_re.tools.plist import plist_inspect
+from liebert_re.tools.unity import unity_asset_analyzer
+from liebert_re.tools.unreal import unreal_asset_analyzer
+from liebert_re.tools.upx import upx_unpack
 
 
 def _j(raw):
@@ -283,7 +283,7 @@ class Il2cppMapperToolMissingTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_tool_missing_is_a_structured_result(self):
-        with mock.patch("tools_il2cpp._il2cppdumper", return_value=None):
+        with mock.patch("liebert_re.tools.il2cpp._il2cppdumper", return_value=None):
             result = _j(il2cpp_mapper(str(self.binary), str(self.metadata)))
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "IL2CPPDUMPER_TOOL_MISSING")
@@ -300,7 +300,7 @@ class UpxUnpackToolMissingTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_tool_missing_is_a_structured_result(self):
-        with mock.patch("tools_upx._upx_binary", return_value=None):
+        with mock.patch("liebert_re.tools.upx._upx_binary", return_value=None):
             result = _j(upx_unpack(str(self.target)))
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], "TOOL_MISSING")

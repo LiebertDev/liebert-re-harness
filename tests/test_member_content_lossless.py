@@ -17,9 +17,9 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from tools_formats import archive_inspect
-from tools_godot import godot_asset_analyzer
-from tools_unreal import unreal_asset_analyzer
+from liebert_re.tools.formats import archive_inspect
+from liebert_re.tools.godot import godot_asset_analyzer
+from liebert_re.tools.unreal import unreal_asset_analyzer
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRATCH = REPO_ROOT / "dataset" / "runtime" / "_test_member_content_lossless_scratch"

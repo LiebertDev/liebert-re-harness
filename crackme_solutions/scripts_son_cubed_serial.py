@@ -71,7 +71,7 @@ def expected_serial(target_path=None):
     produce exactly one 32-character run (which would mean the binary is not
     the frozen one this was derived from).
     """
-    from tools_vb6_pcode import vb6_pcode
+    from liebert_re.tools.vb6_pcode import vb6_pcode
 
     path = Path(target_path) if target_path else Path(TARGET)
     result = json.loads(vb6_pcode(path=str(path), operation="procedure",

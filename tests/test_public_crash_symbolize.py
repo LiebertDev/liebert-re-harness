@@ -11,10 +11,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import owned_binary_fixtures
-import tools_workspace
-from crash_symbolize import crash_symbolize, symbolize_rva
-from msf_pdb import write_synthetic_pdb
+import liebert_re.recover.owned_binary_fixtures as owned_binary_fixtures
+import liebert_re.workspace as tools_workspace
+from liebert_re.recover.crash_symbolize import crash_symbolize, symbolize_rva
+from liebert_re.recover.msf_pdb import write_synthetic_pdb
 
 
 class SymbolizeRvaTests(unittest.TestCase):
@@ -88,14 +88,14 @@ class ConfidenceDescribesTheSymbolTests(unittest.TestCase):
     by confidence would have put it above a real but non-exact match."""
 
     def test_no_symbol_never_claims_high_or_medium(self):
-        from crash_symbolize import _confidence_describes_the_symbol
+        from liebert_re.recover.crash_symbolize import _confidence_describes_the_symbol
         for claimed in ("HIGH", "MEDIUM"):
             got = _confidence_describes_the_symbol(
                 {"symbol": None, "confidence": claimed, "status": "MISMATCH"})
             self.assertEqual(got["confidence"], "LOW", claimed)
 
     def test_a_real_symbol_keeps_the_confidence_it_earned(self):
-        from crash_symbolize import _confidence_describes_the_symbol
+        from liebert_re.recover.crash_symbolize import _confidence_describes_the_symbol
         for claimed in ("HIGH", "MEDIUM", "LOW"):
             got = _confidence_describes_the_symbol(
                 {"symbol": "DriverEntry", "confidence": claimed, "status": "MATCH"})
@@ -104,7 +104,7 @@ class ConfidenceDescribesTheSymbolTests(unittest.TestCase):
     def test_the_certainty_of_a_mismatch_verdict_is_still_reported(self):
         # The rule removes a misleading confidence, not the information: a
         # mismatch is still stated exactly, in the fields that mean it.
-        from crash_symbolize import _confidence_describes_the_symbol
+        from liebert_re.recover.crash_symbolize import _confidence_describes_the_symbol
         got = _confidence_describes_the_symbol({
             "symbol": None, "confidence": "HIGH", "status": "MISMATCH",
             "identity": {"status": "MISMATCH", "identity_match": False},

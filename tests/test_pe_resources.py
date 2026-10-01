@@ -26,8 +26,8 @@ import json
 import unittest
 from pathlib import Path
 
-import tools_workspace
-from tools_binary import pe_resources
+import liebert_re.workspace as tools_workspace
+from liebert_re.tools.binary import pe_resources
 
 CRACKBEE = Path(tools_workspace.WORKSPACE) / "benchmarks" / "real_corpora" / "cm1_unpack_reactor" / "extracted" / "CrackBeePck.exe"
 RASM = Path(tools_workspace.WORKSPACE) / "benchmarks" / "real_corpora" / "cm1_ring0_keygenme" / "extracted" / "rAsM_kGm_x" / "rAsM_kGm.exe"

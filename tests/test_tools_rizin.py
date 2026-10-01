@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import tools_rizin as tr
+import liebert_re.tools.rizin as tr
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LOGINCRACKME = REPO_ROOT / "benchmarks/windows_native_ladder/corpus/tier1/logincrackme/LoginCrackme.exe"
@@ -103,8 +103,8 @@ class RizinTimeoutTests(unittest.TestCase):
         fake_result = mock.Mock(timed_out=True, cancelled=False, returncode=None,
                                  stdout="", stderr="", output_truncated=False)
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
-             mock.patch("tools_rizin.safe_path", return_value=LOGINCRACKME), \
-             mock.patch("tools_rizin.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.run_bounded_process", return_value=fake_result):
             out = tr.rizin_functions(str(LOGINCRACKME), timeout_seconds=10)
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -114,8 +114,8 @@ class RizinTimeoutTests(unittest.TestCase):
         fake_result = mock.Mock(timed_out=False, cancelled=True, returncode=None,
                                  stdout="", stderr="", output_truncated=False)
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
-             mock.patch("tools_rizin.safe_path", return_value=LOGINCRACKME), \
-             mock.patch("tools_rizin.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.run_bounded_process", return_value=fake_result):
             out = tr.rizin_functions(str(LOGINCRACKME), timeout_seconds=10)
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -130,8 +130,8 @@ class RizinMalformedOutputTests(unittest.TestCase):
         fake_result = mock.Mock(timed_out=False, cancelled=False, returncode=0,
                                  stdout="no brackets here", stderr="", output_truncated=False)
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
-             mock.patch("tools_rizin.safe_path", return_value=LOGINCRACKME), \
-             mock.patch("tools_rizin.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.run_bounded_process", return_value=fake_result):
             out = tr.rizin_functions(str(LOGINCRACKME), timeout_seconds=10)
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -141,8 +141,8 @@ class RizinMalformedOutputTests(unittest.TestCase):
         fake_result = mock.Mock(timed_out=False, cancelled=False, returncode=0,
                                  stdout="[{not valid json,,,]", stderr="", output_truncated=False)
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
-             mock.patch("tools_rizin.safe_path", return_value=LOGINCRACKME), \
-             mock.patch("tools_rizin.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.run_bounded_process", return_value=fake_result):
             out = tr.rizin_functions(str(LOGINCRACKME), timeout_seconds=10)
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -152,8 +152,8 @@ class RizinMalformedOutputTests(unittest.TestCase):
         fake_result = mock.Mock(timed_out=False, cancelled=False, returncode=1,
                                  stdout="", stderr="rizin: cannot open file", output_truncated=False)
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
-             mock.patch("tools_rizin.safe_path", return_value=LOGINCRACKME), \
-             mock.patch("tools_rizin.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.run_bounded_process", return_value=fake_result):
             out = tr.rizin_functions(str(LOGINCRACKME), timeout_seconds=10)
         data = json.loads(out)
         self.assertFalse(data["ok"])

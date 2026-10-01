@@ -22,7 +22,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from tools_binary import disassemble_pe
+from liebert_re.tools.binary import disassemble_pe
 
 FIXTURE_DIR = Path(__file__).resolve().parent.parent / "benchmarks" / "dynamic_fixtures" / "owned_cfg_deobfuscate_x86_32_loop"
 FIXTURE_EXE = FIXTURE_DIR / "loop32_fixture.exe"

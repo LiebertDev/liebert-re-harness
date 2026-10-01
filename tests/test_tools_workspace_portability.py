@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import tools_workspace as tw
+import liebert_re.workspace as tw
 
 _WIN_ENV = ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "WINDIR", "SystemRoot")
 

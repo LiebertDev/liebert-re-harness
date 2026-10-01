@@ -23,13 +23,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import owned_binary_fixtures
-import tools_workspace
-from tools_cpp_rtti import cpp_rtti_inspect
-from tools_delphi import delphi_inspect
-from tools_image_map import image_address_map
-from tools_tls_directory import analyze_tls_directory
-from tools_vb6 import vb6_inspect
+import liebert_re.recover.owned_binary_fixtures as owned_binary_fixtures
+import liebert_re.workspace as tools_workspace
+from liebert_re.tools.cpp_rtti import cpp_rtti_inspect
+from liebert_re.tools.delphi import delphi_inspect
+from liebert_re.tools.image_map import image_address_map
+from liebert_re.tools.tls_directory import analyze_tls_directory
+from liebert_re.tools.vb6 import vb6_inspect
 
 
 def _j(raw):

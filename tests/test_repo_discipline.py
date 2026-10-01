@@ -40,15 +40,15 @@ _END = "# END-" + "PRIVATE-NAMES"
 # Modules with no test import today. New modules must ship with a test instead
 # of being added here.
 KNOWN_UNREFERENCED = {
-    "asar_parser": "only reached indirectly via tools_formats.detect_asar; no direct test yet",
-    "process_lock": "only reached indirectly via claim_index/evidence_index/workspace_index; no direct test yet",
+    "liebert_re.tools.asar_parser": "only reached indirectly via tools_formats.detect_asar; no direct test yet",
+    "liebert_re.evidence.process_lock": "only reached indirectly via claim_index/evidence_index/workspace_index; no direct test yet",
 }
 
 # Tracked files that contain a machine-specific user path today. Empty = none.
 # Both are generic placeholders surfaced when the scan widened to the home and root dirs (not real users).
 KNOWN_USER_PATHS = {
     "tests/test_public_provenance_and_fixtures.py": "fake POSIX model path used as a test input, not a real user",
-    "tools_workspace.py": "comment example path under a fake home dir, a placeholder, not a real user",
+    "liebert_re/workspace.py": "comment example path under a fake home dir, a placeholder, not a real user",
 }
 
 # BEGIN-PRIVATE-NAMES
@@ -63,16 +63,16 @@ KNOWN_PRIVATE_REFS = {
     "docs/ROADMAP.md": ({"tools_emulate_range"}, _DOC),
     "crackme_solutions/README.md": ({"tools_emulate_range"}, "says the solution script imports an unshipped module"),
     "crackme_solutions/scripts_mutated_crackme5_serial.py": ({"tools_emulate_range"}, "documentation-only script that imports an unshipped module"),
-    "artifact_provenance.py": ({"TEACHER_"}, "teacher_* identifiers (e.g. prompts/teacher_system.md, teacher_model); surfaced by the case-insensitive scan"),
-    "evidence_index.py": ({"research_state"}, _DEAD),
-    "evidence_security.py": ({"TEACHER_", "research_state"}, _DEAD + "; lowercase teacher_runtime_tool_dispatch string"),
-    "lll_exact.py": ({"teacher.py"}, _DEAD),
-    "tool_families.py": ({"tools_emulation"}, _DEAD),
-    "tools_rizin.py": ({"tools_decompiler"}, _DEAD),
-    "tools_il2cpp.py": ({"TEACHER_"}, "temp-dir prefix teacher_il2cpp_; surfaced by the case-insensitive scan"),
-    "tools_workspace.py": ({"TEACHER_", "teacher.py"}, _ENV + " (live code: TEACHER_WORKSPACE etc.)"),
-    "tools_yara_x.py": ({"TEACHER_", "tools_capability_extract", "tools_decompiler"}, _DEAD + "; temp-dir prefix teacher_yarax_rule_"),
-    "workspace_index.py": ({"TEACHER_", "tools_memory_scan"}, _ENV + "; plus a dead docstring reference"),
+    "liebert_re/evidence/artifact_provenance.py": ({"TEACHER_"}, "teacher_* identifiers (e.g. prompts/teacher_system.md, teacher_model); surfaced by the case-insensitive scan"),
+    "liebert_re/evidence/index.py": ({"research_state"}, _DEAD),
+    "liebert_re/evidence/security.py": ({"TEACHER_", "research_state"}, _DEAD + "; lowercase teacher_runtime_tool_dispatch string"),
+    "liebert_re/recover/lll_exact.py": ({"teacher.py"}, _DEAD),
+    "liebert_re/report/tool_families.py": ({"tools_emulation"}, _DEAD),
+    "liebert_re/tools/rizin.py": ({"tools_decompiler"}, _DEAD),
+    "liebert_re/tools/il2cpp.py": ({"TEACHER_"}, "temp-dir prefix teacher_il2cpp_; surfaced by the case-insensitive scan"),
+    "liebert_re/workspace.py": ({"TEACHER_", "teacher.py"}, _ENV + " (live code: TEACHER_WORKSPACE etc.)"),
+    "liebert_re/tools/yara_x.py": ({"TEACHER_", "tools_capability_extract", "tools_decompiler"}, _DEAD + "; temp-dir prefix teacher_yarax_rule_"),
+    "liebert_re/evidence/workspace_index.py": ({"TEACHER_", "tools_memory_scan"}, _ENV + "; plus a dead docstring reference"),
     "tests/conftest.py": ({"TEACHER_", "mcp_server", "research_state", "teacher.py", "tools_capability_extract", "tools_decompiler",
                            "tools_emulate_range", "tools_emulation", "tools_isolated_dynamic", "tools_memory_scan"}, _DEAD),
     "tests/test_artifact_provenance_absent_inputs.py": ({"TEACHER_"}, "names prompts/teacher_system.md; surfaced by the case-insensitive scan"),
@@ -134,17 +134,16 @@ def _private_regexes():
 
 
 def _top_modules():
-    return sorted(p.stem for p in ROOT.glob("*.py"))
+    """Dotted name of every module in the liebert_re package (package markers excluded)."""
+    pkg = ROOT / "liebert_re"
+    return sorted(
+        ".".join(p.relative_to(ROOT).with_suffix("").parts)
+        for p in pkg.rglob("*.py") if p.name != "__init__.py"
+    )
 
 
 def _pyproject():
     return tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-
-
-def _py_modules():
-    mods = _pyproject().get("tool", {}).get("setuptools", {}).get("py-modules")
-    assert mods, "pyproject.toml has no [tool.setuptools] py-modules list"
-    return list(mods)
 
 
 def _git_ls(root):
@@ -220,14 +219,37 @@ def _uses_module(m, corpus):
     ))
 
 
-def test_py_modules_matches_disk():
-    listed_all = _py_modules()
-    dupes = sorted({m for m in listed_all if listed_all.count(m) > 1})
-    assert not dupes, f"duplicate py-modules entries: {dupes}"
-    on_disk, listed = set(_top_modules()), set(listed_all)
-    unlisted, missing = sorted(on_disk - listed), sorted(listed - on_disk)
-    assert not unlisted, f"top-level modules missing from py-modules: {unlisted}"
-    assert not missing, f"py-modules entries with no file on disk: {missing}"
+def test_layout_matches_packaging():
+    """The flat layout must not come back, and the package must be a real package tree."""
+    assert list(ROOT.glob("*.py")) == [], "modules at the repo root: they belong inside liebert_re/"
+    pkg = ROOT / "liebert_re"
+    assert (pkg / "__init__.py").is_file()
+    missing = sorted(
+        str(d.relative_to(ROOT)) for d in [pkg, *(x for x in pkg.rglob("*") if x.is_dir())]
+        if d.name != "__pycache__" and any(d.glob("*.py")) and not (d / "__init__.py").is_file()
+    )
+    assert not missing, f"directories with modules but no __init__.py: {missing}"
+    top_pkgs = sorted(d.name for d in ROOT.iterdir() if d.is_dir() and (d / "__init__.py").is_file() and d.name != "tests")
+    assert top_pkgs == ["liebert_re"], f"liebert_re must be the only top-level package: {top_pkgs}"
+    assert _pyproject().get("tool", {}).get("setuptools", {}).get("packages", {}).get("find", {}).get("include") == ["liebert_re*"]
+
+
+def test_package_root_is_anchored_in_one_place():
+    """No module may build a dataset/ or benchmarks/ path from its own __file__: the package-root
+    anchor lives in liebert_re.workspace (PROJECT_ROOT) and nowhere else."""
+    import ast
+    offenders = []
+    for p in sorted((ROOT / "liebert_re").rglob("*.py")):
+        for node in ast.walk(ast.parse(p.read_text(encoding="utf-8-sig"))):
+            if not isinstance(node, ast.stmt) or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.If, ast.For, ast.While, ast.With, ast.Try)):
+                continue
+            sub = list(ast.walk(node))
+            uses_file = any(isinstance(n, ast.Name) and n.id == "__file__" for n in sub)
+            names_dir = any(isinstance(n, ast.Constant) and isinstance(n.value, str)
+                            and n.value.split("/")[0] in ("dataset", "benchmarks") for n in sub)
+            if uses_file and names_dir:
+                offenders.append(f"{p.relative_to(ROOT)}:{node.lineno}")
+    assert not offenders, f"__file__-anchored dataset/benchmarks paths: {offenders}"
 
 
 def test_top_level_packages_are_declared():
@@ -254,14 +276,13 @@ def test_every_module_is_referenced_by_a_test():
     unreferenced = [
         m for m in _top_modules()
         if m not in KNOWN_UNREFERENCED
-        and not (TESTS / f"test_{m}.py").exists()
         and not _uses_module(m, corpus)
     ]
     assert not unreferenced, f"modules with no test import: {unreferenced}"
     stale = sorted(m for m in KNOWN_UNREFERENCED if m not in _top_modules())
     assert not stale, f"KNOWN_UNREFERENCED lists modules that no longer exist: {stale}"
     # An allowlisted module that gained a real test must leave the list.
-    healed = sorted(m for m in KNOWN_UNREFERENCED if (TESTS / f"test_{m}.py").exists() or _uses_module(m, corpus))
+    healed = sorted(m for m in KNOWN_UNREFERENCED if _uses_module(m, corpus))
     assert not healed, f"remove from KNOWN_UNREFERENCED, now tested: {healed}"
 
 
@@ -345,12 +366,12 @@ def test_allowlists_have_not_grown():
     # an entry would otherwise blind the scan while every test stays green.
     assert len(PRIVATE_IDS) == 12
     assert hashlib.sha256(repr(PRIVATE_IDS).encode()).hexdigest().startswith("3694464b333b3ecd")
-    assert set(KNOWN_UNREFERENCED) == {"asar_parser", "process_lock"}
-    assert set(KNOWN_USER_PATHS) == {"tests/test_public_provenance_and_fixtures.py", "tools_workspace.py"}
+    assert set(KNOWN_UNREFERENCED) == {"liebert_re.tools.asar_parser", "liebert_re.evidence.process_lock"}
+    assert set(KNOWN_USER_PATHS) == {"tests/test_public_provenance_and_fixtures.py", "liebert_re/workspace.py"}
     assert len(KNOWN_PRIVATE_REFS) == 33
     assert sum(len(ids) for ids, _ in KNOWN_PRIVATE_REFS.values()) == 51
     # Fingerprint of every (path, identifiers) pair: swapping an entry, not only
     # adding one, changes it. Update it only when REMOVING entries.
     digest = hashlib.sha256(repr(sorted((f, sorted(i)) for f, (i, _) in KNOWN_PRIVATE_REFS.items())).encode()).hexdigest()
-    assert digest.startswith("f739265fb45951c7")
+    assert digest.startswith("7ce0349c2a0b72a8")
     assert all(reason for _, reason in KNOWN_PRIVATE_REFS.values())

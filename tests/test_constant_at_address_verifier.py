@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from constant_at_address_verifier import verify_constant_at_address
+from liebert_re.evidence.constant_at_address_verifier import verify_constant_at_address
 
 try:
     import pefile  # noqa: F401

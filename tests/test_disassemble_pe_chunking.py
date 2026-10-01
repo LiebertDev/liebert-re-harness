@@ -26,10 +26,10 @@ import capstone
 import pefile
 import psutil
 
-import code_sweep_chunking
-import tools_binary
-from owned_binary_fixtures import build_owned_pe_with_code
-from tools_binary import disassemble_pe
+import liebert_re.recover.code_sweep_chunking as code_sweep_chunking
+import liebert_re.tools.binary as tools_binary
+from liebert_re.recover.owned_binary_fixtures import build_owned_pe_with_code
+from liebert_re.tools.binary import disassemble_pe
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # safe_path confines to the workspace, so fixtures live under it (as siblings do).

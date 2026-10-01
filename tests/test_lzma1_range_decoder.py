@@ -21,7 +21,7 @@ import os
 import random
 import unittest
 
-from lzma1_range_decoder import LzmaFormatError, decode_lzma1_stream
+from liebert_re.recover.lzma1_range_decoder import LzmaFormatError, decode_lzma1_stream
 
 
 def _lzma1_raw_stream(data: bytes, lc: int = 3, lp: int = 0, pb: int = 2, preset: int = 6):
@@ -157,7 +157,7 @@ class Lzma1RangeDecoderNegativeControlTests(unittest.TestCase):
         # A hand-crafted stream is not needed: directly drive LzmaState's
         # copy_match to prove the bounds check itself, independent of
         # whether any real stream could produce this shape.
-        from lzma1_range_decoder import LzmaState, RangeDecoder
+        from liebert_re.recover.lzma1_range_decoder import LzmaState, RangeDecoder
         raw, lc, lp, pb = _lzma1_raw_stream(b"x")
         rc = RangeDecoder(raw, 0)
         st = LzmaState(rc, lc, lp, pb)

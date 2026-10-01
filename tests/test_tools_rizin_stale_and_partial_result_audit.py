@@ -32,8 +32,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import tools_rizin as tr
-from pe_address import normalize_address
+import liebert_re.tools.rizin as tr
+from liebert_re.recover.pe_address import normalize_address
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOGINCRACKME = REPO_ROOT / "benchmarks/windows_native_ladder/corpus/tier1/logincrackme/LoginCrackme.exe"
@@ -65,8 +65,8 @@ class RizinFunctionsEmptyListPolarityTests(unittest.TestCase):
 
     def _run(self, stdout, truncated=False):
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
-             mock.patch("tools_rizin.safe_path", return_value=LOGINCRACKME), \
-             mock.patch("tools_rizin.run_bounded_process",
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.run_bounded_process",
                         return_value=_fake_cp(stdout=stdout, truncated=truncated)):
             return json.loads(tr.rizin_functions(str(LOGINCRACKME), timeout_seconds=10))
 
@@ -145,8 +145,8 @@ class RizinFunctionsNonEmptyFabricationPolarityTests(unittest.TestCase):
 
     def _run(self, stdout):
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
-             mock.patch("tools_rizin.safe_path", return_value=self._file), \
-             mock.patch("tools_rizin.run_bounded_process",
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=self._file), \
+             mock.patch("liebert_re.tools.rizin.run_bounded_process",
                         return_value=_fake_cp(stdout=stdout)):
             return json.loads(tr.rizin_functions(str(self._file), timeout_seconds=10))
 
@@ -191,8 +191,8 @@ class RizinDisasmCoverageTests(unittest.TestCase):
 
     def _listing(self, entries, truncated=False):
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
-             mock.patch("tools_rizin.safe_path", return_value=LOGINCRACKME), \
-             mock.patch("tools_rizin.run_bounded_process",
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.run_bounded_process",
                         return_value=_fake_cp(stdout=json.dumps(entries), truncated=truncated)):
             return json.loads(tr.rizin_disasm_listing(
                 str(LOGINCRACKME), self.file_offset, "file_offset", count=2, timeout_seconds=10))
@@ -232,8 +232,8 @@ class RizinPatchPlanNegativePolarityTests(unittest.TestCase):
     def _plan(self, entries, operation, instruction_count=1):
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
              mock.patch.object(tr, "_rizin_asm_binary", return_value="C:/fake/rz-asm.exe"), \
-             mock.patch("tools_rizin.safe_path", return_value=LOGINCRACKME), \
-             mock.patch("tools_rizin.run_bounded_process",
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.run_bounded_process",
                         side_effect=_dispatch(json.dumps(entries))):
             return json.loads(tr.rizin_patch_plan(
                 str(LOGINCRACKME), self.file_offset, operation, "file_offset",
@@ -287,8 +287,8 @@ class RizinPatchPlanNegativePolarityTests(unittest.TestCase):
                     "type": "nop", "opcode": "nop"}]
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
              mock.patch.object(tr, "_rizin_asm_binary", return_value="C:/fake/rz-asm.exe"), \
-             mock.patch("tools_rizin.safe_path", return_value=LOGINCRACKME), \
-             mock.patch("tools_rizin.run_bounded_process",
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.run_bounded_process",
                         side_effect=_dispatch(json.dumps(entries), asm_stdout="invalid\ninvalid\n")):
             data = json.loads(tr.rizin_patch_plan(
                 str(LOGINCRACKME), self.file_offset, "nop_out", "file_offset", timeout_seconds=10))
@@ -408,7 +408,7 @@ class PatchWritePathVerificationTests(unittest.TestCase):
             Path(dst).write_bytes(b"NOT-THE-ORIGINAL")
             return str(dst)
 
-        with mock.patch("tools_rizin.shutil.copy2", _bad_copy):
+        with mock.patch("liebert_re.tools.rizin.shutil.copy2", _bad_copy):
             data = json.loads(tr.binary_patch(
                 str(self.target), "apply", self._one_patch(offset),
                 dry_run=False, in_place=True, backup=True))

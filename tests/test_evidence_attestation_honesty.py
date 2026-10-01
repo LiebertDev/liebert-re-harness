@@ -31,8 +31,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import tools_workspace
-from evidence_security import (
+import liebert_re.workspace as tools_workspace
+from liebert_re.evidence.security import (
     TRUSTED_SOURCE_KINDS,
     build_provenance,
     evaluate_record,

@@ -10,7 +10,7 @@ import unittest
 
 import capstone
 
-from code_sweep_chunking import chunk_boundaries, disasm_chunk
+from liebert_re.recover.code_sweep_chunking import chunk_boundaries, disasm_chunk
 
 
 class ChunkBoundariesTests(unittest.TestCase):

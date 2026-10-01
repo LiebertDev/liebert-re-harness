@@ -34,7 +34,7 @@ import random
 import unittest
 from fractions import Fraction
 
-from lll_exact import (
+from liebert_re.recover.lll_exact import (
     EnumerationBudgetExceeded,
     LLLError,
     enumerate_short_vectors,

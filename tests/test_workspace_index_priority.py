@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from workspace_index import WorkspaceIndex
+from liebert_re.evidence.workspace_index import WorkspaceIndex
 
 
 def _touch_many(directory: Path, count: int, prefix: str, ext: str = ".txt") -> None:

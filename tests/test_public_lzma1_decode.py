@@ -13,8 +13,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import tools_workspace
-from tools_lzma1_decode import MAX_OUT_SIZE, lzma1_decode
+import liebert_re.workspace as tools_workspace
+from liebert_re.tools.lzma1_decode import MAX_OUT_SIZE, lzma1_decode
 
 
 def _lzma1_raw_stream(data: bytes, lc: int = 3, lp: int = 0, pb: int = 2, preset: int = 6):

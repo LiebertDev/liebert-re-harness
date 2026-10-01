@@ -17,9 +17,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import artifact_provenance
-import owned_binary_fixtures
-import provenance
+import liebert_re.evidence.artifact_provenance as artifact_provenance
+import liebert_re.recover.owned_binary_fixtures as owned_binary_fixtures
+import liebert_re.evidence.provenance as provenance
 
 
 class ProvenanceHelperTests(unittest.TestCase):

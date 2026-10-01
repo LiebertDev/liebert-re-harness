@@ -28,8 +28,8 @@ from unittest import mock
 
 import psutil
 
-import tools_archive2
-from tools_archive2 import rar_7z
+import liebert_re.tools.archive2 as tools_archive2
+from liebert_re.tools.archive2 import rar_7z
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRATCH = REPO_ROOT / "dataset" / "runtime" / "_test_decompression_bounds_scratch"

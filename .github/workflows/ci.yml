@@ -102,8 +102,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      # Proves the built wheel, not the checkout, contains every module listed in
-      # py-modules. No editable install here: that would let the source tree
+      # Proves the built wheel, not the checkout, contains every module of the
+      # liebert_re package. No editable install here: that would let the source tree
       # satisfy imports the wheel cannot.
       - name: Build wheel
         run: |
@@ -113,20 +113,25 @@ jobs:
         run: |
           python -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install dist/*.whl
-      - name: Smoke-import every py-modules entry from outside the repo
+      - name: Check wheel contents
         run: |
-          python - <<'PY' > "$RUNNER_TEMP/modules.txt"
-          import re, tomllib
-          t = tomllib.load(open("pyproject.toml", "rb"))
-          print("\n".join(t["tool"]["setuptools"]["py-modules"]))
+          python - <<'PY'
+          import glob, zipfile
+          (whl,) = glob.glob("dist/*.whl")
+          bad = [n for n in zipfile.ZipFile(whl).namelist()
+                 if not (n.startswith("liebert_re/") or n.split("/")[0].endswith(".dist-info"))]
+          assert not bad, bad
           PY
-          test -s "$RUNNER_TEMP/modules.txt"
+      - name: Smoke-import every module of the installed package from outside the repo
+        run: |
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/venv/bin/python" - <<'PY'
-          import importlib, os, sys
-          mods = open(os.path.join(os.environ["RUNNER_TEMP"], "modules.txt")).read().split()
+          import importlib, os, pkgutil, sys
+          import liebert_re
           repo = os.environ["GITHUB_WORKSPACE"]
-          assert mods and not any(os.path.abspath(p or ".") == repo for p in sys.path), sys.path
+          assert not any(os.path.abspath(p or ".") == repo for p in sys.path), sys.path
+          mods = sorted(m.name for m in pkgutil.walk_packages(liebert_re.__path__, "liebert_re.") if not m.ispkg)
+          assert len(mods) == 64, (len(mods), mods)
           failed = []
           for m in mods:
               try:
@@ -136,6 +141,6 @@ jobs:
                   failed.append(f"{m}: {type(e).__name__}: {e}")
           print(f"imported {len(mods) - len(failed)}/{len(mods)}")
           if failed:
-              print("\n".join(failed))
+              print(chr(10).join(failed))
               sys.exit(1)
           PY

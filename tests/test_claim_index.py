@@ -22,8 +22,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from claim_index import ClaimError, ClaimIndex, claim_index
-from evidence_index import EvidenceIndex
+from liebert_re.evidence.claim_index import ClaimError, ClaimIndex, claim_index
+from liebert_re.evidence.index import EvidenceIndex
 
 REAL_EVIDENCE_ROOT = Path(__file__).resolve().parent.parent / "dataset" / "evidence"
 REAL_CASE_FILES = [

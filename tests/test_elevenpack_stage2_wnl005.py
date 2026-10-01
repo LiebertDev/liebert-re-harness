@@ -37,7 +37,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "emulation_scripts"))
-import vex  # noqa: E402  -- for its FIPS-197-anchored AES round
+import liebert_re.recover.vex as vex  # noqa: E402  -- for its FIPS-197-anchored AES round
 
 TARGET_SHA256 = "00881b495de5fb85523a739f0367d14f89ac585925c5ca868255786cadf4cd5d"
 SECTION_RVA = 0x700000

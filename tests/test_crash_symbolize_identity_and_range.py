@@ -7,11 +7,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import crash_symbolize
-import owned_binary_fixtures
-import tools_workspace
-from crash_symbolize import symbolize_rva
-from msf_pdb import write_synthetic_pdb
+import liebert_re.recover.crash_symbolize as crash_symbolize
+import liebert_re.recover.owned_binary_fixtures as owned_binary_fixtures
+import liebert_re.workspace as tools_workspace
+from liebert_re.recover.crash_symbolize import symbolize_rva
+from liebert_re.recover.msf_pdb import write_synthetic_pdb
 
 
 class RvaRange(unittest.TestCase):

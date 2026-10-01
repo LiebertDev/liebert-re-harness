@@ -1,6 +1,6 @@
 import unittest
 
-from analysis_ir import (
+from liebert_re.recover.analysis_ir import (
     UNKNOWN,
     AnalysisIR,
     Artifact,
@@ -16,7 +16,7 @@ from analysis_ir import (
     module_id,
     stable_id,
 )
-from binary_version_diff import diff_analysis_ir
+from liebert_re.recover.binary_version_diff import diff_analysis_ir
 
 
 class BinaryVersionDiffTests(unittest.TestCase):

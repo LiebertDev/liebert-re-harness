@@ -5,7 +5,7 @@ from __future__ import annotations
 import struct
 import unittest
 
-from tools_dart import _scan_headers
+from liebert_re.tools.dart import _scan_headers
 
 _MAGIC = struct.pack("<I", 0xDCDCF5F5)
 

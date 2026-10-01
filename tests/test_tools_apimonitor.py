@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import tools_apimonitor as am
+import liebert_re.dynamic.apimonitor as am
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -90,7 +90,7 @@ class ApiMonitorUnsupportedOperationTests(unittest.TestCase):
     verified against the actual binary before this module was written."""
 
     def test_live_trace_never_starts_a_subprocess(self):
-        with mock.patch("tools_apimonitor.run_bounded_process") as mocked_run:
+        with mock.patch("liebert_re.dynamic.apimonitor.run_bounded_process") as mocked_run:
             out = am.live_trace(target_path="C:/some/target.exe", isolated_context_confirmed=True)
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -104,7 +104,7 @@ class ApiMonitorUnsupportedOperationTests(unittest.TestCase):
         self.assertEqual(data["status"], "NOT_SUPPORTED")
 
     def test_parse_trace_never_reads_a_file(self):
-        with mock.patch("tools_apimonitor.run_bounded_process") as mocked_run:
+        with mock.patch("liebert_re.dynamic.apimonitor.run_bounded_process") as mocked_run:
             out = am.parse_trace(trace_path="C:/some/trace.apmx64")
         data = json.loads(out)
         self.assertFalse(data["ok"])

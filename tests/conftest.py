@@ -43,7 +43,7 @@ from pathlib import Path
 
 import pytest
 
-import tools_workspace
+import liebert_re.workspace as tools_workspace
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_EVIDENCE_ROOT = (REPO_ROOT / "dataset" / "evidence").resolve()

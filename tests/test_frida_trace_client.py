@@ -25,7 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CLIENT_DIR = REPO_ROOT / "guest_agents" / "frida_client"
 sys.path.insert(0, str(CLIENT_DIR))
 
-import frida_trace_client as client  # noqa: E402
+import liebert_re.dynamic.frida_trace_client as client  # noqa: E402
 
 
 class _FakeScript:

@@ -12,7 +12,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from native_pdb_toolchain import detect_native_pdb_toolchain
+from liebert_re.recover.native_pdb_toolchain import detect_native_pdb_toolchain
 
 
 class NativePdbToolchainTests(unittest.TestCase):
@@ -42,7 +42,7 @@ class VswhereQueryTests(unittest.TestCase):
     """
 
     def test_it_falls_back_past_the_newest_installation(self):
-        import native_pdb_toolchain as toolchain
+        import liebert_re.recover.native_pdb_toolchain as toolchain
         seen = []
 
         def fake_query(arguments):
@@ -65,7 +65,7 @@ class VswhereQueryTests(unittest.TestCase):
         self.assertNotIn("-latest", seen[1])
 
     def test_the_first_answer_wins(self):
-        import native_pdb_toolchain as toolchain
+        import liebert_re.recover.native_pdb_toolchain as toolchain
         calls = []
 
         def fake_query(arguments):

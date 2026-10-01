@@ -14,9 +14,9 @@ import pytest
 # (ImportError raised inside it) propagate; a bare checkout must skip, not fail.
 mpmath = pytest.importorskip("mpmath")
 
-import lll_exact
-import tools_lattice
-from tools_lattice import MAX_BASIS_ENTRY_BITS, MAX_DIMENSION, lattice_reduce
+import liebert_re.recover.lll_exact as lll_exact
+import liebert_re.tools.lattice as tools_lattice
+from liebert_re.tools.lattice import MAX_BASIS_ENTRY_BITS, MAX_DIMENSION, lattice_reduce
 
 
 class ToolsLatticeContractTests(unittest.TestCase):

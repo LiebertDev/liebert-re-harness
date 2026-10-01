@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from msf_pdb import MSF_MAGIC, build_synthetic_msf, detect_pdb_container, parse_msf, write_synthetic_msf
+from liebert_re.recover.msf_pdb import MSF_MAGIC, build_synthetic_msf, detect_pdb_container, parse_msf, write_synthetic_msf
 
 
 class MsfPdbP0Tests(unittest.TestCase):

@@ -17,8 +17,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import tools_workspace
-from generic_static_probe import generic_static_probe, normalize_tool_result
+import liebert_re.workspace as tools_workspace
+from liebert_re.tools.generic_static_probe import generic_static_probe, normalize_tool_result
 
 
 class GenericStaticProbeTests(unittest.TestCase):

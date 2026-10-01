@@ -8,11 +8,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import tool_families
-import tools_workspace
-from minidump_analyzer import _module_containing_address, analyze_minidump, minidump_analyzer
-from minidump_structural import read_memory_at_va
-from msf_pdb import write_synthetic_pdb
+import liebert_re.report.tool_families as tool_families
+import liebert_re.workspace as tools_workspace
+from liebert_re.recover.minidump_analyzer import _module_containing_address, analyze_minidump, minidump_analyzer
+from liebert_re.recover.minidump_structural import read_memory_at_va
+from liebert_re.recover.msf_pdb import write_synthetic_pdb
 
 # NOTE: intentionally NOT importing helpers from tests.test_codeview_rsds via
 # `from tests.test_codeview_rsds import ...`. In this environment a stray

@@ -11,11 +11,11 @@ from pathlib import Path
 
 from tests import conftest
 
-import tool_families
+import liebert_re.report.tool_families as tool_families
 
 EVIDENCE_OWNERS = {
-    "tools_apimonitor", "tools_binary", "tools_die",
-    "tools_rizin", "tools_upx", "tools_yara_x",
+    "liebert_re.dynamic.apimonitor", "liebert_re.tools.binary", "liebert_re.tools.die",
+    "liebert_re.tools.rizin", "liebert_re.tools.upx", "liebert_re.tools.yara_x",
 }
 
 

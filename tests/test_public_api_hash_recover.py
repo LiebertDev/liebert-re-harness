@@ -16,7 +16,7 @@ import unittest
 import zlib
 from pathlib import Path
 
-from api_hash_recover import ALGORITHMS, crack_api_hash
+from liebert_re.recover.api_hash_recover import ALGORITHMS, crack_api_hash
 
 KERNEL32 = Path(r"C:\Windows\System32\kernel32.dll")
 

@@ -17,8 +17,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-import tools_yara_x as ty
-from evidence_index import EvidenceIndex, record_write as _evidence_index_record_write_real
+import liebert_re.tools.yara_x as ty
+from liebert_re.evidence.index import EvidenceIndex, record_write as _evidence_index_record_write_real
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TBM_EXE = REPO_ROOT / "benchmarks/real_corpora/trybypassme/TBM.exe"
@@ -63,7 +63,7 @@ class YaraXInputValidationTests(unittest.TestCase):
 
     def test_nonexistent_target_returns_not_found_before_any_subprocess_call(self):
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.run_bounded_process") as mocked_run:
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process") as mocked_run:
             out = ty.yara_x_scan(str(REPO_ROOT / "benchmarks" / "does_not_exist_at_all.bin"),
                                   rules_text="rule r{condition:true}")
         data = json.loads(out)
@@ -73,8 +73,8 @@ class YaraXInputValidationTests(unittest.TestCase):
 
     def test_neither_rule_source_given_is_rules_missing_before_any_subprocess_call(self):
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_yara_x.run_bounded_process") as mocked_run:
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process") as mocked_run:
             out = ty.yara_x_scan(str(TBM_EXE))
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -97,8 +97,8 @@ class YaraXRuleCompileFailedTests(unittest.TestCase):
         fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=1,
                                  stdout="", stderr="error[E001]: syntax error", output_truncated=False)
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_yara_x.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process", return_value=fake_result):
             out = ty.yara_x_scan(str(TBM_EXE), rules_text="rule broken { condition")
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -111,8 +111,8 @@ class YaraXTimeoutTests(unittest.TestCase):
         fake_result = mock.Mock(cancelled=False, timed_out=True, returncode=None,
                                  stdout="", stderr="", output_truncated=False)
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_yara_x.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process", return_value=fake_result):
             out = ty.yara_x_scan(str(TBM_EXE), rules_text="rule r{condition:true}", timeout_seconds=10)
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -122,8 +122,8 @@ class YaraXTimeoutTests(unittest.TestCase):
         fake_result = mock.Mock(cancelled=True, timed_out=False, returncode=None,
                                  stdout="", stderr="", output_truncated=False)
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_yara_x.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process", return_value=fake_result):
             out = ty.yara_x_scan(str(TBM_EXE), rules_text="rule r{condition:true}", timeout_seconds=10)
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -133,8 +133,8 @@ class YaraXTimeoutTests(unittest.TestCase):
         fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=0,
                                  stdout=REAL_YARA_X_JSON_MATCH, stderr="", output_truncated=True)
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_yara_x.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process", return_value=fake_result):
             out = ty.yara_x_scan(str(TBM_EXE), rules_text="rule r{condition:true}")
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -150,8 +150,8 @@ class YaraXParsingTests(unittest.TestCase):
         fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=0,
                                  stdout=REAL_YARA_X_JSON_MATCH, stderr="", output_truncated=False)
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_yara_x.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process", return_value=fake_result):
             out = ty.yara_x_scan(str(TBM_EXE), rules_text="rule test_mz_header{strings:$mz={4D 5A} condition:$mz at 0}")
         data = json.loads(out)
         self.assertTrue(data["ok"], data)
@@ -167,8 +167,8 @@ class YaraXParsingTests(unittest.TestCase):
         fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=0,
                                  stdout=REAL_YARA_X_JSON_NO_MATCH, stderr="", output_truncated=False)
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_yara_x.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process", return_value=fake_result):
             out = ty.yara_x_scan(str(TBM_EXE), rules_text="rule never_matches{strings:$x=\"nope\" condition:$x}")
         data = json.loads(out)
         self.assertTrue(data["ok"], data)
@@ -180,8 +180,8 @@ class YaraXParsingTests(unittest.TestCase):
         fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=0,
                                  stdout="{not valid json,,,}", stderr="", output_truncated=False)
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_yara_x.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process", return_value=fake_result):
             out = ty.yara_x_scan(str(TBM_EXE), rules_text="rule r{condition:true}")
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -207,8 +207,8 @@ class YaraXPaginationTests(unittest.TestCase):
         fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=0,
                                  stdout=self._many_matches_json(30), stderr="", output_truncated=False)
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_yara_x.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process", return_value=fake_result):
             first = json.loads(ty.yara_x_scan(str(TBM_EXE), rules_text="rule r{condition:true}", max_chars=1000))
         self.assertTrue(first["content_has_more"])
         self.assertEqual(first["content_returned_chars"], len(first["content"]))
@@ -217,8 +217,8 @@ class YaraXPaginationTests(unittest.TestCase):
         collected = first["content"]
         offset = first["content_offset"] + first["content_returned_chars"]
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_yara_x.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process", return_value=fake_result):
             while True:
                 page = json.loads(ty.yara_x_scan(str(TBM_EXE), rules_text="rule r{condition:true}",
                                                    max_chars=1000, content_offset=offset))
@@ -228,8 +228,8 @@ class YaraXPaginationTests(unittest.TestCase):
                     break
 
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_yara_x.run_bounded_process", return_value=fake_result):
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process", return_value=fake_result):
             whole = json.loads(ty.yara_x_scan(str(TBM_EXE), rules_text="rule r{condition:true}", max_chars=120000))
         self.assertEqual(collected, whole["content"])
 
@@ -252,8 +252,8 @@ class YaraXRulesTextIsThrowawayTests(unittest.TestCase):
                               stdout=REAL_YARA_X_JSON_NO_MATCH, stderr="", output_truncated=False)
 
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_yara_x.run_bounded_process", side_effect=_spy):
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process", side_effect=_spy):
             ty.yara_x_scan(str(TBM_EXE), rules_text="rule r{condition:true}")
         self.assertEqual(len(captured_paths), 1)
         self.assertFalse(Path(captured_paths[0]).exists(), "inline rule temp file must be cleaned up after the call")
@@ -311,8 +311,8 @@ class YaraXRulesetSelectionTests(unittest.TestCase):
 
     def test_unknown_ruleset_name_is_rules_missing_before_any_subprocess_call(self):
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_yara_x.run_bounded_process") as mocked_run:
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process") as mocked_run:
             out = ty.yara_x_scan(str(TBM_EXE), ruleset="not_a_real_ruleset_name")
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -322,9 +322,9 @@ class YaraXRulesetSelectionTests(unittest.TestCase):
 
     def test_known_but_uninstalled_ruleset_is_rules_missing_before_any_subprocess_call(self):
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
              mock.patch.object(ty, "_resolve_ruleset", return_value=None), \
-             mock.patch("tools_yara_x.run_bounded_process") as mocked_run:
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process") as mocked_run:
             out = ty.yara_x_scan(str(TBM_EXE), ruleset="yara_forge_core")
         data = json.loads(out)
         self.assertFalse(data["ok"])
@@ -341,9 +341,9 @@ class YaraXRulesetSelectionTests(unittest.TestCase):
                               stdout=REAL_YARA_X_JSON_NO_MATCH, stderr="", output_truncated=False)
 
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
              mock.patch.object(ty, "_resolve_ruleset", return_value=Path("C:/fake/ruleset.yar")), \
-             mock.patch("tools_yara_x.run_bounded_process", side_effect=_spy):
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process", side_effect=_spy):
             out = ty.yara_x_scan(str(TBM_EXE), rules_text="rule r{condition:true}", ruleset="yara_forge_core")
         data = json.loads(out)
         self.assertTrue(data["ok"], data)
@@ -404,8 +404,8 @@ class EvidenceIndexWriteTimeHookTests(unittest.TestCase):
                 return _evidence_index_record_write_real(path, root=ty.EVIDENCE, db_path=db_path)
 
             with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-                 mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
-                 mock.patch("tools_yara_x.run_bounded_process", return_value=fake_result), \
+                 mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
+                 mock.patch("liebert_re.tools.yara_x.run_bounded_process", return_value=fake_result), \
                  mock.patch.object(ty, "_evidence_index_record_write", _redirected):
                 out = ty.yara_x_scan(str(TBM_EXE), rules_text="rule r{condition:true}")
 
@@ -425,8 +425,8 @@ class EvidenceIndexWriteTimeHookTests(unittest.TestCase):
             raise RuntimeError("index unavailable")
 
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
-             mock.patch("tools_yara_x.safe_path", return_value=TBM_EXE), \
-             mock.patch("tools_yara_x.run_bounded_process", return_value=fake_result), \
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=TBM_EXE), \
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process", return_value=fake_result), \
              mock.patch.object(ty, "_evidence_index_record_write", _boom):
             out = ty.yara_x_scan(str(TBM_EXE), rules_text="rule r{condition:true}")
 

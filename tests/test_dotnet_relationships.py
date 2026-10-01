@@ -1,7 +1,7 @@
 import unittest
 
-from analysis_ir import UNKNOWN
-from dotnet_relationships import build_dotnet_relationships
+from liebert_re.recover.analysis_ir import UNKNOWN
+from liebert_re.recover.dotnet_relationships import build_dotnet_relationships
 
 
 class DotnetRelationshipTests(unittest.TestCase):

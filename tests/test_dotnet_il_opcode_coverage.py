@@ -32,8 +32,8 @@ against the fix (0 UNSUPPORTED_OPCODE events across the same 54 methods).
 import unittest
 from pathlib import Path
 
-import tools_workspace
-from dotnet_il import parse_dotnet_il, parse_il_body
+import liebert_re.workspace as tools_workspace
+from liebert_re.recover.dotnet_il import parse_dotnet_il, parse_il_body
 
 TARGET = Path(tools_workspace.WORKSPACE) / "benchmarks" / "real_corpora" / "cm1_confuserex_userpass" / "extracted" / "CrackMeV1.exe"
 # Decrypt() in CrackMeV1.exe -- real, measured evidence: 100 of its own

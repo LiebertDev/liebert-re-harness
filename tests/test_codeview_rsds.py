@@ -19,7 +19,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from codeview_rsds import (
+from liebert_re.recover.codeview_rsds import (
     correlate_rsds,
     extract_pe_rsds,
     extract_pe_section_map,

@@ -16,7 +16,7 @@ import struct
 import unittest
 from pathlib import Path
 
-from tools_binary import disassemble_pe
+from liebert_re.tools.binary import disassemble_pe
 
 # tools_binary.disassemble_pe -> safe_path enforces WORKSPACE (repo root)
 # containment, so the fixture must live under the repo, not the OS temp dir.

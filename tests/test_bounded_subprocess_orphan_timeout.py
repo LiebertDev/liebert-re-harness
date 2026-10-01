@@ -22,7 +22,7 @@ import time
 import unittest
 from pathlib import Path
 
-from bounded_subprocess import run_bounded_process
+from liebert_re.bounded_subprocess import run_bounded_process
 
 
 def _process_exists(pid: int) -> bool:

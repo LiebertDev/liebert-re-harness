@@ -1,10 +1,10 @@
 import unittest
 
-from analysis_ir import (
+from liebert_re.recover.analysis_ir import (
     AnalysisIR, Artifact, Evidence, Export, Function, Import, Module, Reference,
     artifact_id, function_id, module_id, stable_id,
 )
-from cross_binary_relationships import build_cross_binary_relationships
+from liebert_re.recover.cross_binary_relationships import build_cross_binary_relationships
 
 
 def fixture(sha, name):

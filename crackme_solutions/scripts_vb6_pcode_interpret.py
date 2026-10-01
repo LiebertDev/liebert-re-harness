@@ -105,7 +105,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
-import tools_vb6_pcode as pcode
+import liebert_re.tools.vb6_pcode as pcode
 
 DEFAULT_MAX_STEPS = 20000
 DEFAULT_MAX_CALL_DEPTH = 16

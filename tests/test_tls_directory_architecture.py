@@ -9,9 +9,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import tools_workspace
-from owned_binary_fixtures import build_owned_pe_with_code
-from tools_tls_directory import analyze_tls_directory
+import liebert_re.workspace as tools_workspace
+from liebert_re.recover.owned_binary_fixtures import build_owned_pe_with_code
+from liebert_re.tools.tls_directory import analyze_tls_directory
 
 _COFF_MACHINE = 64 + 4  # e_lfanew + "PE\0\0"
 _OPT = _COFF_MACHINE + 20

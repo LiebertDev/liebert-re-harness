@@ -1,6 +1,6 @@
 import unittest
 
-from analysis_findings import (
+from liebert_re.report.analysis_findings import (
     build_security_hypothesis, render_finding_report, validate_finding,
     verify_counter_evidence,
 )

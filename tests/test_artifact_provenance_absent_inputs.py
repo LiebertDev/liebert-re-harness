@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import artifact_provenance as ap
+import liebert_re.evidence.artifact_provenance as ap
 
 _HASH_KEYS = ("system_prompt_sha256", "tool_registry_hash", "router_hash", "planner_hash", "claim_verifier_hash")
 

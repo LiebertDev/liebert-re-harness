@@ -8,9 +8,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import tools_workspace
-from tools_godot import godot_asset_analyzer
-from tools_unreal import unreal_asset_analyzer
+import liebert_re.workspace as tools_workspace
+from liebert_re.tools.godot import godot_asset_analyzer
+from liebert_re.tools.unreal import unreal_asset_analyzer
 
 
 class PackVersionRefusals(unittest.TestCase):

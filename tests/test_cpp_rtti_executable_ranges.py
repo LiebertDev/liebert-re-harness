@@ -6,7 +6,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from tools_cpp_rtti import IMAGE_SCN_MEM_EXECUTE, _executable_ranges, _in_executable_range
+from liebert_re.tools.cpp_rtti import IMAGE_SCN_MEM_EXECUTE, _executable_ranges, _in_executable_range
 
 
 def _image(*sections):

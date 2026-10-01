@@ -17,8 +17,8 @@ import unittest
 import zipfile
 from pathlib import Path
 
-import tools_workspace
-from tools_formats import archive_inspect
+import liebert_re.workspace as tools_workspace
+from liebert_re.tools.formats import archive_inspect
 
 _SCRATCH = tools_workspace.WORKSPACE_ROOT / ".pytest_archive_extract_scratch"
 
@@ -241,7 +241,7 @@ class TestExtractOutcomes(_ScratchGuard):
         self.assertEqual(result["error"], "MEMBER_NOT_FOUND")
 
     def test_oversized_member_is_capped_without_write(self):
-        import tools_formats
+        import liebert_re.tools.formats as tools_formats
         archive = _SCRATCH / "big.zip"
         _make_zip(archive, {"big.bin": b"x" * 1000})
         dest = self._dest("big.bin")
