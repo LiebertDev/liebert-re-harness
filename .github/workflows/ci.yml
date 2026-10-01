@@ -131,7 +131,9 @@ jobs:
           repo = os.environ["GITHUB_WORKSPACE"]
           assert not any(os.path.abspath(p or ".") == repo for p in sys.path), sys.path
           mods = sorted(m.name for m in pkgutil.walk_packages(liebert_re.__path__, "liebert_re.") if not m.ispkg)
-          assert len(mods) == 64, (len(mods), mods)
+          # Deliberate count: what the wheel ships cannot change without a
+          # reviewed edit here. 66 = 64 library modules + cli + __main__.
+          assert len(mods) == 66, (len(mods), mods)
           failed = []
           for m in mods:
               try:
