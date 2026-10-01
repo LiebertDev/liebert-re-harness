@@ -179,9 +179,7 @@ def correlate_rsds(left: dict | None, right: dict | None) -> dict:
         }
     guid_match = left["guid"] == right["guid"]
     age_match = int(left["age"]) == int(right["age"])
-    path_left = Path(str(left.get("pdb_path") or "")).name.casefold()
-    path_right = Path(str(right.get("pdb_path") or "")).name.casefold()
-    path_match = bool(path_left and path_right and path_left == path_right)
+    path_match = module_basename_match(left.get("pdb_path"), right.get("pdb_path"))
     if guid_match and age_match:
         basis = ["guid", "age"]
         if path_match:
@@ -352,7 +350,19 @@ def extract_pe_rsds(path: str | Path, *, max_entries: int = MAX_PE_DEBUG_ENTRIES
     }
 
 
-def module_basename_match(module_name: str, binary_name: str) -> bool:
-    left = Path(str(module_name or "")).name.casefold()
-    right = Path(str(binary_name or "")).name.casefold()
+def module_basename_match(module_name: object, binary_name: object) -> bool:
+    r"""True when two dump/PE paths name the same file, ignoring directory and case.
+
+    Paths here come out of crash dumps and PE debug records, so they are Windows
+    paths whatever host analyses them. Split on BOTH backslash and slash and never
+    use pathlib/os.path: on POSIX those treat a backslash as an ordinary
+    character, so a whole C:\dir\foo.dll became one "basename" that matched
+    nothing (an ambiguous module then resolved silently). Case is folded
+    unconditionally -- Windows names are case-insensitive and the host
+    filesystem's rule is irrelevant.
+    """
+    left, right = (
+        str(value or "").replace(chr(92), "/").rstrip("/").rsplit("/", 1)[-1].casefold()
+        for value in (module_name, binary_name)
+    )
     return bool(left and right and left == right)
