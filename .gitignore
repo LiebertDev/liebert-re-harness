@@ -83,3 +83,7 @@ runs/
 ghidra_projects/
 *.gpr
 *.rep/
+
+# Runtime and test scratch written by the harness itself. Nothing here is source.
+dataset/
+.pytest_evidence_scratch/

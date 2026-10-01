@@ -53,7 +53,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff", "black"]
+dev = ["pytest", "ruff", "black", "tomli; python_version < \"3.11\""]
 # frida_trace_client.py is the only module that needs it, and it is a client for
 # an isolated-VM tracing setup rather than something the core analysis path uses.
 # Kept out of the required set so a plain install stays small and platform-portable.
