@@ -384,10 +384,16 @@ def _utc_iso(epoch: float) -> str:
 
 
 def _rmtree(p: Path) -> None:
-    def onexc(fn, path, exc):
+    def _clear_readonly_and_retry(fn, path, _exc):
         os.chmod(path, stat.S_IWRITE)
         fn(path)
-    shutil.rmtree(p, onexc=onexc)
+    # `onexc` exists only on Python 3.12+; `onerror` is the same hook (its
+    # third argument is an exc_info tuple, unused here) and is deprecated
+    # from 3.12 but still the only spelling on 3.10/3.11.
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(p, onexc=_clear_readonly_and_retry)
+    else:
+        shutil.rmtree(p, onerror=_clear_readonly_and_retry)
 
 
 def _dir_bytes(p: Path) -> int:
