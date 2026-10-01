@@ -1,9 +1,8 @@
 """Synthetic owned-binary fixture builders (PE/RSDS, minidump).
 
-Extracted from the former ``qwen8b_safe_test_specialist.py`` module during the
-local-model/training-era cleanup: these builders are generic PE and minidump
-fixture generators used by several live kernel/native/Ghidra tests and carry
-no dependency on any model-candidate benchmarking code.
+Generic PE and minidump fixture generators used by several kernel, native and
+Ghidra tests. The binaries they produce are synthetic and owned, and the
+builders have no dependency on any other part of the package.
 """
 from __future__ import annotations
 
@@ -11,7 +10,7 @@ import struct
 from pathlib import Path
 
 from liebert_re.workspace import PROJECT_ROOT as APP
-FIXTURE_DIR = APP / "dataset" / "runtime" / "qwen8b_safe_fixtures"
+FIXTURE_DIR = APP / "dataset" / "runtime" / "owned_fixtures"
 
 GUID_LE = struct.pack("<IHH", 0x8F11D2A0, 0x41B7, 0x4B0D) + bytes.fromhex("9E42112233445566")
 AGE = 7

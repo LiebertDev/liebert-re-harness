@@ -98,6 +98,7 @@ PRIVATE_IDS = (
     "TEACHER_", "teacher-agent", "teacher.py", "Liebert" + " Harness",
     "tools_emulate_range", "tools_emulation", "tools_isolated_dynamic", "tools_decompiler",
     "tools_capability_extract", "tools_memory_scan", "mcp_server", "research_state",
+    "qwen", "llama", "mistral", "gemma", "phi-3",  # local model names
 )
 # END-PRIVATE-NAMES
 
@@ -364,8 +365,8 @@ def test_allowlists_have_not_grown():
     """Exact contents, so adding an entry means editing this test deliberately."""
     # The identifier tuple itself is pinned (by hash, so this file names none of them): deleting
     # an entry would otherwise blind the scan while every test stays green.
-    assert len(PRIVATE_IDS) == 12
-    assert hashlib.sha256(repr(PRIVATE_IDS).encode()).hexdigest().startswith("3694464b333b3ecd")
+    assert len(PRIVATE_IDS) == 17
+    assert hashlib.sha256(repr(PRIVATE_IDS).encode()).hexdigest().startswith("d51a752750a0f2a7")
     assert set(KNOWN_UNREFERENCED) == {"liebert_re.tools.asar_parser", "liebert_re.evidence.process_lock"}
     assert set(KNOWN_USER_PATHS) == {"tests/test_public_provenance_and_fixtures.py", "liebert_re/workspace.py"}
     assert len(KNOWN_PRIVATE_REFS) == 33

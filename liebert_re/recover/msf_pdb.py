@@ -674,7 +674,7 @@ def find_owned_native_msf_pdbs(root: str | Path, *, max_files: int = 8000) -> di
     """Read-only scan for real owned native MSF PDBs. Skips synthetic fixtures."""
     base = Path(root)
     skip_parts = {
-        "qwen8b_safe_fixtures",
+        "owned_fixtures",
         "__pycache__",
         ".git",
         ".venv",

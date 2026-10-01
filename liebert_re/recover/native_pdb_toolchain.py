@@ -8,8 +8,8 @@ import subprocess
 from pathlib import Path
 
 from liebert_re.workspace import PROJECT_ROOT as APP
-SOURCE = APP / "dataset" / "runtime" / "qwen8b_safe_fixtures" / "owned_native" / "owned_native.c"
-OUT_DIR = APP / "dataset" / "runtime" / "qwen8b_safe_fixtures" / "owned_native"
+SOURCE = APP / "dataset" / "runtime" / "owned_fixtures" / "owned_native" / "owned_native.c"
+OUT_DIR = APP / "dataset" / "runtime" / "owned_fixtures" / "owned_native"
 VSWHERE = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
 
 

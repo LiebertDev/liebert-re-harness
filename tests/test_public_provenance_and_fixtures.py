@@ -187,7 +187,7 @@ class OwnedBinaryFixturesTests(unittest.TestCase):
         self.assertLess(truncated.stat().st_size, full.stat().st_size)
 
     # ensure_owned_fixtures() is deliberately not exercised here: it writes
-    # into this repo's own benchmarks/qwen8b_safe_fixtures/ tree (a fixed
+    # into this repo's own dataset/runtime/owned_fixtures/ tree (a fixed
     # path derived from the module's own location), not a caller-supplied
     # temp directory, so calling it from a test would leave real generated
     # files behind in whichever repo runs this suite. The three builder
