@@ -58,9 +58,20 @@ def _dump(frame: str) -> str:
             f"  File {frame}\n")
 
 
-def test_the_measured_unicorn_mem_map_dump_is_the_only_known_one():
-    known = _dump('"C:\\v\\site-packages\\unicorn\\unicorn_py3\\unicorn.py", line 831 in mem_map')
-    assert gate.fatal_findings(known * 3, "stderr") == []
-    other = _dump('"C:\\v\\site-packages\\unicorn\\unicorn_py3\\unicorn.py", line 9 in emu_start')
-    assert len(gate.fatal_findings(known + other, "stderr")) == 1
-    assert gate.fatal_findings(FATAL + "\n", "stderr")           # no readable frame: still blocks
+_MEM_MAP = '"C:/v/site-packages/unicorn/unicorn_py3/unicorn.py", line 831 in mem_map'
+_EMU_START = '"C:/v/site-packages/unicorn/unicorn_py3/unicorn.py", line 9 in emu_start'
+
+
+def test_every_dump_blocks_whatever_its_frame():
+    """No allow-list: not even the once-measured unicorn mem_map dump is skipped."""
+    mem_map, other = _dump(_MEM_MAP), _dump(_EMU_START)
+    assert len(gate.fatal_findings(mem_map, "stderr")) == 1
+    assert len(gate.fatal_findings(other, "stderr")) == 1
+    assert len(gate.fatal_findings(mem_map * 3 + other, "stderr")) == 4
+    assert gate.fatal_findings(FATAL + "\n", "stderr")           # no readable frame: blocks
+
+
+def test_a_child_that_prints_the_mem_map_dump_is_blocked_end_to_end():
+    dump = _dump(_MEM_MAP)
+    rc, hits = gate.run_pytest(_child(f"import sys; sys.stderr.write({dump!r})"))
+    assert rc == 0 and len(hits) == 1

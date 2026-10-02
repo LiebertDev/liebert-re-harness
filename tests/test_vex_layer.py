@@ -24,7 +24,12 @@ decodes VEX correctly, these tests must still pass.
 """
 from __future__ import annotations
 
+import contextlib
+import faulthandler
+import functools
 import unittest
+
+import pytest
 
 try:
     from unicorn import Uc, UC_ARCH_X86, UC_MODE_64, UC_HOOK_CODE
@@ -39,6 +44,62 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "emulation_scripts"))
 import liebert_re.recover.vex as vex  # noqa: E402
+
+
+# Unicorn 2.1.4 on Windows raises one harmless first-chance access violation inside every
+# `Uc.mem_map` call, so faulthandler prints a "Windows fatal exception: access violation" dump
+# (top frame unicorn.py `mem_map`) each time: 30 per full run, with every test passing and exit 0.
+# It reproduces outside this repo with three lines (`Uc(UC_ARCH_X86, UC_MODE_64).mem_map(0x1000,
+# 0x4000)` under `python -X faulthandler`), so it is engine behaviour, not something a test does.
+# Some of those calls are in production code (`vex.self_check`), so they are wrapped here at the
+# class, not in a test helper. The pre-push gate scans for fatal reports unconditionally, so the
+# noise has to stop at the source. The silence is scoped as tightly as possible: faulthandler is
+# off only for the duration of each `mem_map` call and is restored in a `finally`, never off
+# for the file, and never off globally (no `-p no:faulthandler`). A crash anywhere else in these
+# tests, or in a later module, still dumps. The wrap itself is removed at module teardown by a
+# fixture, so it cannot leak; tests/test_zz_vex_patch_does_not_leak.py locks that.
+
+
+def _restore_faulthandler(fd):
+    faulthandler.enable(file=fd) if fd is not None else faulthandler.enable()
+
+
+@contextlib.contextmanager
+def mem_map_silenced(fd=None):
+    """Patch `Uc.mem_map` so faulthandler is off only while the call runs; undo on exit."""
+    import unicorn
+    original = unicorn.Uc.mem_map
+
+    @functools.wraps(original)
+    def quiet(self, *args, **kwargs):
+        was_on = faulthandler.is_enabled()
+        faulthandler.disable()
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            if was_on:
+                _restore_faulthandler(fd)
+
+    unicorn.Uc.mem_map = quiet
+    try:
+        yield
+    finally:
+        unicorn.Uc.mem_map = original
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _quiet_unicorn_mem_map(request):
+    if not ENGINE:
+        yield
+        return
+    try:
+        from _pytest.faulthandler import fault_handler_stderr_fd_key
+        fd = request.config.stash.get(fault_handler_stderr_fd_key, None)
+    except Exception:  # pragma: no cover - pytest internals moved
+        fd = None
+    with mem_map_silenced(fd):
+        yield
+
 
 CODE = 0x1000
 A = bytes(range(16))

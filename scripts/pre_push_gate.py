@@ -46,32 +46,18 @@ exec "$PY" "$script" hook "$@"
 # This repo's rule is never to mask a failure. A pytest run that prints a native crash report
 # ("Windows fatal exception: access violation", "Fatal Python error") and still exits 0 has hidden
 # a failure behind a green exit code, so the gate treats that text as a block on its own.
-# No test or fixture contains these phrases, so the patterns are not narrowed. One exception is
-# measured, not assumed: every full run on this Windows / Python 3.14 setup prints 30 faulthandler
-# "access violation" dumps whose current thread is inside unicorn.py mem_map, called from
-# tests/test_vex_layer.py, with all tests passing and exit 0 (reproduced 10 of 10 runs, and by that
-# file alone; none are printed with -p no:faulthandler). Only a dump whose first current-thread
-# frame is exactly that one is skipped; a dump anywhere else, or with no readable frame, still blocks.
+# No test or fixture contains these phrases, so the patterns are not narrowed, and there is no
+# allow-list: every dump blocks, whatever its frames. The unicorn mem_map dumps that used to
+# appear on every run are silenced at their source, only around the `Uc.mem_map` call, in
+# tests/test_vex_layer.py.
 FATAL_PATTERNS = (re.compile(r"Windows fatal exception", re.I), re.compile(r"Fatal Python error", re.I),
                   re.compile(r"access violation", re.I))
-KNOWN_UNICORN_DUMP = re.compile(r'unicorn[\\/]unicorn_py3[\\/]unicorn\.py", line \d+ in mem_map')
-
-
-def _known_unicorn_dump(lines: list[str], i: int) -> bool:
-    """Is the fatal marker at lines[i] the measured unicorn mem_map dump (see above)?"""
-    for j in range(i + 1, min(i + 400, len(lines))):
-        if any(p.search(lines[j]) for p in FATAL_PATTERNS):
-            return False                              # the next dump began first: no readable frame
-        if lines[j].startswith("Current thread 0x"):
-            return j + 1 < len(lines) and bool(KNOWN_UNICORN_DUMP.search(lines[j + 1]))
-    return False
 
 
 def fatal_findings(text: str, stream: str) -> list[str]:
     """Lines of captured pytest output that carry a fatal-exception marker, as 'stream line n: text'."""
-    lines = text.splitlines()
-    return [f"{stream} line {n}: {line.strip()[:160]}" for n, line in enumerate(lines, 1)
-            if any(p.search(line) for p in FATAL_PATTERNS) and not _known_unicorn_dump(lines, n - 1)]
+    return [f"{stream} line {n}: {line.strip()[:160]}" for n, line in enumerate(text.splitlines(), 1)
+            if any(p.search(line) for p in FATAL_PATTERNS)]
 
 
 def run_pytest(cmd: list[str]) -> tuple[int, list[str]]:
