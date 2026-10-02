@@ -89,7 +89,7 @@ Module paths are relative to `liebert_re/`.
 
 ### External-engine wrappers actually present
 
-rizin (listing, function inventory, patching), Detect It Easy, YARA-X, UPX,
+rizin (listing, function inventory, patching), Detect It Easy, YARA-X, capa, UPX,
 JADX, Il2CppDumper, and the API Monitor catalogue only. All are optional and
 return a named tool-missing status when absent. Function inventory
 (`rizin_functions`) needs rizin; it is not pure Python.
@@ -105,9 +105,9 @@ return a named tool-missing status when absent. Function inventory
   `report/analysis_findings.py`, `report/exploit_validation.py`. Partial:
   nothing in the package produces an IR from a binary.
 - Workspace path sandbox, bounded subprocess with process-tree teardown, and a
-  `liebert-re` CLI (`identify`, `probe`, `pe`, `disasm`, `packer`, `unpack`,
-  `scan`, `minidump`, `capabilities`): `workspace.py`, `bounded_subprocess.py`,
-  `cli.py`.
+  `liebert-re` CLI (`identify`, `probe`, `pe`, `disasm`, `packer`, `die`, `diestatus`,
+  `capa`, `capastatus`, `unpack`, `scan`, `minidump`, `capabilities`):
+  `workspace.py`, `bounded_subprocess.py`, `cli.py`.
 
 ### Dynamic and emulation
 
@@ -121,7 +121,7 @@ return a named tool-missing status when absent. Function inventory
 
 ### Test coverage
 
-65 test files; a default run on this checkout gave 527 passed, 39 skipped,
+67 test files; a default run on this checkout gave 527 passed, 39 skipped,
 157 deselected (`heavy`). Fixtures are built in code
 (`recover/owned_binary_fixtures.py`); no real binaries ship. Real-engine paths
 skip on a clean checkout, so CI does not demonstrate them.
@@ -191,7 +191,7 @@ sit on disk.
    there, but `rizin_functions` needs rizin.
 4. `INSTALL.md` counts: "64 Python modules at the repository root", "47 test
    files", "11 standalone challenge-solution scripts in `crackme_solutions/`".
-   Actual: 66 modules inside the `liebert_re/` package (CI asserts 66), 65 test
+   Actual: 67 modules inside the `liebert_re/` package (CI asserts 67), 67 test
    files, and no `crackme_solutions/` directory exists or is tracked.
 5. `README.md`, `BENCHMARKS.md` and `ROADMAP.md` refer to `crackme_solutions/`
    as shipped; `ROADMAP.md` "Start here" item 1 names a script that is not in

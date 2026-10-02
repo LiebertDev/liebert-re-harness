@@ -143,7 +143,7 @@ host rather than trusted by inspection.
 ## 4. Bounded execution
 
 `liebert_re/bounded_subprocess.py` is the single place every external engine call in this
-project goes through (`rizin`, `diec`, `yara-x`, and anything else that shells
+project goes through (`rizin`, `diec`, `yara-x`, `capa`, and anything else that shells
 out). Every call is wrapped with a time bound and an output-size bound, and
 every process it starts is one this module can find and kill by its own
 tracked identity later, not by trusting the tool's own well-behavedness.

@@ -136,11 +136,12 @@ subset *of*:
 
 **Scope warning, so this table is not misread.** It describes the **wider private
 working tree**, not this package. This package drives **rizin, Detect It Easy,
-YARA-X, API Monitor, UPX, JADX and Il2CppDumper** (plus a detect-only MSVC PDB
+YARA-X, API Monitor, capa, UPX, JADX and Il2CppDumper** (plus a detect-only MSVC PDB
 toolchain probe); see the README section "External tools are your responsibility".
-The IDA, Ghidra, capa, FLOSS, pe-sieve, angr and Frida integrations listed below
+The IDA, Ghidra, FLOSS, pe-sieve, angr and Frida integrations listed below
 are *not* in this package, and **this package does not contain or redistribute a
-capa or FLOSS binary** — it has no driver for either. The README lists what is
+capa or FLOSS binary** — capa is driven only if you install it, and there is no
+driver for FLOSS. The README lists what is
 deliberately excluded.
 
 The table is kept because it answers a different and still-useful question: which
@@ -154,7 +155,7 @@ distinction is usually where tool inventories lie.
 | rizin / radare2 | **Real** (rizin wrapper only in this package; no radare2 driver) — bounded subprocess wrapper |
 | Capstone, Unicorn | **Real** — in-process imports (Unicorn only for the VEX self-check in `recover/vex.py`; no range emulation ships) |
 | angr | **Not in this package** — nothing imports it |
-| capa | Real in the private tree only, where it is a separately obtained binary. **Not part of this package: no driver, nothing bundled** |
+| capa | **Real** (wrapper in `liebert_re/tools/capa.py`; the binary is separately obtained and is not bundled) |
 | FLOSS | Real in the private tree only, where it is a separately obtained binary. **Not part of this package: no driver, nothing bundled** |
 | Detect It Easy | **Real** — `diec.exe -j` |
 | pe-sieve, hollows_hunter, Frida | Real, **but isolated-VM only** by policy — never invoked on the host |

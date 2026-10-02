@@ -4,8 +4,8 @@
 
 Only what you need to run and develop the analysis code. Concretely:
 
-- **66 Python modules** in the `liebert_re/` package — the analysis code itself.
-- **65 test files** in `tests/`, plus `conftest.py` and an empty `__init__.py`
+- **67 Python modules** in the `liebert_re/` package — the analysis code itself.
+- **67 test files** in `tests/`, plus `conftest.py` and an empty `__init__.py`
   (the latter is required so the flat top-level modules resolve on `sys.path`).
 - No challenge-solution scripts: they were moved to the `archive/crackme-solutions` branch (see [SOLVED_INDEX.md](../SOLVED_INDEX.md)).
 - Documentation, licence, CI configuration, and issue templates.
@@ -127,8 +127,8 @@ system temp directory is outside the workspace unless you repoint the root, and
 one test file in the upstream tree failed for exactly that reason until it was
 fixed.
 
-Five modules write their own output *outside* this workspace root on purpose:
-`liebert_re/tools/binary.py` (`pe_resources`), `liebert_re/tools/die.py`, `liebert_re/tools/yara_x.py`,
+Six modules write their own output *outside* this workspace root on purpose:
+`liebert_re/tools/binary.py` (`pe_resources`), `liebert_re/tools/die.py`, `liebert_re/tools/capa.py`, `liebert_re/tools/yara_x.py`,
 `liebert_re/tools/rizin.py` (`binary_patch`) and `liebert_re/tools/upx.py` each persist their raw
 engine output under a module-level `dataset/evidence/<tool_name>/` directory
 inside the repository itself, which is git-ignored. The *input* file you pass
