@@ -19,7 +19,7 @@ Both polarities are covered:
 
 rizin itself is faked here (the real binary is exercised by
 tests/test_tools_rizin.py and tests/test_tools_rizin_disasm.py); the disk
-writes are real, against a throwaway copy of a real corpus PE inside the
+writes are real, against a throwaway copy of a PE built in code inside the
 workspace.
 """
 from __future__ import annotations
@@ -35,8 +35,29 @@ from unittest import mock
 import liebert_re.tools.rizin as tr
 from liebert_re.recover.pe_address import normalize_address
 
+from tests._pe_fixtures import build_pe
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
-LOGINCRACKME = REPO_ROOT / "benchmarks/windows_native_ladder/corpus/tier1/logincrackme/LoginCrackme.exe"
+
+# The tests patch a PE built in code (docs/CORPUS.md, "Fixtures for tests"), not a corpus binary the
+# contributor has to download. 0x20 bytes of padding, then a known `jz +10; xor eax, eax; inc eax; ret`
+# at .text + 0x20 -- the bytes the tests read, expect and overwrite -- then padding again.
+FIXTURE_CODE = bytes([0xCC]) * 0x20 + bytes([0x74, 0x0A, 0x31, 0xC0, 0x40, 0xC3]) + bytes([0xCC]) * 0x1A
+FIXTURE_BYTES = build_pe(FIXTURE_CODE)
+FIXTURE_PE = REPO_ROOT / "LoginCrackme_fixture.exe"      # replaced by setUpModule with a real temp file
+_FIXTURE_DIR = None
+
+
+def setUpModule():
+    global FIXTURE_PE, _FIXTURE_DIR
+    _FIXTURE_DIR = tempfile.TemporaryDirectory(dir=str(REPO_ROOT))
+    FIXTURE_PE = Path(_FIXTURE_DIR.name) / "LoginCrackme_fixture.exe"
+    FIXTURE_PE.write_bytes(FIXTURE_BYTES)
+
+
+def tearDownModule():
+    if _FIXTURE_DIR is not None:
+        _FIXTURE_DIR.cleanup()
 
 
 def _fake_cp(stdout="", stderr="", returncode=0, truncated=False):
@@ -56,7 +77,6 @@ def _dispatch(pdj_stdout, asm_stdout="nop\nnop\nnop\nnop\nnop"):
     return _run
 
 
-@unittest.skipUnless(LOGINCRACKME.is_file(), "tier1 LoginCrackme.exe corpus binary not present")
 class RizinFunctionsEmptyListPolarityTests(unittest.TestCase):
     """`aaa; aflj` printing an empty array is NOT the measurement
     "this binary has zero functions" unless rizin actually loaded the file.
@@ -65,10 +85,10 @@ class RizinFunctionsEmptyListPolarityTests(unittest.TestCase):
 
     def _run(self, stdout, truncated=False):
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
-             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=FIXTURE_PE), \
              mock.patch("liebert_re.tools.rizin.run_bounded_process",
                         return_value=_fake_cp(stdout=stdout, truncated=truncated)):
-            return json.loads(tr.rizin_functions(str(LOGINCRACKME), timeout_seconds=10))
+            return json.loads(tr.rizin_functions(str(FIXTURE_PE), timeout_seconds=10))
 
     def test_empty_list_without_load_probe_is_not_recoverable_not_zero_functions(self):
         data = self._run("[]\n")
@@ -175,27 +195,26 @@ class RizinFunctionsNonEmptyFabricationPolarityTests(unittest.TestCase):
         self.assertEqual(data["load_probe"]["status"], "PROBE_UNAVAILABLE")
 
 
-@unittest.skipUnless(LOGINCRACKME.is_file(), "tier1 LoginCrackme.exe corpus binary not present")
 class RizinDisasmCoverageTests(unittest.TestCase):
     """A listing that contains bytes rizin could not decode must say so."""
 
     @classmethod
     def setUpClass(cls):
         import pefile
-        pe = pefile.PE(data=LOGINCRACKME.read_bytes(), fast_load=True)
+        pe = pefile.PE(data=FIXTURE_PE.read_bytes(), fast_load=True)
         text = next(s for s in pe.sections if s.Name.startswith(b".text"))
         cls.file_offset = hex(int(text.PointerToRawData) + 0x20)
-        resolved = normalize_address(str(LOGINCRACKME), cls.file_offset, "file_offset")
+        resolved = normalize_address(str(FIXTURE_PE), cls.file_offset, "file_offset")
         assert resolved.get("ok"), resolved
         cls.va_int = int(resolved["va"], 16)
 
     def _listing(self, entries, truncated=False):
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
-             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=FIXTURE_PE), \
              mock.patch("liebert_re.tools.rizin.run_bounded_process",
                         return_value=_fake_cp(stdout=json.dumps(entries), truncated=truncated)):
             return json.loads(tr.rizin_disasm_listing(
-                str(LOGINCRACKME), self.file_offset, "file_offset", count=2, timeout_seconds=10))
+                str(FIXTURE_PE), self.file_offset, "file_offset", count=2, timeout_seconds=10))
 
     def test_undecodable_instruction_is_reported_as_partial_coverage(self):
         data = self._listing([
@@ -219,7 +238,6 @@ class RizinDisasmCoverageTests(unittest.TestCase):
         self.assertEqual(data["error"], "RIZIN_OUTPUT_TRUNCATED_AT_CAP")
 
 
-@unittest.skipUnless(LOGINCRACKME.is_file(), "tier1 LoginCrackme.exe corpus binary not present")
 class RizinPatchPlanNegativePolarityTests(unittest.TestCase):
     """"I could not decode this" must not be rendered as "this is not a
     conditional branch" -- the same polarity of defect as a slicer answering
@@ -232,11 +250,11 @@ class RizinPatchPlanNegativePolarityTests(unittest.TestCase):
     def _plan(self, entries, operation, instruction_count=1):
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
              mock.patch.object(tr, "_rizin_asm_binary", return_value="C:/fake/rz-asm.exe"), \
-             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=FIXTURE_PE), \
              mock.patch("liebert_re.tools.rizin.run_bounded_process",
                         side_effect=_dispatch(json.dumps(entries))):
             return json.loads(tr.rizin_patch_plan(
-                str(LOGINCRACKME), self.file_offset, operation, "file_offset",
+                str(FIXTURE_PE), self.file_offset, operation, "file_offset",
                 instruction_count=instruction_count, timeout_seconds=10))
 
     def test_undecodable_byte_is_not_recoverable_not_a_definite_negative(self):
@@ -287,11 +305,11 @@ class RizinPatchPlanNegativePolarityTests(unittest.TestCase):
                     "type": "nop", "opcode": "nop"}]
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
              mock.patch.object(tr, "_rizin_asm_binary", return_value="C:/fake/rz-asm.exe"), \
-             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=FIXTURE_PE), \
              mock.patch("liebert_re.tools.rizin.run_bounded_process",
                         side_effect=_dispatch(json.dumps(entries), asm_stdout="invalid\ninvalid\n")):
             data = json.loads(tr.rizin_patch_plan(
-                str(LOGINCRACKME), self.file_offset, "nop_out", "file_offset", timeout_seconds=10))
+                str(FIXTURE_PE), self.file_offset, "nop_out", "file_offset", timeout_seconds=10))
         self.assertFalse(data["ok"])
         self.assertEqual(data["status"], "DISASSEMBLY_FAILED")
         self.assertEqual(data["error"], "RZ_ASM_ROUNDTRIP_UNDECODABLE")
@@ -305,7 +323,6 @@ def _short_write(self, data):
     return len(data) // 2
 
 
-@unittest.skipUnless(LOGINCRACKME.is_file(), "tier1 LoginCrackme.exe corpus binary not present")
 class PatchWritePathVerificationTests(unittest.TestCase):
     """The patch paths modify a file, so a wrong answer here is not a wrong
     report -- it is a wrong file. Nothing may be reported as written that was
@@ -315,10 +332,10 @@ class PatchWritePathVerificationTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(dir=str(REPO_ROOT))
         self.addCleanup(self._tmp.cleanup)
         self.dir = Path(self._tmp.name)
-        self.target = self.dir / "LoginCrackme_copy.exe"
-        shutil.copy2(LOGINCRACKME, self.target)
+        self.target = self.dir / "Fixture_copy.exe"
+        shutil.copy2(FIXTURE_PE, self.target)
         self.original = self.target.read_bytes()
-        self.out = self.dir / "LoginCrackme_copy.patched.exe"
+        self.out = self.dir / "Fixture_copy.patched.exe"
 
     def _first_text_offset(self):
         import pefile
@@ -428,6 +445,41 @@ class PatchWritePathVerificationTests(unittest.TestCase):
         self.assertEqual(data["sha256_verified_from"], "READ_BACK_FROM_DISK")
         self.assertEqual(data["sha256_after"], hashlib.sha256(self.target.read_bytes()).hexdigest())
         self.assertEqual(self.target.read_bytes()[offset:offset + 2], b"\x90\x90")
+
+    def test_binary_patch_that_leaves_an_unparseable_pe_is_reverted_from_backup(self):
+        # binary_patch can only address section bytes, and pefile tolerates every single-byte change
+        # to this fixture's sections (measured), so a patch cannot really make the PE unparseable.
+        # The PE validator is therefore made to reject exactly the patched bytes, as it would a
+        # corrupted file; everything else (write, read-back, backup, revert) is real.
+        offset = self._first_text_offset()
+        real_open = tr._open_pe_from_bytes
+
+        def _reject_patched(data):
+            if bytes(data) != self.original:
+                raise ValueError("fixture: the patched image is not a valid PE")
+            return real_open(data)
+
+        with mock.patch.object(tr, "_open_pe_from_bytes", _reject_patched):
+            data = json.loads(tr.binary_patch(
+                str(self.target), "apply", self._one_patch(offset),
+                dry_run=False, in_place=True, backup=True))
+        self.assertFalse(data["ok"], data)
+        self.assertEqual(data["status"], "REVERTED_INVALID_PE")
+        self.assertFalse(data["pe_valid_after"])
+        self.assertEqual(self.target.read_bytes(), self.original,
+                         "an in-place patch that leaves an unparseable PE must be rolled back")
+        self.assertEqual(data["sha256_after"], hashlib.sha256(self.original).hexdigest())
+
+    def test_binary_patch_restore_puts_the_original_back_from_the_backup(self):
+        offset = self._first_text_offset()
+        applied = json.loads(tr.binary_patch(
+            str(self.target), "apply", self._one_patch(offset),
+            dry_run=False, in_place=True, backup=True))
+        self.assertTrue(applied["ok"], applied)
+        self.assertNotEqual(self.target.read_bytes(), self.original)
+        restored = json.loads(tr.binary_patch(str(self.target), "restore"))
+        self.assertTrue(restored["ok"], restored)
+        self.assertEqual(self.target.read_bytes(), self.original)
 
 
 if __name__ == "__main__":  # pragma: no cover
