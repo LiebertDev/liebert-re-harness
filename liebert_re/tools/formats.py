@@ -1,6 +1,6 @@
 """Bounded, read-only format/container/data inspection tools."""
 from __future__ import annotations
-import configparser,csv,hashlib,io,json,mimetypes,re,sqlite3,struct,tarfile,zipfile
+import configparser,csv,hashlib,io,json,mimetypes,re,sqlite3,struct,tarfile,zipfile,zlib
 import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime,timezone
@@ -184,8 +184,28 @@ def _looks_executable(data):
         if head[:len(magic)]==magic:return label
     return None
 
+_MEMBER_READ_ERRORS=(RuntimeError,NotImplementedError,zipfile.BadZipFile,zlib.error,EOFError,tarfile.TarError,OSError)
+
 def archive_inspect(path,operation='summary',query='',member='',max_results=200,max_chars=30000,dest_path='',password='',allow_executable_content=False):
-    p=safe_path(path); max_results=max(1,min(int(max_results),MAX_ARCHIVE_MEMBERS)); max_chars=max(1000,min(int(max_chars),MAX_RETURN_CHARS)); kind,obj,items=_archive_members(p)
+    p=safe_path(path); max_results=max(1,min(int(max_results),MAX_ARCHIVE_MEMBERS)); max_chars=max(1000,min(int(max_chars),MAX_RETURN_CHARS))
+    def _member_read_failure(base,member,exc,encrypted,has_pwd):
+        """Map every exception zipfile/tarfile can raise while READING one member
+        to a structured result (the wrapper contract: never raise, always JSON).
+        ZipCrypto's password check is a single byte, so a wrong password passes it
+        1 time in 256 and then fails later as a CRC error or a zlib error on
+        garbage. For an ENCRYPTED member those failures cannot be told apart from
+        genuinely corrupt data, so the status says so instead of claiming either."""
+        detail=str(exc)
+        if isinstance(exc,RuntimeError):
+            return _json({**base,'ok':False,'error':'BAD_PASSWORD' if has_pwd else 'PASSWORD_REQUIRED','member':member,'detail':detail})
+        if isinstance(exc,NotImplementedError):
+            return _json({**base,'ok':False,'error':'ENCRYPTION_UNSUPPORTED','member':member,'detail':detail})
+        if encrypted:
+            return _json({**base,'ok':False,'error':'BAD_PASSWORD_OR_CORRUPT_DATA','member':member,'detail':detail})
+        return _json({**base,'ok':False,'error':'CORRUPT_MEMBER','member':member,'detail':detail})
+    try:kind,obj,items=_archive_members(p)
+    except ValueError as exc:return _json({'ok':False,'tool':'archive_inspect','path':relative(p),'error':'UNSUPPORTED_ARCHIVE','detail':str(exc)})
+    except (zipfile.BadZipFile,tarfile.TarError,EOFError,zlib.error,OSError) as exc:return _json({'ok':False,'tool':'archive_inspect','path':relative(p),'error':'ARCHIVE_UNREADABLE','error_type':type(exc).__name__,'detail':str(exc)})
     try:
         total=sum(max(0,x['size']) for x in items); warnings=[]
         if len(items)>MAX_ARCHIVE_MEMBERS:warnings.append('MEMBER_LIMIT_EXCEEDED')
@@ -216,7 +236,14 @@ def archive_inspect(path,operation='summary',query='',member='',max_results=200,
             if _unsafe_member(hit['name']):return _json({**base,'ok':False,'status':'ANALYSIS_LIMITED','error':'PATH_TRAVERSAL_BLOCKED','member':member})
             if hit.get('is_symlink'):return _json({**base,'ok':False,'status':'ANALYSIS_LIMITED','error':'SYMLINK_MEMBER_BLOCKED','member':member})
             if hit['size']>MAX_ARCHIVE_MEMBER:return _json({**base,'ok':False,'error':'MEMBER_TOO_LARGE','member':member})
-            raw=obj.read(member) if kind=='zip' else obj.extractfile(next(x for x in obj.getmembers() if x.name==member)).read()
+            try:
+                if kind=='zip':raw=obj.read(member)
+                else:
+                    fileobj=obj.extractfile(next(x for x in obj.getmembers() if x.name==member))
+                    if fileobj is None:return _json({**base,'ok':False,'error':'MEMBER_NOT_A_REGULAR_FILE','member':member})
+                    raw=fileobj.read()
+            except _MEMBER_READ_ERRORS as exc:
+                return _member_read_failure(base,member,exc,bool(hit.get('encrypted')),False)
             if b'\x00' in raw[:4096]:return _json({**base,'ok':False,'error':'BINARY_MEMBER','member':member,'size':len(raw)})
             try:text=raw.decode('utf-8')
             except UnicodeDecodeError as e:return _json({**base,'ok':False,'error':'BINARY_MEMBER','member':member,'size':len(raw),'first_invalid_utf8_offset':e.start})
@@ -278,16 +305,16 @@ def archive_inspect(path,operation='summary',query='',member='',max_results=200,
                         return _json({**base,'ok':False,'error':'PASSWORD_REQUIRED','member':member})
                     try:
                         raw=obj.read(member,pwd=pwd) if pwd else obj.read(member)
-                    except RuntimeError as exc:
-                        return _json({**base,'ok':False,'error':'BAD_PASSWORD','member':member,'detail':str(exc)})
-                    except NotImplementedError as exc:
-                        return _json({**base,'ok':False,'error':'ENCRYPTION_UNSUPPORTED','member':member,'detail':str(exc)})
+                    except _MEMBER_READ_ERRORS as exc:
+                        return _member_read_failure(base,member,exc,bool(hit.get('encrypted')),bool(pwd))
                 else:
                     if password:return _json({**base,'ok':False,'error':'PASSWORD_NOT_SUPPORTED_FOR_TAR','member':member})
                     member_info=next(x for x in obj.getmembers() if x.name==member)
                     fileobj=obj.extractfile(member_info)
                     if fileobj is None:return _json({**base,'ok':False,'error':'MEMBER_NOT_A_REGULAR_FILE','member':member})
-                    raw=fileobj.read()
+                    try:raw=fileobj.read()
+                    except _MEMBER_READ_ERRORS as exc:
+                        return _member_read_failure(base,member,exc,False,False)
             except KeyError as exc:
                 return _json({**base,'ok':False,'error':'MEMBER_NOT_FOUND','member':member,'detail':str(exc)})
             executable_kind=_looks_executable(raw)

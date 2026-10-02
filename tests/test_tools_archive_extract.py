@@ -64,7 +64,18 @@ def _make_zip(path, members):
             z.writestr(name, data)
 
 
-def _make_zip_traditional_encrypted(path, name, data, password):
+# ZipCrypto's password check is a SINGLE byte (the last byte of the 12-byte
+# encryption header must equal the CRC's top byte), so a WRONG password passes
+# that check with probability 1/256 and only fails later as a CRC error. The
+# header's 11 filler bytes therefore decide whether a wrong-password test hits
+# the clean BAD_PASSWORD path or the collision path. Keep them seeded: an
+# unseeded RNG makes the suite flaky at ~1/256 per run. Seed 0 was verified to
+# give BAD_PASSWORD for "wrong-password"; seed 107 is the verified collision.
+_FIXTURE_SEED = 0
+_COLLIDING_SEED = 107
+
+
+def _make_zip_traditional_encrypted(path, name, data, password, seed=_FIXTURE_SEED):
     """Hand-builds a minimal, spec-valid ZIP with ONE STORED, traditional-
     PKWARE-(ZipCrypto)-encrypted entry -- the scheme stdlib zipfile can
     actually DECRYPT (unlike AES, which it can only detect, never read).
@@ -126,8 +137,9 @@ def _make_zip_traditional_encrypted(path, name, data, password):
 
     raw = data
     crc = zlib.crc32(raw) & 0xFFFFFFFF
+    rng = random.Random(seed)
     enc = _Encrypter(password.encode("utf-8"))
-    header = bytes(random.randint(0, 255) for _ in range(11)) + bytes([(crc >> 24) & 0xFF])
+    header = bytes(rng.randint(0, 255) for _ in range(11)) + bytes([(crc >> 24) & 0xFF])
     encrypted = bytes(enc.encrypt(b) for b in header) + bytes(enc.encrypt(b) for b in raw)
 
     name_bytes = name.encode("utf-8")
@@ -325,6 +337,46 @@ class TestExtractOutcomes(_ScratchGuard):
                                              password="wrong-password"))
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "BAD_PASSWORD")
+
+    def test_wrong_password_that_passes_zipcrypto_check_is_honest_not_a_crash(self):
+        # Seed 107 builds an encryption header for which "wrong-password" slips
+        # past ZipCrypto's 1-byte check, so zipfile raises BadZipFile (bad CRC)
+        # instead of RuntimeError. That cannot be told apart from corrupt data,
+        # so the status must not claim BAD_PASSWORD, and must not raise.
+        archive = _SCRATCH / "enc_collision.zip"
+        _make_zip_traditional_encrypted(archive, "secret.txt", b"the real content", "s3cr3t",
+                                        seed=_COLLIDING_SEED)
+        result = json.loads(archive_inspect(str(archive), operation="extract",
+                                             member="secret.txt", dest_path=self._dest("out.txt"),
+                                             password="wrong-password"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "BAD_PASSWORD_OR_CORRUPT_DATA")
+        self.assertIn("CRC", result["detail"])
+        self.assertFalse((_SCRATCH / "out.txt").exists())
+
+    def test_corrupt_unencrypted_zip_member_is_corrupt_member(self):
+        archive = _SCRATCH / "corrupt.zip"
+        payload = b"payload that will be damaged on disk"
+        _make_zip(archive, {"a.txt": payload})
+        blob = bytearray(archive.read_bytes())
+        offset = blob.index(payload)  # stored member data
+        blob[offset] ^= 0xFF  # CRC no longer matches
+        archive.write_bytes(bytes(blob))
+        for operation, kwargs in (("extract", {"dest_path": self._dest("out.txt")}), ("read", {})):
+            with self.subTest(operation=operation):
+                result = json.loads(archive_inspect(str(archive), operation=operation,
+                                                     member="a.txt", **kwargs))
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["error"], "CORRUPT_MEMBER")
+                self.assertIn("CRC", result["detail"])
+        self.assertFalse((_SCRATCH / "out.txt").exists())
+
+    def test_unreadable_archive_container_is_structured_not_raised(self):
+        archive = _SCRATCH / "notarchive.zip"
+        archive.write_bytes(b"this is not an archive at all")
+        result = json.loads(archive_inspect(str(archive)))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "UNSUPPORTED_ARCHIVE")
 
     def test_encrypted_zip_member_with_correct_password_extracts(self):
         data = b"the real content"
