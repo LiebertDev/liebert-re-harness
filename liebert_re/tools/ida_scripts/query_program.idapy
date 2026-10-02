@@ -1,0 +1,500 @@
+"""IDAPython worker for ``liebert_re.tools.ida`` (``ida_query``).
+
+Runs INSIDE idat's own interpreter, never in the harness venv: only the
+standard library and IDA's ``ida_*`` / ``idaapi`` / ``idautils`` / ``idc``
+modules are importable here, and this file must not import anything from
+``liebert_re``. The wrapper copies it into a private work directory as
+``liebert_ida_job.py`` (BOM-free: a UTF-8 BOM makes IDAPython fail with
+``invalid non-printable character U+FEFF``) and launches
+
+    idat -A -c -Opdb:off -Lida.log -odb.i64 -Sliebert_ida_job.py <input>
+
+for a first analysis, or ``idat -A -Opdb:off -Lida.log -Sliebert_ida_job.py db.i64``
+to reopen the cached database.
+
+The job is NOT passed through ``-S``'s own argument re-splitting (quotes and
+spaces in a path or a query corrupt it). The wrapper writes a JSON job file
+and names it in the ``LIEBERT_IDA_JOB`` environment variable:
+
+    {"output": "<abs path>", "operation": "...", "query": "...",
+     "max_results": 200, "offset": 0, "mode": "create" | "reopen"}
+
+``create`` (the first analysis of a file) only ever runs ``summary``; every
+other operation runs in a ``reopen`` session on the cached database, which
+marks the session temporary so that a query cannot change the cache.
+
+The result is written to ``output`` as UTF-8 JSON, atomically (temp file then
+``os.replace``), and the file carries ``"script_completed": true`` as its last
+key. The wrapper treats a missing file or a missing marker as failure; it
+never reads success from idat's exit code (a broken script exits 1 and
+leaves loose .id0/.id1/.id2/.nam/.til files, a working one exits 0, and a
+script that raised before writing can still exit 0).
+
+Read-only: nothing in this file renames, comments, patches or retypes
+anything. Write operations are a separate, later change.
+"""
+import json
+import os
+import sys
+import time
+import traceback
+
+import ida_auto
+import ida_funcs
+import ida_hexrays
+import ida_ida
+import ida_loader
+import ida_name
+import ida_nalt
+import ida_pro
+import ida_segment
+import ida_xref
+import idaapi
+import idautils
+import idc
+
+JOB_ENV = "LIEBERT_IDA_JOB"
+
+_OPERATIONS = (
+    "summary", "list_functions", "segments", "function_at_address",
+    "decompile_function", "xrefs_to", "imports_exports", "strings",
+)
+
+# Defense-in-depth ceilings for the two walks whose size is controlled by the
+# target, not the caller. Deliberately not equal to ``max_results`` (which the
+# wrapper clamps to 1000): a guard that only ever matches the value it guards
+# against never trips. A pathological import table or string list is stopped
+# with a structured ``walk_limit`` (the wrapper reports PARTIAL) instead of an
+# unbounded walk.
+_WALK_MAX_ITEMS = 50_000
+_WALK_MAX_SECONDS = 120.0
+
+
+class _Budget:
+    """Item-count and wall-clock ceiling for one walk."""
+
+    def __init__(self, label, max_items=_WALK_MAX_ITEMS, max_seconds=_WALK_MAX_SECONDS):
+        self.label = label
+        self.max_items = max_items
+        self.max_seconds = max_seconds
+        self.items = 0
+        self.started = time.monotonic()
+        self.tripped = None
+
+    def tick(self):
+        """Count one item; True once a ceiling is reached (stop walking)."""
+        self.items += 1
+        if self.items >= self.max_items:
+            self.tripped = "MAX_ITEMS"
+        elif (self.items & 0xFF) == 0 and time.monotonic() - self.started > self.max_seconds:
+            self.tripped = "MAX_SECONDS"
+        return self.tripped is not None
+
+    def as_limited(self):
+        return {
+            "walk_limit": {"walk": self.label, "reason": self.tripped, "items_visited": self.items,
+                           "max_items": self.max_items, "max_seconds": self.max_seconds},
+        }
+
+
+def _job():
+    path = os.environ.get(JOB_ENV, "").strip()
+    if not path:
+        return None, "MISSING_JOB_ENV"
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            job = json.load(handle)
+    except Exception as exc:  # noqa: BLE001
+        return None, "JOB_UNREADABLE: %s: %s" % (type(exc).__name__, exc)
+    if not isinstance(job, dict) or not job.get("output"):
+        return None, "JOB_MALFORMED"
+    return job, None
+
+
+def _safe(callable_, default=None):
+    try:
+        return callable_()
+    except Exception:  # noqa: BLE001 - one unavailable field never fails the query
+        return default
+
+
+def _hex(value):
+    return hex(value) if isinstance(value, int) else None
+
+
+def _hexdigest(value):
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    return str(value) if value else None
+
+
+def _func_json(ea):
+    return {
+        "name": ida_name.get_name(ea),
+        "address": hex(ea),
+        "signature": idc.get_type(ea) or "",
+    }
+
+
+def _address_form(ea):
+    """The five-field address shape (file offset, RVA, VA, image base,
+    section), built from IDA's own loader state, not a hardcoded delta."""
+    if ea is None or ea == idc.BADADDR:
+        return {"resolved": False, "error": "BADADDR"}
+    file_offset = idaapi.get_fileregion_offset(ea)
+    if file_offset is None or file_offset < 0:
+        return {"resolved": False, "error": "NO_FILE_OFFSET", "va": hex(ea)}
+    image_base = ida_nalt.get_imagebase()
+    return {
+        "file_offset": hex(file_offset),
+        "rva": hex(ea - image_base),
+        "va": hex(ea),
+        "image_base": hex(image_base),
+        "section": idc.get_segm_name(ea) or "",
+    }
+
+
+def _parse_address(text):
+    try:
+        return int(str(text), 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_name_or_address(query):
+    """A symbol name, or a raw hex/decimal virtual address. Returns an ea or
+    None. A raw address must sit inside a loaded segment."""
+    if not query:
+        return None
+    ea = idc.get_name_ea_simple(query)
+    if ea != idc.BADADDR:
+        return ea
+    value = _parse_address(query)
+    if value is None or value == idc.BADADDR:
+        return None
+    return value if idc.get_segm_name(value) else None
+
+
+def _resolve_function(query):
+    ea = _resolve_name_or_address(query)
+    if ea is None:
+        return None
+    func = ida_funcs.get_func(ea)
+    return func.start_ea if func else None
+
+
+def _settled_function_count():
+    """Auto-analysis can still be settling after the first ``auto_wait()``
+    (functions are created only once xrefs from a prior pass are processed),
+    so a single count right after it can undercount on a fresh database
+    compared with a reopened one. Loop wait+count until two consecutive
+    counts agree."""
+    passes = 1
+    count = sum(1 for _ in idautils.Functions())
+    previous = None
+    while previous != count and passes < 5:
+        previous = count
+        ida_auto.auto_wait()
+        count = sum(1 for _ in idautils.Functions())
+        passes += 1
+    return count, passes, (passes >= 5 and previous != count)
+
+
+def _op_summary(result, query, max_results, offset):
+    count, passes, unstable = _settled_function_count()
+    result["function_count"] = count
+    result["analysis_passes"] = passes
+    result["analysis_unstable"] = unstable
+    result["segment_count"] = sum(1 for _ in idautils.Segments())
+    result["hexrays_available"] = bool(_safe(ida_hexrays.init_hexrays_plugin, False))
+    result["hexrays_version"] = _safe(ida_hexrays.get_hexrays_version) if result["hexrays_available"] else None
+    result["processor"] = _safe(ida_ida.inf_get_procname)
+    result["is_64bit"] = _safe(ida_ida.inf_is_64bit)
+    result["file_type"] = _safe(ida_loader.get_file_type_name)
+    result["image_base"] = _hex(_safe(ida_nalt.get_imagebase))
+    result["ida_kernel_version"] = _safe(idaapi.get_kernel_version)
+
+
+def _op_list_functions(result, query, max_results, offset):
+    # Paged: ``total_function_count`` is the real count regardless of page
+    # size and ``next_offset`` is null at the end, so a caller can loop on
+    # ``while next_offset is not None`` without knowing the total up front.
+    functions = list(idautils.Functions())
+    page = functions[offset:offset + max_results]
+    result["items"] = [_func_json(ea) for ea in page]
+    result["total_function_count"] = len(functions)
+    result["offset"] = offset
+    result["returned_count"] = len(page)
+    following = offset + len(page)
+    result["next_offset"] = following if following < len(functions) else None
+
+
+def _perm_text(perm):
+    return "".join(c if perm & bit else "-" for c, bit in (("r", 4), ("w", 2), ("x", 1)))
+
+
+def _op_segments(result, query, max_results, offset):
+    segments = list(idautils.Segments())
+    page = segments[offset:offset + max_results]
+    for start in page:
+        seg = ida_segment.getseg(start)
+        result["items"].append({
+            "name": ida_segment.get_segm_name(seg),
+            "start": hex(seg.start_ea),
+            "end": hex(seg.end_ea),
+            "perms": seg.perm,
+            "perms_text": _perm_text(seg.perm),
+        })
+    result["total_segment_count"] = len(segments)
+    result["offset"] = offset
+    result["returned_count"] = len(page)
+    following = offset + len(page)
+    result["next_offset"] = following if following < len(segments) else None
+
+
+def _op_function_at_address(result, query, max_results, offset):
+    ea = _resolve_function(query)
+    if ea is None:
+        result["ok"] = False
+        result["error"] = "FUNCTION_NOT_FOUND"
+        return
+    result["items"].append(_func_json(ea))
+
+
+def _op_decompile_function(result, query, max_results, offset):
+    ea = _resolve_function(query)
+    if ea is None:
+        result["ok"] = False
+        result["error"] = "FUNCTION_NOT_FOUND"
+        return
+    result["items"].append(_func_json(ea))
+    if not ida_hexrays.init_hexrays_plugin():
+        result["ok"] = False
+        result["error"] = "HEXRAYS_NOT_AVAILABLE"
+        return
+    try:
+        cfunc = ida_hexrays.decompile(ea)
+    except ida_hexrays.DecompilationFailure as exc:
+        result["ok"] = False
+        result["error"] = "HEXRAYS_DECOMPILE_FAILED"
+        result["detail"] = str(exc)
+        return
+    if cfunc is None:
+        result["ok"] = False
+        result["error"] = "HEXRAYS_DECOMPILE_FAILED"
+        return
+    result["decompiled"] = str(cfunc)
+
+
+def _op_xrefs_to(result, query, max_results, offset):
+    # Not restricted to function starts: a great many real targets are data
+    # or import-table slots, which IDA places as data items, not functions.
+    ea = _resolve_name_or_address(query)
+    if ea is None:
+        result["ok"] = False
+        result["error"] = "SYMBOL_NOT_FOUND"
+        return
+    result["resolved_address"] = hex(ea)
+    call_types = (ida_xref.fl_CF, ida_xref.fl_CN)  # call far / call near; jumps are not calls
+    refs = list(idautils.XrefsTo(ea))
+    result["total_xref_count"] = len(refs)
+    for xref in refs[offset:offset + max_results]:
+        func = ida_funcs.get_func(xref.frm)
+        result["items"].append({
+            "from": hex(xref.frm),
+            "from_function": ida_name.get_name(func.start_ea) if func else None,
+            "type": xref.type,
+            "type_name": _safe(lambda: idautils.XrefTypeName(xref.type)),
+            "is_call": bool(xref.iscode) and xref.type in call_types,
+        })
+    result["offset"] = offset
+    following = offset + len(result["items"])
+    result["next_offset"] = following if following < len(refs) else None
+
+
+def _op_imports_exports(result, query, max_results, offset):
+    budget = _Budget("imports_exports")
+    result["exports"] = []
+    module_count = ida_nalt.get_import_module_qty()
+    state = {"seen": 0, "stop": False}
+
+    def collect(ea, name, ordinal, module):
+        state["seen"] += 1
+        if state["seen"] > offset:
+            if len(result["items"]) >= max_results:
+                state["stop"] = True
+                return False
+            result["items"].append({
+                "module": module, "name": name or None,
+                "ordinal": ordinal or None, "address": _address_form(ea),
+            })
+        if budget.tick():
+            state["stop"] = True
+            return False
+        return True
+
+    for index in range(module_count):
+        module = ida_nalt.get_import_module_name(index) or ""
+        ida_nalt.enum_import_names(index, lambda ea, name, ordinal, m=module: collect(ea, name, ordinal, m))
+        if state["stop"]:
+            break
+    for _index, ordinal, ea, name in idautils.Entries():
+        if len(result["exports"]) >= max_results or budget.tick():
+            break
+        result["exports"].append({"name": name or None, "ordinal": ordinal, "address": _address_form(ea)})
+    result["import_module_count"] = module_count
+    result["offset"] = offset
+    result["imports_truncated"] = state["stop"]
+    if budget.tripped:
+        result.update(budget.as_limited())
+
+
+def _op_strings(result, query, max_results, offset):
+    # ``query``, when non-empty, is a case-insensitive substring filter on the
+    # decoded value. ``max_results`` caps the RETURNED (matched) items; with a
+    # filter the walk continues past it (bounded by the budget, not by
+    # max_results) so a match beyond the first max_results scanned entries is
+    # still found. ``items_scanned`` / ``items_matched`` tell an empty result
+    # from a truncated one.
+    budget = _Budget("strings")
+    needle = (query or "").lower()
+    scanned = matched = 0
+    try:
+        listing = idautils.Strings()
+    except Exception:  # noqa: BLE001
+        listing = []
+    for entry in listing:
+        if not needle and len(result["items"]) >= max_results:
+            break
+        scanned += 1
+        value = _safe(lambda: str(entry))
+        if not needle or (value is not None and needle in value.lower()):
+            matched += 1
+            if matched > offset and len(result["items"]) < max_results:
+                result["items"].append({
+                    "address": _address_form(entry.ea),
+                    "length": entry.length,
+                    "encoding": entry.strtype,
+                    "value": value,
+                })
+        if budget.tick():
+            break
+    result["items_scanned"] = scanned
+    result["items_matched"] = matched
+    result["offset"] = offset
+    if budget.tripped:
+        result.update(budget.as_limited())
+
+
+_DISPATCH = {
+    "summary": _op_summary,
+    "list_functions": _op_list_functions,
+    "segments": _op_segments,
+    "function_at_address": _op_function_at_address,
+    "decompile_function": _op_decompile_function,
+    "xrefs_to": _op_xrefs_to,
+    "imports_exports": _op_imports_exports,
+    "strings": _op_strings,
+}
+
+
+def _discard_session_changes():
+    """Reopen mode only: mark the session's database temporary so IDA does
+    not write this session's changes back on exit. Never in create mode: a
+    new database marked temporary is deleted on exit (measured: no `.i64` is
+    produced, which the wrapper's four-signal check reports as
+    IDA_NO_DATABASE).
+
+    Measured on IDA 9.4: without this, decompiling one function persists the
+    types the decompiler inferred (`signature` of that function changes from
+    empty to `__int64 __fastcall(__int64)`), so a later `list_functions` on the
+    same cached database answers differently depending on what was asked
+    before it, and every reopen rewrites the whole `.i64` (hundreds of MB for
+    a large target). With the flag set, the file is byte-identical after the
+    session and the changes are not kept. The flag is set before any
+    operation runs, so a worker that dies mid-query cannot save a half-made
+    change. Returns False if this IDA build does not offer the flag; the
+    wrapper reports `database_changes_discarded: false` and the cached database
+    may then pick up inferred types from decompile operations."""
+    try:
+        ida_loader.set_database_flag(ida_loader.DBFL_TEMP)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _stamp_input_identity(result):
+    """What idat says it analysed. The wrapper compares this with the hash of
+    the file the caller named, so a cache slot whose bytes drifted from its
+    name cannot return a result computed over the wrong file."""
+    result["engine_input_sha256"] = _hexdigest(_safe(ida_nalt.retrieve_input_file_sha256))
+    result["engine_input_md5"] = _hexdigest(_safe(ida_nalt.retrieve_input_file_md5))
+
+
+def _run(job):
+    operation = str(job.get("operation") or "")
+    result = {"ok": True, "tool": "ida_query", "operation": operation, "items": []}
+    try:
+        if operation not in _DISPATCH:
+            result["ok"] = False
+            result["error"] = "UNKNOWN_OPERATION"
+            result["allowed"] = list(_OPERATIONS)
+        else:
+            ida_auto.auto_wait()
+            if job.get("mode") == "reopen":
+                result["database_changes_discarded"] = _discard_session_changes()
+            max_results = max(1, min(int(job.get("max_results") or 200), 1000))
+            offset = max(0, int(job.get("offset") or 0))
+            _DISPATCH[operation](result, str(job.get("query") or ""), max_results, offset)
+            result["count"] = len(result["items"])
+    except Exception:  # noqa: BLE001
+        result = {"ok": False, "tool": "ida_query", "operation": operation,
+                  "error": "IDAPYTHON_SCRIPT_EXCEPTION", "traceback": traceback.format_exc()}
+    _stamp_input_identity(result)
+    return result
+
+
+def _write_result(path, result):
+    result["script_completed"] = True  # last key: a truncated file cannot carry it
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(result, handle, ensure_ascii=False, indent=2)
+    os.replace(temporary, path)
+
+
+def main():
+    job, problem = _job()
+    if job is None:
+        sys.stderr.write("liebert_ida_job: %s\n" % problem)
+        return 2
+    try:
+        result = _run(job)
+        _write_result(job["output"], result)
+        if job.get("mode") == "create":
+            # Explicit, idempotent save of the analysed database. Create mode
+            # only ever runs the non-mutating `summary`: the wrapper answers
+            # every other operation from a second, reopen-mode session, so the
+            # cached database is the pristine analysis. The wrapper promotes
+            # the file only after every success signal agrees.
+            _safe(lambda: ida_loader.save_database("", 0))
+        return 0
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return 3
+
+
+def _entry():
+    """Run the job, then ALWAYS leave through ``qexit`` so idat never waits
+    for input (``-A`` suppresses dialogs, not the interactive session)."""
+    code = 4
+    try:
+        code = main()
+    finally:
+        ida_pro.qexit(code)
+
+
+# IDAPython runs a ``-S`` script with ``__name__ == "__main__"``. Importing
+# this file anywhere else (the unit tests, with stub ``ida_*`` modules) must
+# have no side effects.
+if __name__ == "__main__":
+    _entry()

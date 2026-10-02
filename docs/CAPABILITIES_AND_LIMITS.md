@@ -87,9 +87,29 @@ Module paths are relative to `liebert_re/`.
 - Packer identification (Detect It Easy) and rule scanning (YARA-X):
   `tools/die.py`, `tools/yara_x.py`.
 
+### Decompilation and cross-references (needs a licensed IDA)
+
+- `tools/ida.py`: `ida_query` (read-only) and `ida_status`, driving IDA Pro 9.x headless
+  (`idat -A`) in a bounded subprocess. Operations: `summary`, `list_functions`, `segments`,
+  `function_at_address`, `decompile_function` (Hex-Rays pseudocode), `xrefs_to` (any symbol or
+  address, including import slots; calls are flagged, jumps are not calls), `imports_exports`,
+  `strings`. Listings page with `offset` / `next_offset`.
+- Partial, by design: symbol-server (PDB download) lookups are switched off on every launch, so names
+  that exist only in a PDB are absent. IDA's auto-analysis can miss or mis-split code in obfuscated or
+  packed targets, so an absent function or xref is not proof of absence. Pseudocode is IDA's reading,
+  not the source. An IDA database is not accepted as input.
+- The first call on a file pays for IDA's analysis (two idat sessions); later calls reuse a database
+  cached by the input file's SHA-256 (`dataset/ida_cache/`, 5 GiB cap by default). `timeout_seconds`
+  is one budget clamped to 5-600 s: the first analysis may use all of it (it runs once per file
+  content), the session that answers a question never runs longer than 300 s. A timed-out analysis
+  is discarded, not half-cached, and is reported as `TIMEOUT`, never as "nothing found". A listing
+  cut short by a walk ceiling or by `max_chars` is `PARTIAL` and names the ceiling and its value.
+- Not here: renaming, comments, patch planning, microcode, type-member offsets, disassembly listing,
+  and any Ghidra wrapper.
+
 ### External-engine wrappers actually present
 
-rizin (listing, function inventory, patching), Detect It Easy, YARA-X, capa, UPX,
+rizin (listing, function inventory, patching), Detect It Easy, YARA-X, capa, IDA (read-only, see above), UPX,
 JADX, Il2CppDumper, and the API Monitor catalogue only. All are optional and
 return a named tool-missing status when absent. Function inventory
 (`rizin_functions`) needs rizin; it is not pure Python.
@@ -106,7 +126,7 @@ return a named tool-missing status when absent. Function inventory
   nothing in the package produces an IR from a binary.
 - Workspace path sandbox, bounded subprocess with process-tree teardown, and a
   `liebert-re` CLI (`identify`, `probe`, `pe`, `disasm`, `packer`, `die`, `diestatus`,
-  `capa`, `capastatus`, `unpack`, `scan`, `minidump`, `capabilities`):
+  `capa`, `capastatus`, `ida`, `idastatus`, `unpack`, `scan`, `minidump`, `capabilities`):
   `workspace.py`, `bounded_subprocess.py`, `cli.py`.
 
 ### Dynamic and emulation
@@ -121,10 +141,13 @@ return a named tool-missing status when absent. Function inventory
 
 ### Test coverage
 
-67 test files; a default run on this checkout gave 527 passed, 39 skipped,
-157 deselected (`heavy`). Fixtures are built in code
+68 test files; a default run on this checkout gave 527 passed, 39 skipped,
+157 deselected (`heavy`), before the IDA wrapper's tests were added. Fixtures are built in code
 (`recover/owned_binary_fixtures.py`); no real binaries ship. Real-engine paths
 skip on a clean checkout, so CI does not demonstrate them.
+The IDA wrapper's default-tier tests drive the real wrapper code against a stand-in `idat` that writes
+what the real tool writes (log, packed database, result file); only the `IdaRealInstallTests` class runs
+a real IDA, is marked `heavy`, and skips when idat is absent.
 
 ## Part 2: Where it is weak
 
@@ -144,9 +167,10 @@ skip on a clean checkout, so CI does not demonstrate them.
   isolation.
 - No kernel-debugger or live-kernel integration, and no parser for kernel-dump
   formats. Only `MDMP`-format dumps are read.
-- No decompiler (IDA and Ghidra wrappers are not here), and no cross-reference
-  engine that works from real binary bytes; `recover/native_xref.py` resolves
-  only over an IR the caller supplies.
+- No decompiler and no cross-reference engine of its own. With a licensed IDA Pro 9.x on the
+  machine, `ida_query` supplies decompiled pseudocode and cross-references from IDA's analysis of
+  the real bytes (read-only, symbol-server lookups off); without IDA there is neither, and no Ghidra
+  wrapper exists. `recover/native_xref.py` resolves only over an IR the caller supplies.
 - The package has never been demonstrated against a real kernel-mode file. The
   only driver-flavoured artefact is a synthetic fixture in
   `recover/owned_binary_fixtures.py`; kernel-oriented wording in
@@ -179,9 +203,9 @@ skip on a clean checkout, so CI does not demonstrate them.
 Checked against code on this checkout, reading the locally modified docs as they
 sit on disk.
 
-1. `README.md` introduction says the harness exposes IDA and Ghidra. No wrapper
-   for either exists in the package. The README's later scope section and
-   `INSTALL.md` say so correctly; the introduction contradicts them.
+1. `README.md` introduction said the harness exposes IDA and Ghidra. An IDA wrapper now exists
+   (read-only, `tools/ida.py`); no Ghidra wrapper does. The introduction, scope section and
+   `INSTALL.md` now say the same thing.
 2. `README.md` "What it cannot do" says "Mobile targets. No APK/DEX support".
    `tools/dex.py`, `tools/android.py` and `tools/jvm.py` ship (structure only).
    `ROADMAP.md` has the corrected wording.
@@ -191,7 +215,7 @@ sit on disk.
    there, but `rizin_functions` needs rizin.
 4. `INSTALL.md` counts: "64 Python modules at the repository root", "47 test
    files", "11 standalone challenge-solution scripts in `crackme_solutions/`".
-   Actual: 67 modules inside the `liebert_re/` package (CI asserts 67), 67 test
+   Actual: 68 modules inside the `liebert_re/` package (CI asserts 68), 68 test
    files, and no `crackme_solutions/` directory exists or is tracked.
 5. `README.md`, `BENCHMARKS.md` and `ROADMAP.md` refer to `crackme_solutions/`
    as shipped; `ROADMAP.md` "Start here" item 1 names a script that is not in

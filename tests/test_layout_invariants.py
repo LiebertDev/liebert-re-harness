@@ -20,8 +20,8 @@ import liebert_re.report.tool_families as tool_families
 # duplicates it.
 EVIDENCE_OWNERS = {
     "liebert_re.dynamic.apimonitor", "liebert_re.tools.binary", "liebert_re.tools.capa",
-    "liebert_re.tools.die", "liebert_re.tools.rizin", "liebert_re.tools.upx",
-    "liebert_re.tools.yara_x",
+    "liebert_re.tools.die", "liebert_re.tools.ida", "liebert_re.tools.rizin",
+    "liebert_re.tools.upx", "liebert_re.tools.yara_x",
 }
 
 
@@ -63,7 +63,16 @@ def test_published_tool_name_set_is_unchanged():
     # Updated again: liebert_re/tools/capa.py wraps capa (capa_analyze was already
     # a FAMILIES name with no implementation here; capa_status is new), reached from
     # the CLI as `capa` and `capastatus`.
+    #
+    # Updated again: liebert_re/tools/ida.py wraps IDA Pro's headless batch mode. The public
+    # functions added on purpose are ida_query (already a FAMILIES name with no implementation
+    # here) and ida_status (new); the CLI reaches them as `ida` and `idastatus` through the
+    # handlers _ida and _ida_status in cli.py. The set pinned below counts every top-level
+    # function name, private helpers included, so the module's own underscore helpers moved
+    # the digest too; only the two public names are a claim about the published surface.
+    # The IDAPython worker it drives is a data file (ida_scripts/query_program.idapy), not a
+    # module, so it adds no names here.
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "c607e9beb3671f636dd3a657a3b6b092bddab5ea2c71a15d45ee7d8d27efaa14"
+    assert digest == "424c827ea212c8c68ba8ddc66b838cf14138c6c4998d70ef4b59d626fd9fa708"

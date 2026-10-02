@@ -136,12 +136,12 @@ subset *of*:
 
 **Scope warning, so this table is not misread.** It describes the **wider private
 working tree**, not this package. This package drives **rizin, Detect It Easy,
-YARA-X, API Monitor, capa, UPX, JADX and Il2CppDumper** (plus a detect-only MSVC PDB
+YARA-X, API Monitor, capa, IDA (read-only), UPX, JADX and Il2CppDumper** (plus a detect-only MSVC PDB
 toolchain probe); see the README section "External tools are your responsibility".
-The IDA, Ghidra, FLOSS, pe-sieve, angr and Frida integrations listed below
+The Ghidra, FLOSS, pe-sieve, angr and Frida integrations listed below
 are *not* in this package, and **this package does not contain or redistribute a
-capa or FLOSS binary** — capa is driven only if you install it, and there is no
-driver for FLOSS. The README lists what is
+capa, FLOSS or IDA binary** — capa and IDA are driven only if you install them, and
+there is no driver for FLOSS. The README lists what is
 deliberately excluded.
 
 The table is kept because it answers a different and still-useful question: which
@@ -150,7 +150,7 @@ distinction is usually where tool inventories lie.
 
 | Engine | Integration |
 |---|---|
-| IDA (Professional) | **Real** — `idat.exe -A -S` batch, content-hash-keyed database cache |
+| IDA (Professional) | **Real, read-only subset in this package** — `idat -A` batch in a bounded subprocess, database cache keyed by the input file's SHA-256 and size-capped; write operations and microcode are in the private tree only |
 | Ghidra | **Real** — `analyzeHeadless`, session-scoped project |
 | rizin / radare2 | **Real** (rizin wrapper only in this package; no radare2 driver) — bounded subprocess wrapper |
 | Capstone, Unicorn | **Real** — in-process imports (Unicorn only for the VEX self-check in `recover/vex.py`; no range emulation ships) |

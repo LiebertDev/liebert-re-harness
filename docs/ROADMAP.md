@@ -79,12 +79,17 @@ hidden feature.
   anything like slicing.
 - **IDA and Ghidra wrappers** (headless decompilation, cross-references,
   callers/callees, answers normalised across engines so a caller does not need to
-  know which one ran). The README section "External tools are your responsibility" lists what this
-  package drives (rizin, Detect It Easy, YARA-X, API Monitor, UPX, JADX,
-  Il2CppDumper); IDA and Ghidra are not among them. A Ghidra wrapper is the more
-  approachable half of this, since `analyzeHeadless` is scriptable and free to
-  install; an IDA wrapper needs a licensed copy to test against and is a bigger
-  commitment.
+  know which one ran). **Partly done.** The read-only half of an IDA wrapper
+  ships (`liebert_re/tools/ida.py`: `ida_query`, `ida_status`; summary, function list,
+  segments, function-at-address, Hex-Rays pseudocode, cross-references, imports/exports,
+  strings; database cache keyed by input hash and size-capped; PDB downloads off). It
+  needs a licensed IDA Pro 9.x, so CI cannot exercise it: the default tier tests the
+  wrapper against a stand-in `idat`, and one `heavy` class runs the real thing locally.
+  **Still open:** `ida_disasm_listing` and `ida_type_member_offset` (read-only, next
+  round), the write operations (`ida_rename`, `ida_set_comments`, which persist into the
+  database and so need an audit log, and `ida_patch_plan`), microcode export, a Ghidra
+  wrapper (the more approachable half, since `analyzeHeadless` is scriptable and free to
+  install), and normalising answers across engines.
 - **Function-boundary recovery from exception-directory unwind data**, with
   prologue scanning and cross-checking against whatever a disassembly engine
   already found. Valuable specifically for stripped or partially-obfuscated x64

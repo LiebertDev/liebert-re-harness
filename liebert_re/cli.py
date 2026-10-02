@@ -57,6 +57,12 @@ _TEXT_SHAPES = {
 }
 
 
+# The read-only operations liebert_re.tools.ida accepts. Kept here because this
+# file imports each tool lazily; tests/test_tools_ida.py pins the two lists equal.
+_IDA_OPERATIONS = ("summary", "list_functions", "segments", "function_at_address",
+                   "decompile_function", "xrefs_to", "imports_exports", "strings")
+
+
 def _envelope(command, payload, workspace=None):
     """Add ``command`` (and the chosen ``workspace``); never touch a key the module returned."""
     extra = {"workspace": workspace} if workspace else {}
@@ -190,6 +196,17 @@ def _scan(a):
 
 def _minidump(a):
     return _load("liebert_re.recover.minidump_analyzer", "analyze_minidump")(a.path, pe_path=a.pe, pdb_path=a.pdb)
+
+
+def _ida(a):
+    return _load("liebert_re.tools.ida", "ida_query")(
+        a.path, operation=a.operation, query=a.query, max_results=a.max_results,
+        offset=a.offset, timeout_seconds=a.timeout, max_chars=a.max_chars,
+    )
+
+
+def _ida_status(a):
+    return _load("liebert_re.tools.ida", "ida_status")()
 
 
 def _capabilities(a):
@@ -331,6 +348,16 @@ def _build_parser():
     sp.add_argument("--tag", default="", metavar="TAG", help="capa -t: filter on a rule meta field value")
     sp.add_argument("--functions", default="", metavar="VAS", help="capa --restrict-to-functions: comma-separated VAs, to bound the run")
     add("capastatus", _capa_status, "report whether capa is reachable, from where, its version and which backends it accepts", path=False)
+    # IDA is licensed and headless here. The first look at a file pays for IDA's own analysis (the database is
+    # cached by the file's SHA-256 under dataset/ida_cache/, size-capped), later calls reuse it.
+    sp = add("ida", _ida, "query a binary through headless IDA Pro: functions, segments, imports, strings, xrefs, decompiled code")
+    sp.add_argument("--operation", default="summary", choices=_IDA_OPERATIONS, help="what to ask (default: summary)")
+    sp.add_argument("--query", default="", metavar="TEXT", help="a symbol name or virtual address (function_at_address, decompile_function, xrefs_to), or a text filter (strings)")
+    sp.add_argument("--max-results", type=int, default=200, help="1-1000")
+    sp.add_argument("--offset", type=int, default=0, help="page offset for the listing operations")
+    sp.add_argument("--max-chars", type=int, default=60000, help="bound on the JSON response")
+    sp.add_argument("--timeout", type=int, default=180, help="seconds for the whole call, clamped to 5-600; the first analysis of a file may use all of it, the session that answers is capped at 300")
+    add("idastatus", _ida_status, "report whether IDA is reachable, from where, its version and whether the decompiler initialises (runs idat once)", path=False)
     add("unpack", _unpack, "statically unpack a UPX-packed PE (output goes to the evidence cache)").add_argument("--timeout", type=int, default=60)
     add("scan", _scan, "scan with YARA-X rules").add_argument("--rules", required=True, help="rules file")
     sp = add("minidump", _minidump, "analyse a Windows minidump")

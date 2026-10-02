@@ -143,7 +143,7 @@ host rather than trusted by inspection.
 ## 4. Bounded execution
 
 `liebert_re/bounded_subprocess.py` is the single place every external engine call in this
-project goes through (`rizin`, `diec`, `yara-x`, `capa`, and anything else that shells
+project goes through (`rizin`, `diec`, `yara-x`, `capa`, `idat`, and anything else that shells
 out). Every call is wrapped with a time bound and an output-size bound, and
 every process it starts is one this module can find and kill by its own
 tracked identity later, not by trusting the tool's own well-behavedness.
@@ -185,6 +185,22 @@ parent is), escalating from `SIGTERM` to `SIGKILL` after a bounded grace
 period rather than either an instant hard kill or an unbounded wait. Both
 mechanisms are platform-specific; the `BoundedProcessResult` they both feed is
 not — a caller never needs to know which teardown path actually fired.
+
+**Two rules the IDA wrapper (`liebert_re/tools/ida.py`) is built around.**
+
+*Success is not an exit code.* A broken IDAPython script exits 1, produces no database and leaves the
+unpacked `.id0/.id1/.id2/.nam/.til` working files behind; a script that raised before writing its answer
+can still exit 0; a database marked temporary exits 0 with a good answer and no database on disk. The
+wrapper therefore requires four things to agree (exit status, the log without fatal markers, a packed
+database file, and a result file carrying its own completion marker) and throws the whole scratch directory
+away otherwise, so a half-made database is never promoted into the cache.
+
+*A cache key must be something that does not change when you use it.* IDA rewrites an analysed database on
+every open, so a database's own hash differs per call, and cloning an already-analysed database into the
+cache on every call would grow disk use without bound. The key here is the SHA-256 of the input file, a
+database is refused as an input, the session that answers a question tells IDA to discard its changes
+(measured: the cached file is then byte-identical across opens, and decompiling no longer changes what a
+later listing reports), and a byte budget with least-recently-used eviction bounds the directory regardless.
 
 ## 5. Layout, and why no framework
 

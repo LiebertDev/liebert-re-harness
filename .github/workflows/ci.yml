@@ -132,10 +132,15 @@ jobs:
           assert not any(os.path.abspath(p or ".") == repo for p in sys.path), sys.path
           mods = sorted(m.name for m in pkgutil.walk_packages(liebert_re.__path__, "liebert_re.") if not m.ispkg)
           # Deliberate count: what the wheel ships cannot change without a
-          # reviewed edit here. 67 = 65 library modules + cli + __main__.
+          # reviewed edit here. 68 = 66 library modules + cli + __main__.
           # (+1 over 66: liebert_re/tools/capa.py, the capa wrapper.)
-          assert len(mods) == 67, (len(mods), mods)
+          # (+1 over 67: liebert_re/tools/ida.py, the IDA wrapper. Its IDAPython worker is a
+          # data file under ida_scripts/ and is checked below, not imported.)
+          assert len(mods) == 68, (len(mods), mods)
           failed = []
+          import importlib.resources as _res
+          worker = _res.files("liebert_re.tools").joinpath("ida_scripts/query_program.idapy")
+          assert worker.is_file(), "the IDAPython worker is missing from the wheel"
           for m in mods:
               try:
                   mod = importlib.import_module(m)

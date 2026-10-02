@@ -4,8 +4,8 @@
 
 Only what you need to run and develop the analysis code. Concretely:
 
-- **67 Python modules** in the `liebert_re/` package — the analysis code itself.
-- **67 test files** in `tests/`, plus `conftest.py` and an empty `__init__.py`
+- **68 Python modules** in the `liebert_re/` package — the analysis code itself.
+- **68 test files** in `tests/`, plus `conftest.py` and an empty `__init__.py`
   (the latter is required so the flat top-level modules resolve on `sys.path`).
 - No challenge-solution scripts: they were moved to the `archive/crackme-solutions` branch (see [SOLVED_INDEX.md](../SOLVED_INDEX.md)).
 - Documentation, licence, CI configuration, and issue templates.
@@ -18,6 +18,8 @@ else's working state:
   a write-up identifies the file it analysed instead.
 - No decompiler project databases or caches (IDA `.i64`, Ghidra projects). These
   are large, machine-specific, and frequently contain decompiled third-party code.
+  The IDA wrapper builds its own cache locally under `dataset/ida_cache/` (git-ignored,
+  and CI rejects a committed `.i64` / `.idb`).
 - No orchestration internals from the upstream development tree — worker dispatch,
   queues, session bookkeeping. They are specific to how that tree is operated and
   would only be noise here.
@@ -84,7 +86,8 @@ naming it — it does not silently degrade or guess.
 | **JADX** | Decompiling one named class from a DEX, APK-derived DEX or JVM `.class` / `.jar` (`liebert_re/tools/dex.py`, `liebert_re/tools/jvm.py`); structural listing works without it and the decompile operation returns `JADX_TOOL_MISSING` | `JADX_EXE`, else `jadx` on `PATH`, else a `teacher-tools/jadx/bin/jadx.bat` under the user's home directory |
 | **Il2CppDumper** | Unity IL2CPP type and method name to address mapping (`liebert_re/tools/il2cpp.py`); every operation returns `IL2CPPDUMPER_TOOL_MISSING` without it | `IL2CPPDUMPER_EXE`, else a `teacher-tools/il2cppdumper/Il2CppDumper.exe` under the user's home directory |
 | **UPX** | Static UPX unpacking with `upx -d` on a copy of the input (`liebert_re/tools/upx.py`); returns `TOOL_MISSING` without it | `UPX_HOME`, else `upx` on `PATH`, else a `teacher-tools/upx/upx.exe` under the user's home directory |
-| **IDA / Ghidra** | Decompilation, cross-references, callers and callees | Wrappers for these live in the upstream tree; this package does not ship them |
+| **IDA Pro 9.x** (licensed, with the Hex-Rays decompiler for `decompile_function`) | Read-only headless queries through `idat -A`: summary, function list, segments, function-at-address, pseudocode, cross-references, imports/exports, strings (`liebert_re/tools/ida.py`); returns `TOOL_MISSING` without it. Not wrapped: renaming, comments, patch planning, microcode | `IDAT_EXE` (file or folder), else `IDA_HOME`, else `idat` on `PATH`, else the installer's default `IDA Professional 9*` / `IDA Pro 9*` folder under Program Files. Cache size cap: `LIEBERT_IDA_CACHE_BYTES` (default 5 GiB) |
+| **Ghidra** | Decompilation, cross-references, callers and callees | A wrapper for this lives in the upstream tree; this package does not ship it |
 
 Set an environment variable to the tool's install directory, for example:
 
@@ -92,16 +95,19 @@ Set an environment variable to the tool's install directory, for example:
 # Windows (PowerShell)
 $env:RIZIN_HOME = "C:\tools\rizin"
 $env:DIE_HOME   = "C:\tools\die"
+$env:IDA_HOME   = "C:\Program Files\IDA Professional 9.4"
 
 # Linux / macOS
 export RIZIN_HOME=/opt/rizin
 export DIE_HOME=/opt/die
+export IDA_HOME=/opt/ida   # not verified on Linux: only a Windows install was run
 ```
 
 For rizin, Detect It Easy, YARA-X and API Monitor there are no hardcoded fallback
-paths. JADX, Il2CppDumper and UPX are the exception: after their variable and
+paths. IDA checks only the installer's default folder under Program Files, never a home
+directory. JADX, Il2CppDumper and UPX are the exception: after their variable and
 `PATH`, they also look in one fixed `teacher-tools` folder under your home
-directory, and use it if it exists. For the four tools without that fallback, if a
+directory, and use it if it exists. For the tools without a fixed fallback, if a
 variable is unset and the tool is not on `PATH`, the operation reports the tool as
 missing rather than trying a guessed location — a guessed path that happens to exist on somebody else's machine is
 exactly the class of silent wrong answer this project refuses.
@@ -127,24 +133,50 @@ system temp directory is outside the workspace unless you repoint the root, and
 one test file in the upstream tree failed for exactly that reason until it was
 fixed.
 
-Six modules write their own output *outside* this workspace root on purpose:
-`liebert_re/tools/binary.py` (`pe_resources`), `liebert_re/tools/die.py`, `liebert_re/tools/capa.py`, `liebert_re/tools/yara_x.py`,
+Seven modules write their own output *outside* this workspace root on purpose:
+`liebert_re/tools/binary.py` (`pe_resources`), `liebert_re/tools/die.py`, `liebert_re/tools/capa.py`, `liebert_re/tools/ida.py`, `liebert_re/tools/yara_x.py`,
 `liebert_re/tools/rizin.py` (`binary_patch`) and `liebert_re/tools/upx.py` each persist their raw
 engine output under a module-level `dataset/evidence/<tool_name>/` directory
 inside the repository itself, which is git-ignored. The *input* file you pass
 in is still confined by `safe_path()` exactly as above; only each tool's own
 result is deposited there, under a sanitised, content-hash- or UUID-derived
 filename you do not control. See the README's capability table for the same
-note next to each tool.
+note next to each tool. `liebert_re/tools/ida.py` also keeps its analysis-database cache there,
+under `dataset/ida_cache/<sha256-of-input>.<profile>/`: it is capped (`LIEBERT_IDA_CACHE_BYTES`,
+default 5 GiB, least-recently-used whole-slot eviction), keyed by the input file's content,
+and safe to delete.
+
+## What the IDA wrapper does on your machine
+
+`ida_query` runs `idat -A` (headless, no dialogs) in a bounded subprocess; it needs a licensed IDA Pro
+9.x and returns `TOOL_MISSING` without one. `ida_status` launches idat once on an empty database
+(about a second) so "available" means "started headless and exited cleanly", and reports the version and
+whether the decompiler initialises.
+
+- **First call on a file** analyses it (two idat sessions: analyse-and-save, then your question) and
+  stores the database under `dataset/ida_cache/`. Later calls reopen it. The timeout is one budget,
+  clamped to 5-600 s (default 180): the first analysis may use all of it, the session that answers
+  your question never runs longer than 300 s. A timed-out analysis is thrown away rather than
+  half-cached, and is reported as a timeout, not as an empty result.
+- **Symbol-server lookups are off.** Left on, IDA downloads PDBs from a public symbol server during
+  analysis and writes them under your temp directory, which makes results depend on the network and
+  tells a third party which file you analysed. Every launch passes `-Opdb:off`. The consequence: symbols
+  from a PDB are not loaded, even a local one.
+- **Your files are not modified.** The input is only read; the cache holds IDA's own database.
+- **What is returned is scrubbed.** Anything from IDA's log that reaches a result (failure tails) has the
+  licence line, home-directory paths, and the input and scratch paths replaced.
+- Not shipped: renaming, comments, patch planning, microcode. Only IDA 9.x is supported (IDA 9 has a
+  single `idat`; there is no `idat64`).
 
 ## The heavy test tier
 
 `pytest.ini` excludes tests marked `heavy` by default. In this package those are
-the rizin, Detect It Easy, YARA-X and API Monitor wrapper tests (real-tool cases
+the rizin, Detect It Easy, YARA-X, API Monitor and IDA wrapper tests (real-tool cases
 skip when the tool is absent), Unicorn/Capstone emulation tests, tests that need
 corpus files this repository does not ship (they skip when absent), the
 `frida_trace_client` tests, and one long pure-Python unpacking test. Some take
-minutes rather than seconds. No IDA, Ghidra, angr or virtual-machine test ships
+minutes rather than seconds. The IDA real-install class needs a licensed IDA Pro 9.x; it analyses
+a tiny synthetic PE that the test builds itself. No Ghidra, angr or virtual-machine test ships
 here. Once you have the tools configured:
 
 ```bash
