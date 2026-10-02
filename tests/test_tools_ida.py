@@ -1340,6 +1340,22 @@ class EnvironmentErrorTests(IdaCase):
                 self.assertEqual(self.slots(), [])
                 self.assertEqual(self.leftovers(), [])
 
+    def test_a_job_file_that_cannot_be_written_is_reported_not_raised(self):
+        real_write_text = Path.write_text
+
+        def refuse_job(path, *args, **kwargs):
+            if path.name == "job.json":
+                raise OSError(28, "No space left on device")
+            return real_write_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "write_text", refuse_job):
+            data = self.q()
+        self.assertEnvironmentError(data, "IDA_LAUNCH_FAILED", errno=28)
+        self.assertEqual(self.fake.calls, [], "idat was never started")
+        self.assertEqual(self.slots(), [])
+        self.assertEqual(self.leftovers(), [])
+        self.assertFalse(ti._lock_path(ti._slot_dir(self.sha)).exists(), "the lock is released")
+
     def test_a_launch_failure_on_a_reopen_does_not_discard_a_healthy_slot(self):
         self.assertTrue(self.q()["ok"])
         with mock.patch.object(ti, "run_bounded_process", side_effect=PermissionError(13, "Permission denied")):
@@ -1668,6 +1684,223 @@ class ProcessProbeTests(unittest.TestCase):
                 mock.patch.object(ti._ProcessProbe, "_windows", return_value=True) as win:
             self.assertIs(ti._ProcessProbe.alive(1234), True)
             win.assert_called_once_with(1234)
+
+
+class BestEffortBranchTests(IdaCase):
+    """Branches that swallow an OS or probe error on purpose. Each one answers
+    with a defined fallback instead of raising; these pin the fallback and the
+    exception class that triggers it."""
+
+    def _slot(self):
+        slot = ti._slot_dir(self.sha)
+        slot.parent.mkdir(parents=True, exist_ok=True)
+        return slot
+
+    def test_a_search_for_the_binary_that_hits_an_os_error_finds_nothing(self):
+        with mock.patch.dict(os.environ, {"IDAT_EXE": "", "IDA_HOME": ""}), \
+                mock.patch.object(ti.shutil, "which", return_value=None), \
+                mock.patch.object(ti.Path, "glob", side_effect=PermissionError(13, "Permission denied")):
+            self.assertEqual(ti._resolved_by_and_binary(), (None, None))
+
+    def test_a_clamp_of_an_unusable_value_falls_back_to_the_default(self):
+        for bad in ("many", None, [1], object()):
+            with self.subTest(bad=type(bad).__name__):
+                self.assertEqual(ti._clamp(bad, 1, 10, 7), 7)
+        self.assertEqual(ti._clamp("99", 1, 10, 7), 10)
+
+    def test_redaction_still_works_when_the_account_name_is_unavailable(self):
+        with mock.patch.object(ti.getpass, "getuser", side_effect=KeyError("LOGNAME")):
+            text = ti._redact("License: ABC-123\nfine")
+        self.assertIn("<REDACTED>", text)
+        self.assertNotIn("ABC-123", text)
+
+    def test_a_cache_file_that_vanishes_during_the_size_walk_is_skipped(self):
+        (self.root / "kept.bin").write_bytes(b"12345")
+        walked = [(str(self.root), [], ["kept.bin", "vanished.bin"])]
+        with mock.patch.object(ti.os, "walk", return_value=iter(walked)):
+            self.assertEqual(ti._dir_bytes(self.root), 5)
+
+    def test_the_psutil_probe_maps_its_own_errors_to_dead_and_unknown(self):
+        class Gone(Exception):
+            pass
+
+        class Broken(Exception):
+            pass
+
+        def fake_psutil(raises):
+            def process(_pid):
+                raise raises
+            return SimpleNamespace(pid_exists=lambda _pid: True, Process=process, NoSuchProcess=Gone,
+                                   Error=Broken, STATUS_ZOMBIE="zombie")
+
+        self.assertIs(ti._ProcessProbe._psutil(fake_psutil(Gone()), 1, None), False)
+        self.assertIsNone(ti._ProcessProbe._psutil(fake_psutil(Broken()), 1, None))
+        self.assertIsNone(ti._ProcessProbe._psutil(fake_psutil(PermissionError(13, "denied")), 1, None))
+        self.assertIsNone(ti._ProcessProbe._psutil(fake_psutil(ValueError("bad")), 1, None))
+
+    def test_a_windows_probe_that_cannot_run_says_unknown(self):
+        import ctypes
+        broken = SimpleNamespace(kernel32=SimpleNamespace(
+            OpenProcess=mock.Mock(side_effect=RuntimeError("no kernel32"))))
+        with mock.patch.object(ctypes, "windll", broken, create=True):
+            self.assertIsNone(ti._ProcessProbe._windows(os.getpid()))
+
+    def test_a_lock_is_still_created_when_the_process_start_time_cannot_be_read(self):
+        lock = self.root / "x.lock"
+        broken = SimpleNamespace(Process=mock.Mock(side_effect=RuntimeError("no psutil")))
+        with mock.patch.dict(sys.modules, {"psutil": broken}):
+            ti._SlotLock.create(lock, "token-1234567890")
+        record = json.loads(lock.read_text(encoding="utf-8"))
+        self.assertEqual(record["token"], "token-1234567890")
+        self.assertIsNone(record["create_time"])
+
+    def test_an_existing_lock_is_reported_as_such_and_not_overwritten_by_the_fallback(self):
+        lock = self.root / "y.lock"
+        with mock.patch.object(ti.os, "link", side_effect=FileExistsError(17, "exists")), \
+                mock.patch.object(ti.os, "open", side_effect=AssertionError("fallback must not run")):
+            with self.assertRaises(FileExistsError):
+                ti._SlotLock.create(lock, "token-1234567890")
+
+    def test_a_staging_file_that_cannot_be_removed_does_not_fail_the_lock(self):
+        lock = self.root / "z.lock"
+        real_unlink = Path.unlink
+
+        def refuse_staging(path, *args, **kwargs):
+            if path.name.endswith(".tmp"):
+                raise PermissionError(13, "Permission denied")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", refuse_staging):
+            ti._SlotLock.create(lock, "token-1234567890")
+        self.assertTrue(lock.is_file())
+
+    def test_releasing_a_lock_that_cannot_be_deleted_reports_false(self):
+        lock = self.root / "w.lock"
+        ti._SlotLock.create(lock, "token-1234567890")
+        held = ti._SlotLock(lock, "token-1234567890")
+        with mock.patch.object(Path, "unlink", side_effect=PermissionError(13, "Permission denied")):
+            self.assertIs(held.release(), False)
+
+    def test_a_stale_lock_that_cannot_be_removed_is_retried_not_raised(self):
+        slot = self._slot()
+        lock = ti._lock_path(slot)
+        lock.write_text("{}", encoding="utf-8")
+        old = time.time() - ti._LOCK_STALE_SECONDS - 10
+        os.utime(lock, (old, old))
+        real_unlink = Path.unlink
+        calls = []
+
+        def refuse_once(path, *args, **kwargs):
+            if path == lock and not calls:
+                calls.append(path)
+                raise PermissionError(13, "Permission denied")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", refuse_once):
+            taken = ti._acquire_slot_lock(slot, None)
+        self.assertIsNotNone(taken)
+        self.assertEqual(len(calls), 1)
+        ti._release_slot_lock(taken)
+
+    def test_a_database_that_cannot_be_inspected_is_not_a_healthy_slot(self):
+        slot = self._slot()
+        slot.mkdir()
+        (slot / ti._DB_NAME).write_bytes(b"x")
+        with mock.patch.object(Path, "stat", side_effect=PermissionError(13, "Permission denied")):
+            self.assertIs(ti._slot_is_healthy(slot), False)
+
+    def test_metadata_that_cannot_be_written_does_not_fail_the_call(self):
+        slot = self._slot()
+        slot.mkdir()
+        with mock.patch.object(Path, "write_text", side_effect=OSError(28, "No space left on device")):
+            ti._touch_meta(slot, self.sha, created=True)
+        self.assertFalse((slot / "meta.json").exists())
+
+    def test_the_last_used_time_falls_back_to_the_slot_and_then_to_zero(self):
+        slot = self._slot()
+        slot.mkdir()
+        self.assertGreater(ti._slot_last_used(slot), 0.0)
+        with mock.patch.object(Path, "stat", side_effect=PermissionError(13, "Permission denied")):
+            self.assertEqual(ti._slot_last_used(slot), 0.0)
+
+    def test_a_database_size_that_cannot_be_read_counts_as_no_database(self):
+        work = self.root / "work-v"
+        work.mkdir()
+
+        class Unreadable:
+            def is_file(self):
+                return True
+
+            def stat(self):
+                raise PermissionError(13, "Permission denied")
+
+        cp = SimpleNamespace(returncode=0, stdout="", stderr="")
+        _data, _error, signals = ti._verdict(cp, work, Unreadable(), expect_database=True)
+        self.assertIs(signals["database_present"], False)
+        self.assertEqual(signals["database_bytes"], 0)
+
+    def test_a_stale_probe_directory_that_cannot_be_inspected_does_not_fail_status(self):
+        old = self.cache / "status-old00000"
+        old.mkdir(parents=True)
+        real_stat = Path.stat
+
+        def refuse_old(path, *args, **kwargs):
+            if path.name == "status-old00000":
+                raise PermissionError(13, "Permission denied")
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(ti, "_resolved_by_and_binary", return_value=("PATH", "C:/fake/idat.exe")), \
+                mock.patch.object(Path, "stat", refuse_old):
+            data = json.loads(ti.ida_status())
+        self.assertTrue(data["ok"], data)
+
+
+class ErrorNameTests(IdaCase):
+    """The exact status and error names a caller branches on."""
+
+    def test_a_refused_operation_and_a_missing_worker_are_both_analysis_limited(self):
+        data = self.q("rename")
+        self.assertEqual((data["status"], data["error"]), ("ANALYSIS_LIMITED", "UNKNOWN_OPERATION"))
+        with mock.patch.object(ti, "_WORKER_SOURCE", self.root / "absent.idapy"):
+            data = self.q()
+        self.assertEqual((data["status"], data["error"]), ("ANALYSIS_LIMITED", "IDA_WORKER_MISSING"))
+
+    def test_a_cancelled_and_a_timed_out_call_name_the_process_tree_termination(self):
+        for behaviour, status, error in (
+                ("cancel", "CANCELLED", "IDA_CANCELLED_PROCESS_TREE_TERMINATED"),
+                ("timeout", "TIMEOUT", "IDA_TIMEOUT_PROCESS_TREE_TERMINATED")):
+            with self.subTest(behaviour=behaviour):
+                self.fake.behaviour = behaviour
+                data = self.q()
+                self.assertEqual((data["status"], data["error"]), (status, error))
+
+    def test_a_probe_that_times_out_is_reported_with_its_own_error(self):
+        self.fake.behaviour = "timeout"
+        with mock.patch.object(ti, "_resolved_by_and_binary", return_value=("PATH", "C:/fake/idat.exe")):
+            data = json.loads(ti.ida_status())
+        self.assertEqual((data["status"], data["error"]), ("TIMEOUT", "IDA_PROBE_TIMEOUT"))
+
+    def test_a_worker_refusal_without_an_error_name_is_unknown_error_not_a_crash(self):
+        self.fake.behaviour = "script_error"
+
+        def nameless(command, **kwargs):
+            cp = self.fake(command, **kwargs)
+            result = Path(kwargs["cwd"]) / ti._RESULT_NAME
+            body = json.loads(result.read_text(encoding="utf-8"))
+            body.pop("error")
+            result.write_text(json.dumps(body), encoding="utf-8")
+            return cp
+
+        with mock.patch.object(ti, "run_bounded_process", nameless):
+            data = self.q()
+        self.assertEqual((data["status"], data["error"], data["ok"]), ("ANALYSIS_LIMITED", "UNKNOWN_ERROR", False))
+
+    def test_a_binary_found_through_a_folder_in_idat_exe_is_still_attributed_to_idat_exe(self):
+        folder = self.root / "install"
+        folder.mkdir()
+        (folder / "idat.exe").write_bytes(b"")
+        with mock.patch.dict(os.environ, {"IDAT_EXE": str(folder), "IDA_HOME": ""}):
+            self.assertEqual(ti._resolved_by_and_binary(), ("IDAT_EXE", str(folder / "idat.exe")))
 
 
 class SharedBudgetTests(IdaCase):

@@ -494,6 +494,57 @@ class ReadOperationPasswordAndIoTests(_ScratchGuard):
             result = self._read(archive, member="a.txt")
         self.assertEqual((result["error"], result["errno"]), ("MEMBER_READ_IO_ERROR", 110))
 
+    def _plain_tar(self, name="plain.tar"):
+        archive = _SCRATCH / name
+        data = b"plain text member"
+        with tarfile.open(str(archive), "w") as t:
+            info = tarfile.TarInfo(name="a.txt")
+            info.size = len(data)
+            t.addfile(info, io.BytesIO(data))
+        return archive
+
+    def test_an_os_error_on_a_tar_member_extract_is_its_own_status(self):
+        archive = self._plain_tar("io_extract.tar")
+        with unittest.mock.patch.object(tarfile.TarFile, "extractfile", side_effect=OSError(110, "Connection timed out")):
+            result = json.loads(archive_inspect(str(archive), operation="extract", member="a.txt",
+                                                dest_path=self._dest("tar_io_out.txt")))
+        self.assertEqual((result["error"], result["errno"], result["status"]),
+                         ("MEMBER_READ_IO_ERROR", 110, "READ_FAILED"))
+        self.assertFalse((_SCRATCH / "tar_io_out.txt").exists())
+
+    def test_a_member_the_library_cannot_find_is_member_not_found_on_read_and_extract(self):
+        archive = _SCRATCH / "keyerror.zip"
+        _make_zip(archive, {"a.txt": b"fine data"})
+        for operation, kwargs in (("read", {}), ("extract", {"dest_path": self._dest("keyerror_out.txt")})):
+            with self.subTest(operation=operation):
+                with unittest.mock.patch.object(zipfile.ZipFile, "read", side_effect=KeyError("a.txt")):
+                    result = json.loads(archive_inspect(str(archive), operation=operation, member="a.txt", **kwargs))
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["error"], "MEMBER_NOT_FOUND")
+                self.assertIn("a.txt", result["detail"])
+        self.assertFalse((_SCRATCH / "keyerror_out.txt").exists())
+
+    def test_an_archive_that_cannot_be_opened_is_reported_as_unreadable_not_raised(self):
+        archive = self._plain_tar("unreadable.tar")
+        for exc in (zipfile.BadZipFile("File is not a zip file"), tarfile.ReadError("truncated header"),
+                    EOFError("Compressed file ended"), zlib.error("bad data"), OSError(5, "Input/output error")):
+            with self.subTest(exc=type(exc).__name__):
+                with unittest.mock.patch("liebert_re.tools.formats._archive_members", side_effect=exc):
+                    result = json.loads(archive_inspect(str(archive)))
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["error"], "ARCHIVE_UNREADABLE")
+                self.assertEqual(result["error_type"], type(exc).__name__)
+
+    def test_a_destination_that_cannot_be_written_is_write_failed_not_raised(self):
+        archive = _SCRATCH / "writefail.zip"
+        _make_zip(archive, {"a.txt": b"fine data"})
+        with unittest.mock.patch.object(Path, "write_bytes", side_effect=OSError(28, "No space left on device")):
+            result = json.loads(archive_inspect(str(archive), operation="extract", member="a.txt",
+                                                dest_path=self._dest("writefail_out.txt")))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "WRITE_FAILED")
+        self.assertEqual(result["member"], "a.txt")
+
     def test_genuine_corruption_signals_keep_their_corruption_status(self):
         archive = _SCRATCH / "still_corrupt.zip"
         _make_zip(archive, {"a.txt": b"fine data"})
