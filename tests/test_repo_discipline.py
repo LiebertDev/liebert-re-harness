@@ -82,7 +82,6 @@ KNOWN_PRIVATE_REFS = {
     "tests/test_claim_guard.py": ({"TEACHER_", "teacher.py"}, _DEAD),
     "tests/test_disassemble_pe_va_resolution.py": ({"tools_emulation"}, _DEAD),
     "tests/test_evidence_attestation_honesty.py": ({"TEACHER_"}, "fixture string teacher_runtime_tool_dispatch; surfaced by the case-insensitive scan"),
-    "tests/test_pe_resources.py": ({"tools_emulation"}, _DEAD),
     "tests/test_public_format_probes.py": ({"research_state", "tools_decompiler"}, _DEAD),
     "tests/test_public_generic_static_probe.py": ({"research_state"}, _DEAD),
     "tests/test_structured_config_schema.py": ({"TEACHER_", "teacher.py"}, _DEAD),
@@ -372,12 +371,14 @@ def test_allowlists_have_not_grown():
     assert hashlib.sha256(repr(PRIVATE_IDS).encode()).hexdigest().startswith("d51a752750a0f2a7")
     assert set(KNOWN_UNREFERENCED) == {"liebert_re.tools.asar_parser", "liebert_re.evidence.process_lock"}
     assert set(KNOWN_USER_PATHS) == {"tests/test_public_provenance_and_fixtures.py", "liebert_re/workspace.py"}
-    assert len(KNOWN_PRIVATE_REFS) == 24
-    assert sum(len(ids) for ids, _ in KNOWN_PRIVATE_REFS.values()) == 41
+    # 24 -> 23 entries, 41 -> 40 identifiers: tests/test_pe_resources.py now builds its fixtures
+    # (docs/CORPUS.md) and no longer names a private-tree identifier, so its entry was removed.
+    assert len(KNOWN_PRIVATE_REFS) == 23
+    assert sum(len(ids) for ids, _ in KNOWN_PRIVATE_REFS.values()) == 40
     # Fingerprint of every (path, identifiers) pair: swapping an entry, not only
     # adding one, changes it. Update it only when REMOVING entries.
     digest = hashlib.sha256(repr(sorted((f, sorted(i)) for f, (i, _) in KNOWN_PRIVATE_REFS.items())).encode()).hexdigest()
-    assert digest.startswith("d10820d479f3146b")
+    assert digest.startswith("86d47f7f76afe246")
     assert all(reason for _, reason in KNOWN_PRIVATE_REFS.values())
 
 

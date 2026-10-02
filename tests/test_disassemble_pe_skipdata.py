@@ -8,90 +8,27 @@ one undecodable byte early in a section silently truncates the listing to
 far fewer lines than ``max_instructions`` requested, with no error and no
 indication real code continues past the gap.
 
-Self-contained PE builder (does not touch ``tests/fixtures_pe_builder.py``),
-following the same pattern as ``tests/test_import_xrefs_sweep_budget.py``.
+The PE comes from the shared builder in ``tests/_pe_fixtures.py``.
 """
 import shutil
-import struct
 import unittest
 from pathlib import Path
 
 from liebert_re.tools.binary import disassemble_pe
+from tests import _pe_fixtures
+from tests._pe_fixtures import build_pe
 
 # tools_binary.disassemble_pe -> safe_path enforces WORKSPACE (repo root)
 # containment, so the fixture must live under the repo, not the OS temp dir.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRATCH_DIR = REPO_ROOT / "dataset" / "runtime" / "_test_disassemble_pe_skipdata_scratch"
 
-IMAGE_BASE = 0x00400000
-SECTION_RVA = 0x1000
-FILE_ALIGNMENT = 0x200
-SECTION_ALIGNMENT = 0x1000
-HEADER_SIZE = 0x200
+# The builder lives in tests/_pe_fixtures.py (shared with test_pe_resources.py); this name is kept
+# so the call sites below read as before.
+_build_minimal_exec_pe = build_pe
 
-
-def _build_minimal_exec_pe(code: bytes) -> bytes:
-    """A minimal 32-bit PE with exactly one executable section holding
-    ``code`` verbatim (padded to file alignment). See
-    ``tests/test_import_xrefs_sweep_budget.py``'s identical builder for the
-    full field-by-field rationale; duplicated here to stay self-contained."""
-    section_size = (len(code) + FILE_ALIGNMENT - 1) & ~(FILE_ALIGNMENT - 1)
-    section_size = max(section_size, FILE_ALIGNMENT)
-    section = bytearray(section_size)
-    section[:len(code)] = code
-
-    dos = bytearray(0x40)
-    dos[0:2] = b"MZ"
-    dos[0x3C:0x40] = struct.pack("<I", 0x40)
-
-    file_header = struct.pack("<HHIIIHH",
-                              0x014C,   # i386
-                              1,        # one section
-                              0, 0, 0,
-                              0xE0,     # size of optional header
-                              0x0102)   # executable, 32-bit
-
-    optional = struct.pack(
-        "<HBBIIIIIIIIIHHHHHHIIIIHHIIIIII",
-        0x010B, 0, 0,          # PE32
-        len(code), 0, 0,
-        SECTION_RVA,            # entry point (unused -- code is never run)
-        SECTION_RVA, 0,
-        IMAGE_BASE,
-        SECTION_ALIGNMENT, FILE_ALIGNMENT,
-        4, 0, 0, 0, 4, 0,      # versions
-        0,                     # win32 version
-        SECTION_RVA + section_size,   # size of image
-        HEADER_SIZE,           # size of headers
-        0,                     # checksum
-        3, 0,                  # subsystem CONSOLE, dll characteristics
-        0x100000, 0x1000, 0x100000, 0x1000,
-        0, 16)                 # loader flags, number of data directories
-
-    directories = bytearray(16 * 8)  # all zero: no import/export/etc directories
-
-    section_header = struct.pack(
-        "<8sIIIIIIHHI",
-        b".text\x00\x00\x00",
-        section_size, SECTION_RVA,
-        section_size, HEADER_SIZE,
-        0, 0, 0, 0,
-        0x60000020)  # code, executable, readable
-
-    headers = bytearray(HEADER_SIZE)
-    headers[0:0x40] = dos
-    at = 0x40
-    headers[at:at + 4] = b"PE\x00\x00"
-    at += 4
-    headers[at:at + len(file_header)] = file_header
-    at += len(file_header)
-    headers[at:at + len(optional)] = optional
-    at += len(optional)
-    headers[at:at + len(directories)] = directories
-    at += len(directories)
-    headers[at:at + len(section_header)] = section_header
-
-    return bytes(headers) + bytes(section)
+IMAGE_BASE = _pe_fixtures.IMAGE_BASE
+SECTION_RVA = _pe_fixtures.SECTION_RVA
 
 
 class DisassemblePeSkipdataTests(unittest.TestCase):
