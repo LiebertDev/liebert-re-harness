@@ -7,6 +7,7 @@ extract branch.
 """
 from __future__ import annotations
 
+import pytest
 import hashlib
 import io
 import json
@@ -197,6 +198,7 @@ class TestZipSlipGuard(_ScratchGuard):
 
 
 class TestExtractOutcomes(_ScratchGuard):
+    @pytest.mark.contract
     def test_dest_path_outside_workspace_is_path_refused(self):
         archive = _SCRATCH / "a.zip"
         _make_zip(archive, {"hello.txt": b"hi"})
@@ -246,6 +248,7 @@ class TestExtractOutcomes(_ScratchGuard):
             self.assertEqual(result["status"], "PATH_REFUSED")
             self.assertFalse((outside_root / "escaped.txt").exists())
 
+    @pytest.mark.contract
     def test_missing_member_is_member_not_found(self):
         archive = _SCRATCH / "a.zip"
         _make_zip(archive, {"hello.txt": b"hi"})
@@ -310,6 +313,7 @@ class TestExtractOutcomes(_ScratchGuard):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "PATH_TRAVERSAL_BLOCKED")
 
+    @pytest.mark.contract
     def test_tar_password_is_rejected_not_supported(self):
         data = b"tar has no encryption concept"
         archive = _SCRATCH / "sample2.tar"
@@ -323,6 +327,7 @@ class TestExtractOutcomes(_ScratchGuard):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "PASSWORD_NOT_SUPPORTED_FOR_TAR")
 
+    @pytest.mark.contract
     def test_encrypted_zip_member_without_password_is_password_required(self):
         archive = _SCRATCH / "enc.zip"
         _make_zip_traditional_encrypted(archive, "secret.txt", b"the real content", "s3cr3t")
@@ -331,6 +336,7 @@ class TestExtractOutcomes(_ScratchGuard):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "PASSWORD_REQUIRED")
 
+    @pytest.mark.contract
     def test_encrypted_zip_member_with_wrong_password_is_bad_password(self):
         archive = _SCRATCH / "enc2.zip"
         _make_zip_traditional_encrypted(archive, "secret.txt", b"the real content", "s3cr3t")
@@ -340,6 +346,7 @@ class TestExtractOutcomes(_ScratchGuard):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "BAD_PASSWORD")
 
+    @pytest.mark.contract
     def test_wrong_password_that_passes_zipcrypto_check_is_honest_not_a_crash(self):
         # Seed 107 builds an encryption header for which "wrong-password" slips
         # past ZipCrypto's 1-byte check, so zipfile raises BadZipFile (bad CRC)
@@ -356,6 +363,7 @@ class TestExtractOutcomes(_ScratchGuard):
         self.assertIn("CRC", result["detail"])
         self.assertFalse((_SCRATCH / "out.txt").exists())
 
+    @pytest.mark.contract
     def test_corrupt_unencrypted_zip_member_is_corrupt_member(self):
         archive = _SCRATCH / "corrupt.zip"
         payload = b"payload that will be damaged on disk"
@@ -373,6 +381,7 @@ class TestExtractOutcomes(_ScratchGuard):
                 self.assertIn("CRC", result["detail"])
         self.assertFalse((_SCRATCH / "out.txt").exists())
 
+    @pytest.mark.contract
     def test_unreadable_archive_container_is_structured_not_raised(self):
         archive = _SCRATCH / "notarchive.zip"
         archive.write_bytes(b"this is not an archive at all")
@@ -435,21 +444,25 @@ class ReadOperationPasswordAndIoTests(_ScratchGuard):
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["content"], "the real content")
 
+    @pytest.mark.contract
     def test_read_of_an_encrypted_member_without_a_password_is_password_required(self):
         result = self._read(self._enc())
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "PASSWORD_REQUIRED")
 
+    @pytest.mark.contract
     def test_read_with_a_wrong_password_is_bad_password(self):
         result = self._read(self._enc(), password="wrong-password")
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "BAD_PASSWORD")
 
+    @pytest.mark.contract
     def test_read_wrong_password_that_slips_past_the_check_is_not_claimed_as_bad_password(self):
         result = self._read(self._enc("enc_read_collide.zip", seed=_COLLIDING_SEED), password="wrong-password")
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "BAD_PASSWORD_OR_CORRUPT_DATA")
 
+    @pytest.mark.contract
     def test_read_tar_with_a_password_is_not_supported_like_extract(self):
         archive = _SCRATCH / "read.tar"
         data = b"plain text member"
@@ -462,6 +475,7 @@ class ReadOperationPasswordAndIoTests(_ScratchGuard):
         self.assertEqual(result["error"], "PASSWORD_NOT_SUPPORTED_FOR_TAR")
         self.assertTrue(self._read(archive, member="a.txt")["ok"])
 
+    @pytest.mark.contract
     def test_an_os_error_while_reading_is_not_reported_as_corruption_or_a_password_problem(self):
         archive = _SCRATCH / "io.zip"
         _make_zip(archive, {"a.txt": b"fine data"})
@@ -483,6 +497,7 @@ class ReadOperationPasswordAndIoTests(_ScratchGuard):
                 self.assertEqual(result["error_type"], "OSError")
         self.assertFalse((_SCRATCH / "io_out.txt").exists())
 
+    @pytest.mark.contract
     def test_an_os_error_on_a_tar_member_read_is_its_own_status(self):
         archive = _SCRATCH / "io.tar"
         data = b"plain text member"
@@ -503,6 +518,7 @@ class ReadOperationPasswordAndIoTests(_ScratchGuard):
             t.addfile(info, io.BytesIO(data))
         return archive
 
+    @pytest.mark.contract
     def test_an_os_error_on_a_tar_member_extract_is_its_own_status(self):
         archive = self._plain_tar("io_extract.tar")
         with unittest.mock.patch.object(tarfile.TarFile, "extractfile", side_effect=OSError(110, "Connection timed out")):
@@ -512,6 +528,7 @@ class ReadOperationPasswordAndIoTests(_ScratchGuard):
                          ("MEMBER_READ_IO_ERROR", 110, "READ_FAILED"))
         self.assertFalse((_SCRATCH / "tar_io_out.txt").exists())
 
+    @pytest.mark.contract
     def test_a_member_the_library_cannot_find_is_member_not_found_on_read_and_extract(self):
         archive = _SCRATCH / "keyerror.zip"
         _make_zip(archive, {"a.txt": b"fine data"})
@@ -524,6 +541,7 @@ class ReadOperationPasswordAndIoTests(_ScratchGuard):
                 self.assertIn("a.txt", result["detail"])
         self.assertFalse((_SCRATCH / "keyerror_out.txt").exists())
 
+    @pytest.mark.contract
     def test_an_archive_that_cannot_be_opened_is_reported_as_unreadable_not_raised(self):
         archive = self._plain_tar("unreadable.tar")
         for exc in (zipfile.BadZipFile("File is not a zip file"), tarfile.ReadError("truncated header"),
@@ -535,6 +553,7 @@ class ReadOperationPasswordAndIoTests(_ScratchGuard):
                 self.assertEqual(result["error"], "ARCHIVE_UNREADABLE")
                 self.assertEqual(result["error_type"], type(exc).__name__)
 
+    @pytest.mark.contract
     def test_a_destination_that_cannot_be_written_is_write_failed_not_raised(self):
         archive = _SCRATCH / "writefail.zip"
         _make_zip(archive, {"a.txt": b"fine data"})
@@ -545,6 +564,7 @@ class ReadOperationPasswordAndIoTests(_ScratchGuard):
         self.assertEqual(result["status"], "WRITE_FAILED")
         self.assertEqual(result["member"], "a.txt")
 
+    @pytest.mark.contract
     def test_genuine_corruption_signals_keep_their_corruption_status(self):
         archive = _SCRATCH / "still_corrupt.zip"
         _make_zip(archive, {"a.txt": b"fine data"})

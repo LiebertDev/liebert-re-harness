@@ -13,6 +13,7 @@ text for `-w`/`-s` even when `-j` is passed.
 """
 from __future__ import annotations
 
+import pytest
 import json
 import unittest
 from pathlib import Path
@@ -291,6 +292,7 @@ class ToolMissingTests(unittest.TestCase):
     """Every operation, not just die_identify, must return the standard
     TOOL_MISSING shape instead of raising when diec.exe is absent."""
 
+    @pytest.mark.contract
     def test_every_operation_returns_tool_missing(self):
         operations = [
             ("die_identify", lambda: td.die_identify("x")),
@@ -311,6 +313,7 @@ class ToolMissingTests(unittest.TestCase):
                 self.assertEqual(data["tool"], name, name)
                 self.assertIn("DIE_HOME", data["detail"], name)
 
+    @pytest.mark.contract
     def test_die_status_lists_every_operation_this_module_exposes(self):
         """A capability probe that under-reports is worse than none: the
         operation list is what a caller checks before claiming DIE cannot

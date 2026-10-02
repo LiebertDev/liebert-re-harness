@@ -12,6 +12,7 @@ uses elsewhere for a real-system-file dependency
 (tests/test_binary_patch.py's kernel32.dll skipUnless)."""
 from __future__ import annotations
 
+import pytest
 import unittest
 import zlib
 from pathlib import Path
@@ -40,17 +41,20 @@ class CrackApiHashStructuredFailureTests(unittest.TestCase):
     """The documented failure path: a DLL that does not exist must return a
     structured, non-raising result, never an exception."""
 
+    @pytest.mark.contract
     def test_missing_dll_is_a_structured_error_not_a_raise(self):
         result = crack_api_hash(0x12345678, dll_path=r"C:\definitely\not\a\real\path.dll")
         self.assertFalse(result["ok"])
         self.assertIn("DLL_NOT_FOUND", result["error"])
 
+    @pytest.mark.contract
     def test_unknown_algorithm_name_is_rejected(self):
         result = crack_api_hash(0x1, dll_path=str(KERNEL32), algorithms=["not_a_real_algorithm"])
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "UNKNOWN_ALGORITHM")
         self.assertIn("not_a_real_algorithm", result["unknown"])
 
+    @pytest.mark.contract
     def test_zero_matches_still_reports_the_full_search_space(self):
         # A hash value that (near-certainly) matches nothing must still come
         # back ok:true with matches:[] and the exact space searched -- never

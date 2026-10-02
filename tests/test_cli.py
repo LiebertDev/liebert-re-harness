@@ -37,6 +37,7 @@ def test_identify_a_repo_file_is_json_exit_0():
     assert body["command"] == "identify" and body["ok"] is True
 
 
+@pytest.mark.contract
 def test_missing_path_is_a_structured_refusal_not_a_traceback():
     r = _run("identify", "no_such_file_anywhere.bin")
     assert r.returncode == 3
@@ -45,6 +46,7 @@ def test_missing_path_is_a_structured_refusal_not_a_traceback():
     assert "Traceback" not in r.stdout + r.stderr
 
 
+@pytest.mark.contract
 def test_packer_without_die_is_exit_3_tool_missing(monkeypatch, capsys):
     # Forced absence via monkeypatch, so the result does not depend on the runner.
     from liebert_re.tools import die
@@ -75,6 +77,7 @@ def test_envelope_only_adds_command_key():
 
 
 @pytest.mark.parametrize("status,code", [("PARTIAL", 0), ("READY", 0), ("TOOL_MISSING", 3), ("ANALYSIS_LIMITED", 3), ("TIMEOUT", 3)])
+@pytest.mark.contract
 def test_cli_cannot_upgrade_a_module_status(monkeypatch, capsys, status, code):
     from liebert_re.tools import formats
     monkeypatch.setattr(formats, "file_identity", lambda path: json.dumps({"ok": status in ("PARTIAL", "READY"), "status": status}))
@@ -82,6 +85,7 @@ def test_cli_cannot_upgrade_a_module_status(monkeypatch, capsys, status, code):
     assert json.loads(capsys.readouterr().out)["status"] == status
 
 
+@pytest.mark.contract
 def test_unexpected_exception_is_json_failed_exit_1(monkeypatch, capsys):
     from liebert_re.tools import formats
 
@@ -93,6 +97,7 @@ def test_unexpected_exception_is_json_failed_exit_1(monkeypatch, capsys):
     assert body["status"] == "FAILED" and body["error_type"] == "ZeroDivisionError" and "kaboom" in body["error"]
 
 
+@pytest.mark.contract
 def test_missing_optional_dependency_is_tool_missing_exit_3(monkeypatch, capsys):
     from liebert_re.tools import formats
 
@@ -142,6 +147,7 @@ def test_capabilities_reports_a_nonempty_family_set():
 
 # --- unclassifiable text, structured failures, and the workspace choice ---
 
+@pytest.mark.contract
 def test_unrecognised_failure_text_does_not_exit_zero(monkeypatch, capsys):
     from liebert_re.tools import binary
     monkeypatch.setattr(binary, "pe_imports", lambda path: "Something went badly wrong in some new way.")

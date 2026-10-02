@@ -9,7 +9,14 @@ As a hook (git feeds "<local ref> <local sha> <remote ref> <remote sha>" lines o
   1. pytest -q tests/test_repo_discipline.py        (the discipline + privacy gate on the tree)
   2. pytest -q, the default (not heavy) suite minus the discipline file already run in 1, so a
      discipline failure stays its own named stage and no test runs twice. Never `-m heavy`.
-  3. the SAME identity probes that gate uses, over every commit's author, e-mail and message in
+  3. `pytest -m contract` (the wrapper-contract tests: a call never raises, it returns an honest
+     status) on EVERY supported interpreter it can find (3.10, 3.12 and 3.14, the CI matrix). Stdlib
+     exception behaviour differs between versions (Path.is_dir() re-raised PermissionError before 3.13),
+     so one interpreter cannot vouch for the contract. A version with no usable interpreter is reported
+     loudly as "did not run"; it is never skipped silently. Discovery: LIEBERT_CONTRACT_PYTHONS (paths
+     separated by os.pathsep), the venvs under ~/.liebert-venvs (override: LIEBERT_VENV_DIR), the repo
+     .venv*, the running interpreter. LIEBERT_CONTRACT_STRICT=1 turns a missing version into a BLOCK.
+  4. the SAME identity probes that gate uses, over every commit's author, e-mail and message in
      the pushed range (the file scan cannot see commit messages or history).
 A red or leaking tree cannot be pushed without `git push --no-verify`. Commits and all local work
 stay unrestricted: this runs on push only. It never pushes anything itself.
@@ -60,8 +67,9 @@ def fatal_findings(text: str, stream: str) -> list[str]:
             if any(p.search(line) for p in FATAL_PATTERNS)]
 
 
-def run_pytest(cmd: list[str]) -> tuple[int, list[str]]:
-    """Run pytest, relaying its output live, and return (exit code, fatal-exception findings)."""
+def run_pytest(cmd: list[str], failed: list[str] | None = None) -> tuple[int, list[str]]:
+    """Run pytest, relaying its output live, and return (exit code, fatal-exception findings).
+    If `failed` is given it receives the FAILED/ERROR test ids from pytest's -rfE summary."""
     proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     bufs: dict[str, list[str]] = {"stdout": [], "stderr": []}
 
@@ -80,7 +88,112 @@ def run_pytest(cmd: list[str]) -> tuple[int, list[str]]:
         t.join()
     rc = proc.wait()
     hits = [h for name, lines in bufs.items() for h in fatal_findings("".join(lines), name)]
+    if failed is not None:
+        failed.extend(failed_ids("".join(bufs["stdout"])))
     return rc, hits
+
+
+def failed_ids(text: str) -> list[str]:
+    """Test ids from pytest's short summary lines ('FAILED tests/x.py::Cls::test - message')."""
+    return [m.group(1) for m in re.finditer(r"^(?:FAILED|ERROR) (\S+)", text, re.M)]
+
+
+# ---- contract stage: interpreter discovery -------------------------------------------------------
+# Mirrors the CI matrix on purpose; tests/test_pre_push_gate.py checks the two lists agree.
+CONTRACT_VERSIONS = ("3.10", "3.12", "3.14")
+_PROBE = ("import sys; print('%d.%d' % sys.version_info[:2]); print(sys.version.split()[0]); "
+          "import pytest, liebert_re, mpmath")
+
+
+def _venv_python(d: Path) -> Path | None:
+    for rel in ("Scripts/python.exe", "bin/python"):
+        if (d / rel).is_file():
+            return d / rel
+    return None
+
+
+def candidate_interpreters(env=None) -> list[Path]:
+    """Where to look, in priority order. Nothing is hard-coded to one machine: an explicit list from
+    LIEBERT_CONTRACT_PYTHONS, then the per-user venv directory (default ~/.liebert-venvs, where one
+    venv per version is the natural layout and carries pytest and the dev extras), then the repo's
+    own .venv*, then the interpreter running the gate."""
+    env = os.environ if env is None else env
+    out: list[Path] = [Path(x) for x in env.get("LIEBERT_CONTRACT_PYTHONS", "").split(os.pathsep) if x.strip()]
+    vdir = Path(env.get("LIEBERT_VENV_DIR") or Path.home() / ".liebert-venvs")
+    roots = [*(sorted(vdir.iterdir()) if vdir.is_dir() else []), *sorted(ROOT.glob(".venv*"))]
+    out += [p for r in roots if r.is_dir() and (p := _venv_python(r))]
+    out.append(Path(sys.executable))
+    return out
+
+
+def probe_interpreter(py: Path):
+    """(major.minor, full version) if `py` can run the contract tests, else a reason string."""
+    try:
+        r = subprocess.run([str(py), "-c", _PROBE], capture_output=True, text=True, timeout=60, cwd=ROOT)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"cannot start: {e.__class__.__name__}"
+    if r.returncode != 0:
+        tail = (r.stderr.strip().splitlines() or ["?"])[-1][:120]
+        return f"pytest or the package dependencies are not importable ({tail})"
+    lines = r.stdout.split()
+    return lines[0], lines[1]
+
+
+def find_contract_interpreters(env=None):
+    """({'3.10': (path, '3.10.11'), ...} for the versions found usable,
+    {'3.10': [rejected candidates and why]} for the versions not found)."""
+    found: dict[str, tuple[Path, str]] = {}
+    rejected: list[tuple[Path, str]] = []
+    seen: set[str] = set()
+    for py in candidate_interpreters(env):
+        key = os.path.normcase(str(py.resolve())) if py.exists() else str(py)
+        if key in seen:
+            continue
+        seen.add(key)
+        res = probe_interpreter(py) if py.exists() else "path does not exist"
+        if isinstance(res, str):
+            rejected.append((py, res))
+        elif res[0] in CONTRACT_VERSIONS and res[0] not in found:
+            found[res[0]] = (py, res[1])
+    why = {v: [f"{p}: {r}" for p, r in rejected] for v in CONTRACT_VERSIONS if v not in found}
+    return found, why
+
+
+def run_contract_stage(env=None) -> bool:
+    """Run `-m contract` on every supported interpreter. True means the stage failed (block)."""
+    found, why = find_contract_interpreters(env)
+    blocked = False
+    strict = (os.environ if env is None else env).get("LIEBERT_CONTRACT_STRICT") == "1"
+    for ver in CONTRACT_VERSIONS:
+        if ver not in found:
+            print(f"pre-push gate: WARNING, no usable Python {ver} found: the contract tests DID NOT RUN on "
+                  f"{ver}. Python-version-dependent stdlib behaviour is unverified here "
+                  "(set LIEBERT_CONTRACT_PYTHONS, or create a venv under ~/.liebert-venvs with "
+                  "`pip install -e .[dev,lattice]`).", file=sys.stderr)
+            for w in why.get(ver, [])[:5]:
+                print("  rejected candidate " + w, file=sys.stderr)
+            if strict:
+                print(f"pre-push gate: BLOCKED, LIEBERT_CONTRACT_STRICT=1 and Python {ver} is missing.",
+                      file=sys.stderr)
+                blocked = True
+            continue
+        py, full = found[ver]
+        print(f"pre-push gate:   contract tests on Python {full} ({py}) ...", file=sys.stderr, flush=True)
+        failed: list[str] = []
+        rc, fatal = run_pytest([str(py), "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rfE", "-m", "contract"],
+                               failed=failed)
+        if fatal:
+            _report_fatal(f"the contract tests on Python {full}", rc, fatal)
+            blocked = True
+        elif rc != 0:
+            print(f"pre-push gate: BLOCKED, contract tests are red on Python {full} ({py}), pytest exit {rc}:",
+                  file=sys.stderr)
+            for t in failed[:30] or ["(no FAILED line captured; see the output above)"]:
+                print(f"  [py{ver}] {t}", file=sys.stderr)
+            blocked = True
+        else:
+            print(f"pre-push gate:   Python {full}: contract tests ok.", file=sys.stderr)
+    return blocked
 
 
 def _git(*args: str) -> str:
@@ -136,11 +249,11 @@ def _report_fatal(what: str, rc: int, hits: list[str]) -> None:
 
 
 def run_gate(ranges: list[list[str]]) -> int:
-    print("pre-push gate: discipline test + test suite + commit-message identity probes "
+    print("pre-push gate: discipline test + test suite + contract tests on every Python + identity probes "
           "(bypass only with: git push --no-verify)", file=sys.stderr)
     pytest = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
     failed = False
-    print("pre-push gate: [1/3] discipline test ...", file=sys.stderr, flush=True)
+    print("pre-push gate: [1/4] discipline test ...", file=sys.stderr, flush=True)
     rc, fatal = run_pytest([*pytest, "tests/test_repo_discipline.py"])
     if fatal:
         _report_fatal("tests/test_repo_discipline.py", rc, fatal)
@@ -149,9 +262,9 @@ def run_gate(ranges: list[list[str]]) -> int:
         print("pre-push gate: BLOCKED, tests/test_repo_discipline.py is not green.", file=sys.stderr)
         failed = True
     else:
-        print("pre-push gate: [1/3] discipline test: ok.", file=sys.stderr)
+        print("pre-push gate: [1/4] discipline test: ok.", file=sys.stderr)
     # Default mode of pytest.ini (-m "not heavy" from addopts); the discipline file ran above.
-    print("pre-push gate: [2/3] test suite (not heavy) ...", file=sys.stderr, flush=True)
+    print("pre-push gate: [2/4] test suite (not heavy) ...", file=sys.stderr, flush=True)
     rc, fatal = run_pytest([*pytest, "-rfE", "--ignore=tests/test_repo_discipline.py"])
     if fatal:
         _report_fatal("the test suite", rc, fatal)
@@ -161,8 +274,13 @@ def run_gate(ranges: list[list[str]]) -> int:
               "failed tests are listed above as FAILED/ERROR).", file=sys.stderr)
         failed = True
     else:
-        print("pre-push gate: [2/3] test suite: ok.", file=sys.stderr)
-    print("pre-push gate: [3/3] commit-message identity probes ...", file=sys.stderr, flush=True)
+        print("pre-push gate: [2/4] test suite: ok.", file=sys.stderr)
+    print("pre-push gate: [3/4] contract tests on every supported Python ...", file=sys.stderr, flush=True)
+    if run_contract_stage():
+        failed = True
+    else:
+        print("pre-push gate: [3/4] contract tests: done.", file=sys.stderr)
+    print("pre-push gate: [4/4] commit-message identity probes ...", file=sys.stderr, flush=True)
     try:
         hits = message_findings(ranges)
     except Exception as e:                           # cannot scan messages => do not wave it through

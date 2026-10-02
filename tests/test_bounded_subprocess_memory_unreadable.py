@@ -5,6 +5,7 @@ non-elevated host produces; these tests do not need an unprivileged machine.
 """
 from __future__ import annotations
 
+import pytest
 import sys
 import unittest
 from unittest import mock
@@ -19,6 +20,7 @@ _BIG = 10 * 1024 ** 3
 
 
 class UnreadableMemoryIsNotOverLimit(unittest.TestCase):
+    @pytest.mark.contract
     def test_unreadable_root_is_refused_before_spawn_and_not_over_limit(self):
         with mock.patch.object(psutil.Process, "memory_info", side_effect=psutil.AccessDenied(1)), \
                 mock.patch.object(bounded_subprocess.subprocess, "Popen") as popen:
@@ -27,6 +29,7 @@ class UnreadableMemoryIsNotOverLimit(unittest.TestCase):
         self.assertTrue(result.resource_limit_unavailable)
         self.assertFalse(result.memory_exceeded)
 
+    @pytest.mark.contract
     def test_unreadable_descendant_does_not_kill_a_healthy_tree(self):
         real = psutil.Process.memory_info
         me = psutil.Process().pid
@@ -49,6 +52,7 @@ class UnreadableMemoryIsNotOverLimit(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("ok", result.stdout)
 
+    @pytest.mark.contract
     def test_real_over_limit_is_still_reported_as_memory_exceeded(self):
         code = "b=bytearray(200*1024*1024); import time; time.sleep(5)"
         result = run_bounded_process([sys.executable, "-c", code], timeout_seconds=20, max_memory_bytes=50 * 1024 ** 2)

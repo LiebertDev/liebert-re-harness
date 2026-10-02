@@ -19,6 +19,7 @@ that, by design (see module docstring above).
 """
 from __future__ import annotations
 
+import pytest
 import tempfile
 import unittest
 from pathlib import Path
@@ -63,10 +64,12 @@ class FormatProbeNotThisFormatTests(unittest.TestCase):
         self.assertEqual(result["snapshot_magic_occurrences"], 0)
         self.assertEqual(result["plausible_snapshot_headers"], 0)
 
+    @pytest.mark.contract
     def test_dart_aot_recovery_missing_file_is_a_structured_error(self):
         result = _j(dart_aot_recovery(str(self.root / "nope.so")))
         self.assertIn("error", result)
 
+    @pytest.mark.contract
     def test_android_resource_analyzer_rejects_non_axml_non_apk(self):
         result = _j(android_resource_analyzer(str(self.garbage)))
         self.assertFalse(result["ok"])
@@ -282,6 +285,7 @@ class Il2cppMapperToolMissingTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    @pytest.mark.contract
     def test_tool_missing_is_a_structured_result(self):
         with mock.patch("liebert_re.tools.il2cpp._il2cppdumper", return_value=None):
             result = _j(il2cpp_mapper(str(self.binary), str(self.metadata)))
@@ -299,6 +303,7 @@ class UpxUnpackToolMissingTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    @pytest.mark.contract
     def test_tool_missing_is_a_structured_result(self):
         with mock.patch("liebert_re.tools.upx._upx_binary", return_value=None):
             result = _j(upx_unpack(str(self.target)))

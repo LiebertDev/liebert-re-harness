@@ -94,6 +94,7 @@ class ToolsLatticeMpmathFailClosedTests(unittest.TestCase):
     installed in this environment, so absence is simulated by patching the
     _HAVE_MPMATH flag both modules read."""
 
+    @pytest.mark.contract
     def test_reduce_reports_tool_missing_when_mpmath_absent(self):
         with mock.patch.object(tools_lattice, "_HAVE_MPMATH", False):
             result = json.loads(lattice_reduce([[10, 1], [1, 10]], operation="reduce"))
@@ -102,6 +103,7 @@ class ToolsLatticeMpmathFailClosedTests(unittest.TestCase):
         self.assertEqual(result["error"], "MPMATH_UNAVAILABLE")
         self.assertEqual(result["missing_dependency"], "mpmath")
 
+    @pytest.mark.contract
     def test_reduce_and_enumerate_reports_tool_missing_when_mpmath_absent(self):
         with mock.patch.object(tools_lattice, "_HAVE_MPMATH", False):
             result = json.loads(lattice_reduce([[2, 0], [0, 2]], operation="reduce_and_enumerate", max_norm_sq=4))

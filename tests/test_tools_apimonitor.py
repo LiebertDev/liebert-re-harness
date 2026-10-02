@@ -63,10 +63,12 @@ class ApiMonitorMissingTests(unittest.TestCase):
     TOOL_MISSING shape, independent of whether API Monitor is actually
     installed on the machine running the test."""
 
+    @pytest.mark.contract
     def test_missing_exe_reports_unavailable(self):
         with mock.patch.object(am, "_exe_path", return_value=None):
             self.assertFalse(am.apimonitor_available())
 
+    @pytest.mark.contract
     def test_status_reports_unavailable_when_no_exe_present(self):
         with mock.patch.object(am, "_exe_path", return_value=None), \
              mock.patch.object(am, "_api_dir", return_value=Path("C:/does/not/exist")):
@@ -76,6 +78,7 @@ class ApiMonitorMissingTests(unittest.TestCase):
         self.assertFalse(data["available"])
         self.assertFalse(data["api_definitions_dir_present"])
 
+    @pytest.mark.contract
     def test_api_catalog_returns_tool_missing_when_api_dir_absent(self):
         with mock.patch.object(am, "_api_dir", return_value=Path("C:/definitely/not/here")):
             out = am.api_catalog()
@@ -90,6 +93,7 @@ class ApiMonitorUnsupportedOperationTests(unittest.TestCase):
     CLI/headless automation surface exists for either on this real install,
     verified against the actual binary before this module was written."""
 
+    @pytest.mark.contract
     def test_live_trace_never_starts_a_subprocess(self):
         with mock.patch("liebert_re.dynamic.apimonitor.run_bounded_process") as mocked_run:
             out = am.live_trace(target_path="C:/some/target.exe", isolated_context_confirmed=True)
@@ -99,11 +103,13 @@ class ApiMonitorUnsupportedOperationTests(unittest.TestCase):
         self.assertFalse(data["execution_performed"])
         mocked_run.assert_not_called()
 
+    @pytest.mark.contract
     def test_live_trace_refuses_even_with_arbitrary_args(self):
         out = am.live_trace()
         data = json.loads(out)
         self.assertEqual(data["status"], "NOT_SUPPORTED")
 
+    @pytest.mark.contract
     def test_parse_trace_never_reads_a_file(self):
         with mock.patch("liebert_re.dynamic.apimonitor.run_bounded_process") as mocked_run:
             out = am.parse_trace(trace_path="C:/some/trace.apmx64")

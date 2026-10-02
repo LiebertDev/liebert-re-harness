@@ -47,6 +47,7 @@ class RizinMissingTests(unittest.TestCase):
     TOOL_MISSING shape, independent of whether rizin is actually installed
     on the machine running the test."""
 
+    @pytest.mark.contract
     def test_missing_binary_returns_tool_missing_not_an_exception(self):
         with mock.patch.object(tr, "_rizin_binary", return_value=None):
             out = tr.rizin_functions(str(LOGINCRACKME))
@@ -55,6 +56,7 @@ class RizinMissingTests(unittest.TestCase):
         self.assertEqual(data["status"], "TOOL_MISSING")
         self.assertIn("required_capability", data)
 
+    @pytest.mark.contract
     def test_status_reports_unavailable_when_binary_absent(self):
         with mock.patch.object(tr, "_rizin_binary", return_value=None):
             out = tr.rizin_status()
@@ -122,6 +124,7 @@ class RizinTimeoutTests(unittest.TestCase):
     binary or wall-clock waiting: run_bounded_process's own timed_out
     signal is what tools_rizin.py branches on, so simulate it directly."""
 
+    @pytest.mark.contract
     def test_timeout_result_from_run_bounded_process_becomes_timeout_status(self):
         fake_result = mock.Mock(timed_out=True, cancelled=False, returncode=None,
                                  stdout="", stderr="", output_truncated=False)
@@ -134,6 +137,7 @@ class RizinTimeoutTests(unittest.TestCase):
         self.assertFalse(data["ok"])
         self.assertEqual(data["status"], "TIMEOUT")
 
+    @pytest.mark.contract
     def test_cancellation_result_becomes_cancelled_status(self):
         fake_result = mock.Mock(timed_out=False, cancelled=True, returncode=None,
                                  stdout="", stderr="", output_truncated=False)
@@ -151,6 +155,7 @@ class RizinMalformedOutputTests(unittest.TestCase):
     """rizin producing unparseable or non-JSON stdout must degrade to a
     structured status, never an unhandled exception."""
 
+    @pytest.mark.contract
     def test_no_json_in_stdout_is_analysis_limited_not_a_crash(self):
         fake_result = mock.Mock(timed_out=False, cancelled=False, returncode=0,
                                  stdout="no brackets here", stderr="", output_truncated=False)
@@ -163,6 +168,7 @@ class RizinMalformedOutputTests(unittest.TestCase):
         self.assertFalse(data["ok"])
         self.assertEqual(data["status"], "ANALYSIS_LIMITED")
 
+    @pytest.mark.contract
     def test_malformed_json_array_is_result_parse_failed_not_a_crash(self):
         fake_result = mock.Mock(timed_out=False, cancelled=False, returncode=0,
                                  stdout="[{not valid json,,,]", stderr="", output_truncated=False)
@@ -175,6 +181,7 @@ class RizinMalformedOutputTests(unittest.TestCase):
         self.assertFalse(data["ok"])
         self.assertEqual(data["status"], "RESULT_PARSE_FAILED")
 
+    @pytest.mark.contract
     def test_nonzero_exit_code_is_analysis_limited_not_a_crash(self):
         fake_result = mock.Mock(timed_out=False, cancelled=False, returncode=1,
                                  stdout="", stderr="rizin: cannot open file", output_truncated=False)
@@ -189,6 +196,7 @@ class RizinMalformedOutputTests(unittest.TestCase):
 
 
 class RizinNotFoundTests(unittest.TestCase):
+    @pytest.mark.contract
     def test_nonexistent_path_returns_not_found(self):
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"):
             out = tr.rizin_functions(str(REPO_ROOT / "benchmarks" / "does_not_exist_at_all.exe"))

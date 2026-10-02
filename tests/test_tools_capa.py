@@ -13,6 +13,7 @@ match set must stay an honest negative.
 """
 from __future__ import annotations
 
+import pytest
 import json
 import unittest
 from pathlib import Path
@@ -231,6 +232,7 @@ class InvocationTests(_WithSample):
 
 
 class FailureVocabularyTests(_WithSample):
+    @pytest.mark.contract
     def test_nonzero_exit_is_reported_not_retried_with_another_backend(self):
         """The pefile-backend crash on capa 9.4.0 is the real case here: a
         result from a different engine would be a different claim."""
@@ -243,6 +245,7 @@ class FailureVocabularyTests(_WithSample):
         self.assertIn("NotImplementedError", data["stderr_tail"])
         self.assertIn("different claim", data["detail"])
 
+    @pytest.mark.contract
     def test_timeout_says_not_to_read_it_as_no_capabilities(self):
         result = BoundedProcessResult(None, "", "", timed_out=True)
         data = self.run_analyze(result, timeout_seconds=60)
@@ -250,21 +253,25 @@ class FailureVocabularyTests(_WithSample):
         self.assertEqual(data["timeout_seconds"], 60)
         self.assertIn("do not read a timeout as", data["detail"])
 
+    @pytest.mark.contract
     def test_cancellation_is_its_own_status(self):
         result = BoundedProcessResult(None, "", "", cancelled=True)
         data = self.run_analyze(result)
         self.assertEqual(data["status"], "CANCELLED")
 
+    @pytest.mark.contract
     def test_non_json_stdout_is_analysis_limited(self):
         data = self.run_analyze(_ok("capa: error: something went wrong"))
         self.assertEqual(data["status"], "ANALYSIS_LIMITED")
         self.assertEqual(data["error"], "CAPA_NO_JSON_OUTPUT")
 
+    @pytest.mark.contract
     def test_json_without_a_rules_object_is_a_parse_failure_not_an_empty_result(self):
         data = self.run_analyze(_ok(json.dumps({"meta": {}})))
         self.assertEqual(data["status"], "RESULT_PARSE_FAILED")
         self.assertEqual(data["error"], "CAPA_OUTPUT_MISSING_RULES_OBJECT")
 
+    @pytest.mark.contract
     def test_unparseable_json_is_reported_as_version_drift(self):
         data = self.run_analyze(_ok("{not json at all}"))
         self.assertEqual(data["status"], "RESULT_PARSE_FAILED")
@@ -278,6 +285,7 @@ class FailureVocabularyTests(_WithSample):
 
 
 class AvailabilityTests(unittest.TestCase):
+    @pytest.mark.contract
     def test_missing_binary_returns_tool_missing_for_both_operations(self):
         with mock.patch.object(tc, "_capa_binary", return_value=None):
             for name, call in (("capa_analyze", lambda: tc.capa_analyze("x")),

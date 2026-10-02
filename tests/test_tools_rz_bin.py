@@ -177,21 +177,25 @@ class RelocationsTests(_WithSample):
 
 
 class FailureVocabularyTests(_WithSample):
+    @pytest.mark.contract
     def test_nonzero_exit_and_empty_stdout_are_analysis_limited(self):
         d = self.call(tr.rz_bin_imports, BoundedProcessResult(1, "", "rz_core: Cannot open file"))
         self.assertEqual((d["status"], d["exit_code"]), ("ANALYSIS_LIMITED", 1))
         d = self.call(tr.rz_bin_imports, _ok(""))
         self.assertEqual(d["status"], "ANALYSIS_LIMITED")
 
+    @pytest.mark.contract
     def test_truncated_output_is_never_a_complete_result(self):
         d = self.call(tr.rz_bin_imports, BoundedProcessResult(0, IMPORTS, "", output_truncated=True))
         self.assertEqual((d["status"], d["error"]), ("ANALYSIS_LIMITED", "RZ_BIN_OUTPUT_TRUNCATED_AT_CAP"))
 
+    @pytest.mark.contract
     def test_bad_json_and_wrong_shape_are_parse_failures(self):
         self.assertEqual(self.call(tr.rz_bin_imports, _ok("{not json"))["status"], "RESULT_PARSE_FAILED")
         self.assertEqual(self.call(tr.rz_bin_imports, _ok('{"sections":[]}'))["status"], "RESULT_PARSE_FAILED")
         self.assertEqual(self.call(tr.rz_bin_imports, _ok('{"imports":5}'))["status"], "RESULT_PARSE_FAILED")
 
+    @pytest.mark.contract
     def test_timeout_and_cancellation(self):
         d = self.call(tr.rz_bin_imports, BoundedProcessResult(None, "", "", timed_out=True))
         self.assertEqual(d["status"], "TIMEOUT")
@@ -212,6 +216,7 @@ class FailureVocabularyTests(_WithSample):
             tr.rz_bin_imports(str(self.sample), timeout_seconds=10**6)
         self.assertEqual(seen["timeout_seconds"], tr._MAX_TIMEOUT_SECONDS)
 
+    @pytest.mark.contract
     def test_environment_errors_are_labelled_as_such_and_never_raised(self):
         for exc in (PermissionError(13, "Access is denied"), FileNotFoundError(2, "no such file"),
                     OSError(22, "bad")):
@@ -221,6 +226,7 @@ class FailureVocabularyTests(_WithSample):
             self.assertEqual(d["environment_error"]["type"], type(exc).__name__)
             self.assertEqual(d["environment_error"]["errno"], exc.errno)
 
+    @pytest.mark.contract
     def test_unexpected_exception_still_returns_json(self):
         d = self.call(tr.rz_bin_sections, RuntimeError("boom"))
         self.assertEqual((d["status"], d["error"]), ("ANALYSIS_LIMITED", "RZ_BIN_UNEXPECTED_ERROR"))
@@ -228,6 +234,7 @@ class FailureVocabularyTests(_WithSample):
 
 
 class PathAndToolGateTests(unittest.TestCase):
+    @pytest.mark.contract
     def test_missing_tool_is_tool_missing_for_every_operation(self):
         with mock.patch.object(tr._RzBin, "binary", return_value=None), \
              mock.patch.object(tr, "run_bounded_process") as run:
@@ -238,6 +245,7 @@ class PathAndToolGateTests(unittest.TestCase):
             self.assertEqual(d["status"], "TOOL_MISSING")
             run.assert_not_called()
 
+    @pytest.mark.contract
     def test_path_is_checked_before_any_subprocess(self):
         with mock.patch.object(tr._RzBin, "binary", return_value="C:/fake/rz-bin.exe"), \
              mock.patch.object(tr, "run_bounded_process") as run:
@@ -250,6 +258,7 @@ class PathAndToolGateTests(unittest.TestCase):
                     self.assertEqual(json.loads(tr.rz_bin_imports("x"))["status"], "NOT_FOUND")
             run.assert_not_called()
 
+    @pytest.mark.contract
     def test_a_path_check_os_error_is_an_environment_error(self):
         with mock.patch.object(tr._RzBin, "binary", return_value="C:/fake/rz-bin.exe"), \
              mock.patch.object(tr, "safe_path", side_effect=PermissionError(13, "denied")) as sp:

@@ -59,6 +59,16 @@ the venv, then re-run `install --force`). The gate also blocks when pytest print
 report ("Windows fatal exception", "Fatal Python error") even though its exit code is 0.
 `python scripts/pre_push_gate.py --check` says whether the hook is installed.
 
+The gate has four stages: discipline test, default suite, contract tests, commit-message identity
+probes. The contract stage runs `pytest -m contract` (error-path tests: a wrapper never raises and
+returns an honest status) on every CI-matrix Python it finds (3.10, 3.12, 3.14), because stdlib
+exception behaviour differs between versions. It looks in `LIEBERT_CONTRACT_PYTHONS` (interpreter paths
+separated by `os.pathsep`), then the venvs under `~/.liebert-venvs` (`LIEBERT_VENV_DIR` overrides the
+directory; each needs `pip install -e ".[dev,lattice]"`), then the repo's `.venv*`, then the running
+interpreter. A version that is not found prints "DID NOT RUN" and the push is NOT blocked, so a fresh
+clone does not need three venvs; CI runs the contract tests on all legs. `LIEBERT_CONTRACT_STRICT=1`
+turns a missing version into a block. A red test on a found interpreter always blocks and names it.
+
 ### Python dependencies
 
 Installed automatically: `pefile`, `capstone`, `unicorn`, `keystone-engine`,

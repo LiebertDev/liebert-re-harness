@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import unittest
 import zipfile
+import pytest
 from pathlib import Path
 
 from liebert_re.tools.binary import disassemble_pe
@@ -98,6 +99,7 @@ class DisassemblePeNonPeInputTests(unittest.TestCase):
     def tearDown(self):
         self.zip_path.unlink(missing_ok=True)
 
+    @pytest.mark.contract
     def test_zip_input_never_raises_and_returns_a_structured_failure(self):
         # Must not raise pefile.PEFormatError -- previously uncaught.
         result = disassemble_pe(str(self.zip_path))
@@ -106,10 +108,12 @@ class DisassemblePeNonPeInputTests(unittest.TestCase):
         self.assertEqual(result["error"], "INVALID_PE")
         self.assertNotIn("Traceback", result["message"])
 
+    @pytest.mark.contract
     def test_zip_input_error_text_names_the_real_cause(self):
         result = disassemble_pe(str(self.zip_path))
         self.assertIn("PE", result["message"])
 
+    @pytest.mark.contract
     def test_truncated_pe_header_also_fails_gracefully(self):
         truncated = SCRATCH_DIR / "__truncated__.exe"
         truncated.write_bytes(b"MZ" + b"\x00" * 10)
@@ -131,5 +135,4 @@ if __name__ == "__main__":
 # module) a real external analysis tool or spawns a bounded subprocess -- these can be
 # slow or hang, so they are excluded from the default run and must be run explicitly
 # with `pytest -m heavy`. See pytest.ini in this repo for the tools actually involved.
-import pytest as _pytest_heavy_marker
-pytestmark = _pytest_heavy_marker.mark.heavy
+pytestmark = pytest.mark.heavy

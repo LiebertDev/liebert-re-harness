@@ -89,6 +89,7 @@ class DieMissingTests(unittest.TestCase):
     TOOL_MISSING shape, independent of whether diec.exe is actually
     installed on the machine running the test."""
 
+    @pytest.mark.contract
     def test_missing_binary_returns_tool_missing_not_an_exception(self):
         with mock.patch.object(td, "_die_binary", return_value=None):
             out = td.die_identify(str(TBM_EXE))
@@ -97,12 +98,14 @@ class DieMissingTests(unittest.TestCase):
         self.assertEqual(data["status"], "TOOL_MISSING")
         self.assertIn("required_capability", data)
 
+    @pytest.mark.contract
     def test_die_available_reports_false_when_binary_absent(self):
         with mock.patch.object(td, "_die_binary", return_value=None):
             self.assertFalse(td.die_available())
 
 
 class DieNotFoundTests(unittest.TestCase):
+    @pytest.mark.contract
     def test_nonexistent_path_returns_not_found_before_any_subprocess_call(self):
         with mock.patch.object(td, "_die_binary", return_value="C:/fake/diec.exe"), \
              mock.patch("liebert_re.tools.die.run_bounded_process") as mocked_run:
@@ -164,6 +167,7 @@ class DieParsingTests(unittest.TestCase):
 
 
 class DieTimeoutTests(unittest.TestCase):
+    @pytest.mark.contract
     def test_timeout_result_from_run_bounded_process_becomes_timeout_status(self):
         fake_result = mock.Mock(cancelled=False, timed_out=True, returncode=None,
                                  stdout="", stderr="", output_truncated=False)
@@ -176,6 +180,7 @@ class DieTimeoutTests(unittest.TestCase):
         self.assertFalse(data["ok"])
         self.assertEqual(data["status"], "TIMEOUT")
 
+    @pytest.mark.contract
     def test_cancellation_result_becomes_cancelled_status(self):
         fake_result = mock.Mock(cancelled=True, timed_out=False, returncode=None,
                                  stdout="", stderr="", output_truncated=False)
@@ -190,6 +195,7 @@ class DieTimeoutTests(unittest.TestCase):
 
 
 class DieMalformedOutputTests(unittest.TestCase):
+    @pytest.mark.contract
     def test_no_json_in_stdout_is_analysis_limited_not_a_crash(self):
         fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=0,
                                  stdout="no braces here", stderr="", output_truncated=False)
@@ -202,6 +208,7 @@ class DieMalformedOutputTests(unittest.TestCase):
         self.assertFalse(data["ok"])
         self.assertEqual(data["status"], "ANALYSIS_LIMITED")
 
+    @pytest.mark.contract
     def test_malformed_json_object_is_result_parse_failed_not_a_crash(self):
         fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=0,
                                  stdout="{not valid json,,,}", stderr="", output_truncated=False)
@@ -214,6 +221,7 @@ class DieMalformedOutputTests(unittest.TestCase):
         self.assertFalse(data["ok"])
         self.assertEqual(data["status"], "RESULT_PARSE_FAILED")
 
+    @pytest.mark.contract
     def test_nonzero_exit_code_is_analysis_limited_not_a_crash(self):
         fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=1,
                                  stdout="", stderr="diec: cannot open file", output_truncated=False)

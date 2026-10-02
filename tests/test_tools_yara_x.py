@@ -68,6 +68,7 @@ REAL_YARA_X_JSON_NO_MATCH = json.dumps({"version": "1.20.0", "matches": []})
 
 
 class YaraXMissingTests(unittest.TestCase):
+    @pytest.mark.contract
     def test_missing_binary_returns_tool_missing_not_an_exception(self):
         with mock.patch.object(ty, "_yara_x_binary", return_value=None):
             out = ty.yara_x_scan(str(TBM_EXE), rules_text="rule r{condition:true}")
@@ -76,6 +77,7 @@ class YaraXMissingTests(unittest.TestCase):
         self.assertEqual(data["status"], "TOOL_MISSING")
         self.assertIn("required_capability", data)
 
+    @pytest.mark.contract
     def test_yara_x_available_reports_false_when_binary_absent(self):
         with mock.patch.object(ty, "_yara_x_binary", return_value=None):
             self.assertFalse(ty.yara_x_available())
@@ -84,6 +86,7 @@ class YaraXMissingTests(unittest.TestCase):
 class YaraXInputValidationTests(unittest.TestCase):
     """Every one of these must be rejected before any subprocess call."""
 
+    @pytest.mark.contract
     def test_nonexistent_target_returns_not_found_before_any_subprocess_call(self):
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
              mock.patch("liebert_re.tools.yara_x.run_bounded_process") as mocked_run:
@@ -94,6 +97,7 @@ class YaraXInputValidationTests(unittest.TestCase):
         self.assertEqual(data["status"], "NOT_FOUND")
         mocked_run.assert_not_called()
 
+    @pytest.mark.contract
     def test_neither_rule_source_given_is_rules_missing_before_any_subprocess_call(self):
         with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
              mock.patch("liebert_re.tools.yara_x.safe_path", return_value=STUB_PE), \
@@ -105,6 +109,7 @@ class YaraXInputValidationTests(unittest.TestCase):
         self.assertEqual(data["status"], "RULES_MISSING")
         mocked_run.assert_not_called()
 
+    @pytest.mark.contract
     def test_nonexistent_rules_path_is_rules_missing(self):
         # Only the stand-in target bypasses the workspace check; rules_path
         # still goes through the real safe_path.
@@ -121,6 +126,7 @@ class YaraXInputValidationTests(unittest.TestCase):
 
 
 class YaraXRuleCompileFailedTests(unittest.TestCase):
+    @pytest.mark.contract
     def test_nonzero_exit_with_empty_stdout_is_rule_compile_failed(self):
         # Verified live against the real installed yr.exe: a syntax error in
         # the rule source exits 1 with EMPTY stdout (all diagnostics on
@@ -139,6 +145,7 @@ class YaraXRuleCompileFailedTests(unittest.TestCase):
 
 
 class YaraXTimeoutTests(unittest.TestCase):
+    @pytest.mark.contract
     def test_timeout_result_from_run_bounded_process_becomes_timeout_status(self):
         fake_result = mock.Mock(cancelled=False, timed_out=True, returncode=None,
                                  stdout="", stderr="", output_truncated=False)
@@ -151,6 +158,7 @@ class YaraXTimeoutTests(unittest.TestCase):
         self.assertFalse(data["ok"])
         self.assertEqual(data["status"], "TIMEOUT")
 
+    @pytest.mark.contract
     def test_cancellation_result_becomes_cancelled_status(self):
         fake_result = mock.Mock(cancelled=True, timed_out=False, returncode=None,
                                  stdout="", stderr="", output_truncated=False)
@@ -163,6 +171,7 @@ class YaraXTimeoutTests(unittest.TestCase):
         self.assertFalse(data["ok"])
         self.assertEqual(data["status"], "CANCELLED")
 
+    @pytest.mark.contract
     def test_output_truncated_is_analysis_limited_not_a_silent_crop(self):
         fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=0,
                                  stdout=REAL_YARA_X_JSON_MATCH, stderr="", output_truncated=True)

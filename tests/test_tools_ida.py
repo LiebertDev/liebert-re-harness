@@ -238,6 +238,7 @@ class IdaCase(unittest.TestCase):
 # resolution, availability, argument checks
 # ---------------------------------------------------------------------------
 class AvailabilityTests(unittest.TestCase):
+    @pytest.mark.contract
     def test_missing_binary_returns_tool_missing_for_both_operations(self):
         with mock.patch.object(ti, "_resolved_by_and_binary", return_value=(None, None)):
             for name, call in (("ida_query", lambda: ti.ida_query("x")), ("ida_status", ti.ida_status)):
@@ -276,6 +277,7 @@ class AvailabilityTests(unittest.TestCase):
                  mock.patch.object(ti.shutil, "which", return_value=None):
                 self.assertEqual(ti._resolved_by_and_binary()[0], "known_install")
 
+    @pytest.mark.contract
     def test_resolution_never_raises_when_nothing_is_there(self):
         with mock.patch.dict(os.environ, {"IDAT_EXE": "Z:/nowhere/idat.exe", "IDA_HOME": "Z:/nowhere", "ProgramFiles": "Z:/nowhere"}), \
              mock.patch.object(ti.shutil, "which", return_value=None):
@@ -284,17 +286,20 @@ class AvailabilityTests(unittest.TestCase):
 
 
 class ArgumentTests(IdaCase):
+    @pytest.mark.contract
     def test_nonexistent_path_returns_not_found_before_any_subprocess_call(self):
         data = json.loads(ti.ida_query(str(self.root / "no_such_file.exe")))
         self.assertEqual(data["status"], "NOT_FOUND")
         self.assertEqual(self.fake.calls, [])
 
+    @pytest.mark.contract
     def test_path_outside_the_workspace_is_refused_before_any_subprocess_call(self):
         with mock.patch.object(ti, "safe_path", side_effect=PermissionError("outside the workspace")):
             data = json.loads(ti.ida_query(str(self.sample)))
         self.assertEqual(data["status"], "PATH_REFUSED")
         self.assertEqual(self.fake.calls, [])
 
+    @pytest.mark.contract
     def test_unknown_operation_is_refused_and_lists_what_is_accepted(self):
         data = self.q("rename")      # a write operation is not part of this module
         self.assertFalse(data["ok"])
@@ -303,6 +308,7 @@ class ArgumentTests(IdaCase):
         self.assertNotIn("rename", data["accepted"])
         self.assertEqual(self.fake.calls, [])
 
+    @pytest.mark.contract
     def test_a_database_file_is_refused_as_input(self):
         """Cloning an already-analysed database into the cache on every call
         grows disk use without bound; IDA also rewrites a database on every open."""
@@ -608,6 +614,7 @@ class FourSignalTests(IdaCase):
         self.assertEqual(self.slots(), [], "a failed first analysis must leave no slot")
         self.assertEqual(self.leftovers(), [], "and no scratch directory")
 
+    @pytest.mark.contract
     def test_a_broken_script_exits_1_leaves_loose_components_and_is_discarded(self):
         self.fake.behaviour = "broken"
         data = self.q()
@@ -618,6 +625,7 @@ class FourSignalTests(IdaCase):
         self.assertIn("not defined", data["stderr_tail"])
         self.assertEqual(list(self.cache.rglob("*.id0")), [])
 
+    @pytest.mark.contract
     def test_exit_zero_without_a_result_file_is_not_success(self):
         self.fake.behaviour = "no_output"
         data = self.q()
@@ -625,24 +633,28 @@ class FourSignalTests(IdaCase):
         self.assertEqual(data["signals"]["exit_code"], 0)
         self.assertFalse(data["signals"]["result_file_present"])
 
+    @pytest.mark.contract
     def test_exit_zero_with_a_fatal_log_line_is_not_success(self):
         self.fake.behaviour = "fatal_log"
         data = self.q()
         self.assertLimited(data, "IDA_LOG_REPORTS_FAILURE")
         self.assertIn("fatal error", data["signals"]["log_fatal_markers"])
 
+    @pytest.mark.contract
     def test_a_result_file_without_the_completion_marker_is_not_success(self):
         self.fake.behaviour = "incomplete"
         data = self.q()
         self.assertLimited(data, "IDA_OUTPUT_INCOMPLETE")
         self.assertFalse(data["signals"]["result_script_completed"])
 
+    @pytest.mark.contract
     def test_a_first_analysis_that_produced_no_database_is_not_success(self):
         """Seen when a session marks a new database temporary: exit 0, a good
         result file, and no .i64 at all."""
         self.fake.behaviour = "no_db"
         self.assertLimited(self.q(), "IDA_NO_DATABASE")
 
+    @pytest.mark.contract
     def test_unparseable_result_json_is_a_parse_failure(self):
         self.fake.behaviour = "garbage"
         data = self.q()
@@ -658,6 +670,7 @@ class FourSignalTests(IdaCase):
         self.assertEqual((s["exit_code"], s["log_fatal_markers"], s["loose_components"]), (0, [], []))
         self.assertTrue(s["database_present"] and s["result_file_present"] and s["result_script_completed"])
 
+    @pytest.mark.contract
     def test_a_failed_reopen_discards_the_slot_because_the_database_may_be_half_written(self):
         self.q()
         self.assertEqual(len(self.slots()), 1)
@@ -668,6 +681,7 @@ class FourSignalTests(IdaCase):
         self.fake.behaviour = "ok"
         self.assertEqual(self.q("list_functions")["database_cache"], "CREATED")
 
+    @pytest.mark.contract
     def test_a_worker_that_answers_no_is_not_a_cache_failure(self):
         self.q()
         self.fake.behaviour = "script_error"
@@ -679,6 +693,7 @@ class FourSignalTests(IdaCase):
         self.fake.behaviour = "ok"
         self.assertEqual(self.q("list_functions")["database_cache"], "HIT")
 
+    @pytest.mark.contract
     def test_timeout_says_not_to_read_it_as_nothing_found_and_keeps_nothing(self):
         self.fake.behaviour = "timeout"
         data = self.q(timeout_seconds=60)
@@ -688,18 +703,21 @@ class FourSignalTests(IdaCase):
         self.assertEqual(self.slots(), [])
         self.assertEqual(self.leftovers(), [])
 
+    @pytest.mark.contract
     def test_cancellation_is_its_own_status(self):
         self.fake.behaviour = "cancel"
         data = self.q()
         self.assertEqual(data["status"], "CANCELLED")
         self.assertEqual(self.slots(), [])
 
+    @pytest.mark.contract
     def test_a_timeout_on_reopen_discards_the_slot(self):
         self.q()
         self.fake.behaviour = "timeout"
         self.assertEqual(self.q("list_functions")["status"], "TIMEOUT")
         self.assertEqual(self.slots(), [])
 
+    @pytest.mark.contract
     def test_input_identity_mismatch_is_refused_and_the_slot_dropped(self):
         self.fake.behaviour = "mismatch"
         data = self.q()
@@ -714,6 +732,7 @@ class FourSignalTests(IdaCase):
         self.assertEqual(prov["status"], "UNVERIFIABLE")
         self.assertEqual(ti._provenance(self.sha, self.md5, {"engine_input_md5": self.md5})["status"], "VERIFIED")
 
+    @pytest.mark.contract
     def test_a_missing_packaged_worker_is_reported_not_raised(self):
         with mock.patch.object(ti, "_WORKER_SOURCE", self.root / "absent.idapy"):
             data = self.q()
@@ -763,6 +782,7 @@ class ResultTests(IdaCase):
         self.assertEqual(saved["engine_input_sha256"], self.sha)
         self.assertIsNone(data["evidence_write_error"])
 
+    @pytest.mark.contract
     def test_an_evidence_write_failure_is_reported_and_does_not_fail_the_query(self):
         blocker = self.root / "not_a_directory"
         blocker.write_text("x")
@@ -772,6 +792,7 @@ class ResultTests(IdaCase):
         self.assertIn("evidence_write_error", data)
         self.assertTrue(data["evidence_write_error"])
 
+    @pytest.mark.contract
     def test_an_evidence_index_failure_never_propagates(self):
         with mock.patch.object(ti, "_evidence_index_record_write", side_effect=RuntimeError("index down")):
             self.assertTrue(self.q("list_functions")["ok"])
@@ -1004,6 +1025,7 @@ class WorkerLogicTests(unittest.TestCase):
         self.assertEqual([x["from"] for x in result["items"]], ["0x1", "0x2"])
         self.assertEqual(result["next_offset"], 3)
 
+    @pytest.mark.contract
     def test_unresolvable_symbol_is_a_named_error_not_an_exception(self):
         self.ida["idc"].get_name_ea_simple.return_value = self.ida["idc"].BADADDR
         self.ida["idc"].get_segm_name.return_value = ""
@@ -1047,6 +1069,7 @@ class WorkerLogicTests(unittest.TestCase):
         _code, data = self.run_job(operation="list_functions", mode="reopen")
         self.assertFalse(data["database_changes_discarded"])
 
+    @pytest.mark.contract
     def test_unknown_operation_and_exceptions_still_write_a_completed_result(self):
         code, data = self.run_job(operation="rename")
         self.assertEqual((code, data["error"], data["ok"]), (0, "UNKNOWN_OPERATION", False))
@@ -1127,6 +1150,7 @@ class StatusTests(IdaCase):
         self.assertFalse(data["decompiler_available"])
         self.assertIn("decompile_function", data["note"])
 
+    @pytest.mark.contract
     def test_probe_failure_is_analysis_limited_and_names_the_signals(self):
         self.fake.behaviour = "broken"
         data = self.status()
@@ -1135,6 +1159,7 @@ class StatusTests(IdaCase):
         self.assertEqual(data["binary"], "C:/fake/idat.exe")
         self.assertEqual([p for p in self.cache.iterdir()], [])
 
+    @pytest.mark.contract
     def test_probe_timeout_is_reported(self):
         self.fake.behaviour = "timeout"
         self.assertEqual(self.status()["status"], "TIMEOUT")
@@ -1173,6 +1198,7 @@ class DiscardGuaranteeTests(IdaCase):
         self.assertTrue(self.q()["ok"])
         self.assertEqual(len(self.slots()), 1)
 
+    @pytest.mark.contract
     def test_a_reopen_result_with_the_flag_false_is_not_a_success_and_drops_the_slot(self):
         self._prime()
         evidence_before = sorted(self.evidence.iterdir())
@@ -1186,6 +1212,7 @@ class DiscardGuaranteeTests(IdaCase):
         self.assertEqual(self.slots(), [], "a database that may have taken the decompiler's types is not kept")
         self.assertEqual(sorted(self.evidence.iterdir()), evidence_before, "no evidence is written for a refused answer")
 
+    @pytest.mark.contract
     def test_a_reopen_result_without_the_flag_is_not_a_success_either(self):
         self._prime()
         self.fake.discard_flag = _OMIT
@@ -1195,6 +1222,7 @@ class DiscardGuaranteeTests(IdaCase):
         self.assertIsNone(data["signals"]["database_changes_discarded"])
         self.assertEqual(self.slots(), [])
 
+    @pytest.mark.contract
     def test_a_worker_that_declined_to_run_is_reported_with_its_own_error_named(self):
         self._prime()
         declined = {"ok": False, "tool": "ida_query", "operation": "list_functions", "items": [],
@@ -1240,6 +1268,7 @@ class WorkerDiscardGuardTests(unittest.TestCase):
             code = self.w.main()
         return code, json.loads((self.tmp / "out.json").read_text(encoding="utf-8"))
 
+    @pytest.mark.contract
     def test_when_the_temp_flag_cannot_be_set_the_operation_does_not_run(self):
         self.ida["ida_loader"].set_database_flag.side_effect = AttributeError("older build")
         self.ida["idautils"].Functions.return_value = [0x1000]
@@ -1257,12 +1286,14 @@ class WorkerDiscardGuardTests(unittest.TestCase):
         self.ida["ida_auto"].auto_wait.assert_not_called()
         self.ida["ida_loader"].save_database.assert_not_called()
 
+    @pytest.mark.contract
     def test_a_flag_that_reports_failure_by_returning_false_is_not_a_success_path(self):
         with mock.patch.object(self.w, "_discard_session_changes", return_value=False):
             _code, data = self.run_job(operation="list_functions")
         self.assertEqual(data["error"], "DATABASE_CHANGES_NOT_DISCARDABLE")
         self.ida["idautils"].Functions.assert_not_called()
 
+    @pytest.mark.contract
     def test_the_flag_is_set_before_anything_else_runs(self):
         order = []
         self.ida["ida_loader"].set_database_flag.side_effect = lambda *_a: order.append("flag")
@@ -1272,6 +1303,7 @@ class WorkerDiscardGuardTests(unittest.TestCase):
         self.assertEqual(order[:2], ["flag", "auto_wait"])
         self.assertIn("op", order)
 
+    @pytest.mark.contract
     def test_an_exception_during_the_operation_keeps_the_discard_signal(self):
         self.ida["idautils"].Functions.side_effect = RuntimeError("kernel said no")
         _code, data = self.run_job(operation="list_functions")
@@ -1294,6 +1326,7 @@ class EnvironmentErrorTests(IdaCase):
         self.assertIn("environment", data["detail"])
         self.assertNotIn("corrupt", data["detail"].lower())
 
+    @pytest.mark.contract
     def test_a_cache_root_that_is_a_file_is_reported_not_raised(self):
         self.cache.write_text("not a directory", encoding="utf-8")
         data = self.q()
@@ -1301,6 +1334,7 @@ class EnvironmentErrorTests(IdaCase):
         self.assertEqual(data["target_sha256"], self.sha)
         self.assertEqual(self.fake.calls, [])
 
+    @pytest.mark.contract
     def test_status_with_a_cache_root_that_is_a_file_is_reported_not_raised(self):
         self.cache.write_text("not a directory", encoding="utf-8")
         with mock.patch.object(ti, "_resolved_by_and_binary", return_value=("PATH", "C:/fake/idat.exe")):
@@ -1314,6 +1348,7 @@ class EnvironmentErrorTests(IdaCase):
             raise PermissionError(13, "Permission denied")
         return SimpleNamespace(is_file=lambda: True, read_bytes=refuse)
 
+    @pytest.mark.contract
     def test_an_unreadable_packaged_worker_is_reported_not_raised(self):
         with mock.patch.object(ti, "_WORKER_SOURCE", self._unreadable_worker()):
             data = self.q()
@@ -1323,12 +1358,14 @@ class EnvironmentErrorTests(IdaCase):
         self.assertEqual(self.leftovers(), [])
         self.assertFalse(ti._lock_path(ti._slot_dir(self.sha)).exists(), "the lock is released")
 
+    @pytest.mark.contract
     def test_status_with_an_unreadable_worker_is_reported_not_raised(self):
         with mock.patch.object(ti, "_resolved_by_and_binary", return_value=("PATH", "C:/fake/idat.exe")), \
                 mock.patch.object(ti, "_WORKER_SOURCE", self._unreadable_worker()):
             data = json.loads(ti.ida_status())
         self.assertEnvironmentError(data, "IDA_WORKER_UNREADABLE", errno=13)
 
+    @pytest.mark.contract
     def test_a_binary_that_exists_but_cannot_be_started_is_reported_not_raised(self):
         for exc, errno in ((FileNotFoundError(2, "The system cannot find the file specified"), 2),
                            (OSError(193, "%1 is not a valid Win32 application"), 193),
@@ -1340,6 +1377,7 @@ class EnvironmentErrorTests(IdaCase):
                 self.assertEqual(self.slots(), [])
                 self.assertEqual(self.leftovers(), [])
 
+    @pytest.mark.contract
     def test_a_job_file_that_cannot_be_written_is_reported_not_raised(self):
         real_write_text = Path.write_text
 
@@ -1356,6 +1394,7 @@ class EnvironmentErrorTests(IdaCase):
         self.assertEqual(self.leftovers(), [])
         self.assertFalse(ti._lock_path(ti._slot_dir(self.sha)).exists(), "the lock is released")
 
+    @pytest.mark.contract
     def test_a_launch_failure_on_a_reopen_does_not_discard_a_healthy_slot(self):
         self.assertTrue(self.q()["ok"])
         with mock.patch.object(ti, "run_bounded_process", side_effect=PermissionError(13, "Permission denied")):
@@ -1363,6 +1402,7 @@ class EnvironmentErrorTests(IdaCase):
         self.assertEnvironmentError(data, "IDA_LAUNCH_FAILED", errno=13)
         self.assertEqual(len(self.slots()), 1, "idat never started, so the database was not touched")
 
+    @pytest.mark.contract
     def test_status_with_a_binary_that_cannot_be_started_is_reported_not_raised(self):
         with mock.patch.object(ti, "_resolved_by_and_binary", return_value=("PATH", "C:/fake/idat.exe")), \
                 mock.patch.object(ti, "run_bounded_process",
@@ -1371,6 +1411,7 @@ class EnvironmentErrorTests(IdaCase):
         self.assertEnvironmentError(data, "IDA_LAUNCH_FAILED", errno=193)
         self.assertEqual(data["binary"], "C:/fake/idat.exe")
 
+    @pytest.mark.contract
     def test_an_unreadable_input_is_reported_not_raised(self):
         with mock.patch.object(ti, "_sha256_md5", side_effect=PermissionError(13, "Permission denied")):
             data = self.q()
@@ -1379,12 +1420,14 @@ class EnvironmentErrorTests(IdaCase):
         self.assertEqual(data["error"], "IDA_INPUT_UNREADABLE")
         self.assertEqual(data["environment_error"]["errno"], 13)
 
+    @pytest.mark.contract
     def test_an_os_error_inside_the_locked_section_is_reported_and_the_lock_released(self):
         with mock.patch.object(ti, "_query_locked", side_effect=OSError(28, "No space left on device")):
             data = self.q()
         self.assertEnvironmentError(data, "IDA_CACHE_IO_ERROR", errno=28)
         self.assertFalse(ti._lock_path(ti._slot_dir(self.sha)).exists())
 
+    @pytest.mark.contract
     def test_the_os_message_carries_no_machine_path(self):
         exc = PermissionError(13, "Permission denied")
         exc.filename = _HOME + "\\secret\\worker.idapy"
@@ -1392,6 +1435,7 @@ class EnvironmentErrorTests(IdaCase):
             raw = ti.ida_query(str(self.sample))
         self.assertNotIn(_HOME_NAME, raw)
 
+    @pytest.mark.contract
     def test_the_cases_that_already_answered_honestly_still_do(self):
         with mock.patch.object(ti, "_WORKER_SOURCE", self.root / "absent.idapy"):
             self.assertEqual(self.q()["error"], "IDA_WORKER_MISSING")
@@ -1405,6 +1449,7 @@ class EnvironmentErrorTests(IdaCase):
 
 
 class StricterVerdictTests(IdaCase):
+    @pytest.mark.contract
     def test_an_unreadable_log_does_not_count_as_the_log_signal(self):
         self.fake.log_unreadable = True
         data = self.q()
@@ -1413,6 +1458,7 @@ class StricterVerdictTests(IdaCase):
         self.assertFalse(data["signals"]["log_readable"])
         self.assertEqual(self.slots(), [])
 
+    @pytest.mark.contract
     def test_an_empty_log_does_not_count_either(self):
         self.fake.behaviour = "empty_log"
         data = self.q()
@@ -1421,6 +1467,7 @@ class StricterVerdictTests(IdaCase):
         self.assertFalse(data["signals"]["log_present"])
         self.assertEqual(self.slots(), [])
 
+    @pytest.mark.contract
     def test_a_fatal_marker_in_stdout_is_still_named_when_the_log_is_unreadable(self):
         self.fake.log_unreadable = True
         with mock.patch.object(FakeIdat, "__call__", autospec=True,
@@ -1428,6 +1475,7 @@ class StricterVerdictTests(IdaCase):
             data = self.q()
         self.assertEqual(data["error"], "IDA_LOG_REPORTS_FAILURE")
 
+    @pytest.mark.contract
     def test_a_result_for_another_operation_is_not_success(self):
         self.fake.result_operation = "list_functions"
         data = self.q("summary")
@@ -1436,6 +1484,7 @@ class StricterVerdictTests(IdaCase):
         self.assertFalse(data["signals"]["result_operation_matches"])
         self.assertEqual(self.slots(), [])
 
+    @pytest.mark.contract
     def test_a_reopen_result_for_another_operation_is_refused_and_the_slot_dropped(self):
         self.assertTrue(self.q()["ok"])
         evidence_before = sorted(self.evidence.iterdir())
@@ -1445,6 +1494,7 @@ class StricterVerdictTests(IdaCase):
         self.assertEqual(self.slots(), [])
         self.assertEqual(sorted(self.evidence.iterdir()), evidence_before)
 
+    @pytest.mark.contract
     def test_a_result_with_no_operation_at_all_is_not_success(self):
         self.assertTrue(self.q()["ok"])
         with mock.patch.object(FakeIdat, "_body", lambda s, job, sha: {
@@ -1453,6 +1503,7 @@ class StricterVerdictTests(IdaCase):
             data = self.q("list_functions")
         self.assertEqual(data["error"], "IDA_RESULT_OPERATION_MISMATCH")
 
+    @pytest.mark.contract
     def test_the_status_probe_demands_a_summary_answer_and_a_readable_log(self):
         with mock.patch.object(ti, "_resolved_by_and_binary", return_value=("PATH", "C:/fake/idat.exe")):
             self.fake.result_operation = "list_functions"
@@ -1696,30 +1747,35 @@ class BestEffortBranchTests(IdaCase):
         slot.parent.mkdir(parents=True, exist_ok=True)
         return slot
 
+    @pytest.mark.contract
     def test_a_search_for_the_binary_that_hits_an_os_error_finds_nothing(self):
         with mock.patch.dict(os.environ, {"IDAT_EXE": "", "IDA_HOME": ""}), \
                 mock.patch.object(ti.shutil, "which", return_value=None), \
                 mock.patch.object(ti.Path, "glob", side_effect=PermissionError(13, "Permission denied")):
             self.assertEqual(ti._resolved_by_and_binary(), (None, None))
 
+    @pytest.mark.contract
     def test_a_clamp_of_an_unusable_value_falls_back_to_the_default(self):
         for bad in ("many", None, [1], object()):
             with self.subTest(bad=type(bad).__name__):
                 self.assertEqual(ti._clamp(bad, 1, 10, 7), 7)
         self.assertEqual(ti._clamp("99", 1, 10, 7), 10)
 
+    @pytest.mark.contract
     def test_redaction_still_works_when_the_account_name_is_unavailable(self):
         with mock.patch.object(ti.getpass, "getuser", side_effect=KeyError("LOGNAME")):
             text = ti._redact("License: ABC-123\nfine")
         self.assertIn("<REDACTED>", text)
         self.assertNotIn("ABC-123", text)
 
+    @pytest.mark.contract
     def test_a_cache_file_that_vanishes_during_the_size_walk_is_skipped(self):
         (self.root / "kept.bin").write_bytes(b"12345")
         walked = [(str(self.root), [], ["kept.bin", "vanished.bin"])]
         with mock.patch.object(ti.os, "walk", return_value=iter(walked)):
             self.assertEqual(ti._dir_bytes(self.root), 5)
 
+    @pytest.mark.contract
     def test_the_psutil_probe_maps_its_own_errors_to_dead_and_unknown(self):
         class Gone(Exception):
             pass
@@ -1738,6 +1794,7 @@ class BestEffortBranchTests(IdaCase):
         self.assertIsNone(ti._ProcessProbe._psutil(fake_psutil(PermissionError(13, "denied")), 1, None))
         self.assertIsNone(ti._ProcessProbe._psutil(fake_psutil(ValueError("bad")), 1, None))
 
+    @pytest.mark.contract
     def test_a_windows_probe_that_cannot_run_says_unknown(self):
         import ctypes
         broken = SimpleNamespace(kernel32=SimpleNamespace(
@@ -1745,6 +1802,7 @@ class BestEffortBranchTests(IdaCase):
         with mock.patch.object(ctypes, "windll", broken, create=True):
             self.assertIsNone(ti._ProcessProbe._windows(os.getpid()))
 
+    @pytest.mark.contract
     def test_a_lock_is_still_created_when_the_process_start_time_cannot_be_read(self):
         lock = self.root / "x.lock"
         broken = SimpleNamespace(Process=mock.Mock(side_effect=RuntimeError("no psutil")))
@@ -1754,6 +1812,7 @@ class BestEffortBranchTests(IdaCase):
         self.assertEqual(record["token"], "token-1234567890")
         self.assertIsNone(record["create_time"])
 
+    @pytest.mark.contract
     def test_an_existing_lock_is_reported_as_such_and_not_overwritten_by_the_fallback(self):
         lock = self.root / "y.lock"
         with mock.patch.object(ti.os, "link", side_effect=FileExistsError(17, "exists")), \
@@ -1761,6 +1820,7 @@ class BestEffortBranchTests(IdaCase):
             with self.assertRaises(FileExistsError):
                 ti._SlotLock.create(lock, "token-1234567890")
 
+    @pytest.mark.contract
     def test_a_staging_file_that_cannot_be_removed_does_not_fail_the_lock(self):
         lock = self.root / "z.lock"
         real_unlink = Path.unlink
@@ -1774,6 +1834,7 @@ class BestEffortBranchTests(IdaCase):
             ti._SlotLock.create(lock, "token-1234567890")
         self.assertTrue(lock.is_file())
 
+    @pytest.mark.contract
     def test_releasing_a_lock_that_cannot_be_deleted_reports_false(self):
         lock = self.root / "w.lock"
         ti._SlotLock.create(lock, "token-1234567890")
@@ -1781,6 +1842,7 @@ class BestEffortBranchTests(IdaCase):
         with mock.patch.object(Path, "unlink", side_effect=PermissionError(13, "Permission denied")):
             self.assertIs(held.release(), False)
 
+    @pytest.mark.contract
     def test_a_stale_lock_that_cannot_be_removed_is_retried_not_raised(self):
         slot = self._slot()
         lock = ti._lock_path(slot)
@@ -1802,6 +1864,7 @@ class BestEffortBranchTests(IdaCase):
         self.assertEqual(len(calls), 1)
         ti._release_slot_lock(taken)
 
+    @pytest.mark.contract
     def test_a_database_that_cannot_be_inspected_is_not_a_healthy_slot(self):
         slot = self._slot()
         slot.mkdir()
@@ -1809,6 +1872,7 @@ class BestEffortBranchTests(IdaCase):
         with mock.patch.object(Path, "stat", side_effect=PermissionError(13, "Permission denied")):
             self.assertIs(ti._slot_is_healthy(slot), False)
 
+    @pytest.mark.contract
     def test_metadata_that_cannot_be_written_does_not_fail_the_call(self):
         slot = self._slot()
         slot.mkdir()
@@ -1816,6 +1880,7 @@ class BestEffortBranchTests(IdaCase):
             ti._touch_meta(slot, self.sha, created=True)
         self.assertFalse((slot / "meta.json").exists())
 
+    @pytest.mark.contract
     def test_the_last_used_time_falls_back_to_the_slot_and_then_to_zero(self):
         slot = self._slot()
         slot.mkdir()
@@ -1823,6 +1888,7 @@ class BestEffortBranchTests(IdaCase):
         with mock.patch.object(Path, "stat", side_effect=PermissionError(13, "Permission denied")):
             self.assertEqual(ti._slot_last_used(slot), 0.0)
 
+    @pytest.mark.contract
     def test_a_database_size_that_cannot_be_read_counts_as_no_database(self):
         work = self.root / "work-v"
         work.mkdir()
@@ -1839,6 +1905,7 @@ class BestEffortBranchTests(IdaCase):
         self.assertIs(signals["database_present"], False)
         self.assertEqual(signals["database_bytes"], 0)
 
+    @pytest.mark.contract
     def test_a_stale_probe_directory_that_cannot_be_inspected_does_not_fail_status(self):
         old = self.cache / "status-old00000"
         old.mkdir(parents=True)
@@ -1858,6 +1925,7 @@ class BestEffortBranchTests(IdaCase):
 class ErrorNameTests(IdaCase):
     """The exact status and error names a caller branches on."""
 
+    @pytest.mark.contract
     def test_a_refused_operation_and_a_missing_worker_are_both_analysis_limited(self):
         data = self.q("rename")
         self.assertEqual((data["status"], data["error"]), ("ANALYSIS_LIMITED", "UNKNOWN_OPERATION"))
@@ -1865,6 +1933,7 @@ class ErrorNameTests(IdaCase):
             data = self.q()
         self.assertEqual((data["status"], data["error"]), ("ANALYSIS_LIMITED", "IDA_WORKER_MISSING"))
 
+    @pytest.mark.contract
     def test_a_cancelled_and_a_timed_out_call_name_the_process_tree_termination(self):
         for behaviour, status, error in (
                 ("cancel", "CANCELLED", "IDA_CANCELLED_PROCESS_TREE_TERMINATED"),
@@ -1874,12 +1943,14 @@ class ErrorNameTests(IdaCase):
                 data = self.q()
                 self.assertEqual((data["status"], data["error"]), (status, error))
 
+    @pytest.mark.contract
     def test_a_probe_that_times_out_is_reported_with_its_own_error(self):
         self.fake.behaviour = "timeout"
         with mock.patch.object(ti, "_resolved_by_and_binary", return_value=("PATH", "C:/fake/idat.exe")):
             data = json.loads(ti.ida_status())
         self.assertEqual((data["status"], data["error"]), ("TIMEOUT", "IDA_PROBE_TIMEOUT"))
 
+    @pytest.mark.contract
     def test_a_worker_refusal_without_an_error_name_is_unknown_error_not_a_crash(self):
         self.fake.behaviour = "script_error"
 
@@ -1895,6 +1966,7 @@ class ErrorNameTests(IdaCase):
             data = self.q()
         self.assertEqual((data["status"], data["error"], data["ok"]), ("ANALYSIS_LIMITED", "UNKNOWN_ERROR", False))
 
+    @pytest.mark.contract
     def test_a_binary_found_through_a_folder_in_idat_exe_is_still_attributed_to_idat_exe(self):
         folder = self.root / "install"
         folder.mkdir()
@@ -1908,6 +1980,7 @@ class SharedBudgetTests(IdaCase):
         times = iter(values)
         return SimpleNamespace(monotonic=lambda: next(times, values[-1]), time=time.time, sleep=time.sleep)
 
+    @pytest.mark.contract
     def test_when_the_analysis_used_the_whole_budget_the_question_is_not_started(self):
         # lock wait, deadline, then 70 s later against a 60 s budget
         with mock.patch.object(ti, "time", self._clock(100.0, 100.0, 170.0)):
@@ -1923,6 +1996,7 @@ class SharedBudgetTests(IdaCase):
         self.fake.calls.clear()
         self.assertEqual(self.q("list_functions")["database_cache"], "HIT")
 
+    @pytest.mark.contract
     def test_less_than_one_second_left_is_also_a_timeout(self):
         with mock.patch.object(ti, "time", self._clock(100.0, 100.0, 159.5)):
             data = self.q("list_functions", timeout_seconds=60)
@@ -1971,6 +2045,7 @@ class CliTests(unittest.TestCase):
         """cli.py imports the module lazily, so it keeps its own copy of the list."""
         self.assertEqual(tuple(cli._IDA_OPERATIONS), tuple(ti._ALLOWED_OPERATIONS))
 
+    @pytest.mark.contract
     def test_ida_without_idat_is_exit_3_tool_missing(self):
         with TemporaryDirectory() as td:
             sample = Path(td) / "s.exe"
@@ -1983,6 +2058,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(body["status"], "TOOL_MISSING")
         self.assertEqual(body["command"], "ida")
 
+    @pytest.mark.contract
     def test_idastatus_without_idat_is_exit_3_tool_missing(self):
         with mock.patch.object(ti, "_resolved_by_and_binary", return_value=(None, None)), \
              mock.patch("sys.stdout") as out:
