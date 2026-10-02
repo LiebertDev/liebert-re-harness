@@ -24,13 +24,14 @@ import pytest
 from pathlib import Path
 
 from liebert_re.tools.binary import disassemble_pe
+from tests._scratch import process_scratch
 
 FIXTURE_DIR = Path(__file__).resolve().parent.parent / "benchmarks" / "dynamic_fixtures" / "owned_cfg_deobfuscate_x86_32_loop"
 FIXTURE_EXE = FIXTURE_DIR / "loop32_fixture.exe"
 FIXTURE_ADDRESSES = FIXTURE_DIR / "loop32_fixture_addresses.json"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRATCH_DIR = REPO_ROOT / "dataset" / "runtime" / "_test_disassemble_pe_scratch"
+SCRATCH_DIR = process_scratch("disassemble_pe_va_resolution")
 
 
 @unittest.skipUnless(FIXTURE_EXE.exists() and FIXTURE_ADDRESSES.exists(), "owned loop32 fixture not present")

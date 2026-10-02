@@ -22,8 +22,9 @@ from pathlib import Path
 
 import liebert_re.workspace as tools_workspace
 from liebert_re.tools.formats import archive_inspect
+from tests._scratch import process_scratch
 
-_SCRATCH = tools_workspace.WORKSPACE_ROOT / ".pytest_archive_extract_scratch"
+_SCRATCH = process_scratch("archive_extract")
 
 
 def _symlinks_are_creatable() -> bool:
@@ -31,7 +32,7 @@ def _symlinks_are_creatable() -> bool:
     hosts allow unprivileged symlink creation (Developer Mode / the right
     group policy), most don't without admin. Skip cleanly instead of
     silently skipping without saying why -- see the test below."""
-    probe_dir = _SCRATCH.parent / ".pytest_symlink_probe"
+    probe_dir = _SCRATCH.parent / "symlink_probe"
     probe_dir.mkdir(parents=True, exist_ok=True)
     link = probe_dir / "link"
     target = probe_dir / "target"

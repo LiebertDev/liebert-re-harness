@@ -29,10 +29,11 @@ from unittest import mock
 import psutil
 
 import liebert_re.tools.archive2 as tools_archive2
+from tests._scratch import process_scratch
 from liebert_re.tools.archive2 import rar_7z
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRATCH = REPO_ROOT / "dataset" / "runtime" / "_test_decompression_bounds_scratch"
+SCRATCH = process_scratch("decompression_bounds")
 MIB = 1024 * 1024
 BOMB_BYTES = 96 * MIB  # 1.5x the 64 MiB cap; the old path would allocate all of it (and its str copy)
 

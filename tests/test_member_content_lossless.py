@@ -20,9 +20,10 @@ from pathlib import Path
 from liebert_re.tools.formats import archive_inspect
 from liebert_re.tools.godot import godot_asset_analyzer
 from liebert_re.tools.unreal import unreal_asset_analyzer
+from tests._scratch import process_scratch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRATCH = REPO_ROOT / "dataset" / "runtime" / "_test_member_content_lossless_scratch"
+SCRATCH = process_scratch("member_content_lossless")
 
 TEXT = "hello é中 asset\n".encode("utf-8")
 BINARY = b"ok prefix \xff\xfe\x00\x80binary"

@@ -30,10 +30,11 @@ import liebert_re.recover.code_sweep_chunking as code_sweep_chunking
 import liebert_re.tools.binary as tools_binary
 from liebert_re.recover.owned_binary_fixtures import build_owned_pe_with_code
 from liebert_re.tools.binary import disassemble_pe
+from tests._scratch import process_scratch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # safe_path confines to the workspace, so fixtures live under it (as siblings do).
-SCRATCH = REPO_ROOT / "dataset" / "runtime" / "_test_disassemble_pe_chunking_scratch"
+SCRATCH = process_scratch("disassemble_pe_chunking")
 
 MOV_RAX_IMM64 = b"\x48\xb8" + struct.pack("<Q", 0x1122334455667788)  # 10 bytes
 MOV_EAX_1 = b"\xb8\x01\x00\x00\x00"                                   # 5 bytes

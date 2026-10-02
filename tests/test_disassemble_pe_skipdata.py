@@ -15,13 +15,14 @@ import unittest
 from pathlib import Path
 
 from liebert_re.tools.binary import disassemble_pe
+from tests._scratch import process_scratch
 from tests import _pe_fixtures
 from tests._pe_fixtures import build_pe
 
 # tools_binary.disassemble_pe -> safe_path enforces WORKSPACE (repo root)
 # containment, so the fixture must live under the repo, not the OS temp dir.
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRATCH_DIR = REPO_ROOT / "dataset" / "runtime" / "_test_disassemble_pe_skipdata_scratch"
+SCRATCH_DIR = process_scratch("disassemble_pe_skipdata")
 
 # The builder lives in tests/_pe_fixtures.py (shared with test_pe_resources.py); this name is kept
 # so the call sites below read as before.
