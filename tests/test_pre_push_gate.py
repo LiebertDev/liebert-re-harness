@@ -177,3 +177,59 @@ def test_a_candidate_that_does_not_exist_is_rejected_with_a_reason_not_dropped()
 def test_failed_ids_reads_the_short_summary():
     text = "\n".join(["FAILED tests/a.py::C::test_one - boom", "ERROR tests/b.py::test_two", "PASSED x"])
     assert gate.failed_ids(text) == ["tests/a.py::C::test_one", "tests/b.py::test_two"]
+
+
+# ---- failure evidence: a BLOCKed stage keeps its full output ------------------------------------------
+def _use_evidence_dir(monkeypatch, tmp_path):
+    d = tmp_path / "gate_failures"
+    monkeypatch.setattr(gate, "EVIDENCE_DIR", d)
+    return d
+
+
+def test_a_blocked_stage_saves_its_full_unfiltered_output_and_names_the_file(monkeypatch, tmp_path, capsys):
+    d = _use_evidence_dir(monkeypatch, tmp_path)
+    cmd = _child("import sys; print('FAILED tests/x.py::Cls::test_the_one_that_fell - boom'); "
+                 "print('traceback detail', file=sys.stderr); sys.exit(1)")
+    rc, _ = gate.run_pytest(cmd)
+    assert rc == 1
+    path = gate.save_evidence(cmd, "contract", "py3.10.11")
+    assert list(d.glob("*.log")) == [path]
+    assert path.name.endswith("Z_contract_py3.10.11.log") and path.name[:8].isdigit()
+    body = path.read_text(encoding="utf-8")
+    assert "test_the_one_that_fell" in body and "traceback detail" in body
+    assert str(path) in capsys.readouterr().err
+
+
+def test_a_passing_gate_writes_no_evidence(monkeypatch, tmp_path):
+    d = _use_evidence_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(gate, "run_pytest", lambda cmd, **kw: (0, []))
+    monkeypatch.setattr(gate, "message_findings", lambda ranges: [])
+    monkeypatch.setattr(gate, "run_contract_stage", lambda: False)
+    assert gate.run_gate([["HEAD"]]) == 0
+    assert not d.exists()
+
+
+def test_evidence_is_not_saved_for_a_run_whose_output_is_not_on_hand(monkeypatch, tmp_path):
+    d = _use_evidence_dir(monkeypatch, tmp_path)
+    gate.run_pytest(_child("print('x')"))
+    assert gate.save_evidence(["some", "other", "cmd"], "suite", "py3.14") is None
+    assert not d.exists()
+
+
+def test_only_the_newest_ten_evidence_files_are_kept(monkeypatch, tmp_path):
+    d = _use_evidence_dir(monkeypatch, tmp_path)
+    cmd = _child("import sys; sys.exit(1)")
+    paths = []
+    for _ in range(14):
+        gate.run_pytest(cmd)
+        paths.append(gate.save_evidence(cmd, "suite", "py3.14"))
+    kept = sorted(f.name for f in d.glob("*.log"))
+    assert len(kept) == gate.EVIDENCE_KEEP == 10
+    assert kept == sorted(p.name for p in paths[-10:])
+
+
+def test_the_evidence_directory_is_gitignored():
+    import subprocess
+    r = subprocess.run(["git", "-C", str(ROOT), "check-ignore", "-q", "--no-index",
+                        str(gate.EVIDENCE_DIR / "x.log")])
+    assert r.returncode == 0

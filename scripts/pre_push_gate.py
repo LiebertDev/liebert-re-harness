@@ -30,6 +30,7 @@ import re
 import subprocess
 import sys
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -61,6 +62,53 @@ FATAL_PATTERNS = (re.compile(r"Windows fatal exception", re.I), re.compile(r"Fat
                   re.compile(r"access violation", re.I))
 
 
+# A stage that BLOCKs leaves its complete, unfiltered stdout+stderr here, so a failure seen once can
+# still be diagnosed after the terminal scrollback is gone (a 3.10 contract BLOCK that never recurred
+# was lost exactly because only a filtered summary survived). The directory is gitignored, and the
+# repo-discipline gate bans it from the tree: the output carries machine paths and environment
+# details and must never be committed. Only failures write a file; the newest EVIDENCE_KEEP stay.
+EVIDENCE_DIR = ROOT / ".pytest_evidence_scratch" / "gate_failures"
+EVIDENCE_KEEP = 10
+_LAST_RUN: tuple | None = None     # (cmd, rc, stdout, stderr) of the most recent run_pytest call
+
+
+def prune_evidence(directory: Path | None = None, keep: int | None = None) -> None:
+    """Delete all but the newest `keep` evidence files (names start with a sortable UTC stamp)."""
+    directory = EVIDENCE_DIR if directory is None else directory
+    keep = EVIDENCE_KEEP if keep is None else keep
+    files = sorted(directory.glob("*.log"), key=lambda f: f.name, reverse=True)
+    for old in files[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def save_evidence(cmd: list[str], stage: str, interpreter: str, directory: Path | None = None) -> Path | None:
+    """Write the full captured output of the run_pytest(cmd) that just BLOCKed and say where it went.
+    Returns the path, or None if that run's output is not on hand or the file cannot be written
+    (evidence is best effort and never changes the gate's verdict)."""
+    directory = EVIDENCE_DIR if directory is None else directory
+    if _LAST_RUN is None or _LAST_RUN[0] is not cmd:
+        return None
+    _, rc, out, err = _LAST_RUN
+    now = datetime.now(timezone.utc)
+    tag = re.sub(r"[^A-Za-z0-9.]+", "-", interpreter)
+    name = f"{now:%Y%m%dT%H%M%S}{now.microsecond:06d}Z_{stage}_{tag}.log"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        path.write_text(f"# stage: {stage}\n# interpreter: {interpreter}\n# command: {' '.join(cmd)}\n"
+                        f"# pytest exit code: {rc}\n\n===== STDOUT =====\n{out}\n===== STDERR =====\n{err}",
+                        encoding="utf-8", errors="replace")
+        prune_evidence(directory)
+    except OSError as e:
+        print(f"pre-push gate: could not save the failing output ({e.__class__.__name__}).", file=sys.stderr)
+        return None
+    print(f"pre-push gate: full output of the failing stage saved to {path}", file=sys.stderr)
+    return path
+
+
 def fatal_findings(text: str, stream: str) -> list[str]:
     """Lines of captured pytest output that carry a fatal-exception marker, as 'stream line n: text'."""
     return [f"{stream} line {n}: {line.strip()[:160]}" for n, line in enumerate(text.splitlines(), 1)
@@ -87,6 +135,8 @@ def run_pytest(cmd: list[str], failed: list[str] | None = None) -> tuple[int, li
     for t in threads:
         t.join()
     rc = proc.wait()
+    global _LAST_RUN
+    _LAST_RUN = (cmd, rc, "".join(bufs["stdout"]), "".join(bufs["stderr"]))
     hits = [h for name, lines in bufs.items() for h in fatal_findings("".join(lines), name)]
     if failed is not None:
         failed.extend(failed_ids("".join(bufs["stdout"])))
@@ -180,16 +230,18 @@ def run_contract_stage(env=None) -> bool:
         py, full = found[ver]
         print(f"pre-push gate:   contract tests on Python {full} ({py}) ...", file=sys.stderr, flush=True)
         failed: list[str] = []
-        rc, fatal = run_pytest([str(py), "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rfE", "-m", "contract"],
-                               failed=failed)
+        cmd = [str(py), "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rfE", "-m", "contract"]
+        rc, fatal = run_pytest(cmd, failed=failed)
         if fatal:
             _report_fatal(f"the contract tests on Python {full}", rc, fatal)
+            save_evidence(cmd, "contract", f"py{full}")
             blocked = True
         elif rc != 0:
             print(f"pre-push gate: BLOCKED, contract tests are red on Python {full} ({py}), pytest exit {rc}:",
                   file=sys.stderr)
             for t in failed[:30] or ["(no FAILED line captured; see the output above)"]:
                 print(f"  [py{ver}] {t}", file=sys.stderr)
+            save_evidence(cmd, "contract", f"py{full}")
             blocked = True
         else:
             print(f"pre-push gate:   Python {full}: contract tests ok.", file=sys.stderr)
@@ -254,24 +306,31 @@ def run_gate(ranges: list[list[str]]) -> int:
     pytest = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
     failed = False
     print("pre-push gate: [1/4] discipline test ...", file=sys.stderr, flush=True)
-    rc, fatal = run_pytest([*pytest, "tests/test_repo_discipline.py"])
+    cmd = [*pytest, "tests/test_repo_discipline.py"]
+    rc, fatal = run_pytest(cmd)
+    py_tag = "py" + sys.version.split()[0]
     if fatal:
         _report_fatal("tests/test_repo_discipline.py", rc, fatal)
+        save_evidence(cmd, "discipline", py_tag)
         failed = True
     elif rc != 0:
         print("pre-push gate: BLOCKED, tests/test_repo_discipline.py is not green.", file=sys.stderr)
+        save_evidence(cmd, "discipline", py_tag)
         failed = True
     else:
         print("pre-push gate: [1/4] discipline test: ok.", file=sys.stderr)
     # Default mode of pytest.ini (-m "not heavy" from addopts); the discipline file ran above.
     print("pre-push gate: [2/4] test suite (not heavy) ...", file=sys.stderr, flush=True)
-    rc, fatal = run_pytest([*pytest, "-rfE", "--ignore=tests/test_repo_discipline.py"])
+    cmd = [*pytest, "-rfE", "--ignore=tests/test_repo_discipline.py"]
+    rc, fatal = run_pytest(cmd)
     if fatal:
         _report_fatal("the test suite", rc, fatal)
+        save_evidence(cmd, "suite", py_tag)
         failed = True
     elif rc != 0:
         print(f"pre-push gate: BLOCKED, the test suite is not green (pytest exit {rc}; "
               "failed tests are listed above as FAILED/ERROR).", file=sys.stderr)
+        save_evidence(cmd, "suite", py_tag)
         failed = True
     else:
         print("pre-push gate: [2/4] test suite: ok.", file=sys.stderr)
