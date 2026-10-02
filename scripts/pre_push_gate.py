@@ -7,7 +7,9 @@
 
 As a hook (git feeds "<local ref> <local sha> <remote ref> <remote sha>" lines on stdin) it runs
   1. pytest -q tests/test_repo_discipline.py        (the discipline + privacy gate on the tree)
-  2. the SAME identity probes that gate uses, over every commit's author, e-mail and message in
+  2. pytest -q, the default (not heavy) suite minus the discipline file already run in 1, so a
+     discipline failure stays its own named stage and no test runs twice. Never `-m heavy`.
+  3. the SAME identity probes that gate uses, over every commit's author, e-mail and message in
      the pushed range (the file scan cannot see commit messages or history).
 A red or leaking tree cannot be pushed without `git push --no-verify`. Commits and all local work
 stay unrestricted: this runs on push only. It never pushes anything itself.
@@ -81,14 +83,27 @@ def pushed_ranges(stdin_text: str) -> list[list[str]]:
 
 
 def run_gate(ranges: list[list[str]]) -> int:
-    print("pre-push gate: discipline test + commit-message identity probes "
+    print("pre-push gate: discipline test + test suite + commit-message identity probes "
           "(bypass only with: git push --no-verify)", file=sys.stderr)
-    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-                        "tests/test_repo_discipline.py"], cwd=ROOT)
+    pytest = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
     failed = False
+    print("pre-push gate: [1/3] discipline test ...", file=sys.stderr, flush=True)
+    r = subprocess.run([*pytest, "tests/test_repo_discipline.py"], cwd=ROOT)
     if r.returncode != 0:
         print("pre-push gate: BLOCKED, tests/test_repo_discipline.py is not green.", file=sys.stderr)
         failed = True
+    else:
+        print("pre-push gate: [1/3] discipline test: ok.", file=sys.stderr)
+    # Default mode of pytest.ini (-m "not heavy" from addopts); the discipline file ran above.
+    print("pre-push gate: [2/3] test suite (not heavy) ...", file=sys.stderr, flush=True)
+    r = subprocess.run([*pytest, "-rfE", "--ignore=tests/test_repo_discipline.py"], cwd=ROOT)
+    if r.returncode != 0:
+        print(f"pre-push gate: BLOCKED, the test suite is not green (pytest exit {r.returncode}; "
+              "failed tests are listed above as FAILED/ERROR).", file=sys.stderr)
+        failed = True
+    else:
+        print("pre-push gate: [2/3] test suite: ok.", file=sys.stderr)
+    print("pre-push gate: [3/3] commit-message identity probes ...", file=sys.stderr, flush=True)
     try:
         hits = message_findings(ranges)
     except Exception as e:                           # cannot scan messages => do not wave it through
