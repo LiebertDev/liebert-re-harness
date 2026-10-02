@@ -11,13 +11,35 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import mock
 
+import pytest
 import liebert_re.tools.rizin as tr
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LOGINCRACKME = REPO_ROOT / "benchmarks/windows_native_ladder/corpus/tier1/logincrackme/LoginCrackme.exe"
 ELEVENPACK = REPO_ROOT / "benchmarks/windows_native_ladder/corpus/tier2/decryption_key1/elevenpack.exe"
+
+# The mocked tests below never run rizin, but rizin_functions() checks that
+# the input file exists before it reaches the (mocked) subprocess. They use
+# this tiny stand-in file so they run with or without the unshipped corpus;
+# only RizinRealBinaryTests needs the real corpus binary and skips without it.
+_STUB_DIR = None
+STUB_PE = Path()
+
+
+def setUpModule():
+    global _STUB_DIR, STUB_PE
+    _STUB_DIR = TemporaryDirectory()
+    STUB_PE = Path(_STUB_DIR.name) / "LoginCrackme.exe"
+    STUB_PE.write_bytes(b"MZ" + bytes(64))
+
+
+def tearDownModule():
+    if _STUB_DIR is not None:
+        _STUB_DIR.cleanup()
+
 
 
 class RizinMissingTests(unittest.TestCase):
@@ -41,6 +63,7 @@ class RizinMissingTests(unittest.TestCase):
         self.assertFalse(data["available"])
 
 
+@pytest.mark.heavy
 class RizinRealBinaryTests(unittest.TestCase):
     """Exercised against real rizin + a real corpus binary when rizin is
     actually installed; skips cleanly otherwise (matches the guard style
@@ -103,9 +126,10 @@ class RizinTimeoutTests(unittest.TestCase):
         fake_result = mock.Mock(timed_out=True, cancelled=False, returncode=None,
                                  stdout="", stderr="", output_truncated=False)
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
-             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=STUB_PE), \
+             mock.patch.object(tr, "relative", return_value=STUB_PE.name), \
              mock.patch("liebert_re.tools.rizin.run_bounded_process", return_value=fake_result):
-            out = tr.rizin_functions(str(LOGINCRACKME), timeout_seconds=10)
+            out = tr.rizin_functions(str(STUB_PE), timeout_seconds=10)
         data = json.loads(out)
         self.assertFalse(data["ok"])
         self.assertEqual(data["status"], "TIMEOUT")
@@ -114,9 +138,10 @@ class RizinTimeoutTests(unittest.TestCase):
         fake_result = mock.Mock(timed_out=False, cancelled=True, returncode=None,
                                  stdout="", stderr="", output_truncated=False)
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
-             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=STUB_PE), \
+             mock.patch.object(tr, "relative", return_value=STUB_PE.name), \
              mock.patch("liebert_re.tools.rizin.run_bounded_process", return_value=fake_result):
-            out = tr.rizin_functions(str(LOGINCRACKME), timeout_seconds=10)
+            out = tr.rizin_functions(str(STUB_PE), timeout_seconds=10)
         data = json.loads(out)
         self.assertFalse(data["ok"])
         self.assertEqual(data["status"], "CANCELLED")
@@ -130,9 +155,10 @@ class RizinMalformedOutputTests(unittest.TestCase):
         fake_result = mock.Mock(timed_out=False, cancelled=False, returncode=0,
                                  stdout="no brackets here", stderr="", output_truncated=False)
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
-             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=STUB_PE), \
+             mock.patch.object(tr, "relative", return_value=STUB_PE.name), \
              mock.patch("liebert_re.tools.rizin.run_bounded_process", return_value=fake_result):
-            out = tr.rizin_functions(str(LOGINCRACKME), timeout_seconds=10)
+            out = tr.rizin_functions(str(STUB_PE), timeout_seconds=10)
         data = json.loads(out)
         self.assertFalse(data["ok"])
         self.assertEqual(data["status"], "ANALYSIS_LIMITED")
@@ -141,9 +167,10 @@ class RizinMalformedOutputTests(unittest.TestCase):
         fake_result = mock.Mock(timed_out=False, cancelled=False, returncode=0,
                                  stdout="[{not valid json,,,]", stderr="", output_truncated=False)
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
-             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=STUB_PE), \
+             mock.patch.object(tr, "relative", return_value=STUB_PE.name), \
              mock.patch("liebert_re.tools.rizin.run_bounded_process", return_value=fake_result):
-            out = tr.rizin_functions(str(LOGINCRACKME), timeout_seconds=10)
+            out = tr.rizin_functions(str(STUB_PE), timeout_seconds=10)
         data = json.loads(out)
         self.assertFalse(data["ok"])
         self.assertEqual(data["status"], "RESULT_PARSE_FAILED")
@@ -152,9 +179,10 @@ class RizinMalformedOutputTests(unittest.TestCase):
         fake_result = mock.Mock(timed_out=False, cancelled=False, returncode=1,
                                  stdout="", stderr="rizin: cannot open file", output_truncated=False)
         with mock.patch.object(tr, "_rizin_binary", return_value="C:/fake/rizin.exe"), \
-             mock.patch("liebert_re.tools.rizin.safe_path", return_value=LOGINCRACKME), \
+             mock.patch("liebert_re.tools.rizin.safe_path", return_value=STUB_PE), \
+             mock.patch.object(tr, "relative", return_value=STUB_PE.name), \
              mock.patch("liebert_re.tools.rizin.run_bounded_process", return_value=fake_result):
-            out = tr.rizin_functions(str(LOGINCRACKME), timeout_seconds=10)
+            out = tr.rizin_functions(str(STUB_PE), timeout_seconds=10)
         data = json.loads(out)
         self.assertFalse(data["ok"])
         self.assertEqual(data["status"], "ANALYSIS_LIMITED")
@@ -171,13 +199,3 @@ class RizinNotFoundTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-# --- heavy marker (test-suite split: fast baseline vs external-tool integration) ---
-# This test invokes (directly or via an imported tools_*/tools_emulation*/kernel_corpus/
-# environment_contamination_check/isolated_artifact/phase81_live_control/runpod_acceptance
-# module) a real external analysis tool or spawns a bounded subprocess -- these can be
-# slow or hang, so they are excluded from the default run and must be run explicitly
-# with `pytest -m heavy`. See pytest.ini in this repo for the tools actually involved.
-import pytest as _pytest_heavy_marker
-pytestmark = _pytest_heavy_marker.mark.heavy

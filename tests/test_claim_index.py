@@ -22,6 +22,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
 from liebert_re.evidence.claim_index import ClaimError, ClaimIndex, claim_index
 from liebert_re.evidence.index import EvidenceIndex
 
@@ -374,6 +375,7 @@ class ClaimEventFilesAreSourceOfTruthTests(unittest.TestCase):
     REAL_EVIDENCE_ROOT.is_dir() and all((REAL_EVIDENCE_ROOT / f).exists() for f in REAL_CASE_FILES),
     "real evidence fixture files not present on this machine",
 )
+@pytest.mark.heavy
 class RealCaseValidationTests(unittest.TestCase):
     """Encodes today's actual chain (see claim_index.py's module docstring)
     from the REAL dataset/evidence/ files on disk -- copied verbatim into an
@@ -512,13 +514,3 @@ class RealCaseValidationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-# --- heavy marker (test-suite split: fast baseline vs external-tool integration) ---
-# This test invokes (directly or via an imported tools_*/tools_emulation*/kernel_corpus/
-# environment_contamination_check/isolated_artifact/phase81_live_control/runpod_acceptance
-# module) a real external analysis tool or spawns a bounded subprocess -- these can be
-# slow or hang, so they are excluded from the default run and must be run explicitly
-# with `pytest -m heavy`. See pytest.ini in this repo for the tools actually involved.
-import pytest as _pytest_heavy_marker
-pytestmark = _pytest_heavy_marker.mark.heavy

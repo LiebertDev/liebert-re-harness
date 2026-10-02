@@ -80,20 +80,14 @@ KNOWN_PRIVATE_REFS = {
                            "tools_emulate_range", "tools_emulation", "tools_isolated_dynamic", "tools_memory_scan"}, _DEAD),
     "tests/test_artifact_provenance_absent_inputs.py": ({"TEACHER_"}, "names prompts/teacher_system.md; surfaced by the case-insensitive scan"),
     "tests/test_claim_guard.py": ({"TEACHER_", "teacher.py"}, _DEAD),
-    "tests/test_claim_index.py": ({"tools_emulation"}, _DEAD),
     "tests/test_disassemble_pe_va_resolution.py": ({"tools_emulation"}, _DEAD),
     "tests/test_evidence_attestation_honesty.py": ({"TEACHER_"}, "fixture string teacher_runtime_tool_dispatch; surfaced by the case-insensitive scan"),
-    "tests/test_frida_trace_client.py": ({"tools_emulation"}, _DEAD),
     "tests/test_pe_resources.py": ({"tools_emulation"}, _DEAD),
     "tests/test_public_format_probes.py": ({"research_state", "tools_decompiler"}, _DEAD),
     "tests/test_public_generic_static_probe.py": ({"research_state"}, _DEAD),
     "tests/test_structured_config_schema.py": ({"TEACHER_", "teacher.py"}, _DEAD),
-    "tests/test_tools_apimonitor.py": ({"tools_emulation"}, _DEAD),
-    "tests/test_tools_die.py": ({"tools_emulation"}, _DEAD),
     "tests/test_tools_lattice.py": ({"teacher.py"}, _DEAD),
-    "tests/test_tools_rizin.py": ({"tools_emulation"}, _DEAD),
-    "tests/test_tools_yara_x.py": ({"tools_decompiler", "tools_emulation"}, _DEAD),
-    "tests/test_vex_layer.py": ({"tools_emulation"}, _DEAD),
+    "tests/test_tools_yara_x.py": ({"tools_decompiler"}, _DEAD),
 }
 
 # Identifiers that belong to the private tree and must not appear in the public one.
@@ -378,12 +372,12 @@ def test_allowlists_have_not_grown():
     assert hashlib.sha256(repr(PRIVATE_IDS).encode()).hexdigest().startswith("d51a752750a0f2a7")
     assert set(KNOWN_UNREFERENCED) == {"liebert_re.tools.asar_parser", "liebert_re.evidence.process_lock"}
     assert set(KNOWN_USER_PATHS) == {"tests/test_public_provenance_and_fixtures.py", "liebert_re/workspace.py"}
-    assert len(KNOWN_PRIVATE_REFS) == 30
-    assert sum(len(ids) for ids, _ in KNOWN_PRIVATE_REFS.values()) == 48
+    assert len(KNOWN_PRIVATE_REFS) == 24
+    assert sum(len(ids) for ids, _ in KNOWN_PRIVATE_REFS.values()) == 41
     # Fingerprint of every (path, identifiers) pair: swapping an entry, not only
     # adding one, changes it. Update it only when REMOVING entries.
     digest = hashlib.sha256(repr(sorted((f, sorted(i)) for f, (i, _) in KNOWN_PRIVATE_REFS.items())).encode()).hexdigest()
-    assert digest.startswith("5f0196ac135629fc")
+    assert digest.startswith("d10820d479f3146b")
     assert all(reason for _, reason in KNOWN_PRIVATE_REFS.values())
 
 
