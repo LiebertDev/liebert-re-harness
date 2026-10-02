@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -345,3 +346,88 @@ def test_a_contract_stage_that_cannot_be_judged_blocks_and_still_runs_the_other_
     monkeypatch.setattr(gate, "run_pytest", fake)
     assert gate.run_contract_stage() is True
     assert len(calls) == 3 and "GATE_RELAY_FAILURE" in capsys.readouterr().err
+
+
+# ---- first-chance REPORT MODE ----------------------------------------------------------------------
+NOTE = "behaviour monitor noise, measured in a bare interpreter"
+
+
+@pytest.fixture(autouse=True)
+def _no_report_mode_unless_a_test_sets_it(monkeypatch):
+    for name in (gate.FIRSTCHANCE_ENV, gate.FIRSTCHANCE_NOTE_ENV, "CI", "GITHUB_ACTIONS"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _gate_with(monkeypatch, tmp_path, run):
+    monkeypatch.setattr(gate, "ROOT", tmp_path)
+    monkeypatch.setattr(gate, "run_pytest", run)
+    monkeypatch.setattr(gate, "message_findings", lambda ranges: [])
+    monkeypatch.setattr(gate, "run_contract_stage", lambda: False)
+
+
+def _report(monkeypatch, note=NOTE):
+    monkeypatch.setenv(gate.FIRSTCHANCE_ENV, "report")
+    if note is not None:
+        monkeypatch.setenv(gate.FIRSTCHANCE_NOTE_ENV, note)
+
+
+def test_a_trace_blocks_without_the_flag(monkeypatch, tmp_path):
+    _gate_with(monkeypatch, tmp_path, lambda cmd, **kw: (0, [f"stderr line 1: {FATAL}"]))
+    assert gate.run_gate([["HEAD"]]) == 1
+    assert not (tmp_path / "dataset").exists()
+
+
+def test_a_trace_is_reported_not_blocked_with_flag_and_reason_and_is_recorded(monkeypatch, tmp_path, capsys):
+    _gate_with(monkeypatch, tmp_path, lambda cmd, **kw: (0, [f"stderr line 1: {FATAL}", f"stderr line 9: {FATAL}"]))
+    _report(monkeypatch)
+    assert gate.run_gate([["HEAD"]]) == 0
+    err = capsys.readouterr().err
+    assert "REPORT MODE" in err and NOTE in err and "2 first-chance trace line(s)" in err
+    record = json.loads(next((tmp_path / "dataset" / "evidence" / "pre_push_gate").glob("*.json")).read_text())
+    assert record["mode"] == "report" and record["note"] == NOTE and record["gate_exit"] == 0
+    assert record["traces_total"] == 4 and len(record["stages"]) == 2
+
+
+@pytest.mark.parametrize("note", [None, "", "   "])
+def test_flag_without_a_reason_is_ignored_and_still_blocks(monkeypatch, tmp_path, capsys, note):
+    _gate_with(monkeypatch, tmp_path, lambda cmd, **kw: (0, [f"stderr line 1: {FATAL}"]))
+    _report(monkeypatch, note)
+    assert gate.run_gate([["HEAD"]]) == 1
+    assert "is ignored" in capsys.readouterr().err
+
+
+def test_report_mode_is_never_active_in_ci(monkeypatch, tmp_path):
+    _gate_with(monkeypatch, tmp_path, lambda cmd, **kw: (0, [f"stderr line 1: {FATAL}"]))
+    _report(monkeypatch)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    assert gate.run_gate([["HEAD"]]) == 1
+
+
+def test_a_real_failure_still_blocks_in_report_mode(monkeypatch, tmp_path):
+    _gate_with(monkeypatch, tmp_path, lambda cmd, **kw: (1, [f"stderr line 1: {FATAL}"]))
+    _report(monkeypatch)
+    assert gate.run_gate([["HEAD"]]) == 1
+    _gate_with(monkeypatch, tmp_path, lambda cmd, **kw: (1, []))
+    assert gate.run_gate([["HEAD"]]) == 1
+
+
+def test_timeouts_and_relay_failures_still_block_in_report_mode(monkeypatch, tmp_path):
+    def boom(cmd, **kw):
+        raise gate.GateStageError("GATE_RELAY_FAILURE", "x")
+    _gate_with(monkeypatch, tmp_path, boom)
+    _report(monkeypatch)
+    assert gate.run_gate([["HEAD"]]) == 1
+
+
+def test_the_contract_stage_honours_report_mode_only_for_traces(monkeypatch, tmp_path):
+    monkeypatch.setattr(gate, "find_contract_interpreters", lambda env=None: (_found("3.10", "3.12", "3.14"), {}))
+    monkeypatch.setattr(gate, "run_pytest", lambda cmd, failed=None, **kw: (0, [f"stderr line 1: {FATAL}"]))
+    _report(monkeypatch)
+    assert gate.run_contract_stage({}) is False
+    monkeypatch.setattr(gate, "run_pytest", lambda cmd, failed=None, **kw: (1, [f"stderr line 1: {FATAL}"]))
+    assert gate.run_contract_stage({}) is True
+
+
+def test_the_flag_is_written_into_no_file():
+    for text in (gate.HOOK_TEMPLATE, (gate.ROOT / "pytest.ini").read_text(), (gate.ROOT / ".github" / "workflows" / "ci.yml").read_text()):
+        assert gate.FIRSTCHANCE_ENV not in text

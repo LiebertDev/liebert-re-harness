@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -62,6 +63,73 @@ exec "$PY" "$script" hook "$@"
 # tests/test_vex_layer.py.
 FATAL_PATTERNS = (re.compile(r"Windows fatal exception", re.I), re.compile(r"Fatal Python error", re.I),
                   re.compile(r"access violation", re.I))
+
+
+# REPORT MODE for first-chance traces only. On a machine where a security product's behaviour monitor
+# makes every Python process print a handled access violation (measured: a bare interpreter spinning in a
+# loop, and the baseline commit, both do), the scan above would block every run. Two variables, BOTH
+# required, make the scan count, print and record those traces without blocking on them:
+#   LIEBERT_GATE_FIRSTCHANCE=report  and  LIEBERT_GATE_FIRSTCHANCE_NOTE="<non-empty reason>"
+# No reason, no bypass: the flag alone is ignored and the gate blocks as usual. It is never active when
+# CI or GITHUB_ACTIONS is set, and it is never written to a hook, pytest.ini or any file: it lives only in
+# the environment of one run. It touches the trace scan and nothing else: a failing test, a nonzero exit,
+# a stage timeout and GATE_RELAY_FAILURE block in every mode. Mode, reason and counts go to the output
+# and to dataset/evidence/pre_push_gate/ so a forgotten flag stays visible afterwards.
+FIRSTCHANCE_ENV = "LIEBERT_GATE_FIRSTCHANCE"
+FIRSTCHANCE_NOTE_ENV = "LIEBERT_GATE_FIRSTCHANCE_NOTE"
+_FIRSTCHANCE_SEEN: list[dict] = []
+
+
+def firstchance_report_note(env=None) -> str | None:
+    """The reason text when report mode is validly requested, else None."""
+    env = os.environ if env is None else env
+    if env.get(FIRSTCHANCE_ENV, "").strip() != "report":
+        return None
+    if env.get("CI") or env.get("GITHUB_ACTIONS"):
+        print(f"pre-push gate: NOTE, {FIRSTCHANCE_ENV} is ignored in CI; first-chance traces block.", file=sys.stderr)
+        return None
+    note = env.get(FIRSTCHANCE_NOTE_ENV, "").strip()
+    if not note:
+        print(f"pre-push gate: NOTE, {FIRSTCHANCE_ENV}=report is ignored because {FIRSTCHANCE_NOTE_ENV} is empty; "
+              "first-chance traces block.", file=sys.stderr)
+        return None
+    return note
+
+
+def fatal_blocks(what: str, rc: int, hits: list[str], env=None) -> bool:
+    """True when `hits` (a non-empty list of trace lines) must block. In a valid report mode they are
+    counted, printed with the reason, and do not block; everything else is unchanged."""
+    note = firstchance_report_note(env)
+    if note is None:
+        _report_fatal(what, rc, hits)
+        return True
+    _FIRSTCHANCE_SEEN.append({"stage": what, "traces": len(hits), "pytest_exit": rc, "sample": hits[:3]})
+    print(f"pre-push gate: REPORT MODE, {len(hits)} first-chance trace line(s) in {what} were counted and "
+          f"NOT blocked on (pytest exit {rc}). Reason given: {note}", file=sys.stderr)
+    return False
+
+
+def write_firstchance_record(verdict: int, env=None) -> Path | None:
+    """Evidence of report mode for this run (written whenever the mode is active, hits or not)."""
+    note = firstchance_report_note(env)
+    if note is None:
+        return None
+    directory = ROOT / "dataset" / "evidence" / "pre_push_gate"
+    now = datetime.now(timezone.utc)
+    record = {"mode": "report", "note": note, "gate_exit": verdict, "stages": list(_FIRSTCHANCE_SEEN),
+              "traces_total": sum(x["traces"] for x in _FIRSTCHANCE_SEEN),
+              "scope": "first-chance trace scan only; failures, nonzero exits, timeouts and relay failures still block",
+              "at": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{now:%Y%m%dT%H%M%S}{now.microsecond:06d}Z_firstchance_report.json"
+        path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(f"pre-push gate: could not write the report-mode record ({e.__class__.__name__}).", file=sys.stderr)
+        return None
+    print(f"pre-push gate: REPORT MODE was active: {record['traces_total']} trace line(s) in total; record at {path}",
+          file=sys.stderr)
+    return path
 
 
 # A stage that BLOCKs leaves its complete, unfiltered stdout+stderr here, so a failure seen once can
@@ -345,8 +413,7 @@ def run_contract_stage(env=None) -> bool:
             save_evidence(cmd, "contract", f"py{full}")
             blocked = True
             continue
-        if fatal:
-            _report_fatal(f"the contract tests on Python {full}", rc, fatal)
+        if fatal and fatal_blocks(f"the contract tests on Python {full}", rc, fatal):
             save_evidence(cmd, "contract", f"py{full}")
             blocked = True
         elif rc != 0:
@@ -414,8 +481,11 @@ def _report_fatal(what: str, rc: int, hits: list[str]) -> None:
 
 
 def run_gate(ranges: list[list[str]]) -> int:
+    _FIRSTCHANCE_SEEN.clear()
     try:
-        return _run_gate(ranges)
+        verdict = _run_gate(ranges)
+        write_firstchance_record(verdict)
+        return verdict
     finally:
         shutil.rmtree(Path(tempfile.gettempdir()) / f"liebert-gate-{os.getpid()}", ignore_errors=True)
 
@@ -436,8 +506,7 @@ def _run_gate(ranges: list[list[str]]) -> int:
         rc, fatal, failed = 1, [], True
     if failed:
         pass
-    elif fatal:
-        _report_fatal("tests/test_repo_discipline.py", rc, fatal)
+    elif fatal and fatal_blocks("tests/test_repo_discipline.py", rc, fatal):
         save_evidence(cmd, "discipline", py_tag)
         failed = True
     elif rc != 0:
@@ -458,8 +527,7 @@ def _run_gate(ranges: list[list[str]]) -> int:
         rc, fatal, failed, suite_failed = 1, [], True, True
     if suite_failed:
         pass
-    elif fatal:
-        _report_fatal("the test suite", rc, fatal)
+    elif fatal and fatal_blocks("the test suite", rc, fatal):
         save_evidence(cmd, "suite", py_tag)
         failed = True
     elif rc != 0:
