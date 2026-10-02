@@ -1,7 +1,7 @@
 # What transfers: protection classes
 
 Distilled from ten worked crackmes (listed in [../SOLVED_INDEX.md](../SOLVED_INDEX.md);
-raw scripts on the `archive/crackme-solutions` branch). Organized by protection
+the raw scripts are not distributed in this package). Organized by protection
 class. Per-binary addresses, keys and serials are deliberately left out; if a line
 would not help on a different binary with the same protection, it is not here.
 

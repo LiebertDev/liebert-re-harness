@@ -3,11 +3,9 @@
 Which public crackmes this harness has a worked solution for. One line each:
 name (author, corpus id), protection class, what defeated it.
 
-The per-binary scripts are not in the working tree. They live on the
-`archive/crackme-solutions` branch under `crackme_solutions/`:
-
-    git checkout archive/crackme-solutions
-    git show archive/crackme-solutions:crackme_solutions/<file>
+The per-binary solution scripts are not part of this public package. No
+`crackme_solutions/` directory is tracked in this repository, so the entries below
+describe what was solved, not a script you can run from here.
 
 What transfers to other binaries is in [docs/PROTECTION_CLASSES.md](docs/PROTECTION_CLASSES.md),
 organized by protection class. Serials and keys are deliberately not recorded here.

@@ -233,19 +233,17 @@ sit on disk.
    instruction-semantics correction layer. It also lists function inventory
    there, but `rizin_functions` needs rizin.
 4. `INSTALL.md` counts: "64 Python modules at the repository root", "47 test
-   files", "11 standalone challenge-solution scripts in `crackme_solutions/`".
-   Actual: 68 modules inside the `liebert_re/` package (CI asserts 68), 68 test
-   files, and no `crackme_solutions/` directory exists or is tracked.
-5. `README.md`, `BENCHMARKS.md` and `ROADMAP.md` refer to `crackme_solutions/`
-   as shipped; `ROADMAP.md` "Start here" item 1 names a script that is not in
-   the tree.
-6. `BENCHMARKS.md` lists angr as a real in-process integration. Nothing in the
+   files". Actual: 68 modules inside the `liebert_re/` package (CI asserts 68),
+   68 test files. The "11 standalone challenge-solution scripts in
+   `crackme_solutions/`" claim was removed; those scripts are not distributed
+   in this package.
+5. `BENCHMARKS.md` lists angr as a real in-process integration. Nothing in the
    package imports it; Unicorn is used only in `recover/vex.py`.
-7. `README.md` and `INSTALL.md` omit modules that exist and run: WebAssembly
+6. `README.md` and `INSTALL.md` omit modules that exist and run: WebAssembly
    inspection (`tools/formats.py`), `recover/native_xref.py` (IR-only) and
    `recover/code_sweep_chunking.py`. Not a false claim, but the capability table
    is not a complete inventory.
-8. `report/tool_families.py` is a routing manifest, not a capability list; its
+7. `report/tool_families.py` is a routing manifest, not a capability list; its
    `published_tools()` helper is the accurate view.
 
 The README capability table is otherwise consistent with the code on the points

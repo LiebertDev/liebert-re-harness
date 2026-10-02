@@ -17,7 +17,7 @@ Small, self-contained, and each closable without touching more than one or two
 files.
 
 1. **The mutated-crackme-5 serial solver is not runnable from this tree.** Its
-   script was moved to the `archive/crackme-solutions` branch (see
+   script is not distributed in this public package (see
    [SOLVED_INDEX.md](../SOLVED_INDEX.md)); its emulation step depended on a
    bounded-emulation module from the upstream tree that was never published here
    (see the README's "deliberately not in this repository" list). The write-up

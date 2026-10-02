@@ -25,8 +25,7 @@ was enforced against our own work.
 
 Live count of the project's challenge manifests (one per challenge) in the private
 working tree this project is developed in. **That manifest set and its corpus are
-not part of this published repository** — they are not the solution scripts (kept on the
-`archive/crackme-solutions` branch), and there is nothing in this repo to re-run the count
+not part of this published repository** — they are not the solution scripts (which are not distributed in this package either), and there is nothing in this repo to re-run the count
 against. These results are not reproducible from this repository. The number below is reported as-is from its source tree, not
 re-derived from anything checkable in this repository:
 
@@ -65,8 +64,8 @@ binary is executed to produce a static solve.
 
 Each of these was fetched from its author's own page. **The binaries are not
 redistributed here** — see [CORPUS.md](CORPUS.md). The
-standalone attack scripts are on the `archive/crackme-solutions` branch; see
-[SOLVED_INDEX.md](../SOLVED_INDEX.md).
+standalone attack scripts are not distributed in this package; see
+[SOLVED_INDEX.md](../SOLVED_INDEX.md) for the record of what was solved.
 
 | Challenge | Author | Source | Status |
 |---|---|---|---|

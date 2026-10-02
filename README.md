@@ -133,8 +133,8 @@ import is the exact failure this project is organised against:
 
 - **Bounded emulation** (Unicorn-based range emulation, execution traces, the
   backward slicer, per-instruction byte snapshots, register capture). Not here. The
-  script that needed it (the mutated-crackme-5 serial solver) lives only on the
-  `archive/crackme-solutions` branch and is documentation-only.
+  script that needed it (the mutated-crackme-5 serial solver) is not
+  distributed in this public package; it is documentation-only.
 - **A Ghidra wrapper, and normalisation of answers across engines.** Not here. An IDA
   wrapper *is* here, read-only (`ida_query`, `ida_status`); IDA's write operations
   (rename, comments, patch planning), microcode export, type-member offsets and the
@@ -238,10 +238,10 @@ gap rather than rounded up.
 
 The standalone attack scripts from this work — a SipHash
 key-recovery attack, a Lagarias–Odlyzko lattice attack, a meet-in-the-middle
-search, a VB6 P-Code interpreter — are not in this tree; they live on the
-`archive/crackme-solutions` branch, and [SOLVED_INDEX.md](SOLVED_INDEX.md) and
-[docs/PROTECTION_CLASSES.md](docs/PROTECTION_CLASSES.md) describe them. They read on their own and are the best
-introduction to how the toolkit is actually used.
+search, a VB6 P-Code interpreter — are not distributed in this public package.
+[SOLVED_INDEX.md](SOLVED_INDEX.md) and
+[docs/PROTECTION_CLASSES.md](docs/PROTECTION_CLASSES.md) describe what was solved and
+what transfers, without the scripts.
 
 Per [docs/CORPUS.md](docs/CORPUS.md), the binaries themselves are **not**
 redistributed. Each write-up names its challenge, its author, where it was
@@ -409,7 +409,7 @@ file and there is nothing to measure — not `"unknown"`, not `"x86"` as a defau
 That is the whole design in one output.
 
 Some operations are pure computation with no engine behind them at all — this is
-the lattice reduction the knapsack attack on the `archive/crackme-solutions` branch is built on:
+the lattice reduction a knapsack attack of the kind described in `SOLVED_INDEX.md` is built on:
 
 ```python
 >>> import lll_exact

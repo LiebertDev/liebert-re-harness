@@ -272,11 +272,10 @@ wire it up — it is not evidence that they did.
    dependency or tool is absent; `docs/INSTALL.md` makes no promise about the
    skip count) — if it doesn't, that is a bug worth reporting
    before you build on top of it.
-2. **Read one script from the `archive/crackme-solutions` branch** (indexed in
-   `SOLVED_INDEX.md`) before reading the analysis
-   modules it uses. They are written to be self-contained and are the
-   fastest way to see how the toolkit's typed operations actually compose
-   into an attack, rather than reading a module's docstring in isolation.
+2. **Read `SOLVED_INDEX.md` and `docs/PROTECTION_CLASSES.md`** before reading
+   the analysis modules. The solution scripts themselves are not in this public
+   package, so these two documents are the description of how the toolkit's
+   typed operations were composed into attacks.
 3. **Pick a "start here" item from `docs/ROADMAP.md`.** It is maintained
    separately from this document and is the current, prioritised list of
    what is worth working on next; do not assume this document's gap
