@@ -19,7 +19,7 @@ import liebert_re.report.tool_families as tool_families
 # below is what must be read and edited, and a number in the name only
 # duplicates it.
 EVIDENCE_OWNERS = {
-    "liebert_re.dynamic.apimonitor", "liebert_re.tools.binary", "liebert_re.tools.capa",
+    "liebert_re.dynamic.apimonitor", "liebert_re.dynamic.lab_gate", "liebert_re.tools.binary", "liebert_re.tools.capa",
     "liebert_re.tools.die", "liebert_re.tools.ida", "liebert_re.tools.pe_sieve", "liebert_re.tools.rizin",
     "liebert_re.tools.upx", "liebert_re.tools.yara_x",
 }
@@ -97,7 +97,15 @@ def test_published_tool_name_set_is_unchanged():
     # tool_families.FAMILIES["dynamic"]; the CLI reaches them as `sieve` and `sievestatus`. The
     # scanner helpers live in the private class _PeSieve; the only other names that joined the
     # pinned set are the two CLI handlers in liebert_re/cli.py, _sieve and _sieve_status.
+    #
+    # Updated again: liebert_re/dynamic/lab_gate.py implements dynamic_lab_gate (a name already
+    # declared in tool_families.FAMILIES["dynamic"] with no implementation) and adds
+    # dynamic_lab_register_owned_process, registered in the same family. The gate's helpers live in
+    # the class LabGate, so only those two public names joined the pin from that module. The
+    # CLI joined three top-level names on purpose: the handlers _labgate and _labregister and the
+    # shared argument helper _gate_args, reached as `labgate` and `labregister`; pe_sieve_scan
+    # now takes the gate's authorization arguments through the same helper.
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "1d053b44353e97d9bcb51cf31390086519d8e65eafda93535354e4bb1f91d30b"
+    assert digest == "a6ad6f3b06ef77e395f2271e6d46deee5fb55b5452dc30b6e2dbcabc9e5d77a5"

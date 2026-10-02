@@ -66,7 +66,7 @@ FAMILIES = {
     # ever auto-invoked by file routing -- they only ever reach the model via
     # this keyword/state-driven family, never via artifact classification.
     "dynamic": {"pe_sieve_scan", "pe_sieve_status", "dynamic_owned_process_scan", "dynamic_owned_process_diff_scan", "isolated_dynamic_validate", "tool_missing",
-                "api_catalog", "apimonitor_status", "differential_execution_validate", "dynamic_lab_gate",
+                "api_catalog", "apimonitor_status", "differential_execution_validate", "dynamic_lab_gate", "dynamic_lab_register_owned_process",
                 "environment_contamination_check", "guest_analyze_static", "guest_checkpoint_create",
                 "guest_checkpoint_delete", "guest_checkpoint_list", "guest_checkpoint_restore",
                 "guest_concurrent_watch", "guest_fetch_file", "guest_frida_breakpoint_inspect", "guest_frida_trace",

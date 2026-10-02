@@ -48,6 +48,7 @@ import shutil
 import uuid
 
 from liebert_re.bounded_subprocess import run_bounded_process
+from liebert_re.dynamic.lab_gate import LabGate
 
 try:
     from liebert_re.evidence.index import record_write as _evidence_index_record_write
@@ -65,6 +66,8 @@ _MIN_TIMEOUT_SECONDS = 10
 # 600 s is a ceiling on one scan, set by this module, not by the shared runner.
 _MAX_TIMEOUT_SECONDS = 600
 _MAX_OUTPUT_CHARS = 8 * 1024 * 1024
+# Memory ceiling for the scanner's process tree, enforced by run_bounded_process and required by the lab gate.
+_MAX_SCANNER_MEMORY_BYTES = 2 * 1024 ** 3
 _KNOWN_INSTALL_DIR = r"C:\Tools\pe-sieve"
 _ENV_VAR = "PE_SIEVE_HOME"
 _BINARY_NAMES = ("pe-sieve64.exe", "pe-sieve32.exe")
@@ -310,93 +313,19 @@ class _PeSieve:
             "scan_kinds": kinds,
         }
 
+    @staticmethod
+    def with_gate(out, gate):
+        """Attach the gate record to a result and finish its evidence with the exact command."""
+        result = json.loads(out)
+        outcome = {"status": result.get("status"), "ok": result.get("ok"), "error": result.get("error")}
+        gate["evidence_finalize_error"] = LabGate.finish(gate, result.get("invoked_argv"), outcome)
+        result["lab_gate"] = gate
+        return _j(result)
 
-def pe_sieve_status():
-    """Whether pe-sieve is reachable, from where, which scanner bitness would be used,
-    and its version. Zero arguments; runs `/version` once, which scans nothing."""
-    tool = "pe_sieve_status"
-    try:
-        exe, how, found = _PeSieve.pick()
-        if not exe:
-            return _PeSieve.missing(tool)
-        argv = [exe, "/version"]
-        cp = run_bounded_process(argv, timeout_seconds=_MIN_TIMEOUT_SECONDS,
-                                 environment={**os.environ, "MSYS_NO_PATHCONV": "1", "MSYS2_ARG_CONV_EXCL": "*"},
-                                 max_output_chars=65536)
-        if cp.timed_out or cp.cancelled:
-            return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "binary": exe,
-                       "error": "PE_SIEVE_VERSION_TIMEOUT"})
-        text = ((cp.stdout or "") + "\n" + (cp.stderr or "")).strip()
-        match = re.search(r"\b\d+\.\d+\.\d+(?:\.\d+)?\b", text)
-        if cp.returncode != 0 or not match:
-            return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "binary": exe,
-                       "error": "PE_SIEVE_VERSION_UNREADABLE", "exit_code": cp.returncode,
-                       "output_tail": _PeSieve.tail(text, 500)})
-        return _j({
-            "ok": True, "tool": tool, "status": "OK",
-            "binary": exe, "resolved_by": how, "scanner_bitness": _PeSieve.bitness(exe),
-            "version": match.group(0),
-            "binaries_found": [{"path": p, "resolved_by": h, "bitness": _PeSieve.bitness(p)} for p, h in found],
-            "invoked_argv": argv,
-            "operations": ["pe_sieve_scan"],
-            "policy": {
-                "scan_only": True, "dump_switches_never_passed": True, "pid_required": True,
-                "whole_system_mode": "refused with PID_REQUIRED", "output_filter": "/ofilter 2 (no dumps)",
-            },
-            "note": (
-                "The 64-bit scanner is used whenever it is present: measured against 0.4.1.1 it scans "
-                "both 64-bit and 32-bit targets, while the 32-bit scanner cannot scan a 64-bit target. "
-                "Output shapes were measured on this version; a different one may change them, and "
-                "RESULT_PARSE_FAILED from a scan is the drift signal."
-            ),
-        })
-    except Exception as exc:  # noqa: BLE001 - the contract is a JSON string, never an exception
-        if isinstance(exc, OSError):
-            return _PeSieve.env_failure(tool, exc)
-        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
-                   "error": "PE_SIEVE_UNEXPECTED_ERROR", "detail": f"{type(exc).__name__}: {exc}"})
-
-
-def pe_sieve_scan(pid=None, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS, cancellation_token=None,
-                  iat=None, shellcode=None, obfuscation=None, data=None, dotnet_policy=None,
-                  threads=False):
-    """Scan ONE running process, by PID, for in-memory differences from its on-disk
-    image, via the real `pe-sieve /json /jlvl 2`. Scan only: nothing is dumped.
-
-    `pid` is required. A missing, non-numeric, zero or negative PID, or any
-    "all processes" spelling, returns `PID_REQUIRED` and starts nothing.
-
-    Depth switches (each passed explicitly, echoed in `scan_flags`):
-
-    * `iat` 0-3 (`/iat`, default 1)       IAT hook scan; 0 off, 3 unfiltered
-    * `shellcode` 0-4 (`/shellc`, default 3)  shellcode detection by patterns / statistics
-    * `obfuscation` 0-3 (`/obfusc`, default 0) encrypted or obfuscated areas
-    * `data` 0-5 (`/data`, default 0)     also scan non-executable pages
-    * `dotnet_policy` 0-4 (`/dnet`, default 0) treatment of managed processes
-    * `threads` (`/threads`, default off) scan thread call stacks
-
-    Statuses:
-
-    * `OK`             the scan completed with no unreadable or skipped part.
-                       `anomalies_found` says whether anything was reported;
-                       `categories` and `categories_nonzero` carry the scanner's
-                       own category names and counts; `findings` the detail.
-    * `SCAN_PARTIAL`   some modules were unreadable or skipped. Whatever was
-                       found is still listed. Never a clean result.
-    * `NOTHING_SCANNED` the scanner reported zero modules scanned.
-    * `ACCESS_DENIED` / `PROCESS_NOT_OPENED`  the process could not be opened
-                       (text-derived; carried with `scanner_message`). Not a
-                       negative result.
-    * `SCANNER_MISMATCH` 32-bit scanner against a 64-bit target.
-    * `PID_REQUIRED`, `TOOL_MISSING`, `TIMEOUT`, `CANCELLED`, `ANALYSIS_LIMITED`
-      (including `environment_error` for a local OS failure),
-      `RESULT_PARSE_FAILED`.
-    """
-    tool = "pe_sieve_scan"
-    try:
-        number = _PeSieve.parse_pid(pid)
-        if number is None:
-            return _PeSieve.pid_refusal(tool, pid)
+    @staticmethod
+    def execute(tool, number, iat, shellcode, obfuscation, data, dotnet_policy, threads,
+                timeout_seconds, cancellation_token):
+        """Everything that happens AFTER the lab gate passed. Returns the JSON string."""
         tail_args, flags, bad = _PeSieve.options(iat, shellcode, obfuscation, data, dotnet_policy, threads)
         if bad:
             return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
@@ -404,10 +333,6 @@ def pe_sieve_scan(pid=None, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS, cancellati
         exe, how, _found = _PeSieve.pick()
         if not exe:
             return _PeSieve.missing(tool)
-        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
-            timeout_seconds = _DEFAULT_TIMEOUT_SECONDS
-        timeout_seconds = max(_MIN_TIMEOUT_SECONDS, min(int(timeout_seconds), _MAX_TIMEOUT_SECONDS))
-
         argv = [exe, "/pid", str(number), *_FIXED_FLAGS, *tail_args]
         # An MSYS shell rewrites a "/flag" argument into a path and the tool then runs with
         # defaults; this call is a direct, list-form spawn, and the guard variables are belt
@@ -416,9 +341,17 @@ def pe_sieve_scan(pid=None, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS, cancellati
         base = {"tool": tool, "pid": number, "scanner": exe, "scanner_bitness": _PeSieve.bitness(exe),
                 "resolved_by": how, "invoked_argv": argv, "scan_flags": flags}
         cp = run_bounded_process(argv, timeout_seconds=timeout_seconds, cancellation_token=cancellation_token,
-                                 environment=env, max_output_chars=_MAX_OUTPUT_CHARS)
+                                 environment=env, max_output_chars=_MAX_OUTPUT_CHARS,
+                                 max_memory_bytes=_MAX_SCANNER_MEMORY_BYTES)
+        if cp.resource_limit_unavailable:
+            return _j({**base, "ok": False, "status": "ANALYSIS_LIMITED", "error": "PE_SIEVE_RESOURCE_LIMIT_UNAVAILABLE",
+                       "detail": "The memory limit could not be enforced on this host, so nothing was started."})
         if cp.cancelled:
             return _j({**base, "ok": False, "status": "CANCELLED", "error": "PE_SIEVE_CANCELLED_PROCESS_TREE_TERMINATED"})
+        if cp.memory_exceeded:
+            return _j({**base, "ok": False, "status": "ANALYSIS_LIMITED", "error": "PE_SIEVE_MEMORY_LIMIT_EXCEEDED_PROCESS_TREE_TERMINATED",
+                       "max_memory_bytes": _MAX_SCANNER_MEMORY_BYTES,
+                       "detail": "The scanner exceeded its memory limit and was stopped; this says nothing about the process."})
         if cp.timed_out:
             return _j({**base, "ok": False, "status": "TIMEOUT", "timeout_seconds": timeout_seconds,
                        "error": "PE_SIEVE_TIMEOUT_PROCESS_TREE_TERMINATED",
@@ -491,8 +424,129 @@ def pe_sieve_scan(pid=None, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS, cancellati
                    "note": ("Category names and counts are pe-sieve's own, read from its JSON. A clean result "
                             "covers the modules and regions scanned at the depth in scan_flags, on this run; "
                             "it is not a statement that the process is benign.")})
+
+
+def pe_sieve_status():
+    """Whether pe-sieve is reachable, from where, which scanner bitness would be used,
+    and its version. Zero arguments; runs `/version` once, which scans nothing."""
+    tool = "pe_sieve_status"
+    try:
+        exe, how, found = _PeSieve.pick()
+        if not exe:
+            return _PeSieve.missing(tool)
+        argv = [exe, "/version"]
+        cp = run_bounded_process(argv, timeout_seconds=_MIN_TIMEOUT_SECONDS,
+                                 environment={**os.environ, "MSYS_NO_PATHCONV": "1", "MSYS2_ARG_CONV_EXCL": "*"},
+                                 max_output_chars=65536)
+        if cp.timed_out or cp.cancelled:
+            return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "binary": exe,
+                       "error": "PE_SIEVE_VERSION_TIMEOUT"})
+        text = ((cp.stdout or "") + "\n" + (cp.stderr or "")).strip()
+        match = re.search(r"\b\d+\.\d+\.\d+(?:\.\d+)?\b", text)
+        if cp.returncode != 0 or not match:
+            return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "binary": exe,
+                       "error": "PE_SIEVE_VERSION_UNREADABLE", "exit_code": cp.returncode,
+                       "output_tail": _PeSieve.tail(text, 500)})
+        return _j({
+            "ok": True, "tool": tool, "status": "OK",
+            "binary": exe, "resolved_by": how, "scanner_bitness": _PeSieve.bitness(exe),
+            "version": match.group(0),
+            "binaries_found": [{"path": p, "resolved_by": h, "bitness": _PeSieve.bitness(p)} for p, h in found],
+            "invoked_argv": argv,
+            "operations": ["pe_sieve_scan"],
+            "policy": {
+                "scan_only": True, "dump_switches_never_passed": True, "pid_required": True,
+                "whole_system_mode": "refused with PID_REQUIRED", "output_filter": "/ofilter 2 (no dumps)",
+            },
+            "note": (
+                "The 64-bit scanner is used whenever it is present: measured against 0.4.1.1 it scans "
+                "both 64-bit and 32-bit targets, while the 32-bit scanner cannot scan a 64-bit target. "
+                "Output shapes were measured on this version; a different one may change them, and "
+                "RESULT_PARSE_FAILED from a scan is the drift signal."
+            ),
+        })
     except Exception as exc:  # noqa: BLE001 - the contract is a JSON string, never an exception
         if isinstance(exc, OSError):
             return _PeSieve.env_failure(tool, exc)
         return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
                    "error": "PE_SIEVE_UNEXPECTED_ERROR", "detail": f"{type(exc).__name__}: {exc}"})
+
+
+def pe_sieve_scan(pid=None, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS, cancellation_token=None,
+                  iat=None, shellcode=None, obfuscation=None, data=None, dotnet_policy=None,
+                  threads=False, authorization=None, sample_sha256=None):
+    """Scan ONE running process, by PID, for in-memory differences from its on-disk
+    image, via the real `pe-sieve /json /jlvl 2`. Scan only: nothing is dumped.
+
+    LAB GATE (behaviour change): this scan now runs only behind `dynamic_lab_gate`
+    (liebert_re.dynamic.lab_gate). It needs the operator switch (LIEBERT_RE_DYNAMIC_LAB=authorized),
+    an `authorization` object naming who, why, this operation and this PID, the declared
+    `sample_sha256` of the process image, and a process this harness started (a direct child of
+    the caller, or one registered with `dynamic_lab_register_owned_process`). Any of these missing
+    or unverifiable refuses the call with the gate's status and starts nothing. The response
+    carries `lab_gate`: what was checked, what was NOT verified (`isolation_verified: false`:
+    guest, snapshot, network) and the evidence file. Observation of a harness-owned process is
+    allowed without isolation; executing or instrumenting one is not offered here.
+
+    `pid` is required. A missing, non-numeric, zero or negative PID, or any
+    "all processes" spelling, returns `PID_REQUIRED` and starts nothing.
+
+    Depth switches (each passed explicitly, echoed in `scan_flags`):
+
+    * `iat` 0-3 (`/iat`, default 1)       IAT hook scan; 0 off, 3 unfiltered
+    * `shellcode` 0-4 (`/shellc`, default 3)  shellcode detection by patterns / statistics
+    * `obfuscation` 0-3 (`/obfusc`, default 0) encrypted or obfuscated areas
+    * `data` 0-5 (`/data`, default 0)     also scan non-executable pages
+    * `dotnet_policy` 0-4 (`/dnet`, default 0) treatment of managed processes
+    * `threads` (`/threads`, default off) scan thread call stacks
+
+    Statuses:
+
+    * `OK`             the scan completed with no unreadable or skipped part.
+                       `anomalies_found` says whether anything was reported;
+                       `categories` and `categories_nonzero` carry the scanner's
+                       own category names and counts; `findings` the detail.
+    * `SCAN_PARTIAL`   some modules were unreadable or skipped. Whatever was
+                       found is still listed. Never a clean result.
+    * `NOTHING_SCANNED` the scanner reported zero modules scanned.
+    * `ACCESS_DENIED` / `PROCESS_NOT_OPENED`  the process could not be opened
+                       (text-derived; carried with `scanner_message`). Not a
+                       negative result.
+    * `SCANNER_MISMATCH` 32-bit scanner against a 64-bit target.
+    * `AUTHORIZATION_REQUIRED`, `SAMPLE_HASH_REQUIRED`, `SAMPLE_HASH_MISMATCH`,
+      `SAMPLE_HASH_UNVERIFIABLE`, `PROCESS_NOT_OWNED`, `OWNERSHIP_UNVERIFIABLE`,
+      `RESOURCE_LIMIT_UNAVAILABLE`: refused by the lab gate before anything started.
+    * `PID_REQUIRED`, `TOOL_MISSING`, `TIMEOUT`, `CANCELLED`, `ANALYSIS_LIMITED`
+      (including `environment_error` for a local OS failure),
+      `RESULT_PARSE_FAILED`.
+    """
+    tool = "pe_sieve_scan"
+    gate = None
+    try:
+        number = _PeSieve.parse_pid(pid)
+        if number is None:
+            return _PeSieve.pid_refusal(tool, pid)
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+            timeout_seconds = _DEFAULT_TIMEOUT_SECONDS
+        timeout_seconds = max(_MIN_TIMEOUT_SECONDS, min(int(timeout_seconds), _MAX_TIMEOUT_SECONDS))
+        gate = LabGate.check("pe_sieve_scan", number, authorization, sample_sha256,
+                             timeout_seconds, _MAX_SCANNER_MEMORY_BYTES)
+        if not gate["ok"]:
+            refused = {"ok": False, "tool": tool, "pid": number, "status": gate["status"], "error": gate["error"],
+                       "detail": gate["detail"] + " Nothing was started.", "lab_gate": gate}
+            if gate.get("environment_error"):
+                refused["environment_error"] = gate["environment_error"]
+            return _j(refused)
+        out = _PeSieve.execute(tool, number, iat, shellcode, obfuscation, data, dotnet_policy, threads,
+                               timeout_seconds, cancellation_token)
+        return _PeSieve.with_gate(out, gate)
+    except Exception as exc:  # noqa: BLE001 - the contract is a JSON string, never an exception
+        if isinstance(exc, OSError):
+            result = json.loads(_PeSieve.env_failure(tool, exc))
+        else:
+            result = {"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
+                      "error": "PE_SIEVE_UNEXPECTED_ERROR", "detail": f"{type(exc).__name__}: {exc}"}
+        if gate is not None and gate.get("ok"):
+            result["lab_gate"] = gate
+            gate["evidence_finalize_error"] = LabGate.finish(gate, None, {"status": result["status"], "error": result["error"]})
+        return _j(result)

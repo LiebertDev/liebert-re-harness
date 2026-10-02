@@ -136,12 +136,13 @@ jobs:
           assert not any(os.path.abspath(p or ".") == repo for p in sys.path), sys.path
           mods = sorted(m.name for m in pkgutil.walk_packages(liebert_re.__path__, "liebert_re.") if not m.ispkg)
           # Deliberate count: what the wheel ships cannot change without a
-          # reviewed edit here. 69 = 67 library modules + cli + __main__.
+          # reviewed edit here. 70 = 68 library modules + cli + __main__.
           # (+1 over 66: liebert_re/tools/capa.py, the capa wrapper.)
           # (+1 over 67: liebert_re/tools/ida.py, the IDA wrapper. Its IDAPython worker is a
           # data file under ida_scripts/ and is checked below, not imported.)
           # (+1 over 68: liebert_re/tools/pe_sieve.py, the pe-sieve wrapper.)
-          assert len(mods) == 69, (len(mods), mods)
+          # (+1 over 69: liebert_re/dynamic/lab_gate.py, the dynamic-lab gate.)
+          assert len(mods) == 70, (len(mods), mods)
           failed = []
           import importlib.resources as _res
           worker = _res.files("liebert_re.tools").joinpath("ida_scripts/query_program.idapy")

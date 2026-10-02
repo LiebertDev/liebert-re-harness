@@ -18,10 +18,12 @@ What was captured and what was not:
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
 import subprocess
+import sys
 import time
 from contextlib import redirect_stdout
 from unittest import mock
@@ -31,6 +33,31 @@ import pytest
 import liebert_re.cli as cli
 import liebert_re.tools.pe_sieve as ps
 from liebert_re.bounded_subprocess import BoundedProcessResult
+import liebert_re.dynamic.lab_gate as lg
+
+# Since the lab gate, pe_sieve_scan runs only with the operator switch, an authorization naming this
+# operation and PID, the declared image hash and a process the harness started. The scan tests below
+# fake the TARGET PROCESS (as they already fake the scanner) so the gate passes; the gate itself is
+# tested for real in tests/test_lab_gate.py and in the heavy class here.
+GATE_IMAGE = sys.executable
+GATE_IMAGE_SHA256 = hashlib.sha256(open(GATE_IMAGE, "rb").read()).hexdigest()
+
+
+def _gate_kwargs(pid=4242):
+    return {"authorization": {"authorized_by": "test", "purpose": "unit test of the scan wrapper",
+                              "operations": ["pe_sieve_scan"], "pids": [pid]},
+            "sample_sha256": GATE_IMAGE_SHA256}
+
+
+@pytest.fixture()
+def gate_open():
+    identity = {"pid": 4242, "create_time": 1.0, "image": GATE_IMAGE, "parent_pid": os.getpid(),
+                "state": "running", "user": "test"}
+    with mock.patch.dict(os.environ, {lg.ENABLE_ENV: lg.ENABLE_VALUE}), \
+         mock.patch.object(lg.LabGate, "target", return_value=(identity, None)), \
+         mock.patch.object(lg.LabGate, "is_direct_child", return_value=True):
+        yield
+
 
 FAKE_EXE = r"C:\fake\pe-sieve64.exe"
 
@@ -108,7 +135,7 @@ def _done(stdout="", stderr="", code=1, **kw):
 
 
 @pytest.fixture()
-def scanner(tmp_path):
+def scanner(tmp_path, gate_open):
     """A resolved fake scanner, evidence redirected into tmp, and the process runner mocked."""
     with mock.patch.object(ps, "EVIDENCE", tmp_path), \
          mock.patch.object(ps._PeSieve, "candidates", return_value=[(FAKE_EXE, "PATH")]), \
@@ -119,6 +146,8 @@ def scanner(tmp_path):
 
 def _scan(**kw):
     kw.setdefault("pid", 4242)
+    for key, value in _gate_kwargs(kw["pid"] if isinstance(kw["pid"], int) else 4242).items():
+        kw.setdefault(key, value)
     out = ps.pe_sieve_scan(**kw)
     assert isinstance(out, str)
     return json.loads(out)
@@ -386,9 +415,9 @@ class TestNeverAGuessedNegative:
 
 @pytest.mark.contract
 class TestFailureBranches:
-    def test_tool_missing(self):
+    def test_tool_missing(self, gate_open):
         with mock.patch.object(ps._PeSieve, "candidates", return_value=[]):
-            for out in (ps.pe_sieve_scan(4242), ps.pe_sieve_status()):
+            for out in (ps.pe_sieve_scan(4242, **_gate_kwargs()), ps.pe_sieve_status()):
                 data = json.loads(out)
                 assert data["ok"] is False and data["status"] == "TOOL_MISSING" and "PE_SIEVE_HOME" in data["detail"]
 
@@ -464,7 +493,7 @@ class TestFailureBranches:
         scanner.return_value = _done(CLEAN_JSON)
         for junk in ("", "{}", "null", "[]", "}{", "\x00\xff", '{"scan_report": null}'):
             scanner.return_value = _done(junk)
-            assert isinstance(json.loads(ps.pe_sieve_scan(4242)), dict)
+            assert isinstance(json.loads(ps.pe_sieve_scan(4242, **_gate_kwargs())), dict)
 
     def test_cli_exit_codes_for_the_new_refusals(self):
         for status in ("PID_REQUIRED", "ACCESS_DENIED", "PROCESS_NOT_OPENED", "SCANNER_MISMATCH",
@@ -507,7 +536,13 @@ class TestLiveScanOfOwnProcess:
 
     def test_scan_of_a_process_this_test_started(self, own_process, tmp_path):
         with mock.patch.object(ps, "EVIDENCE", tmp_path):
-            data = json.loads(ps.pe_sieve_scan(own_process.pid))
+            with mock.patch.dict(os.environ, {lg.ENABLE_ENV: lg.ENABLE_VALUE}),                  mock.patch.object(lg, "EVIDENCE", tmp_path / "gate"):
+                image = lg.LabGate.target(own_process.pid)[0]["image"]
+                digest = lg.LabGate.sha256_of_file(image)[0]
+                data = json.loads(ps.pe_sieve_scan(own_process.pid, **{
+                    "authorization": _gate_kwargs(own_process.pid)["authorization"], "sample_sha256": digest}))
+        assert data["lab_gate"]["ok"] is True and data["lab_gate"]["isolation_verified"] is False
+        assert data["lab_gate"]["ownership"]["basis"] == "direct_child_of_calling_process"
         assert data["pid"] == own_process.pid
         assert data["invoked_argv"][1:3] == ["/pid", str(own_process.pid)]
         # Whatever the outcome, it is one of the honest ones, and a clean claim has coverage behind it.

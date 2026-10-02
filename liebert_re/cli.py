@@ -41,7 +41,13 @@ REFUSAL_STATUSES = frozenset({"TOOL_MISSING", "UNSUPPORTED", "ANALYSIS_LIMITED",
 # pe-sieve (liebert_re.tools.pe_sieve): none of these is a finding about the process. A report
 # that is partial or empty is a refusal to claim "clean", and still carries whatever was found.
 _MODULE_REFUSALS = frozenset({"NOT_FOUND", "UPX_UNPACK_FAILED", "PID_REQUIRED", "ACCESS_DENIED",
-                              "PROCESS_NOT_OPENED", "SCANNER_MISMATCH", "NOTHING_SCANNED", "SCAN_PARTIAL"})
+                              "PROCESS_NOT_OPENED", "SCANNER_MISMATCH", "NOTHING_SCANNED", "SCAN_PARTIAL",
+                              # the dynamic-lab gate (liebert_re.dynamic.lab_gate): a refusal to touch a process,
+                              # never a finding about it
+                              "ISOLATION_REQUIRED", "AUTHORIZATION_REQUIRED", "UNKNOWN_OPERATION",
+                              "PROCESS_NOT_OWNED", "OWNERSHIP_UNVERIFIABLE", "SAMPLE_HASH_REQUIRED",
+                              "SAMPLE_HASH_MISMATCH", "SAMPLE_HASH_UNVERIFIABLE", "BOUNDS_REQUIRED",
+                              "RESOURCE_LIMIT_UNAVAILABLE"})
 _MODULE_USAGE = frozenset({"RULES_MISSING"})
 _REFUSAL_ERRORS = frozenset({"FILE_NOT_FOUND", "FILE_NOT_ACCESSIBLE"})
 
@@ -209,7 +215,17 @@ def _flirt(a):
 def _sieve(a):
     return _load("liebert_re.tools.pe_sieve", "pe_sieve_scan")(
         a.pid, timeout_seconds=a.timeout, iat=a.iat, shellcode=a.shellcode, obfuscation=a.obfuscation,
-        data=a.data, dotnet_policy=a.dotnet_policy, threads=a.threads)
+        data=a.data, dotnet_policy=a.dotnet_policy, threads=a.threads,
+        authorization=a.authorization, sample_sha256=a.sample_sha256)
+
+
+def _labgate(a):
+    return _load("liebert_re.dynamic.lab_gate", "dynamic_lab_gate")(
+        a.operation, a.pid, authorization=a.authorization, sample_sha256=a.sample_sha256)
+
+
+def _labregister(a):
+    return _load("liebert_re.dynamic.lab_gate", "dynamic_lab_register_owned_process")(a.pid)
 
 
 def _sieve_status(a):
@@ -308,6 +324,13 @@ def _apply_workspace(root):
     return undo
 
 
+def _gate_args(sp):
+    sp.add_argument("--authorization", default=None, metavar="JSON",
+                    help='JSON object {"authorized_by","purpose","operations":[...],"pids":[...]}; also needs '
+                         'LIEBERT_RE_DYNAMIC_LAB=authorized in the environment. Default: closed')
+    sp.add_argument("--sample-sha256", dest="sample_sha256", default=None, help="declared sha256 of the target process image")
+
+
 def _build_parser():
     from liebert_re import __version__
     p = argparse.ArgumentParser(prog="liebert-re", description="Static reverse-engineering analysis. JSON output only.")
@@ -395,6 +418,14 @@ def _build_parser():
     sp.add_argument("--data", type=int, default=None, help="non-executable page scan 0-5 (default 0)")
     sp.add_argument("--dotnet-policy", dest="dotnet_policy", type=int, default=None, help="managed-process policy 0-4 (default 0)")
     sp.add_argument("--threads", action="store_true", help="also scan thread call stacks")
+    _gate_args(sp)
+    sp = add("labgate", _labgate, "evaluate the dynamic-lab gate for one operation on one process and record the decision "
+                                  "(reports what it verified and what it could not: isolation is never verified)", path=False)
+    sp.add_argument("--operation", default=None, help="the operation to gate, e.g. pe_sieve_scan")
+    sp.add_argument("--pid", default=None, help="process id the operation would touch")
+    _gate_args(sp)
+    sp = add("labregister", _labregister, "record that a process is a direct child of this process (harness-owned)", path=False)
+    sp.add_argument("--pid", default=None, help="process id of a direct child of this process")
     add("sievestatus", _sieve_status, "report whether pe-sieve is reachable, from where, which scanner bitness and its version", path=False)
     add("rzbinstatus", _rzbin_status, "report whether rz-bin is reachable, from where, and its version", path=False)
     add("diestatus", _die_status, "report whether Detect It Easy is reachable, from where, and its version", path=False)
