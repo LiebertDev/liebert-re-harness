@@ -196,6 +196,17 @@ def _rzbin_status(a):
     return _load("liebert_re.tools.rizin", "rz_bin_status")()
 
 
+def _flirt(a):
+    mod = "liebert_re.tools.rizin"
+    if a.sig_file:
+        return _load(mod, "rizin_flirt_match_file")(a.path, a.sig_file, timeout_seconds=a.timeout)
+    return _load(mod, "rizin_flirt_match")(a.path, signature_filter=a.filter, timeout_seconds=a.timeout)
+
+
+def _flirt_inventory(a):
+    return _load("liebert_re.tools.rizin", "rizin_flirt_inventory")(timeout_seconds=a.timeout)
+
+
 def _unpack(a):
     return _load("liebert_re.tools.upx", "upx_unpack")(a.path, timeout_seconds=a.timeout)
 
@@ -350,6 +361,15 @@ def _build_parser():
     g = sp.add_mutually_exclusive_group(required=True)
     for m in ("imports", "sections", "headers", "relocations"):
         g.add_argument(f"--{m}", dest="mode", action="store_const", const=m)
+    sp = add("flirt", _flirt, "name library functions by FLIRT matching, with rizin's bundled sigdb "
+                              "or one .sig/.pat file")
+    sp.add_argument("--timeout", type=int, default=120, help="seconds, clamped to 10-600")
+    g = sp.add_mutually_exclusive_group()
+    g.add_argument("--filter", help="only signature sets whose file name contains this text (sigdb mode)")
+    g.add_argument("--sig-file", help="apply this .sig or .pat file instead of the sigdb")
+    sp = add("flirtinventory", _flirt_inventory, "list the signature files in rizin's sigdb, by format/arch/bits",
+             path=False)
+    sp.add_argument("--timeout", type=int, default=120, help="seconds, clamped to 10-600")
     add("rzbinstatus", _rzbin_status, "report whether rz-bin is reachable, from where, and its version", path=False)
     add("diestatus", _die_status, "report whether Detect It Easy is reachable, from where, and its version", path=False)
     # capa's default backend takes MINUTES (measured 3m48s for a 1.2 MB PE), so the

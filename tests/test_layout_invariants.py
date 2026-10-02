@@ -83,7 +83,14 @@ def test_published_tool_name_set_is_unchanged():
     # _run_with_faulthandler_off. It is the single shared copy of the faulthandler-off-around-a-call
     # logic that self_check uses around Uc.mem_map and that tests/test_vex_layer.py reuses; it is
     # private and not a published tool, and it is a top-level def (not nested) so the pin counts it.
+    #
+    # Updated again: liebert_re/tools/rizin.py gained FLIRT signature matching done by rizin
+    # itself. The public functions added on purpose are rizin_flirt_match (sigdb, `Fa`),
+    # rizin_flirt_match_file (one .sig/.pat file, `Fs`) and rizin_flirt_inventory (`Fl`),
+    # registered in tool_families.FAMILIES["native"]; the CLI reaches them as `flirt` and
+    # `flirtinventory`. The shared runner is the private class _RzFlirt, so no underscore
+    # helper joined the pinned set.
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "8fd0557923258a4ae7d50adfb573d0f528324af77ac145ddd47ef3aebad814ad"
+    assert digest == "be15cdecb0be301e91a9285158b23fdca78948fca512e9c1c347b6f986fdbc09"

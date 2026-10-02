@@ -90,6 +90,15 @@ Module paths are relative to `liebert_re/`.
   in `tools/rizin.py`. rz-bin reports no section entropy (use `die_entropy`),
   and an empty list from a file rz-bin did not recognise is refused rather than
   reported as zero. Not wrapped: `-z` strings, `-K` checksums, `-P` PDB.
+- FLIRT signature matching, done by rizin itself (not `rz-sign` or `rz-gg`):
+  `rizin_flirt_match` applies the signature sets bundled with rizin that were built for the
+  binary's format, architecture and bit width, one at a time, and returns the functions it
+  named with their addresses and the set that named each; `rizin_flirt_match_file` applies one
+  `.sig` or `.pat` file you supply; `rizin_flirt_inventory` lists what the database holds.
+  A binary no set was built for returns `NO_COMPATIBLE_SIGNATURES`, and a run whose analysis
+  found no functions returns `NO_FUNCTIONS_TO_MATCH`; neither is a zero. rizin checks only the
+  CPU family of a supplied file, so a zero from one is marked as not verified. Matching names
+  library code only. Not wrapped: creating signature files (`Fc`) and dumping them (`Fd`).
 - Packer identification (Detect It Easy) and rule scanning (YARA-X):
   `tools/die.py`, `tools/yara_x.py`.
 
@@ -115,7 +124,7 @@ Module paths are relative to `liebert_re/`.
 
 ### External-engine wrappers actually present
 
-rizin (listing, function inventory, patching, rz-bin structure reads), Detect It Easy, YARA-X, capa, IDA (read-only, see above), UPX,
+rizin (listing, function inventory, patching, rz-bin structure reads, FLIRT matching), Detect It Easy, YARA-X, capa, IDA (read-only, see above), UPX,
 JADX, Il2CppDumper, and the API Monitor catalogue only. All are optional and
 return a named tool-missing status when absent. Function inventory
 (`rizin_functions`) needs rizin; it is not pure Python.
@@ -132,7 +141,7 @@ return a named tool-missing status when absent. Function inventory
   nothing in the package produces an IR from a binary.
 - Workspace path sandbox, bounded subprocess with process-tree teardown, and a
   `liebert-re` CLI (`identify`, `probe`, `pe`, `disasm`, `packer`, `die`, `diestatus`,
-  `capa`, `capastatus`, `ida`, `idastatus`, `rzbin`, `rzbinstatus`, `unpack`, `scan`, `minidump`, `capabilities`):
+  `capa`, `capastatus`, `ida`, `idastatus`, `rzbin`, `rzbinstatus`, `flirt`, `flirtinventory`, `unpack`, `scan`, `minidump`, `capabilities`):
   `workspace.py`, `bounded_subprocess.py`, `cli.py`.
 
 ### Dynamic and emulation

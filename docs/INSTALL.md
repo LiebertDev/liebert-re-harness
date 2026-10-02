@@ -99,7 +99,7 @@ naming it — it does not silently degrade or guess.
 
 | Application | What it unlocks here | How it is found |
 |---|---|---|
-| **rizin** (or radare2) | Disassembly listings, patch planning and application, CRC-32 correction, and `rz-bin` imports, sections, header fields and relocations (`rz-bin.exe` sits next to `rizin.exe`, in the install root or its `bin` folder) | `RIZIN_HOME` environment variable, else `rizin` / `rz-bin` on `PATH` |
+| **rizin** (or radare2) | Disassembly listings, patch planning and application, CRC-32 correction, `rz-bin` imports, sections, header fields and relocations, and FLIRT signature matching (the bundled sigdb needs no extra files) (`rz-bin.exe` sits next to `rizin.exe`, in the install root or its `bin` folder) | `RIZIN_HOME` environment variable, else `rizin` / `rz-bin` on `PATH` |
 | **Detect It Easy** | Packer and compiler identification (`diec.exe -j`) | `DIE_HOME`, else `diec` on `PATH` |
 | **YARA-X** | Rule-based scanning | `YARA_X_EXE` or `YARA_X_HOME`; rule sets via `YARA_RULESETS_HOME` |
 | **API Monitor** | API catalogue lookups (live tracing and trace parsing are both **not** wired up and return `NOT_SUPPORTED` — see the gap list in the README) | `APIMONITOR_HOME` |
@@ -155,7 +155,7 @@ fixed.
 
 Seven modules write their own output *outside* this workspace root on purpose:
 `liebert_re/tools/binary.py` (`pe_resources`), `liebert_re/tools/die.py`, `liebert_re/tools/capa.py`, `liebert_re/tools/ida.py`, `liebert_re/tools/yara_x.py`,
-`liebert_re/tools/rizin.py` (`binary_patch` and the `rz-bin` reads) and `liebert_re/tools/upx.py` each persist their raw
+`liebert_re/tools/rizin.py` (`binary_patch`, the `rz-bin` reads and the FLIRT runs) and `liebert_re/tools/upx.py` each persist their raw
 engine output under a module-level `dataset/evidence/<tool_name>/` directory
 inside the repository itself, which is git-ignored. The *input* file you pass
 in is still confined by `safe_path()` exactly as above; only each tool's own

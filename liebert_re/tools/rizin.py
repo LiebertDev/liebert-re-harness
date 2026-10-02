@@ -2144,3 +2144,432 @@ def rz_bin_status() -> str:
         "operations": list(_RZ_BIN_OPERATIONS) + ["rz_bin_status"],
         "not_wrapped": ["-z strings", "-K checksums", "-P pdb"],
     })
+
+
+# ---------------------------------------------------------------------------
+# FLIRT signature matching, done by rizin itself (its `F` command space) -- not
+# rz-sign (generates/dumps, never matches) and not rz-gg (shellcode/egg
+# generator). MEASURED on rizin 0.9.1, and the reason for each choice below:
+#   * `Fa [filter]` applies the embedded sigdb, `Fs <file>` applies one .sig or
+#     .pat file, `Fl` lists the sigdb. There is no zignature system in this build.
+#   * `Fl` prints a text table only: `Fl,:json` and friends are rejected, so the
+#     inventory parser checks the header and refuses a row it cannot read instead
+#     of skipping it.
+#   * `aaa` applies the sigdb BY ITSELF (analysis.apply.signature=true), so a
+#     later `Fa`/`Fs` would be confounded by names that were already there. Every
+#     call here turns that off and applies exactly what it was asked to.
+#   * A match RENAMES the function to `flirt.<name>`; the names are read from the
+#     function list (`afl`), not from `Ff`, which prints the byte pattern of one
+#     function at the current seek, not match results.
+#   * Unfiltered `Fa` silently skips sets for another CPU; with a filter it tries
+#     every sigdb directory holding that file name and reports an architecture
+#     error for the foreign ones. So the compatible sets are taken from `Fl`
+#     (bin + arch + bits against `iIj`) and applied one at a time, which is also
+#     what attributes each match to a set; the union equalled unfiltered `Fa` on
+#     five real PEs. A target no set was built for is NO_COMPATIBLE_SIGNATURES,
+#     never a zero.
+#   * `Fs` checks the CPU family only: an x86-64 .sig applied to a 32-bit binary
+#     is accepted and finds nothing, with no error. A zero from a caller-supplied
+#     file therefore says so (`compatibility_verified: false`).
+#   * The signature path and the filter are spliced into a rizin command string,
+#     so both are allow-listed before anything runs.
+# ---------------------------------------------------------------------------
+
+
+class _RzFlirt:
+    SET_FILTER = re.compile(r"^[A-Za-z0-9._+\-]{1,64}$")
+    SIG_PATH = re.compile(r"^[\w ._+\-():/\\]+$")
+    ROW = re.compile(r"^(\S+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(\d+)\s*(.*?)\s*$")
+    FUNC = re.compile(r"^(0x[0-9a-fA-F]+)\s+\d+\s+(\d+)\s.*?(flirt\.\S+)\s*$")
+    APPLYING = re.compile(r"^Applying (\S+) signature file", re.M)
+    SET_ERROR = re.compile(r"error while parsing the file (.+?)\. Sorry\.")
+    HEADER = ("bin", "arch", "bits", "name", "modules", "details")
+    ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")  # rizin writes a clear-line escape while it analyses
+
+    @staticmethod
+    def missing(tool: str) -> str:
+        return _j({
+            "ok": False, "tool": tool, "status": "TOOL_MISSING",
+            "required_capability": "rizin (rizin.exe)",
+            "detail": "rizin was not found. Set RIZIN_HOME to the rizin install directory or put rizin on PATH.",
+        })
+
+    @staticmethod
+    def env_failure(tool: str, exc: BaseException, error: str) -> str:
+        if isinstance(exc, OSError):
+            return _j({
+                "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": error,
+                "environment_error": {
+                    "type": type(exc).__name__, "errno": getattr(exc, "errno", None),
+                    "strerror": getattr(exc, "strerror", None) or type(exc).__name__,
+                },
+                "detail": "A local operating-system error stopped this call before rizin produced a "
+                          "result. It describes this machine's environment, not the input file or the "
+                          "signatures; no answer was produced.",
+            })
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
+                   "error": "RIZIN_FLIRT_UNEXPECTED_ERROR", "detail": f"{type(exc).__name__}: {exc}"})
+
+    @staticmethod
+    def launch(tool, exe, commands, target, timeout_seconds, cancellation_token):
+        """One rizin process. Returns (completed, elapsed, None) or (None, 0, error_json)."""
+        argv = [exe, "-e", "scr.color=0", "-e", "analysis.apply.signature=false", "-q", "-c", commands]
+        if target is not None:
+            argv.append(str(target))
+        try:
+            started = time.monotonic()
+            cp = run_bounded_process(argv, timeout_seconds=timeout_seconds,
+                                     cancellation_token=cancellation_token, max_output_chars=_MAX_OUTPUT_CHARS)
+            elapsed = time.monotonic() - started
+        except Exception as exc:  # noqa: BLE001 - the contract is a JSON string, never an exception
+            return None, 0.0, _RzFlirt.env_failure(tool, exc, "RIZIN_FLIRT_COULD_NOT_START")
+        if cp.cancelled:
+            return None, 0.0, _j({"ok": False, "tool": tool, "status": "CANCELLED",
+                                  "error": "RIZIN_FLIRT_CANCELLED_PROCESS_TREE_TERMINATED"})
+        if cp.timed_out:
+            return None, 0.0, _j({"ok": False, "tool": tool, "status": "TIMEOUT",
+                                  "timeout_seconds": timeout_seconds,
+                                  "error": "RIZIN_FLIRT_TIMEOUT_PROCESS_TREE_TERMINATED"})
+        if cp.returncode not in (0, None) or not (cp.stdout or "").strip():
+            return None, 0.0, _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
+                                  "exit_code": cp.returncode, "error": "RIZIN_FLIRT_FAILED_OR_EMPTY_OUTPUT",
+                                  "stderr_tail": (cp.stderr or "")[-2000:],
+                                  "stdout_tail": (cp.stdout or "")[-500:]})
+        if getattr(cp, "output_truncated", False):
+            return None, 0.0, _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
+                                  "error": "RIZIN_FLIRT_OUTPUT_TRUNCATED_AT_CAP", "output_truncated": True,
+                                  "max_output_chars": _MAX_OUTPUT_CHARS})
+        return cp, elapsed, None
+
+    @staticmethod
+    def numbers(tool, timeout_seconds, max_items):
+        try:
+            return (max(_MIN_TIMEOUT_SECONDS, min(int(timeout_seconds), _MAX_TIMEOUT_SECONDS)),
+                    max(1, min(int(max_items), _MAX_FUNCTIONS_RETURNED)), None)
+        except (TypeError, ValueError):
+            return None, None, _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
+                                   "error": "RIZIN_FLIRT_BAD_NUMERIC_ARGUMENT"})
+
+    @staticmethod
+    def resolve(tool, path, what="path"):
+        """safe_path, then an existence check, both before any subprocess."""
+        try:
+            p = safe_path(path)
+        except PermissionError as exc:
+            return None, _j({"ok": False, "tool": tool, "status": "PATH_REFUSED", "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            return None, _RzFlirt.env_failure(tool, exc, "RIZIN_FLIRT_PATH_CHECK_FAILED")
+        try:
+            is_file = p.is_file()
+        except OSError as exc:
+            return None, _RzFlirt.env_failure(tool, exc, "RIZIN_FLIRT_PATH_CHECK_FAILED")
+        if not is_file:
+            return None, _j({"ok": False, "tool": tool, "status": "NOT_FOUND", what: str(path)})
+        return p, None
+
+    @staticmethod
+    def parse_table(text):
+        """The `Fl` table -> (rows, None) or (None, reason). A line that is neither the
+        header, the rule under it nor a readable row is a parse failure, not a skip."""
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if not lines or tuple(lines[0].split()[:6]) != _RzFlirt.HEADER:
+            return None, "RIZIN_FL_HEADER_NOT_RECOGNISED"
+        rows = []
+        for ln in lines[1:]:
+            if not any(ch.isalnum() for ch in ln):
+                continue
+            m = _RzFlirt.ROW.match(ln)
+            if not m:
+                return None, "RIZIN_FL_ROW_NOT_RECOGNISED"
+            rows.append({"bin": m.group(1), "arch": m.group(2), "bits": int(m.group(3)),
+                         "name": m.group(4), "modules": int(m.group(5)), "details": m.group(6),
+                         "path": f"{m.group(1)}/{m.group(2)}/{m.group(3)}/{m.group(4)}"})
+        return rows, None
+
+    @staticmethod
+    def split_sections(text, markers):
+        """stdout -> {marker: lines that FOLLOW it up to the next marker}; '' holds the head."""
+        out, current, buf = {}, "", []
+        for ln in text.splitlines():
+            if ln.strip() in markers:
+                out[current] = "\n".join(buf)
+                current, buf = ln.strip(), []
+            else:
+                buf.append(ln)
+        out[current] = "\n".join(buf)
+        return out
+
+    @staticmethod
+    def write_evidence(p, op, stdout, stderr, commands):
+        try:
+            directory = EVIDENCE.parent / "rizin_flirt"
+            directory.mkdir(parents=True, exist_ok=True)
+            stem = re.sub(r"[^A-Za-z0-9._-]", "_", p.stem)[:80] or "input"
+            out = directory / f"{stem}_{uuid.uuid4().hex[:8]}_{op}.txt"
+            out.write_text(f"# rizin -c {commands!r}\n# --- stdout ---\n{stdout}\n# --- stderr ---\n{stderr or ''}\n",
+                           encoding="utf-8")
+            try:
+                _evidence_index_record_write(out)
+            except Exception:  # noqa: BLE001
+                pass
+            return out.name, None
+        except Exception as exc:  # noqa: BLE001 - an evidence failure never blocks the result
+            return None, f"{type(exc).__name__}: {exc}"
+
+    @staticmethod
+    def functions_after(text, owner, seen):
+        """Fold `afl~flirt` lines into ``seen`` (address -> record); the latest set to name it owns it."""
+        for ln in text.splitlines():
+            m = _RzFlirt.FUNC.match(ln.strip())
+            if not m:
+                continue
+            addr = int(m.group(1), 16)
+            name = m.group(3)[len("flirt."):]
+            rec = seen.get(addr)
+            if rec is None or rec["name"] != name:
+                seen[addr] = {"address": addr, "address_hex": hex(addr), "size": int(m.group(2)),
+                              "name": name, "signature_set": owner}
+
+    @staticmethod
+    def not_loaded(tool, p, probe):
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
+                   "error": "RIZIN_FLIRT_NO_LOADED_BINARY", "load_probe": probe["status"], "path": relative(p),
+                   "detail": "rizin's own binary-info probe does not confirm it recognised this file, so "
+                             "there is nothing to match signatures against."})
+
+    @staticmethod
+    def apply(tool, op, path, signature_filter, sig_file, timeout_seconds, max_items, cancellation_token):
+        exe = _rizin_binary()
+        if not exe:
+            return _RzFlirt.missing(tool)
+        if sig_file is None and signature_filter is not None and (
+                not isinstance(signature_filter, str) or not _RzFlirt.SET_FILTER.match(signature_filter)):
+            return _j({"ok": False, "tool": tool, "status": "INVALID_ARGUMENT", "error": "FLIRT_FILTER_NOT_ALLOWED",
+                       "detail": "signature_filter is matched by rizin against a signature file name; only "
+                                 "letters, digits and . _ + - (1-64 characters) are accepted."})
+        p, err = _RzFlirt.resolve(tool, path)
+        if err:
+            return err
+        sig_p, sig_posix = None, None
+        if sig_file is not None:
+            sig_p, err = _RzFlirt.resolve(tool, sig_file, "signature_file")
+            if err:
+                return err
+            if sig_p.suffix.lower() not in (".sig", ".pat"):
+                return _j({"ok": False, "tool": tool, "status": "INVALID_ARGUMENT",
+                           "error": "FLIRT_FILE_EXTENSION_NOT_SUPPORTED", "signature_file": str(sig_file),
+                           "detail": "rizin loads FLIRT files by extension: .sig or .pat."})
+            sig_posix = sig_p.as_posix()
+            if not _RzFlirt.SIG_PATH.match(sig_posix):
+                return _j({"ok": False, "tool": tool, "status": "INVALID_ARGUMENT",
+                           "error": "FLIRT_SIGNATURE_PATH_NOT_ALLOWED", "signature_file": str(sig_file),
+                           "detail": "The path is placed inside a rizin command, so only word characters, "
+                                     "spaces and . _ + - ( ) : / \\ are accepted; move or rename the file."})
+        timeout_seconds, max_items, err = _RzFlirt.numbers(tool, timeout_seconds, max_items)
+        if err:
+            return err
+
+        # Phase 1 (sigdb mode) -- what is this file, and which sets were built for it.
+        probe, names, compatible = None, [], []
+        if sig_p is None:
+            cp, _elapsed, err = _RzFlirt.launch(tool, exe, "iIj; echo FLIRT_PROBE_END; Fl", p, timeout_seconds,
+                                                cancellation_token)
+            if err:
+                return err
+            head, _, table = _RzFlirt.ANSI.sub("", cp.stdout).partition("FLIRT_PROBE_END")
+            probe = _rizin_load_probe(head)
+            if probe["status"] != "BINARY_LOADED":
+                return _RzFlirt.not_loaded(tool, p, probe)
+            rows, why = _RzFlirt.parse_table(table)
+            if rows is None:
+                return _j({"ok": False, "tool": tool, "status": "RESULT_PARSE_FAILED", "error": why,
+                           "stdout_tail": table[-500:]})
+            compatible = [r for r in rows if r["bin"] == probe.get("bintype") and r["arch"] == probe.get("arch")
+                          and r["bits"] == probe.get("bits")
+                          and (not signature_filter or signature_filter in r["name"])]
+            if not compatible:
+                return _j({
+                    "ok": False, "tool": tool, "status": "NO_COMPATIBLE_SIGNATURES", "path": relative(p),
+                    "target": {"bintype": probe.get("bintype"), "arch": probe.get("arch"),
+                               "bits": probe.get("bits")},
+                    "signature_filter": signature_filter, "sigdb_files": len(rows),
+                    "sigdb_targets": sorted({f"{r['bin']}/{r['arch']}/{r['bits']}" for r in rows}),
+                    "detail": "No signature set in the sigdb matches this binary's format, architecture and "
+                              "bit width" + (f" and the filter {signature_filter!r}" if signature_filter else "")
+                              + ", so nothing was applied. This is not a 'no match' result: a match was never "
+                                "possible.",
+                })
+            for r in compatible:
+                if r["name"] not in names:
+                    names.append(r["name"])
+            apply_cmds = "".join(f"Fa {n}; echo FLIRT_SET {n}; afl~flirt; " for n in names)
+            markers = {f"FLIRT_SET {n}" for n in names}
+        else:
+            apply_cmds = f'Fs "{sig_posix}"; echo FLIRT_SET FILE; afl~flirt; '
+            markers = {"FLIRT_SET FILE"}
+
+        # Phase 2 -- analyse once with the sigdb switched off, then apply and read the names back.
+        cmds = ("iIj; echo FLIRT_PROBE_END; aaa; afl~?; echo FLIRT_BASELINE; afl~flirt; " + apply_cmds).rstrip("; ")
+        cp, elapsed, err = _RzFlirt.launch(tool, exe, cmds, p, timeout_seconds, cancellation_token)
+        if err:
+            return err
+        evidence = _RzFlirt.write_evidence(p, op, cp.stdout, cp.stderr, cmds)
+        stderr_text = _RzFlirt.ANSI.sub("", cp.stderr or "")
+        head, _, rest = _RzFlirt.ANSI.sub("", cp.stdout).partition("FLIRT_PROBE_END")
+        if probe is None:
+            probe = _rizin_load_probe(head)
+            if probe["status"] != "BINARY_LOADED":
+                return _RzFlirt.not_loaded(tool, p, probe)
+        count_text, _, after_baseline = rest.partition("FLIRT_BASELINE")
+        count_lines = [ln.strip() for ln in count_text.splitlines() if ln.strip().isdigit()]
+        functions_analyzed = int(count_lines[0]) if count_lines else None
+        stderr_lines = [ln.strip() for ln in stderr_text.splitlines() if ln.strip()]
+        if functions_analyzed == 0 or any("no analyzed functions" in ln for ln in stderr_lines):
+            return _j({"ok": False, "tool": tool, "status": "NO_FUNCTIONS_TO_MATCH", "path": relative(p),
+                       "functions_analyzed": functions_analyzed or 0, "load_probe": probe["status"],
+                       "internal_evidence_name": evidence[0],
+                       "detail": "rizin's analysis found no functions, so signatures had nothing to name. "
+                                 "This is not a 'no match' result."})
+        sections = _RzFlirt.split_sections(after_baseline, markers)
+        seen: dict = {}
+        _RzFlirt.functions_after(sections.get("", ""), None, seen)
+        baseline = len(seen)
+        target = {"bintype": probe.get("bintype"), "arch": probe.get("arch"), "bits": probe.get("bits")}
+        if sig_p is not None:
+            problems = [ln for ln in stderr_lines if ln.startswith("ERROR: FLIRT:")]
+            if any("Can't open" in ln for ln in problems):
+                return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
+                           "error": "FLIRT_SIGNATURE_FILE_NOT_OPENED", "signature_file": relative(sig_p),
+                           "internal_evidence_name": evidence[0],
+                           "detail": "rizin could not open a signature file that exists; this describes the "
+                                     "machine, not the signatures."})
+            if problems:
+                mismatch = any("architecture did not match" in ln for ln in problems)
+                return _j({"ok": False, "tool": tool,
+                           "status": "SIGNATURE_ARCH_MISMATCH" if mismatch else "SIGNATURE_FILE_REJECTED",
+                           "path": relative(p), "signature_file": relative(sig_p), "target": target,
+                           "rizin_messages": problems[:10], "internal_evidence_name": evidence[0],
+                           "detail": "rizin refused the signature file; nothing was matched, which is not a "
+                                     "'no match' result."})
+            _RzFlirt.functions_after(sections.get("FLIRT_SET FILE", ""), sig_p.name, seen)
+            found = re.search(r"Found (\d+) FLIRT signatures via", after_baseline)
+            extra = {"signature_source": "file", "signature_file": relative(sig_p),
+                     "rizin_reported_signature_count": int(found.group(1)) if found else None,
+                     "compatibility_verified": False,
+                     "compatibility_note": "rizin checks the CPU family of a caller-supplied file but not its "
+                                           "bit width, so a zero here does not prove the file was built for "
+                                           "this binary."}
+            completeness = "COMPLETE" if len(seen) > baseline else "COMPLETE_NO_MATCH_COMPATIBILITY_UNVERIFIED"
+        else:
+            for n in names:
+                _RzFlirt.functions_after(sections.get(f"FLIRT_SET {n}", ""), n, seen)
+            allowed = {r["path"] for r in compatible}
+            errors = set()
+            for m in _RzFlirt.SET_ERROR.finditer(stderr_text):
+                tail = "/".join([x for x in re.split(r"[\\/]", m.group(1)) if x][-4:])
+                if tail in allowed:  # an error on a foreign-arch set sharing the file name is expected noise
+                    errors.add(tail)
+            applied = sorted({a for a in _RzFlirt.APPLYING.findall(after_baseline) if a in allowed} - errors)
+            extra = {"signature_source": "sigdb", "signature_filter": signature_filter,
+                     "signature_sets_considered": sorted(allowed), "signature_sets_applied": applied,
+                     "signature_sets_with_errors": sorted(errors)}
+            completeness = ("PARTIAL_SIGNATURE_ERRORS" if errors
+                            else ("COMPLETE" if len(seen) > baseline else "COMPLETE_NO_MATCH"))
+        for rec in seen.values():
+            if rec["signature_set"] is None:
+                rec["signature_set"] = "(named before any signature was applied)"
+        ordered = sorted(seen.values(), key=lambda r: r["address"])
+        shaped = ordered[:max_items]
+        per_set: dict = {}
+        for r in ordered:
+            per_set[r["signature_set"]] = per_set.get(r["signature_set"], 0) + 1
+        return _j({
+            "ok": True, "tool": tool, "status": "OK", "path": relative(p),
+            "engine": "rizin", "target": target, "load_probe": probe["status"],
+            "functions_analyzed": functions_analyzed,
+            "match_count": len(ordered), "returned": len(shaped), "truncated": len(ordered) > len(shaped),
+            "analysis_completeness": "LIST_CAPPED_AT_MAX_ITEMS" if len(ordered) > len(shaped) else completeness,
+            "matches_per_signature_set": dict(sorted(per_set.items())),
+            "named_functions": shaped,
+            **extra,
+            "wall_clock_seconds": round(elapsed, 3),
+            "internal_evidence_name": evidence[0], "evidence_write_error": evidence[1],
+        })
+
+
+def rizin_flirt_match(path, signature_filter=None, timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+                      max_items: int = _MAX_FUNCTIONS_RETURNED, cancellation_token=None) -> str:
+    """Name library functions by matching the sigdb bundled with rizin (`Fa`) against
+    `path`. No signature files are needed. Only the sets built for the binary's own format,
+    architecture and bit width are applied, one at a time, so every named function carries
+    the `signature_set` that named it (as `<bin>/<arch>/<bits>/<file>.sig`). `signature_filter`
+    narrows the sets by a case-sensitive part of the file name (`winsdk`, `VisualStudio2019`).
+    Each hit is a function rizin renamed: `address`, `size`, `name` (without rizin's `flirt.`
+    prefix). `analysis_completeness` is COMPLETE, COMPLETE_NO_MATCH (the compatible sets were
+    applied and none matched: a real negative), PARTIAL_SIGNATURE_ERRORS or
+    LIST_CAPPED_AT_MAX_ITEMS; `match_count` is the full count.
+    Status: OK, TOOL_MISSING, PATH_REFUSED, NOT_FOUND, INVALID_ARGUMENT, CANCELLED, TIMEOUT,
+    RESULT_PARSE_FAILED, ANALYSIS_LIMITED (failure, empty/truncated output, an environment
+    error carrying `environment_error`, or a file rizin did not recognise as a binary),
+    NO_COMPATIBLE_SIGNATURES (no set exists for this format/arch/bits, or none survives the
+    filter: a match was never possible) and NO_FUNCTIONS_TO_MATCH (the analysis found no
+    functions). The last two are never a zero."""
+    return _RzFlirt.apply("rizin_flirt_match", "fa", path, signature_filter, None, timeout_seconds,
+                          max_items, cancellation_token)
+
+
+def rizin_flirt_match_file(path, signature_file, timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+                           max_items: int = _MAX_FUNCTIONS_RETURNED, cancellation_token=None) -> str:
+    """Apply one FLIRT file (`.sig` or `.pat`, `Fs`) to `path`, e.g. one of an IDA install's
+    `sig` files. `signature_file` goes through the workspace sandbox like `path`. Result shape
+    as rizin_flirt_match with `signature_source: "file"`. rizin checks only the CPU family of
+    such a file, never its bit width, so a zero is reported as
+    COMPLETE_NO_MATCH_COMPATIBILITY_UNVERIFIED with `compatibility_verified: false`.
+    Extra statuses: SIGNATURE_FILE_REJECTED (not a FLIRT file / corrupt) and
+    SIGNATURE_ARCH_MISMATCH (different CPU family); a missing file is NOT_FOUND and any
+    other extension is INVALID_ARGUMENT."""
+    return _RzFlirt.apply("rizin_flirt_match_file", "fs", path, None, signature_file, timeout_seconds,
+                          max_items, cancellation_token)
+
+
+def rizin_flirt_inventory(timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS, cancellation_token=None) -> str:
+    """What the sigdb holds (`Fl`): one entry per signature file with `bin`, `arch`, `bits`,
+    `name`, `module` count, `details` and `path` (`<bin>/<arch>/<bits>/<file>`), plus
+    `by_target` totals so a caller can see whether a binary's architecture is covered before
+    matching. A separate operation, not part of rizin_status: that call has a fixed two-key
+    shape callers rely on, and the sigdb can be missing or empty while rizin.exe is present
+    (SIGDB_EMPTY_OR_UNAVAILABLE, not a zero-file success). rizin 0.9.1 has no JSON form of
+    `Fl`; the table is parsed strictly. Status: OK, TOOL_MISSING, CANCELLED, TIMEOUT,
+    ANALYSIS_LIMITED, RESULT_PARSE_FAILED, SIGDB_EMPTY_OR_UNAVAILABLE."""
+    tool = "rizin_flirt_inventory"
+    exe = _rizin_binary()
+    if not exe:
+        return _RzFlirt.missing(tool)
+    timeout_seconds, _unused, err = _RzFlirt.numbers(tool, timeout_seconds, 1)
+    if err:
+        return err
+    cp, elapsed, err = _RzFlirt.launch(tool, exe, "Fl", None, timeout_seconds, cancellation_token)
+    if err:
+        return err
+    table = _RzFlirt.ANSI.sub("", cp.stdout)
+    rows, why = _RzFlirt.parse_table(table)
+    if rows is None:
+        return _j({"ok": False, "tool": tool, "status": "RESULT_PARSE_FAILED", "error": why,
+                   "stdout_tail": table[-500:]})
+    if not rows:
+        return _j({"ok": False, "tool": tool, "status": "SIGDB_EMPTY_OR_UNAVAILABLE",
+                   "stderr_tail": (cp.stderr or "")[-500:],
+                   "detail": "rizin listed no signature files. The embedded sigdb may be missing from this "
+                             "install; supply files with rizin_flirt_match_file instead."})
+    by_target: dict = {}
+    for r in rows:
+        t = by_target.setdefault((r["bin"], r["arch"], r["bits"]), {"files": 0, "modules": 0})
+        t["files"] += 1
+        t["modules"] += r["modules"]
+    return _j({
+        "ok": True, "tool": tool, "status": "OK", "engine": "rizin",
+        "file_count": len(rows), "module_count": sum(r["modules"] for r in rows),
+        "by_target": [{"bin": b, "arch": a, "bits": n, **v} for (b, a, n), v in sorted(by_target.items())],
+        "signature_files": rows,
+        "wall_clock_seconds": round(elapsed, 3),
+    })
