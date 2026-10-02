@@ -97,6 +97,9 @@ DOWNLOAD_LOG = (
 )
 
 
+_OMIT = object()
+
+
 def _cp(returncode=0, stdout="", stderr="", **flags):
     return BoundedProcessResult(returncode, stdout, stderr, **flags)
 
@@ -115,6 +118,11 @@ class FakeIdat:
         self.log = log
         self.calls = []       # dicts: command, cwd, job, timeout, environment
         self.fields = {"summary": SUMMARY}
+        # What a reopen-mode worker reports about discarding the session's
+        # changes: True (the real worker's normal answer), False, or _OMIT.
+        self.discard_flag = True
+        self.result_operation = None   # override the `operation` the result claims
+        self.log_unreadable = False    # make ida.log a directory, so reading it raises OSError
 
     def __call__(self, command, *, timeout_seconds, cancellation_token=None, cwd=None,
                  environment=None, max_output_chars=None):
@@ -129,11 +137,16 @@ class FakeIdat:
             return _cp(None, timed_out=True)
         if name == "cancel":
             return _cp(None, cancelled=True)
-        (work / ti._LOG_NAME).write_text(self.log, encoding="utf-8")
+        if self.log_unreadable:
+            (work / ti._LOG_NAME).mkdir()
+        else:
+            (work / ti._LOG_NAME).write_text(self.log, encoding="utf-8")
         if name == "broken":
             for suffix in (".id0", ".id1", ".id2", ".nam", ".til"):
                 (work / f"db{suffix}").write_bytes(b"x" * 8)
             return _cp(1, stderr="liebert_ida_job.py: name 'this' is not defined\n")
+        if name == "empty_log":
+            (work / ti._LOG_NAME).write_text("", encoding="utf-8")
         if name == "fatal_log":
             (work / ti._LOG_NAME).write_text(self.log + "FATAL ERROR: Oops! internal error 1228 occurred.\n", encoding="utf-8")
         if name == "stderr_license":
@@ -153,6 +166,10 @@ class FakeIdat:
             body = {"ok": False, "tool": "ida_query", "operation": job["operation"], "items": [],
                     "error": "FUNCTION_NOT_FOUND", "engine_input_sha256": sha,
                     "engine_input_md5": self.md5, "script_completed": True}
+        if mode == "reopen" and self.discard_flag is not _OMIT:
+            body["database_changes_discarded"] = self.discard_flag
+        if self.result_operation is not None:
+            body["operation"] = self.result_operation
         (work / ti._RESULT_NAME).write_text(json.dumps(body), encoding="utf-8")
         return _cp(0)
 
@@ -761,6 +778,7 @@ class ResultTests(IdaCase):
 
     def test_oversized_output_is_trimmed_to_valid_json_and_says_so(self):
         many = [{"name": f"sub_{i:08x}", "address": hex(i), "signature": ""} for i in range(2000)]
+        self.q()   # the first call is a `summary` analysis; the patched answer below is a reopen session's
         with mock.patch.object(FakeIdat, "_body", lambda s, job, sha: _result(
                 "list_functions", sha, s.md5, items=many, total_function_count=2000, offset=0,
                 returned_count=2000, next_offset=None)):
@@ -778,6 +796,7 @@ class ResultTests(IdaCase):
 
     def test_long_pseudocode_is_cut_not_corrupted(self):
         huge = "int f(void) {\n" + "  x += 1;\n" * 5000 + "}\n"
+        self.q()   # the first call is a `summary` analysis; the patched answer below is a reopen session's
         with mock.patch.object(FakeIdat, "_body", lambda s, job, sha: _result(
                 "decompile_function", sha, s.md5, items=FUNCTIONS[:1], decompiled=huge)):
             data = json.loads(ti.ida_query(str(self.sample), "decompile_function", "f", max_chars=5000))
@@ -785,6 +804,7 @@ class ResultTests(IdaCase):
         self.assertLess(len(data["decompiled"]), len(huge))
 
     def test_a_walk_limit_in_the_worker_is_a_partial_result(self):
+        self.q()   # the first call is a `summary` analysis; the patched answer below is a reopen session's
         with mock.patch.object(FakeIdat, "_body", lambda s, job, sha: _result(
                 "strings", sha, s.md5, items=[], items_scanned=50000, items_matched=0,
                 walk_limit={"walk": "strings", "reason": "MAX_ITEMS", "items_visited": 50000,
@@ -797,6 +817,7 @@ class ResultTests(IdaCase):
         self.assertIn("strings", text)
 
     def test_a_time_ceiling_is_named_with_its_value(self):
+        self.q()   # the first call is a `summary` analysis; the patched answer below is a reopen session's
         with mock.patch.object(FakeIdat, "_body", lambda s, job, sha: _result(
                 "imports_exports", sha, s.md5, items=[], walk_limit={
                     "walk": "imports_exports", "reason": "MAX_SECONDS", "items_visited": 768,
@@ -1136,6 +1157,553 @@ class StatusTests(IdaCase):
         self.assertEqual(data["cache"]["slot_count"], 1)
         self.assertEqual(data["cache"]["budget_bytes"], ti._cache_budget_bytes())
         self.assertEqual(data["cache"]["root"], "<cache root>")        # no machine path in the report
+
+
+# ---------------------------------------------------------------------------
+# hardening: the discard guarantee, environment errors, the verdict, the lock,
+# and the shared time budget
+# ---------------------------------------------------------------------------
+class DiscardGuaranteeTests(IdaCase):
+    """A query must not change the cached database. The worker refuses to run
+    the operation when it cannot set that up, AND the wrapper independently
+    refuses any reopen result that does not carry `database_changes_discarded:
+    true`, so neither layer is the only thing standing in the way."""
+
+    def _prime(self):
+        self.assertTrue(self.q()["ok"])
+        self.assertEqual(len(self.slots()), 1)
+
+    def test_a_reopen_result_with_the_flag_false_is_not_a_success_and_drops_the_slot(self):
+        self._prime()
+        evidence_before = sorted(self.evidence.iterdir())
+        self.fake.discard_flag = False
+        data = self.q("decompile_function", "start")
+        self.assertFalse(data["ok"], data)
+        self.assertEqual(data["status"], "ANALYSIS_LIMITED")
+        self.assertEqual(data["error"], "DATABASE_CHANGES_NOT_DISCARDED")
+        self.assertIs(data["signals"]["database_changes_discarded"], False)
+        self.assertNotIn("decompiled", data)
+        self.assertEqual(self.slots(), [], "a database that may have taken the decompiler's types is not kept")
+        self.assertEqual(sorted(self.evidence.iterdir()), evidence_before, "no evidence is written for a refused answer")
+
+    def test_a_reopen_result_without_the_flag_is_not_a_success_either(self):
+        self._prime()
+        self.fake.discard_flag = _OMIT
+        data = self.q("list_functions")
+        self.assertFalse(data["ok"], data)
+        self.assertEqual(data["error"], "DATABASE_CHANGES_NOT_DISCARDED")
+        self.assertIsNone(data["signals"]["database_changes_discarded"])
+        self.assertEqual(self.slots(), [])
+
+    def test_a_worker_that_declined_to_run_is_reported_with_its_own_error_named(self):
+        self._prime()
+        declined = {"ok": False, "tool": "ida_query", "operation": "list_functions", "items": [],
+                    "error": "DATABASE_CHANGES_NOT_DISCARDABLE", "database_changes_discarded": False,
+                    "engine_input_sha256": self.sha, "engine_input_md5": self.md5, "script_completed": True}
+        self.fake.discard_flag = _OMIT   # leave the worker's own `False` in the body untouched
+        with mock.patch.object(FakeIdat, "_body", lambda s, job, sha: dict(declined)):
+            data = self.q("list_functions")
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["error"], "DATABASE_CHANGES_NOT_DISCARDED")
+        self.assertEqual(data["worker_error"], "DATABASE_CHANGES_NOT_DISCARDABLE")
+        self.assertEqual(self.slots(), [])
+
+    def test_the_first_analysis_session_is_not_required_to_discard(self):
+        """Create mode saves the pristine analysis; it must never be marked temporary."""
+        self.fake.discard_flag = _OMIT
+        self.assertTrue(self.q("summary")["ok"])
+
+    def test_the_normal_case_is_untouched(self):
+        self._prime()
+        data = self.q("list_functions")
+        self.assertTrue(data["ok"], data)
+        self.assertIs(data["signals"]["database_changes_discarded"], True)
+        self.assertEqual(data["database_cache"], "HIT")
+
+
+class WorkerDiscardGuardTests(unittest.TestCase):
+    """The worker side of the guarantee, against the stub ida_* modules."""
+
+    def setUp(self):
+        self.w, self.ida = _load_worker()
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+
+    def run_job(self, **job):
+        job.setdefault("operation", "list_functions")
+        job.setdefault("mode", "reopen")
+        job["output"] = str(self.tmp / "out.json")
+        job_file = self.tmp / "job.json"
+        job_file.write_text(json.dumps(job), encoding="utf-8")
+        with mock.patch.dict(os.environ, {self.w.JOB_ENV: str(job_file)}):
+            code = self.w.main()
+        return code, json.loads((self.tmp / "out.json").read_text(encoding="utf-8"))
+
+    def test_when_the_temp_flag_cannot_be_set_the_operation_does_not_run(self):
+        self.ida["ida_loader"].set_database_flag.side_effect = AttributeError("older build")
+        self.ida["idautils"].Functions.return_value = [0x1000]
+        for operation in ("list_functions", "decompile_function"):
+            with self.subTest(operation=operation):
+                code, data = self.run_job(operation=operation, query="start")
+                self.assertEqual(code, 0)
+                self.assertFalse(data["ok"])
+                self.assertEqual(data["error"], "DATABASE_CHANGES_NOT_DISCARDABLE")
+                self.assertIs(data["database_changes_discarded"], False)
+                self.assertTrue(data["script_completed"])
+                self.assertEqual(data["items"], [])
+        self.ida["idautils"].Functions.assert_not_called()
+        self.ida["ida_hexrays"].decompile.assert_not_called()
+        self.ida["ida_auto"].auto_wait.assert_not_called()
+        self.ida["ida_loader"].save_database.assert_not_called()
+
+    def test_a_flag_that_reports_failure_by_returning_false_is_not_a_success_path(self):
+        with mock.patch.object(self.w, "_discard_session_changes", return_value=False):
+            _code, data = self.run_job(operation="list_functions")
+        self.assertEqual(data["error"], "DATABASE_CHANGES_NOT_DISCARDABLE")
+        self.ida["idautils"].Functions.assert_not_called()
+
+    def test_the_flag_is_set_before_anything_else_runs(self):
+        order = []
+        self.ida["ida_loader"].set_database_flag.side_effect = lambda *_a: order.append("flag")
+        self.ida["ida_auto"].auto_wait.side_effect = lambda *_a: order.append("auto_wait")
+        self.ida["idautils"].Functions.side_effect = lambda *_a: order.append("op") or []
+        self.run_job(operation="list_functions")
+        self.assertEqual(order[:2], ["flag", "auto_wait"])
+        self.assertIn("op", order)
+
+    def test_an_exception_during_the_operation_keeps_the_discard_signal(self):
+        self.ida["idautils"].Functions.side_effect = RuntimeError("kernel said no")
+        _code, data = self.run_job(operation="list_functions")
+        self.assertEqual(data["error"], "IDAPYTHON_SCRIPT_EXCEPTION")
+        self.assertIs(data["database_changes_discarded"], True)
+
+
+class EnvironmentErrorTests(IdaCase):
+    """The wrapper's contract is never to raise: a local OS error becomes JSON
+    that names itself as one and does not blame the input, the cache or IDA."""
+
+    def assertEnvironmentError(self, data, error, errno=None):
+        self.assertIsInstance(data, dict)
+        self.assertFalse(data["ok"], data)
+        self.assertEqual(data["error"], error, data)
+        self.assertEqual(data["status"], "ANALYSIS_LIMITED")
+        self.assertIn("environment_error", data)
+        if errno is not None:
+            self.assertEqual(data["environment_error"]["errno"], errno)
+        self.assertIn("environment", data["detail"])
+        self.assertNotIn("corrupt", data["detail"].lower())
+
+    def test_a_cache_root_that_is_a_file_is_reported_not_raised(self):
+        self.cache.write_text("not a directory", encoding="utf-8")
+        data = self.q()
+        self.assertEnvironmentError(data, "IDA_CACHE_ROOT_UNUSABLE")
+        self.assertEqual(data["target_sha256"], self.sha)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_status_with_a_cache_root_that_is_a_file_is_reported_not_raised(self):
+        self.cache.write_text("not a directory", encoding="utf-8")
+        with mock.patch.object(ti, "_resolved_by_and_binary", return_value=("PATH", "C:/fake/idat.exe")):
+            data = json.loads(ti.ida_status())
+        self.assertEnvironmentError(data, "IDA_CACHE_ROOT_UNUSABLE")
+        self.assertEqual(data["tool"], "ida_status")
+        self.assertEqual(self.fake.calls, [])
+
+    def _unreadable_worker(self):
+        def refuse():
+            raise PermissionError(13, "Permission denied")
+        return SimpleNamespace(is_file=lambda: True, read_bytes=refuse)
+
+    def test_an_unreadable_packaged_worker_is_reported_not_raised(self):
+        with mock.patch.object(ti, "_WORKER_SOURCE", self._unreadable_worker()):
+            data = self.q()
+        self.assertEnvironmentError(data, "IDA_WORKER_UNREADABLE", errno=13)
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.slots(), [])
+        self.assertEqual(self.leftovers(), [])
+        self.assertFalse(ti._lock_path(ti._slot_dir(self.sha)).exists(), "the lock is released")
+
+    def test_status_with_an_unreadable_worker_is_reported_not_raised(self):
+        with mock.patch.object(ti, "_resolved_by_and_binary", return_value=("PATH", "C:/fake/idat.exe")), \
+                mock.patch.object(ti, "_WORKER_SOURCE", self._unreadable_worker()):
+            data = json.loads(ti.ida_status())
+        self.assertEnvironmentError(data, "IDA_WORKER_UNREADABLE", errno=13)
+
+    def test_a_binary_that_exists_but_cannot_be_started_is_reported_not_raised(self):
+        for exc, errno in ((FileNotFoundError(2, "The system cannot find the file specified"), 2),
+                           (OSError(193, "%1 is not a valid Win32 application"), 193),
+                           (PermissionError(13, "Permission denied"), 13)):
+            with self.subTest(exc=type(exc).__name__):
+                with mock.patch.object(ti, "run_bounded_process", side_effect=exc):
+                    data = self.q()
+                self.assertEnvironmentError(data, "IDA_LAUNCH_FAILED", errno=errno)
+                self.assertEqual(self.slots(), [])
+                self.assertEqual(self.leftovers(), [])
+
+    def test_a_launch_failure_on_a_reopen_does_not_discard_a_healthy_slot(self):
+        self.assertTrue(self.q()["ok"])
+        with mock.patch.object(ti, "run_bounded_process", side_effect=PermissionError(13, "Permission denied")):
+            data = self.q("list_functions")
+        self.assertEnvironmentError(data, "IDA_LAUNCH_FAILED", errno=13)
+        self.assertEqual(len(self.slots()), 1, "idat never started, so the database was not touched")
+
+    def test_status_with_a_binary_that_cannot_be_started_is_reported_not_raised(self):
+        with mock.patch.object(ti, "_resolved_by_and_binary", return_value=("PATH", "C:/fake/idat.exe")), \
+                mock.patch.object(ti, "run_bounded_process",
+                                  side_effect=OSError(193, "%1 is not a valid Win32 application")):
+            data = json.loads(ti.ida_status())
+        self.assertEnvironmentError(data, "IDA_LAUNCH_FAILED", errno=193)
+        self.assertEqual(data["binary"], "C:/fake/idat.exe")
+
+    def test_an_unreadable_input_is_reported_not_raised(self):
+        with mock.patch.object(ti, "_sha256_md5", side_effect=PermissionError(13, "Permission denied")):
+            data = self.q()
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["status"], "READ_FAILED")
+        self.assertEqual(data["error"], "IDA_INPUT_UNREADABLE")
+        self.assertEqual(data["environment_error"]["errno"], 13)
+
+    def test_an_os_error_inside_the_locked_section_is_reported_and_the_lock_released(self):
+        with mock.patch.object(ti, "_query_locked", side_effect=OSError(28, "No space left on device")):
+            data = self.q()
+        self.assertEnvironmentError(data, "IDA_CACHE_IO_ERROR", errno=28)
+        self.assertFalse(ti._lock_path(ti._slot_dir(self.sha)).exists())
+
+    def test_the_os_message_carries_no_machine_path(self):
+        exc = PermissionError(13, "Permission denied")
+        exc.filename = _HOME + "\\secret\\worker.idapy"
+        with mock.patch.object(ti, "run_bounded_process", side_effect=exc):
+            raw = ti.ida_query(str(self.sample))
+        self.assertNotIn(_HOME_NAME, raw)
+
+    def test_the_cases_that_already_answered_honestly_still_do(self):
+        with mock.patch.object(ti, "_WORKER_SOURCE", self.root / "absent.idapy"):
+            self.assertEqual(self.q()["error"], "IDA_WORKER_MISSING")
+        db = self.root / "x.i64"
+        db.write_bytes(b"x")
+        self.assertEqual(self.q(path=db)["error"], "DATABASE_INPUT_NOT_SUPPORTED")
+        with mock.patch.object(ti, "safe_path", side_effect=PermissionError("outside the workspace")):
+            self.assertEqual(self.q()["status"], "PATH_REFUSED")
+        with mock.patch.object(ti, "_ida_binary", return_value=None):
+            self.assertEqual(self.q()["status"], "TOOL_MISSING")
+
+
+class StricterVerdictTests(IdaCase):
+    def test_an_unreadable_log_does_not_count_as_the_log_signal(self):
+        self.fake.log_unreadable = True
+        data = self.q()
+        self.assertFalse(data["ok"], data)
+        self.assertEqual(data["error"], "IDA_LOG_UNREADABLE")
+        self.assertFalse(data["signals"]["log_readable"])
+        self.assertEqual(self.slots(), [])
+
+    def test_an_empty_log_does_not_count_either(self):
+        self.fake.behaviour = "empty_log"
+        data = self.q()
+        self.assertEqual(data["error"], "IDA_LOG_UNREADABLE")
+        self.assertTrue(data["signals"]["log_readable"])
+        self.assertFalse(data["signals"]["log_present"])
+        self.assertEqual(self.slots(), [])
+
+    def test_a_fatal_marker_in_stdout_is_still_named_when_the_log_is_unreadable(self):
+        self.fake.log_unreadable = True
+        with mock.patch.object(FakeIdat, "__call__", autospec=True,
+                               side_effect=lambda s, *a, **k: _cp(0, stdout="Fatal error: boom")):
+            data = self.q()
+        self.assertEqual(data["error"], "IDA_LOG_REPORTS_FAILURE")
+
+    def test_a_result_for_another_operation_is_not_success(self):
+        self.fake.result_operation = "list_functions"
+        data = self.q("summary")
+        self.assertFalse(data["ok"], data)
+        self.assertEqual(data["error"], "IDA_RESULT_OPERATION_MISMATCH")
+        self.assertFalse(data["signals"]["result_operation_matches"])
+        self.assertEqual(self.slots(), [])
+
+    def test_a_reopen_result_for_another_operation_is_refused_and_the_slot_dropped(self):
+        self.assertTrue(self.q()["ok"])
+        evidence_before = sorted(self.evidence.iterdir())
+        self.fake.result_operation = "segments"
+        data = self.q("list_functions")
+        self.assertEqual(data["error"], "IDA_RESULT_OPERATION_MISMATCH")
+        self.assertEqual(self.slots(), [])
+        self.assertEqual(sorted(self.evidence.iterdir()), evidence_before)
+
+    def test_a_result_with_no_operation_at_all_is_not_success(self):
+        self.assertTrue(self.q()["ok"])
+        with mock.patch.object(FakeIdat, "_body", lambda s, job, sha: {
+                "ok": True, "tool": "ida_query", "items": [], "database_changes_discarded": True,
+                "engine_input_sha256": sha, "engine_input_md5": s.md5, "script_completed": True}):
+            data = self.q("list_functions")
+        self.assertEqual(data["error"], "IDA_RESULT_OPERATION_MISMATCH")
+
+    def test_the_status_probe_demands_a_summary_answer_and_a_readable_log(self):
+        with mock.patch.object(ti, "_resolved_by_and_binary", return_value=("PATH", "C:/fake/idat.exe")):
+            self.fake.result_operation = "list_functions"
+            data = json.loads(ti.ida_status())
+            self.assertEqual(data["error"], "IDA_RESULT_OPERATION_MISMATCH")
+            self.fake.result_operation = None
+            self.fake.log_unreadable = True
+            data = json.loads(ti.ida_status())
+            self.assertEqual(data["error"], "IDA_LOG_UNREADABLE")
+
+    def test_no_false_alarm_every_operation_succeeds_on_a_first_call_and_on_a_hit(self):
+        """The hardening must not reject what already worked."""
+        for operation in ti._ALLOWED_OPERATIONS:
+            for state in ("CREATED", "HIT"):
+                with self.subTest(operation=operation, state=state):
+                    data = self.q(operation, "start")
+                    self.assertTrue(data["ok"], data)
+                    self.assertEqual(data["status"], "OK")
+                    self.assertEqual(data["operation"], operation)
+                    self.assertTrue(data["signals"]["log_readable"] and data["signals"]["log_present"])
+                    self.assertTrue(data["signals"]["result_operation_matches"])
+            self.fake.calls.clear()
+            for slot in self.slots():
+                import shutil
+                shutil.rmtree(slot)
+
+    def test_the_status_probe_still_succeeds(self):
+        with mock.patch.object(ti, "_resolved_by_and_binary", return_value=("PATH", "C:/fake/idat.exe")):
+            data = json.loads(ti.ida_status())
+        self.assertTrue(data["ok"], data)
+
+
+class SlotOwnershipTests(IdaCase):
+    def _slot(self):
+        slot = ti._slot_dir(self.sha)
+        slot.parent.mkdir(parents=True, exist_ok=True)
+        return slot
+
+    def _plant(self, slot, record, age=0.0):
+        lock = ti._lock_path(slot)
+        lock.write_text(json.dumps(record), encoding="utf-8")
+        if age:
+            old = time.time() - age
+            os.utime(lock, (old, old))
+        return lock
+
+    def _dead_pid(self):
+        import subprocess
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        return proc.pid
+
+    def test_the_lock_records_its_owner_atomically(self):
+        slot = self._slot()
+        lock = ti._acquire_slot_lock(slot, None)
+        record = json.loads(ti._lock_path(slot).read_text(encoding="utf-8"))
+        self.assertEqual(record["pid"], os.getpid())
+        self.assertEqual(record["token"], lock.token)
+        self.assertEqual(len(lock.token), 32)
+        self.assertEqual([p.name for p in slot.parent.iterdir() if p.name.endswith(".tmp")], [],
+                         "the staging file used to publish the record is removed")
+        lock.release()
+
+    def test_every_acquisition_gets_its_own_token(self):
+        slot = self._slot()
+        first = ti._acquire_slot_lock(slot, None)
+        first.release()
+        second = ti._acquire_slot_lock(slot, None)
+        self.assertNotEqual(first.token, second.token)
+        second.release()
+
+    def test_a_taken_over_lock_owner_cannot_delete_its_successors_lock(self):
+        """A is suspended past the stale age, B takes over; when A wakes up and
+        releases, B's lock must survive."""
+        slot = self._slot()
+        a = ti._acquire_slot_lock(slot, None)
+        old = time.time() - ti._LOCK_OWNER_ALIVE_CEILING_SECONDS - 10
+        os.utime(a.path, (old, old))
+        with mock.patch.object(ti._ProcessProbe, "alive", return_value=False):
+            b = ti._acquire_slot_lock(slot, None)
+        self.assertIsNotNone(b)
+        self.assertNotEqual(a.token, b.token)
+        self.assertFalse(a.release(), "A no longer owns the lock")
+        ti._release_slot_lock(a)
+        self.assertTrue(b.path.exists(), "A's release must not remove B's lock")
+        self.assertEqual(json.loads(b.path.read_text(encoding="utf-8"))["token"], b.token)
+        self.assertTrue(b.release())
+        self.assertFalse(b.path.exists())
+
+    def test_a_query_whose_lock_was_taken_over_mid_run_leaves_the_new_owners_lock(self):
+        """The same through ida_query: another caller replaces the lock file
+        while idat is running; this call's finally must not remove it."""
+        slot = ti._slot_dir(self.sha)
+        other = {"pid": os.getpid(), "token": "b" * 32, "started": time.time(), "create_time": None}
+
+        def behaviour(mode, job):
+            ti._lock_path(slot).write_text(json.dumps(other), encoding="utf-8")
+            return "ok"
+
+        self.fake.behaviour = behaviour
+        self.assertTrue(self.q()["ok"])
+        survivor = json.loads(ti._lock_path(slot).read_text(encoding="utf-8"))
+        self.assertEqual(survivor["token"], "b" * 32)
+
+    def test_releasing_a_lock_that_is_already_gone_is_harmless(self):
+        slot = self._slot()
+        lock = ti._acquire_slot_lock(slot, None)
+        lock.path.unlink()
+        self.assertFalse(lock.release())
+        ti._release_slot_lock(lock)
+
+    def test_a_running_owner_keeps_the_lock_past_the_stale_age(self):
+        slot = self._slot()
+        self._plant(slot, {"pid": os.getpid(), "token": "a" * 32, "started": 0, "create_time": None},
+                    age=ti._LOCK_STALE_SECONDS + 60)
+        self.assertTrue(ti._lock_is_live(ti._lock_path(slot)))
+        with mock.patch.object(ti, "_LOCK_WAIT_SECONDS", 0.3):
+            data = self.q()
+        self.assertEqual(data["error"], "IDA_CACHE_SLOT_BUSY")
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(json.loads(ti._lock_path(slot).read_text(encoding="utf-8"))["token"], "a" * 32)
+
+    def test_a_running_owner_is_not_trusted_forever(self):
+        slot = self._slot()
+        lock = self._plant(slot, {"pid": os.getpid(), "token": "a" * 32, "started": 0, "create_time": None},
+                           age=ti._LOCK_OWNER_ALIVE_CEILING_SECONDS + 60)
+        self.assertFalse(ti._lock_is_live(lock))
+        self.assertTrue(self.q()["ok"])
+
+    def test_a_dead_owner_makes_an_old_lock_stale_but_a_young_one_is_still_respected(self):
+        slot = self._slot()
+        pid = self._dead_pid()
+        lock = self._plant(slot, {"pid": pid, "token": "a" * 32, "started": 0, "create_time": None},
+                           age=ti._LOCK_STALE_SECONDS + 10)
+        self.assertFalse(ti._lock_is_live(lock))
+        self.assertTrue(self.q()["ok"])
+        # young: the dead process's idat child could still be using the slot
+        self._plant(slot, {"pid": pid, "token": "a" * 32, "started": 0, "create_time": None}, age=5)
+        self.assertTrue(ti._lock_is_live(lock))
+
+    def test_a_reused_pid_is_not_mistaken_for_the_owner(self):
+        slot = self._slot()
+        lock = self._plant(slot, {"pid": os.getpid(), "token": "a" * 32, "started": 0,
+                                  "create_time": time.time() - 100000},
+                           age=ti._LOCK_STALE_SECONDS + 10)
+        self.assertFalse(ti._lock_is_live(lock))
+
+    def test_a_lock_without_an_owner_record_is_judged_by_age_as_before(self):
+        slot = self._slot()
+        lock = ti._lock_path(slot)
+        lock.write_text("{}")
+        self.assertTrue(ti._lock_is_live(lock))
+        lock.write_text("{half-written")
+        self.assertTrue(ti._lock_is_live(lock))
+        old = time.time() - ti._LOCK_STALE_SECONDS - 10
+        os.utime(lock, (old, old))
+        self.assertFalse(ti._lock_is_live(lock))
+
+    def test_a_lock_that_changed_after_it_was_judged_stale_is_not_removed(self):
+        slot = self._slot()
+        lock = ti._lock_path(slot)
+        lock.write_text("{}")
+        replacement = json.dumps({"pid": os.getpid(), "token": "c" * 32})
+        calls = []
+
+        def judged(path):
+            calls.append(path)
+            path.write_text(replacement, encoding="utf-8")   # somebody else took over meanwhile
+            return len(calls) > 1                             # first verdict: stale, then live
+
+        with mock.patch.object(ti, "_lock_is_live", side_effect=judged), \
+                mock.patch.object(ti, "_LOCK_WAIT_SECONDS", 0.3):
+            self.assertIsNone(ti._acquire_slot_lock(slot, None))
+        self.assertEqual(lock.read_text(encoding="utf-8"), replacement)
+
+    def test_the_hard_link_fallback_still_excludes(self):
+        slot = self._slot()
+        with mock.patch.object(ti.os, "link", side_effect=OSError(1, "hard links unsupported")):
+            first = ti._acquire_slot_lock(slot, None)
+            self.assertIsNotNone(first)
+            self.assertEqual(json.loads(first.path.read_text(encoding="utf-8"))["token"], first.token)
+            with mock.patch.object(ti, "_LOCK_WAIT_SECONDS", 0.3):
+                self.assertIsNone(ti._acquire_slot_lock(slot, None))
+            first.release()
+
+
+class ProcessProbeTests(unittest.TestCase):
+    def _dead_pid(self):
+        import subprocess
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        return proc.pid
+
+    def test_this_process_is_alive_and_a_finished_one_is_not(self):
+        self.assertIs(ti._ProcessProbe.alive(os.getpid()), True)
+        self.assertIs(ti._ProcessProbe.alive(self._dead_pid()), False)
+
+    def test_a_pid_that_is_not_a_pid_is_unknown(self):
+        for bad in (None, "x", 0, -4):
+            self.assertIsNone(ti._ProcessProbe.alive(bad))
+
+    def test_a_different_creation_time_means_the_pid_was_reused(self):
+        self.assertIs(ti._ProcessProbe.alive(os.getpid(), time.time() - 100000), False)
+
+    @pytest.mark.skipif(os.name != "nt", reason="the Windows branch needs Windows")
+    def test_the_windows_branch_on_its_own(self):
+        self.assertIs(ti._ProcessProbe._windows(os.getpid()), True)
+        self.assertIs(ti._ProcessProbe._windows(self._dead_pid()), False)
+
+    def test_the_posix_branch_on_its_own_with_os_kill_stubbed(self):
+        with mock.patch.object(ti.os, "kill", return_value=None) as kill:
+            self.assertIs(ti._ProcessProbe._posix(4321), True)
+            kill.assert_called_once_with(4321, 0)
+        with mock.patch.object(ti.os, "kill", side_effect=ProcessLookupError()):
+            self.assertIs(ti._ProcessProbe._posix(4321), False)
+        with mock.patch.object(ti.os, "kill", side_effect=PermissionError()):
+            self.assertIs(ti._ProcessProbe._posix(4321), True)
+        with mock.patch.object(ti.os, "kill", side_effect=OSError(22, "invalid")):
+            self.assertIsNone(ti._ProcessProbe._posix(4321))
+
+    def test_without_psutil_the_platform_branch_answers(self):
+        with mock.patch.dict(sys.modules, {"psutil": None}):
+            self.assertIs(ti._ProcessProbe.alive(os.getpid()), True)
+            self.assertIs(ti._ProcessProbe.alive(self._dead_pid()), False)
+
+    def test_the_probe_never_signals_a_process_on_windows(self):
+        with mock.patch.object(ti.os, "name", "nt"), mock.patch.dict(sys.modules, {"psutil": None}), \
+                mock.patch.object(ti.os, "kill", side_effect=AssertionError("os.kill terminates on Windows")), \
+                mock.patch.object(ti._ProcessProbe, "_windows", return_value=True) as win:
+            self.assertIs(ti._ProcessProbe.alive(1234), True)
+            win.assert_called_once_with(1234)
+
+
+class SharedBudgetTests(IdaCase):
+    def _clock(self, *values):
+        times = iter(values)
+        return SimpleNamespace(monotonic=lambda: next(times, values[-1]), time=time.time, sleep=time.sleep)
+
+    def test_when_the_analysis_used_the_whole_budget_the_question_is_not_started(self):
+        # lock wait, deadline, then 70 s later against a 60 s budget
+        with mock.patch.object(ti, "time", self._clock(100.0, 100.0, 170.0)):
+            data = self.q("list_functions", timeout_seconds=60)
+        self.assertFalse(data["ok"], data)
+        self.assertEqual(data["status"], "TIMEOUT")
+        self.assertEqual(data["error"], "IDA_TIMEOUT_BUDGET_EXHAUSTED")
+        self.assertEqual(data["timed_out_stage"], "query")
+        self.assertEqual(data["timeout_seconds"], 60)
+        self.assertIn("nothing found", data["detail"])
+        self.assertEqual(self.fake.modes, ["create"], "no extra seconds were granted to a second session")
+        self.assertEqual(len(self.slots()), 1, "the analysed database was saved")
+        self.fake.calls.clear()
+        self.assertEqual(self.q("list_functions")["database_cache"], "HIT")
+
+    def test_less_than_one_second_left_is_also_a_timeout(self):
+        with mock.patch.object(ti, "time", self._clock(100.0, 100.0, 159.5)):
+            data = self.q("list_functions", timeout_seconds=60)
+        self.assertEqual(data["status"], "TIMEOUT")
+        self.assertEqual(self.fake.modes, ["create"])
+
+    def test_the_second_session_is_never_given_more_than_what_is_left(self):
+        with mock.patch.object(ti, "time", self._clock(100.0, 100.0, 157.0)):
+            data = self.q("list_functions", timeout_seconds=60)
+        self.assertTrue(data["ok"], data)
+        self.assertEqual(self.fake.calls[1]["timeout"], 3, "3 s left means 3 s, not the old 5 s floor")
+
+    def test_the_declared_budget_is_documented_as_a_hard_one(self):
+        self.assertIn("never rounded up", inspect.getsource(ti._query_locked))
 
 
 # ---------------------------------------------------------------------------

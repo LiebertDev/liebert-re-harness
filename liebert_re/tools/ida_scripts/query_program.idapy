@@ -414,8 +414,10 @@ def _discard_session_changes():
     session and the changes are not kept. The flag is set before any
     operation runs, so a worker that dies mid-query cannot save a half-made
     change. Returns False if this IDA build does not offer the flag; the
-    wrapper reports `database_changes_discarded: false` and the cached database
-    may then pick up inferred types from decompile operations."""
+    wrapper reports `database_changes_discarded: false`. `_run` then does NOT
+    run the operation (the cached database could pick up inferred types from a
+    decompile), and the wrapper independently refuses any reopen result that
+    does not carry `database_changes_discarded: true`."""
     try:
         ida_loader.set_database_flag(ida_loader.DBFL_TEMP)
         return True
@@ -440,16 +442,32 @@ def _run(job):
             result["error"] = "UNKNOWN_OPERATION"
             result["allowed"] = list(_OPERATIONS)
         else:
-            ida_auto.auto_wait()
+            discard_ok = True
             if job.get("mode") == "reopen":
-                result["database_changes_discarded"] = _discard_session_changes()
-            max_results = max(1, min(int(job.get("max_results") or 200), 1000))
-            offset = max(0, int(job.get("offset") or 0))
-            _DISPATCH[operation](result, str(job.get("query") or ""), max_results, offset)
-            result["count"] = len(result["items"])
+                # Before anything that could touch the database, auto_wait included.
+                discard_ok = _discard_session_changes()
+                result["database_changes_discarded"] = discard_ok
+            if not discard_ok:
+                # The guarantee that a question cannot change the cached
+                # database could not be set up. Running the operation anyway
+                # would let the decompiler persist inferred types, so it does
+                # not run; the wrapper treats this as a failure and drops the slot.
+                result["ok"] = False
+                result["error"] = "DATABASE_CHANGES_NOT_DISCARDABLE"
+                result["detail"] = ("Could not mark the session database temporary "
+                                    "(DBFL_TEMP); the operation was not run.")
+            else:
+                ida_auto.auto_wait()
+                max_results = max(1, min(int(job.get("max_results") or 200), 1000))
+                offset = max(0, int(job.get("offset") or 0))
+                _DISPATCH[operation](result, str(job.get("query") or ""), max_results, offset)
+                result["count"] = len(result["items"])
     except Exception:  # noqa: BLE001
+        discarded = result.get("database_changes_discarded")
         result = {"ok": False, "tool": "ida_query", "operation": operation,
                   "error": "IDAPYTHON_SCRIPT_EXCEPTION", "traceback": traceback.format_exc()}
+        if discarded is not None:
+            result["database_changes_discarded"] = discarded  # the signal outlives the failure
     _stamp_input_identity(result)
     return result
 

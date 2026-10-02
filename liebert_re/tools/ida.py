@@ -47,7 +47,10 @@ reopens.
 status, the IDA log (no fatal markers), the packed `.i64` on disk, and the
 worker's JSON result file carrying its completion marker. A broken script exits
 1, produces no `.i64` and leaves unpacked `.id0/.id1/.id2/.nam/.til` files; a
-script that raised before writing can still exit 0. Any disagreement is
+script that raised before writing can still exit 0. The log counts as a signal only if it was readable and
+non-empty; the result must answer the operation that was asked; and a reopen
+result must carry `database_changes_discarded: true` (the worker also refuses
+to run the operation when it cannot set that up). Any disagreement is
 ANALYSIS_LIMITED with the signals reported, and the scratch directory (or, for
 a reopen, the possibly half-written slot) is deleted.
 
@@ -134,6 +137,11 @@ _CACHE_BUDGET_DEFAULT = 5 * 1024 ** 3  # 5 GiB
 _EVICT_SKIP_RECENT_SECONDS = 300
 _LOCK_WAIT_SECONDS = 30
 _LOCK_STALE_SECONDS = _MAX_CREATE_TIMEOUT_SECONDS + 120
+# A lock whose recorded owner is still a running process is honoured past the
+# age above (a suspended or very slow owner is not a dead one), but not forever:
+# no legitimate call holds a slot for twice the stale age, so beyond this the
+# pid is taken to have been reused or the owner to be hung.
+_LOCK_OWNER_ALIVE_CEILING_SECONDS = 2 * _LOCK_STALE_SECONDS
 _SLOT_NAME = re.compile(r"^[0-9a-f]{64}\.[A-Za-z0-9]+$")
 
 _KNOWN_INSTALL_GLOBS = ("IDA Professional 9*", "IDA Pro 9*")
@@ -320,43 +328,197 @@ def _dir_bytes(directory):
     return total
 
 
+class _ProcessProbe:
+    """Is a process id still a running process? True / False, or None when
+    this host cannot tell (then the caller falls back to the lock's age).
+    One method per platform so each branch can be tested on its own."""
+
+    @staticmethod
+    def alive(pid, create_time=None):
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return None
+        if pid <= 0:
+            return None
+        try:
+            import psutil  # a declared dependency; the branches below cover its absence
+        except ImportError:
+            return _ProcessProbe._windows(pid) if os.name == "nt" else _ProcessProbe._posix(pid)
+        return _ProcessProbe._psutil(psutil, pid, create_time)
+
+    @staticmethod
+    def _psutil(psutil, pid, create_time):
+        try:
+            if not psutil.pid_exists(pid):
+                return False
+            proc = psutil.Process(pid)
+            if proc.status() == psutil.STATUS_ZOMBIE:
+                return False
+            if create_time is not None and abs(proc.create_time() - float(create_time)) > 2.0:
+                return False  # the id now belongs to a different process
+            return True
+        except psutil.NoSuchProcess:
+            return False
+        except (psutil.Error, OSError, ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _windows(pid):
+        # Never os.kill here: on Windows it TERMINATES the process for any signal
+        # other than the console-control ones, so `os.kill(pid, 0)` is not a probe.
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                error = ctypes.GetLastError()
+                if error == 87:       # ERROR_INVALID_PARAMETER: no such process
+                    return False
+                return True if error == 5 else None  # access denied: it exists
+            try:
+                code = ctypes.c_ulong()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return None
+                return code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001 - a probe that cannot run says "unknown"
+            return None
+
+    @staticmethod
+    def _posix(pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return None
+
+
+class _SlotLock:
+    """Ownership of one slot lock: a file holding {pid, token, started,
+    create_time}. The token is unique to the acquiring call, and `release`
+    removes the file only while it still carries that token, so a call whose
+    lock was taken over as stale can never delete its successor's lock."""
+
+    def __init__(self, path, token):
+        self.path = path
+        self.token = token
+
+    @staticmethod
+    def raw(path):
+        try:
+            return Path(path).read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def read(path):
+        """The owner record, or None when absent, unreadable or not ours to
+        parse (an older or half-written lock then falls back to its age)."""
+        text = _SlotLock.raw(path)
+        try:
+            record = json.loads(text) if text else None
+        except ValueError:
+            return None
+        return record if isinstance(record, dict) else None
+
+    @staticmethod
+    def create(path, token):
+        """Create the lock with its record already inside it, atomically:
+        the record is written to a private file and hard-linked into place,
+        which fails with FileExistsError if a lock exists (O_EXCL semantics)
+        and never exposes a half-written file. A file system without hard
+        links falls back to O_EXCL; a reader that catches that file mid-write
+        sees an unparseable record and judges the lock by its age."""
+        create_time = None
+        try:
+            import psutil
+            create_time = psutil.Process(os.getpid()).create_time()
+        except Exception:  # noqa: BLE001
+            pass
+        record = json.dumps({"pid": os.getpid(), "token": token, "started": time.time(),
+                             "create_time": create_time})
+        staging = path.with_name(f"{path.name}.{token[:8]}.tmp")
+        staging.write_text(record, encoding="utf-8")
+        try:
+            try:
+                os.link(str(staging), str(path))
+            except FileExistsError:
+                raise
+            except OSError:
+                fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(record)
+        finally:
+            try:
+                staging.unlink()
+            except OSError:
+                pass
+
+    def release(self):
+        owner = self.read(self.path)
+        if owner is None or owner.get("token") != self.token:
+            return False  # taken over, or already gone: not ours to delete
+        try:
+            self.path.unlink()
+        except OSError:
+            return False
+        return True
+
+
 def _lock_is_live(lock):
+    """Whether the lock still excludes others. By age alone for a lock with no
+    readable owner; otherwise the owner process decides: one that is gone
+    leaves a lock that goes stale after `_LOCK_STALE_SECONDS`, one that is
+    still running keeps it until `_LOCK_OWNER_ALIVE_CEILING_SECONDS`."""
     try:
-        return (time.time() - lock.stat().st_mtime) < _LOCK_STALE_SECONDS
+        age = time.time() - lock.stat().st_mtime
     except OSError:
         return False
+    owner = _SlotLock.read(lock)
+    if owner is not None and owner.get("pid") is not None:
+        alive = _ProcessProbe.alive(owner.get("pid"), owner.get("create_time"))
+        if alive is True:
+            return age < _LOCK_OWNER_ALIVE_CEILING_SECONDS
+    return age < _LOCK_STALE_SECONDS
 
 
 def _acquire_slot_lock(slot, cancellation_token):
-    """Exclusive, cross-process lock for one slot. Returns the lock path or
+    """Exclusive, cross-process lock for one slot. Returns a `_SlotLock` or
     None when another live process holds it past the bounded wait."""
     lock = _lock_path(slot)
     lock.parent.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
     deadline = time.monotonic() + _LOCK_WAIT_SECONDS
     while True:
         try:
-            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            _SlotLock.create(lock, token)
         except FileExistsError:
+            seen = _SlotLock.raw(lock)
             if not _lock_is_live(lock):
-                try:
-                    lock.unlink()
-                except OSError:
-                    pass
+                # Re-read just before removing: if the lock changed since it was
+                # judged stale, someone else already took it over and it is theirs.
+                if _SlotLock.raw(lock) == seen:
+                    try:
+                        lock.unlink()
+                    except OSError:
+                        pass
                 continue
             if time.monotonic() >= deadline or bool(getattr(cancellation_token, "cancelled", False)):
                 return None
             time.sleep(0.25)
             continue
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps({"pid": os.getpid(), "started": time.time()}))
-        return lock
+        return _SlotLock(lock, token)
 
 
 def _release_slot_lock(lock):
-    try:
-        lock.unlink()
-    except OSError:
-        pass
+    """Release only a lock that is still this call's own."""
+    lock.release()
 
 
 def _evict_slot(slot):
@@ -462,11 +624,42 @@ def _display_cache_root():
 # one idat launch and its four-signal verdict
 # --------------------------------------------------------------------------
 
+class _EnvironmentFailure(Exception):
+    """The local environment refused something the wrapper needs (the cache
+    directory, the packaged worker, process launch). Carries the OSError so
+    the response can name its type and errno without claiming anything about
+    the input file, the cached database or IDA's analysis."""
+
+    def __init__(self, error, exc):
+        super().__init__(error)
+        self.error = error
+        self.exc = exc
+
+    def body(self, tool, **extra):
+        text = _redact(getattr(self.exc, "strerror", None) or type(self.exc).__name__)
+        body = {
+            "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": self.error,
+            "environment_error": {"type": type(self.exc).__name__, "errno": getattr(self.exc, "errno", None),
+                                  "strerror": text},
+            "detail": (
+                "A local operating-system error stopped this call before it produced a result. It is a "
+                "statement about this machine's environment (a path, a permission, a file system), not "
+                "about the input file, the cached databases or what IDA would have found. No answer was "
+                "produced; fix the environment and retry."
+            ),
+        }
+        body.update(extra)
+        return body
+
+
 def _write_worker(work):
     """Copy the worker into the work directory, BOM-free. IDAPython refuses a
     script that starts with a UTF-8 BOM (`invalid non-printable character
     U+FEFF`), so the bytes are normalised here instead of trusting the file."""
-    source = _WORKER_SOURCE.read_bytes()
+    try:
+        source = _WORKER_SOURCE.read_bytes()
+    except OSError as exc:
+        raise _EnvironmentFailure("IDA_WORKER_UNREADABLE", exc) from exc
     if source.startswith(b"\xef\xbb\xbf"):
         source = source[3:]
     (work / _JOB_SCRIPT).write_bytes(source.replace(b"\r\n", b"\n"))
@@ -484,7 +677,10 @@ def _launch(exe, work, job, *, mode, target, timeout_seconds, cancellation_token
     Returns (process_result, command)."""
     _write_worker(work)
     job_path = work / "job.json"
-    job_path.write_text(json.dumps(job), encoding="utf-8")
+    try:
+        job_path.write_text(json.dumps(job), encoding="utf-8")
+    except OSError as exc:
+        raise _EnvironmentFailure("IDA_LAUNCH_FAILED", exc) from exc
     common = ["-A", "-Opdb:off", f"-L{_LOG_NAME}", f"-S{_JOB_SCRIPT}"]
     if mode == "create":
         command = [exe, "-A", "-c", "-Opdb:off", f"-L{_LOG_NAME}", f"-o{_DB_NAME}", f"-S{_JOB_SCRIPT}"]
@@ -494,10 +690,13 @@ def _launch(exe, work, job, *, mode, target, timeout_seconds, cancellation_token
             command.append(str(target))
     else:
         command = [exe, *common, str(target)]
-    cp = run_bounded_process(
-        command, timeout_seconds=timeout_seconds, cancellation_token=cancellation_token,
-        cwd=work, environment=_job_environment(job_path), max_output_chars=_MAX_OUTPUT_CHARS,
-    )
+    try:
+        cp = run_bounded_process(
+            command, timeout_seconds=timeout_seconds, cancellation_token=cancellation_token,
+            cwd=work, environment=_job_environment(job_path), max_output_chars=_MAX_OUTPUT_CHARS,
+        )
+    except OSError as exc:  # the file exists but the OS would not start it (not executable, denied, ...)
+        raise _EnvironmentFailure("IDA_LAUNCH_FAILED", exc) from exc
     return cp, command
 
 
@@ -508,10 +707,23 @@ def _read_text(path):
         return ""
 
 
-def _verdict(cp, work, db_path, *, expect_database):
+def _verdict(cp, work, db_path, *, expect_database, expect_operation=None, require_discard=False):
     """The four signals, read together. Returns (data, failure_error,
-    signals). `failure_error` is None only when every signal agrees."""
-    log = _read_text(work / _LOG_NAME)
+    signals). `failure_error` is None only when every signal agrees.
+
+    The log is one of the four, so it has to be readable and non-empty to
+    count: a log that could not be read, or that idat never wrote to, is
+    IDA_LOG_UNREADABLE rather than "no fatal marker found". When
+    `expect_operation` is given, the result must be an answer to THAT
+    operation. `require_discard` (a reopen session) makes the worker's
+    `database_changes_discarded: true` mandatory: false or absent is a failure,
+    so a worker that could not set up the discard guarantee never yields a
+    success."""
+    try:
+        log = Path(work / _LOG_NAME).read_text(encoding="utf-8", errors="replace")
+        log_readable = True
+    except OSError:
+        log, log_readable = "", False
     combined = "\n".join((log, cp.stdout or "", cp.stderr or "")).lower()
     markers = sorted({m for m in _FATAL_MARKERS if m in combined})
     network = sorted({m for m in _NETWORK_MARKERS if m in log.lower()})
@@ -523,33 +735,46 @@ def _verdict(cp, work, db_path, *, expect_database):
     result_path = work / _RESULT_NAME
     result_present = result_path.is_file()
     data, parse_error, completed = None, None, False
+    operation_matches = expect_operation is None
     if result_present:
         try:
             data = json.loads(result_path.read_text(encoding="utf-8"))
             completed = isinstance(data, dict) and data.get("script_completed") is True
+            if expect_operation is not None:
+                operation_matches = completed and data.get("operation") == expect_operation
         except (OSError, ValueError) as exc:
             parse_error = f"{type(exc).__name__}: {exc}"
     signals = {
         "exit_code": cp.returncode,
         "log_present": bool(log),
+        "log_readable": log_readable,
         "log_fatal_markers": markers,
         "database_present": db_bytes > 0,
         "database_bytes": db_bytes,
         "loose_components": loose,
         "result_file_present": result_present,
         "result_script_completed": completed,
+        "result_operation_matches": operation_matches,
         "network_lookup_detected": bool(network),
     }
+    if require_discard:
+        signals["database_changes_discarded"] = data.get("database_changes_discarded") if completed else None
     if parse_error:
         return None, "RESULT_PARSE_FAILED", {**signals, "parse_error": parse_error}
     if cp.returncode not in (0, None):
         return data, "IDA_EXITED_NONZERO", signals
     if markers:
         return data, "IDA_LOG_REPORTS_FAILURE", signals
+    if not log_readable or not log:
+        return data, "IDA_LOG_UNREADABLE", signals
     if not result_present:
         return None, "IDA_NO_OUTPUT", signals
     if not completed:
         return None, "IDA_OUTPUT_INCOMPLETE", signals
+    if not operation_matches:
+        return data, "IDA_RESULT_OPERATION_MISMATCH", signals
+    if require_discard and data.get("database_changes_discarded") is not True:
+        return data, "DATABASE_CHANGES_NOT_DISCARDED", signals
     if expect_database and (db_bytes <= 0 or loose):
         return data, "IDA_NO_DATABASE", signals
     return data, None, signals
@@ -729,8 +954,13 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
     PARTIAL (a walk limit or the response bound cut the answer short; says
     which), TOOL_MISSING, PATH_REFUSED, NOT_FOUND, TIMEOUT, CANCELLED,
     ANALYSIS_LIMITED (IDA ran and failed, an argument it would reject, a
-    database file as input, a busy cache slot, or an input-identity
-    mismatch), RESULT_PARSE_FAILED.
+    database file as input, a busy cache slot, an input-identity mismatch,
+    a result that does not answer the operation asked or that lacks the
+    discard guarantee, or a local environment error: an unusable cache
+    directory, an unreadable packaged worker, an idat the operating system
+    would not start -- those carry `environment_error` with the errno and make
+    no claim about the input or about IDA), READ_FAILED (the input could not
+    be read), RESULT_PARSE_FAILED.
     """
     tool = "ida_query"
     exe = _ida_binary()
@@ -766,9 +996,22 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
     invocation = {"operation": operation, "query": query, "max_results": max_results, "offset": offset,
                   "timeout_seconds": timeout_seconds}
 
-    sha256, md5 = _sha256_md5(p)
+    try:
+        sha256, md5 = _sha256_md5(p)
+    except OSError as exc:
+        return _j({
+            "ok": False, "tool": tool, "status": "READ_FAILED", "error": "IDA_INPUT_UNREADABLE",
+            "path": relative(p),
+            "environment_error": {"type": type(exc).__name__, "errno": exc.errno,
+                                  "strerror": _redact(exc.strerror or type(exc).__name__)},
+            "detail": "The input file could not be read; no claim is made about its content.",
+        })
     slot = _slot_dir(sha256)
-    lock = _acquire_slot_lock(slot, cancellation_token)
+    try:
+        lock = _acquire_slot_lock(slot, cancellation_token)
+    except OSError as exc:
+        return _j(_EnvironmentFailure("IDA_CACHE_ROOT_UNUSABLE", exc).body(
+            tool, target_sha256=sha256, invocation=invocation))
     if lock is None:
         return _j({
             "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "IDA_CACHE_SLOT_BUSY",
@@ -784,6 +1027,9 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
                 outcome["cache_evicted_bytes"] = outcome_evict[1]
                 outcome["cache_budget_bytes"] = outcome_evict[2]
         return _j(outcome)
+    except OSError as exc:  # the cache directory failed under us (full disk, vanished, denied)
+        return _j(_EnvironmentFailure("IDA_CACHE_IO_ERROR", exc).body(
+            tool, target_sha256=sha256, invocation=invocation))
     finally:
         _release_slot_lock(lock)
 
@@ -814,10 +1060,14 @@ def _run_stage(exe, p, sha256, md5, slot, *, mode, operation, invocation, timeou
            "max_results": invocation["max_results"], "offset": invocation["offset"], "mode": mode}
     try:
         timeout_seconds = min(timeout_seconds, _MAX_CREATE_TIMEOUT_SECONDS if creating else _MAX_QUERY_TIMEOUT_SECONDS)
-        cp, _command = _launch(
-            exe, work, job, mode=mode, target=p if creating else slot / _DB_NAME,
-            timeout_seconds=timeout_seconds, cancellation_token=cancellation_token,
-        )
+        try:
+            cp, _command = _launch(
+                exe, work, job, mode=mode, target=p if creating else slot / _DB_NAME,
+                timeout_seconds=timeout_seconds, cancellation_token=cancellation_token,
+            )
+        except _EnvironmentFailure as failure:
+            # Nothing was launched, so the database was not touched: the slot stays.
+            raise _StageFailure(failure.body(tool, invocation=invocation, target_sha256=sha256)) from failure
         if cp.cancelled or cp.timed_out:
             if not creating:
                 _evict_slot(slot)  # killed mid-session: do not trust the file
@@ -836,14 +1086,21 @@ def _run_stage(exe, p, sha256, md5, slot, *, mode, operation, invocation, timeou
             raise _StageFailure(body)
         data, error, signals = _verdict(
             cp, work, (work / _DB_NAME) if creating else (slot / _DB_NAME), expect_database=creating,
+            expect_operation=operation, require_discard=not creating,
         )
         if error:
-            if not creating and not signals["result_script_completed"]:
+            # A reopen whose result is missing, or is not a trustworthy answer
+            # (wrong operation, no discard guarantee), may have left the
+            # database in a state nobody vouches for: the slot is dropped.
+            if not creating and (not signals["result_script_completed"] or error in (
+                    "IDA_RESULT_OPERATION_MISMATCH", "DATABASE_CHANGES_NOT_DISCARDED")):
                 _evict_slot(slot)
+            extra = {"invocation": invocation, "target_sha256": sha256}
+            if isinstance(data, dict) and data.get("error"):
+                extra["worker_error"] = data.get("error")
             raise _StageFailure(_failure_response(
                 tool, "RESULT_PARSE_FAILED" if error == "RESULT_PARSE_FAILED" else "ANALYSIS_LIMITED", error,
-                operation=operation, signals=signals, cp=cp, work=work, target=p,
-                extra={"invocation": invocation, "target_sha256": sha256},
+                operation=operation, signals=signals, cp=cp, work=work, target=p, extra=extra,
             ))
         provenance = _provenance(sha256, md5, data)
         if provenance["status"] == "MISMATCH":
@@ -882,7 +1139,11 @@ def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation
         cache_state = "CREATED"
 
     def remaining():
-        return max(_MIN_TIMEOUT_SECONDS, int(deadline - time.monotonic()))
+        """Whole seconds left of the one shared budget, never rounded up and
+        never raised to a floor: a stage that would start with none left is
+        not started (see the TIMEOUT below), so the declared budget is the
+        most a call can take."""
+        return int(deadline - time.monotonic())
 
     try:
         data = signals = provenance = None
@@ -895,9 +1156,27 @@ def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation
                 timeout_seconds=total, cancellation_token=cancellation_token,
             )
         if operation != "summary" or cache_state == "HIT":
+            left = remaining()
+            if left < 1:
+                # The first analysis used the whole shared budget. Granting the
+                # question a few more seconds would exceed the budget the caller
+                # was told, so it is not run. The analysed database was already
+                # saved, so a retry is a cache hit.
+                raise _StageFailure({
+                    "ok": False, "tool": tool, "status": "TIMEOUT", "invocation": invocation,
+                    "target_sha256": sha256, "error": "IDA_TIMEOUT_BUDGET_EXHAUSTED",
+                    "timeout_seconds": total, "timed_out_stage": "query",
+                    "stage_ceiling_seconds": _MAX_QUERY_TIMEOUT_SECONDS,
+                    "database_cache": cache_state,
+                    "detail": (
+                        "The first analysis used the whole timeout_seconds budget, so the question was not "
+                        "started. The analysed database is cached: repeat the call (it will be a cache hit). "
+                        "Do not read this as 'nothing found'."
+                    ),
+                })
             data, signals, provenance = _run_stage(
                 exe, p, sha256, md5, slot, mode="reopen", operation=operation, invocation=invocation,
-                timeout_seconds=remaining(), cancellation_token=cancellation_token,
+                timeout_seconds=left, cancellation_token=cancellation_token,
             )
         if data.get("ok") is False:
             # The worker ran and answered "no" (unknown symbol, decompiler refused). The database is fine.
@@ -940,25 +1219,33 @@ def ida_status():
     if not exe:
         return _tool_missing(tool)
     root = _cache_root()
-    root.mkdir(parents=True, exist_ok=True)
-    for old in root.glob("status-*"):            # a probe that was killed mid-run
-        try:
-            if time.time() - old.stat().st_mtime > _LOCK_STALE_SECONDS:
-                shutil.rmtree(old, ignore_errors=True)
-        except OSError:
-            pass
-    probe_root = root / f"status-{uuid.uuid4().hex[:8]}"
-    probe_root.mkdir()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        for old in root.glob("status-*"):            # a probe that was killed mid-run
+            try:
+                if time.time() - old.stat().st_mtime > _LOCK_STALE_SECONDS:
+                    shutil.rmtree(old, ignore_errors=True)
+            except OSError:
+                pass
+        probe_root = root / f"status-{uuid.uuid4().hex[:8]}"
+        probe_root.mkdir()
+    except OSError as exc:
+        return _j(_EnvironmentFailure("IDA_CACHE_ROOT_UNUSABLE", exc).body(
+            tool, binary=exe, resolved_by=resolved_by))
     try:
         job = {"output": str(probe_root / _RESULT_NAME), "operation": "summary", "query": "",
                "max_results": 1, "offset": 0, "mode": "create"}
-        cp, _command = _launch(exe, probe_root, job, mode="create", target=None,
-                               timeout_seconds=_STATUS_TIMEOUT_SECONDS, cancellation_token=None,
-                               empty_database=True)
+        try:
+            cp, _command = _launch(exe, probe_root, job, mode="create", target=None,
+                                   timeout_seconds=_STATUS_TIMEOUT_SECONDS, cancellation_token=None,
+                                   empty_database=True)
+        except _EnvironmentFailure as failure:
+            return _j(failure.body(tool, binary=exe, resolved_by=resolved_by))
         if cp.timed_out:
             return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "binary": exe,
                        "error": "IDA_PROBE_TIMEOUT"})
-        data, error, signals = _verdict(cp, probe_root, probe_root / _DB_NAME, expect_database=True)
+        data, error, signals = _verdict(cp, probe_root, probe_root / _DB_NAME, expect_database=True,
+                                        expect_operation="summary")
         if error:
             return _j(_failure_response(
                 tool, "ANALYSIS_LIMITED", error, operation="summary", signals=signals, cp=cp,
