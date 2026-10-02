@@ -19,8 +19,10 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -32,9 +34,67 @@ root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 script="$root/scripts/pre_push_gate.py"
 [ -f "$script" ] || exit 0
 PY='{py}'
-[ -x "$PY" ] || PY=python
+if [ ! -x "$PY" ]; then
+  echo "pre-push gate: BLOCKED, the interpreter this hook was installed with is missing: $PY" >&2
+  echo "  fix: recreate the venv, then run: python scripts/pre_push_gate.py install --force" >&2
+  exit 1
+fi
 exec "$PY" "$script" hook "$@"
 """
+
+
+# This repo's rule is never to mask a failure. A pytest run that prints a native crash report
+# ("Windows fatal exception: access violation", "Fatal Python error") and still exits 0 has hidden
+# a failure behind a green exit code, so the gate treats that text as a block on its own.
+# No test or fixture contains these phrases, so the patterns are not narrowed. One exception is
+# measured, not assumed: every full run on this Windows / Python 3.14 setup prints 30 faulthandler
+# "access violation" dumps whose current thread is inside unicorn.py mem_map, called from
+# tests/test_vex_layer.py, with all tests passing and exit 0 (reproduced 10 of 10 runs, and by that
+# file alone; none are printed with -p no:faulthandler). Only a dump whose first current-thread
+# frame is exactly that one is skipped; a dump anywhere else, or with no readable frame, still blocks.
+FATAL_PATTERNS = (re.compile(r"Windows fatal exception", re.I), re.compile(r"Fatal Python error", re.I),
+                  re.compile(r"access violation", re.I))
+KNOWN_UNICORN_DUMP = re.compile(r'unicorn[\\/]unicorn_py3[\\/]unicorn\.py", line \d+ in mem_map')
+
+
+def _known_unicorn_dump(lines: list[str], i: int) -> bool:
+    """Is the fatal marker at lines[i] the measured unicorn mem_map dump (see above)?"""
+    for j in range(i + 1, min(i + 400, len(lines))):
+        if any(p.search(lines[j]) for p in FATAL_PATTERNS):
+            return False                              # the next dump began first: no readable frame
+        if lines[j].startswith("Current thread 0x"):
+            return j + 1 < len(lines) and bool(KNOWN_UNICORN_DUMP.search(lines[j + 1]))
+    return False
+
+
+def fatal_findings(text: str, stream: str) -> list[str]:
+    """Lines of captured pytest output that carry a fatal-exception marker, as 'stream line n: text'."""
+    lines = text.splitlines()
+    return [f"{stream} line {n}: {line.strip()[:160]}" for n, line in enumerate(lines, 1)
+            if any(p.search(line) for p in FATAL_PATTERNS) and not _known_unicorn_dump(lines, n - 1)]
+
+
+def run_pytest(cmd: list[str]) -> tuple[int, list[str]]:
+    """Run pytest, relaying its output live, and return (exit code, fatal-exception findings)."""
+    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    bufs: dict[str, list[str]] = {"stdout": [], "stderr": []}
+
+    def pump(src, name, dst):
+        for raw in iter(src.readline, b""):
+            line = raw.decode("utf-8", errors="replace")
+            bufs[name].append(line)
+            dst.write(line)
+            dst.flush()
+
+    threads = [threading.Thread(target=pump, args=(proc.stdout, "stdout", sys.stdout)),
+               threading.Thread(target=pump, args=(proc.stderr, "stderr", sys.stderr))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    rc = proc.wait()
+    hits = [h for name, lines in bufs.items() for h in fatal_findings("".join(lines), name)]
+    return rc, hits
 
 
 def _git(*args: str) -> str:
@@ -82,23 +142,36 @@ def pushed_ranges(stdin_text: str) -> list[list[str]]:
     return ranges
 
 
+def _report_fatal(what: str, rc: int, hits: list[str]) -> None:
+    print(f"pre-push gate: BLOCKED, {what} printed a fatal-exception report (pytest exit {rc}); "
+          "a crash report is a failure even when the exit code is 0:", file=sys.stderr)
+    for h in hits[:10]:
+        print("  " + h, file=sys.stderr)
+
+
 def run_gate(ranges: list[list[str]]) -> int:
     print("pre-push gate: discipline test + test suite + commit-message identity probes "
           "(bypass only with: git push --no-verify)", file=sys.stderr)
     pytest = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
     failed = False
     print("pre-push gate: [1/3] discipline test ...", file=sys.stderr, flush=True)
-    r = subprocess.run([*pytest, "tests/test_repo_discipline.py"], cwd=ROOT)
-    if r.returncode != 0:
+    rc, fatal = run_pytest([*pytest, "tests/test_repo_discipline.py"])
+    if fatal:
+        _report_fatal("tests/test_repo_discipline.py", rc, fatal)
+        failed = True
+    elif rc != 0:
         print("pre-push gate: BLOCKED, tests/test_repo_discipline.py is not green.", file=sys.stderr)
         failed = True
     else:
         print("pre-push gate: [1/3] discipline test: ok.", file=sys.stderr)
     # Default mode of pytest.ini (-m "not heavy" from addopts); the discipline file ran above.
     print("pre-push gate: [2/3] test suite (not heavy) ...", file=sys.stderr, flush=True)
-    r = subprocess.run([*pytest, "-rfE", "--ignore=tests/test_repo_discipline.py"], cwd=ROOT)
-    if r.returncode != 0:
-        print(f"pre-push gate: BLOCKED, the test suite is not green (pytest exit {r.returncode}; "
+    rc, fatal = run_pytest([*pytest, "-rfE", "--ignore=tests/test_repo_discipline.py"])
+    if fatal:
+        _report_fatal("the test suite", rc, fatal)
+        failed = True
+    elif rc != 0:
+        print(f"pre-push gate: BLOCKED, the test suite is not green (pytest exit {rc}; "
               "failed tests are listed above as FAILED/ERROR).", file=sys.stderr)
         failed = True
     else:

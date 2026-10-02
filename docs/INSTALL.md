@@ -49,6 +49,16 @@ tests marked `heavy` (`pytest.ini` sets `addopts = -m "not heavy"`; 9 test files
 module-marked `heavy`). Run everything with `pytest -m ""`. If `pytest -q` fails on a
 fresh clone after the install step, that is a bug worth reporting.
 
+### Pre-push gate (contributors)
+
+`.git/hooks/` is not part of the repository, so every clone installs the gate itself, with the
+venv's interpreter: `.venv/Scripts/python.exe scripts/pre_push_gate.py install` (Windows) or
+`.venv/bin/python scripts/pre_push_gate.py install` (Linux / macOS). The hook records that
+interpreter's path and blocks the push with an explicit error if it later goes missing (recreate
+the venv, then re-run `install --force`). The gate also blocks when pytest prints a fatal-exception
+report ("Windows fatal exception", "Fatal Python error") even though its exit code is 0.
+`python scripts/pre_push_gate.py --check` says whether the hook is installed.
+
 ### Python dependencies
 
 Installed automatically: `pefile`, `capstone`, `unicorn`, `keystone-engine`,
