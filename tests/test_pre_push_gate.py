@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -119,6 +121,26 @@ def test_a_fatal_dump_in_the_contract_stage_blocks_even_with_exit_zero(monkeypat
     monkeypatch.setattr(gate, "run_pytest", lambda cmd, failed=None: (0, [f"stderr line 1: {FATAL}"]))
     assert gate.run_contract_stage({}) is True
     assert "fatal-exception" in capsys.readouterr().err
+
+
+def test_each_contract_interpreter_gets_its_own_basetemp(monkeypatch):
+    """The three interpreters run one after another; none may share a pytest temp root with another or
+    with the suite stage, or what one leaves behind is state the next one sees."""
+    monkeypatch.setattr(gate, "find_contract_interpreters", lambda env=None: (_found("3.10", "3.12", "3.14"), {}))
+    seen = []
+
+    def fake(cmd, failed=None):
+        assert cmd.count("--basetemp") == 1
+        seen.append(cmd[cmd.index("--basetemp") + 1])
+        return 0, []
+
+    monkeypatch.setattr(gate, "run_pytest", fake)
+    assert gate.run_contract_stage({}) is False
+    assert len(seen) == 3 and len(set(seen)) == 3
+    assert all(Path(p).parent.name == f"liebert-gate-{os.getpid()}" for p in seen)
+    assert all(Path(p).parent.is_dir() for p in seen), "pytest creates the basetemp but not its parent"
+    shutil.rmtree(Path(seen[0]).parent, ignore_errors=True)
+    assert gate.isolated_basetemp("suite") != gate.isolated_basetemp("discipline")
 
 
 def test_a_missing_interpreter_is_reported_loudly_not_skipped_silently(monkeypatch, capsys):

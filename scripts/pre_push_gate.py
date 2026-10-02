@@ -27,8 +27,10 @@ import argparse
 import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -107,6 +109,16 @@ def save_evidence(cmd: list[str], stage: str, interpreter: str, directory: Path 
         return None
     print(f"pre-push gate: full output of the failing stage saved to {path}", file=sys.stderr)
     return path
+
+
+def isolated_basetemp(label: str) -> list[str]:
+    """``--basetemp`` for one pytest run, so no two runs of the gate (the three interpreters of the
+    contract stage included) share a temp root. A shared root is a variable: a leftover or a
+    still-open file from one run is state the next run can trip over. The directory is per process and
+    per label, outside the repo; ``run_gate`` removes the process's root when it finishes."""
+    root = Path(tempfile.gettempdir()) / f"liebert-gate-{os.getpid()}"
+    root.mkdir(parents=True, exist_ok=True)              # pytest creates the basetemp, not its parent
+    return ["--basetemp", str(root / label)]
 
 
 def fatal_findings(text: str, stream: str) -> list[str]:
@@ -230,7 +242,8 @@ def run_contract_stage(env=None) -> bool:
         py, full = found[ver]
         print(f"pre-push gate:   contract tests on Python {full} ({py}) ...", file=sys.stderr, flush=True)
         failed: list[str] = []
-        cmd = [str(py), "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rfE", "-m", "contract"]
+        cmd = [str(py), "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rfE", "-m", "contract",
+               *isolated_basetemp(f"contract-py{ver}")]
         rc, fatal = run_pytest(cmd, failed=failed)
         if fatal:
             _report_fatal(f"the contract tests on Python {full}", rc, fatal)
@@ -301,12 +314,19 @@ def _report_fatal(what: str, rc: int, hits: list[str]) -> None:
 
 
 def run_gate(ranges: list[list[str]]) -> int:
+    try:
+        return _run_gate(ranges)
+    finally:
+        shutil.rmtree(Path(tempfile.gettempdir()) / f"liebert-gate-{os.getpid()}", ignore_errors=True)
+
+
+def _run_gate(ranges: list[list[str]]) -> int:
     print("pre-push gate: discipline test + test suite + contract tests on every Python + identity probes "
           "(bypass only with: git push --no-verify)", file=sys.stderr)
     pytest = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
     failed = False
     print("pre-push gate: [1/4] discipline test ...", file=sys.stderr, flush=True)
-    cmd = [*pytest, "tests/test_repo_discipline.py"]
+    cmd = [*pytest, *isolated_basetemp("discipline"), "tests/test_repo_discipline.py"]
     rc, fatal = run_pytest(cmd)
     py_tag = "py" + sys.version.split()[0]
     if fatal:
@@ -321,7 +341,7 @@ def run_gate(ranges: list[list[str]]) -> int:
         print("pre-push gate: [1/4] discipline test: ok.", file=sys.stderr)
     # Default mode of pytest.ini (-m "not heavy" from addopts); the discipline file ran above.
     print("pre-push gate: [2/4] test suite (not heavy) ...", file=sys.stderr, flush=True)
-    cmd = [*pytest, "-rfE", "--ignore=tests/test_repo_discipline.py"]
+    cmd = [*pytest, "-rfE", *isolated_basetemp("suite"), "--ignore=tests/test_repo_discipline.py"]
     rc, fatal = run_pytest(cmd)
     if fatal:
         _report_fatal("the test suite", rc, fatal)
