@@ -245,6 +245,15 @@ class FileMatchTests(_Base):
         script = self.commands[0][self.commands[0].index("-c") + 1]
         self.assertIn(f'Fs "{self.sig.as_posix()}"', script)
 
+    def test_a_windows_short_name_directory_is_an_allowed_path(self):
+        short = Path(self._tmp.name) / "RUNNER~1"
+        short.mkdir()
+        sig = short / "w32.sig"
+        sig.write_bytes(b"x")
+        d = self.match_file(_ok(FS_OK), sig=sig)
+        self.assertEqual(d["status"], "OK")
+        self.assertIn("RUNNER~1", self.commands[0][self.commands[0].index("-c") + 1])
+
     def test_a_zero_from_a_supplied_file_says_its_compatibility_is_unverified(self):
         d = self.match_file(_ok(FS_NONE))
         self.assertEqual((d["ok"], d["match_count"]), (True, 0))

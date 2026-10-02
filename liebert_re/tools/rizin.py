@@ -2178,7 +2178,7 @@ def rz_bin_status() -> str:
 
 class _RzFlirt:
     SET_FILTER = re.compile(r"^[A-Za-z0-9._+\-]{1,64}$")
-    SIG_PATH = re.compile(r"^[\w ._+\-():/\\]+$")
+    SIG_PATH = re.compile(r"^[\w ._+\-():/\\~]+$")  # ~ is Windows 8.3 short names; safe inside the quotes
     ROW = re.compile(r"^(\S+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(\d+)\s*(.*?)\s*$")
     FUNC = re.compile(r"^(0x[0-9a-fA-F]+)\s+\d+\s+(\d+)\s.*?(flirt\.\S+)\s*$")
     APPLYING = re.compile(r"^Applying (\S+) signature file", re.M)
@@ -2364,7 +2364,7 @@ class _RzFlirt:
                 return _j({"ok": False, "tool": tool, "status": "INVALID_ARGUMENT",
                            "error": "FLIRT_SIGNATURE_PATH_NOT_ALLOWED", "signature_file": str(sig_file),
                            "detail": "The path is placed inside a rizin command, so only word characters, "
-                                     "spaces and . _ + - ( ) : / \\ are accepted; move or rename the file."})
+                                     "spaces and . _ + - ( ) : / \\ ~ are accepted; move or rename the file."})
         timeout_seconds, max_items, err = _RzFlirt.numbers(tool, timeout_seconds, max_items)
         if err:
             return err
