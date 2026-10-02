@@ -38,7 +38,10 @@ EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_REFUSED = 0, 1, 2, 3
 REFUSAL_STATUSES = frozenset({"TOOL_MISSING", "UNSUPPORTED", "ANALYSIS_LIMITED", "PATH_REFUSED", "TIMEOUT"})
 # Module-specific statuses outside that vocabulary that still mean "this install
 # could not answer", not "a bug".
-_MODULE_REFUSALS = frozenset({"NOT_FOUND", "UPX_UNPACK_FAILED"})
+# pe-sieve (liebert_re.tools.pe_sieve): none of these is a finding about the process. A report
+# that is partial or empty is a refusal to claim "clean", and still carries whatever was found.
+_MODULE_REFUSALS = frozenset({"NOT_FOUND", "UPX_UNPACK_FAILED", "PID_REQUIRED", "ACCESS_DENIED",
+                              "PROCESS_NOT_OPENED", "SCANNER_MISMATCH", "NOTHING_SCANNED", "SCAN_PARTIAL"})
 _MODULE_USAGE = frozenset({"RULES_MISSING"})
 _REFUSAL_ERRORS = frozenset({"FILE_NOT_FOUND", "FILE_NOT_ACCESSIBLE"})
 
@@ -201,6 +204,16 @@ def _flirt(a):
     if a.sig_file:
         return _load(mod, "rizin_flirt_match_file")(a.path, a.sig_file, timeout_seconds=a.timeout)
     return _load(mod, "rizin_flirt_match")(a.path, signature_filter=a.filter, timeout_seconds=a.timeout)
+
+
+def _sieve(a):
+    return _load("liebert_re.tools.pe_sieve", "pe_sieve_scan")(
+        a.pid, timeout_seconds=a.timeout, iat=a.iat, shellcode=a.shellcode, obfuscation=a.obfuscation,
+        data=a.data, dotnet_policy=a.dotnet_policy, threads=a.threads)
+
+
+def _sieve_status(a):
+    return _load("liebert_re.tools.pe_sieve", "pe_sieve_status")()
 
 
 def _flirt_inventory(a):
@@ -370,6 +383,19 @@ def _build_parser():
     sp = add("flirtinventory", _flirt_inventory, "list the signature files in rizin's sigdb, by format/arch/bits",
              path=False)
     sp.add_argument("--timeout", type=int, default=120, help="seconds, clamped to 10-600")
+    # pe-sieve: the PID is deliberately NOT an argparse-required argument. A missing or "all" PID must
+    # reach the module and come back as a structured PID_REQUIRED refusal, not an argparse usage error.
+    sp = add("sieve", _sieve, "scan ONE running process by PID with pe-sieve for in-memory differences from disk "
+                              "(scan only: nothing is dumped; there is no all-processes mode)", path=False)
+    sp.add_argument("--pid", default=None, help="process id of a process you started (required)")
+    sp.add_argument("--timeout", type=int, default=120, help="seconds, clamped to 10-600")
+    sp.add_argument("--iat", type=int, default=None, help="IAT hook scan 0-3 (default 1)")
+    sp.add_argument("--shellcode", type=int, default=None, help="shellcode detection 0-4 (default 3)")
+    sp.add_argument("--obfuscation", type=int, default=None, help="obfuscated-area detection 0-3 (default 0)")
+    sp.add_argument("--data", type=int, default=None, help="non-executable page scan 0-5 (default 0)")
+    sp.add_argument("--dotnet-policy", dest="dotnet_policy", type=int, default=None, help="managed-process policy 0-4 (default 0)")
+    sp.add_argument("--threads", action="store_true", help="also scan thread call stacks")
+    add("sievestatus", _sieve_status, "report whether pe-sieve is reachable, from where, which scanner bitness and its version", path=False)
     add("rzbinstatus", _rzbin_status, "report whether rz-bin is reachable, from where, and its version", path=False)
     add("diestatus", _die_status, "report whether Detect It Easy is reachable, from where, and its version", path=False)
     # capa's default backend takes MINUTES (measured 3m48s for a 1.2 MB PE), so the

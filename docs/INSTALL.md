@@ -101,6 +101,7 @@ naming it — it does not silently degrade or guess.
 |---|---|---|
 | **rizin** (or radare2) | Disassembly listings, patch planning and application, CRC-32 correction, `rz-bin` imports, sections, header fields and relocations, and FLIRT signature matching (the bundled sigdb needs no extra files) (`rz-bin.exe` sits next to `rizin.exe`, in the install root or its `bin` folder) | `RIZIN_HOME` environment variable, else `rizin` / `rz-bin` on `PATH` |
 | **Detect It Easy** | Packer and compiler identification (`diec.exe -j`) | `DIE_HOME`, else `diec` on `PATH` |
+| **pe-sieve** (0.4.1.1 measured) | Scan of ONE running process, by PID, for in-memory differences from disk (`pe_sieve_scan`, `liebert-re sieve --pid N`); scan only, nothing is dumped, no all-processes mode. Needs a process you started; an elevated or protected one may be refused as `ACCESS_DENIED`. Do not call it from Git Bash without `MSYS_NO_PATHCONV=1` (the wrapper itself spawns it directly and echoes the argument vector) | `PE_SIEVE_HOME` (directory or file), else `pe-sieve64` on `PATH`, else `C:\Tools\pe-sieve`; the 64-bit scanner is used whenever present |
 | **YARA-X** | Rule-based scanning | `YARA_X_EXE` or `YARA_X_HOME`; rule sets via `YARA_RULESETS_HOME` |
 | **API Monitor** | API catalogue lookups (live tracing and trace parsing are both **not** wired up and return `NOT_SUPPORTED` — see the gap list in the README) | `APIMONITOR_HOME` |
 | **JADX** | Decompiling one named class from a DEX, APK-derived DEX or JVM `.class` / `.jar` (`liebert_re/tools/dex.py`, `liebert_re/tools/jvm.py`); structural listing works without it and the decompile operation returns `JADX_TOOL_MISSING` | `JADX_EXE`, else `jadx` on `PATH`, else a `teacher-tools/jadx/bin/jadx.bat` under the user's home directory |
@@ -153,8 +154,8 @@ system temp directory is outside the workspace unless you repoint the root, and
 one test file in the upstream tree failed for exactly that reason until it was
 fixed.
 
-Seven modules write their own output *outside* this workspace root on purpose:
-`liebert_re/tools/binary.py` (`pe_resources`), `liebert_re/tools/die.py`, `liebert_re/tools/capa.py`, `liebert_re/tools/ida.py`, `liebert_re/tools/yara_x.py`,
+Eight modules write their own output *outside* this workspace root on purpose:
+`liebert_re/tools/binary.py` (`pe_resources`), `liebert_re/tools/die.py`, `liebert_re/tools/capa.py`, `liebert_re/tools/ida.py`, `liebert_re/tools/pe_sieve.py`, `liebert_re/tools/yara_x.py`,
 `liebert_re/tools/rizin.py` (`binary_patch`, the `rz-bin` reads and the FLIRT runs) and `liebert_re/tools/upx.py` each persist their raw
 engine output under a module-level `dataset/evidence/<tool_name>/` directory
 inside the repository itself, which is git-ignored. The *input* file you pass

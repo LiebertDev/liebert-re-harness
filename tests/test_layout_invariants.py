@@ -20,7 +20,7 @@ import liebert_re.report.tool_families as tool_families
 # duplicates it.
 EVIDENCE_OWNERS = {
     "liebert_re.dynamic.apimonitor", "liebert_re.tools.binary", "liebert_re.tools.capa",
-    "liebert_re.tools.die", "liebert_re.tools.ida", "liebert_re.tools.rizin",
+    "liebert_re.tools.die", "liebert_re.tools.ida", "liebert_re.tools.pe_sieve", "liebert_re.tools.rizin",
     "liebert_re.tools.upx", "liebert_re.tools.yara_x",
 }
 
@@ -90,7 +90,14 @@ def test_published_tool_name_set_is_unchanged():
     # registered in tool_families.FAMILIES["native"]; the CLI reaches them as `flirt` and
     # `flirtinventory`. The shared runner is the private class _RzFlirt, so no underscore
     # helper joined the pinned set.
+    #
+    # Updated again: liebert_re/tools/pe_sieve.py wraps pe-sieve, the scan of ONE running process the
+    # caller started, by PID. The public functions added on purpose are pe_sieve_scan (PID required,
+    # scan only, no dump switch ever passed) and pe_sieve_status (zero arguments), registered in
+    # tool_families.FAMILIES["dynamic"]; the CLI reaches them as `sieve` and `sievestatus`. The
+    # scanner helpers live in the private class _PeSieve; the only other names that joined the
+    # pinned set are the two CLI handlers in liebert_re/cli.py, _sieve and _sieve_status.
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "be15cdecb0be301e91a9285158b23fdca78948fca512e9c1c347b6f986fdbc09"
+    assert digest == "1d053b44353e97d9bcb51cf31390086519d8e65eafda93535354e4bb1f91d30b"

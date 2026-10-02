@@ -124,7 +124,7 @@ Module paths are relative to `liebert_re/`.
 
 ### External-engine wrappers actually present
 
-rizin (listing, function inventory, patching, rz-bin structure reads, FLIRT matching), Detect It Easy, YARA-X, capa, IDA (read-only, see above), UPX,
+rizin (listing, function inventory, patching, rz-bin structure reads, FLIRT matching), Detect It Easy, YARA-X, capa, IDA (read-only, see above), pe-sieve (one live process, see below), UPX,
 JADX, Il2CppDumper, and the API Monitor catalogue only. All are optional and
 return a named tool-missing status when absent. Function inventory
 (`rizin_functions`) needs rizin; it is not pure Python.
@@ -141,7 +141,7 @@ return a named tool-missing status when absent. Function inventory
   nothing in the package produces an IR from a binary.
 - Workspace path sandbox, bounded subprocess with process-tree teardown, and a
   `liebert-re` CLI (`identify`, `probe`, `pe`, `disasm`, `packer`, `die`, `diestatus`,
-  `capa`, `capastatus`, `ida`, `idastatus`, `rzbin`, `rzbinstatus`, `flirt`, `flirtinventory`, `unpack`, `scan`, `minidump`, `capabilities`):
+  `capa`, `capastatus`, `ida`, `idastatus`, `rzbin`, `rzbinstatus`, `flirt`, `flirtinventory`, `sieve`, `sievestatus`, `unpack`, `scan`, `minidump`, `capabilities`):
   `workspace.py`, `bounded_subprocess.py`, `cli.py`.
 
 ### Dynamic and emulation
@@ -149,6 +149,9 @@ return a named tool-missing status when absent. Function inventory
 - Unicorn is imported only by `recover/vex.py`, which corrects AVX instruction
   execution inside an emulation session someone else sets up. No range
   emulation, tracing or slicing ships.
+- `tools/pe_sieve.py` (`pe_sieve_scan`, `pe_sieve_status`; family `dynamic`): a scan of ONE running process, by PID,
+  for in-memory differences from its on-disk image (patched or hooked code, IAT hooks, replaced or hollowed images, implanted PEs and shellcode). Read from pe-sieve's own `/json /jlvl 2` report, and its category names are passed through as given. Scan only: `/ofilter 2` is always passed and no dump, import-recovery, minidump or reflection switch can be. The PID is required; a missing, invalid or all-processes request is `PID_REQUIRED` and starts nothing. The 64-bit scanner is used whenever it is present, because measured on 0.4.1.1 it scans 32-bit (WOW64) targets too (and also reports the native modules those load), while the 32-bit scanner cannot scan a 64-bit target and prints an all-zero, clean-looking report; that case is `SCANNER_MISMATCH`.
+  **No result here means "clean" unless it is `OK` with `anomalies_found: false`,** and even then only for the modules and regions scanned at the depth in `scan_flags`: a process that could not be opened is `ACCESS_DENIED` or `PROCESS_NOT_OPENED`, zero modules scanned is `NOTHING_SCANNED`, unread or skipped modules make `SCAN_PARTIAL` (findings still listed). The access-denied wording and a non-zero `errors` report were not reproduced on the measuring machine; they are handled from the documented shape and the tests say so. Non-executable pages, thread stacks and kernel memory are not covered by default.
 - `dynamic/apimonitor.py`: catalogue only; live tracing and trace parsing are
   unconditional refusals.
 - `dynamic/frida_trace_client.py`: a guest-side launcher; no host-side driver
