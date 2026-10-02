@@ -22,10 +22,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ['3.10', '3.12']
+        python-version: ['3.10', '3.12', '3.14']
+    # 3.14 is in the matrix because the local .venv is 3.14 and the pre-push gate runs on it, while CI
+    # used to test only 3.10 and 3.12. That asymmetry was an accident, not a decision: a version the
+    # local gate measures but CI does not invites "works on my machine" bugs, and the unicorn/faulthandler
+    # behaviour found on 3.14 was exactly that kind. Do not add continue-on-error here.
     # Every leg is required. The Linux legs were briefly non-blocking while issues
     # #1 (POSIX path refusal) and #2 (POSIX process-group teardown) were open; both
-    # are fixed and all four legs pass, so the flag is gone as promised rather than
+    # are fixed and all legs pass, so the flag is gone as promised rather than
     # left behind to quietly excuse a future failure.
 
     steps:
