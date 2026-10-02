@@ -127,32 +127,126 @@ def fatal_findings(text: str, stream: str) -> list[str]:
             if any(p.search(line) for p in FATAL_PATTERNS)]
 
 
-def run_pytest(cmd: list[str], failed: list[str] | None = None) -> tuple[int, list[str]]:
+class GateStageError(Exception):
+    """A stage could not be judged: it outran its wall-clock ceiling or its output relay failed.
+    The gate treats this as a BLOCK with an honest status. A hung or silent gate is worse than a red
+    one, because it leaves nothing to read and invites `--no-verify`."""
+
+    def __init__(self, status: str, detail: str):
+        super().__init__(f"{status}: {detail}")
+        self.status, self.detail = status, detail
+
+
+# Wall-clock ceilings per stage, in seconds. Typical runs: discipline a few seconds, suite 86-92,
+# one contract interpreter ~8 (about 24 for three). Each ceiling is several times the typical run,
+# so a slow machine passes and only a genuine hang trips it. LIEBERT_GATE_STAGE_TIMEOUT overrides all.
+STAGE_TIMEOUTS = {"discipline": 300, "suite": 600, "contract": 300}
+RELAY_JOIN_GRACE = 15      # seconds the relay threads get to finish once the child is gone
+
+
+def stage_timeout(stage: str, env=None) -> float:
+    raw = (os.environ if env is None else env).get("LIEBERT_GATE_STAGE_TIMEOUT", "")
+    try:
+        if raw and float(raw) > 0:
+            return float(raw)
+    except ValueError:
+        pass
+    return float(STAGE_TIMEOUTS.get(stage, 600))
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=30)
+        else:
+            os.killpg(proc.pid, 9)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _relay(dst, line: str) -> bool:
+    """Write `line` to `dst`; a character the stream's encoding cannot hold is shown as a backslash
+    escape instead of raising. True if that happened (so the loss is visible, never silent)."""
+    try:
+        dst.write(line)
+        dst.flush()
+        return False
+    except UnicodeEncodeError:
+        enc = getattr(dst, "encoding", None) or "ascii"
+        dst.write(line.encode(enc, errors="backslashreplace").decode(enc, errors="replace"))
+        dst.flush()
+        return True
+
+
+def run_pytest(cmd: list[str], failed: list[str] | None = None, stage: str = "suite",
+               timeout: float | None = None) -> tuple[int, list[str]]:
     """Run pytest, relaying its output live, and return (exit code, fatal-exception findings).
-    If `failed` is given it receives the FAILED/ERROR test ids from pytest's -rfE summary."""
-    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    If `failed` is given it receives the FAILED/ERROR test ids from pytest's -rfE summary.
+    Raises GateStageError (GATE_STAGE_TIMEOUT, GATE_RELAY_FAILURE) when the run cannot be judged."""
+    timeout = stage_timeout(stage) if timeout is None else timeout
+    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=(os.name != "nt"))
     bufs: dict[str, list[str]] = {"stdout": [], "stderr": []}
+    problems: list[str] = []
+    lossy = [0]
 
     def pump(src, name, dst):
-        for raw in iter(src.readline, b""):
-            line = raw.decode("utf-8", errors="replace")
-            bufs[name].append(line)
-            dst.write(line)
-            dst.flush()
+        try:
+            for raw in iter(src.readline, b""):
+                line = raw.decode("utf-8", errors="replace")
+                bufs[name].append(line)
+                try:
+                    if _relay(dst, line):
+                        lossy[0] += 1
+                except Exception as e:           # a relay failure must not stop the draining below
+                    problems.append(f"{name} relay: {e.__class__.__name__}: {e}")
+                    for _ in iter(src.readline, b""):   # keep the pipe empty so the child cannot block
+                        pass
+                    return
+        except BaseException as e:
+            problems.append(f"{name} reader died: {e.__class__.__name__}: {e}")
 
-    threads = [threading.Thread(target=pump, args=(proc.stdout, "stdout", sys.stdout)),
-               threading.Thread(target=pump, args=(proc.stderr, "stderr", sys.stderr))]
+    threads = [threading.Thread(target=pump, args=(proc.stdout, "stdout", sys.stdout), daemon=True),
+               threading.Thread(target=pump, args=(proc.stderr, "stderr", sys.stderr), daemon=True)]
     for t in threads:
         t.start()
+    timed_out = False
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_tree(proc)
+        rc = proc.wait()
     for t in threads:
-        t.join()
-    rc = proc.wait()
+        t.join(timeout=RELAY_JOIN_GRACE)
+        if t.is_alive():
+            problems.append("an output relay thread did not finish after the child exited")
     global _LAST_RUN
     _LAST_RUN = (cmd, rc, "".join(bufs["stdout"]), "".join(bufs["stderr"]))
+    if lossy[0]:
+        print(f"pre-push gate: NOTE, {lossy[0]} output line(s) held characters this console encoding cannot "
+              "show; they are printed as backslash escapes here. The saved evidence keeps the full text.",
+              file=sys.stderr)
+    if timed_out:
+        raise GateStageError("GATE_STAGE_TIMEOUT", f"{stage} exceeded {timeout:g}s and its process tree was killed")
+    if problems:
+        raise GateStageError("GATE_RELAY_FAILURE", "; ".join(problems))
     hits = [h for name, lines in bufs.items() for h in fatal_findings("".join(lines), name)]
     if failed is not None:
         failed.extend(failed_ids("".join(bufs["stdout"])))
     return rc, hits
+
+
+def _report_stage_error(what: str, e: GateStageError) -> None:
+    try:
+        print(f"pre-push gate: BLOCKED, {what}: {e.status}: {e.detail}. The stage was not judged; "
+              "this is a block, not a pass.", file=sys.stderr)
+    except Exception:
+        pass
 
 
 def failed_ids(text: str) -> list[str]:
@@ -244,7 +338,13 @@ def run_contract_stage(env=None) -> bool:
         failed: list[str] = []
         cmd = [str(py), "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rfE", "-m", "contract",
                *isolated_basetemp(f"contract-py{ver}")]
-        rc, fatal = run_pytest(cmd, failed=failed)
+        try:
+            rc, fatal = run_pytest(cmd, failed=failed, stage="contract")
+        except GateStageError as e:
+            _report_stage_error(f"the contract tests on Python {full}", e)
+            save_evidence(cmd, "contract", f"py{full}")
+            blocked = True
+            continue
         if fatal:
             _report_fatal(f"the contract tests on Python {full}", rc, fatal)
             save_evidence(cmd, "contract", f"py{full}")
@@ -327,9 +427,16 @@ def _run_gate(ranges: list[list[str]]) -> int:
     failed = False
     print("pre-push gate: [1/4] discipline test ...", file=sys.stderr, flush=True)
     cmd = [*pytest, *isolated_basetemp("discipline"), "tests/test_repo_discipline.py"]
-    rc, fatal = run_pytest(cmd)
     py_tag = "py" + sys.version.split()[0]
-    if fatal:
+    try:
+        rc, fatal = run_pytest(cmd, stage="discipline")
+    except GateStageError as e:
+        _report_stage_error("tests/test_repo_discipline.py", e)
+        save_evidence(cmd, "discipline", py_tag)
+        rc, fatal, failed = 1, [], True
+    if failed:
+        pass
+    elif fatal:
         _report_fatal("tests/test_repo_discipline.py", rc, fatal)
         save_evidence(cmd, "discipline", py_tag)
         failed = True
@@ -342,8 +449,16 @@ def _run_gate(ranges: list[list[str]]) -> int:
     # Default mode of pytest.ini (-m "not heavy" from addopts); the discipline file ran above.
     print("pre-push gate: [2/4] test suite (not heavy) ...", file=sys.stderr, flush=True)
     cmd = [*pytest, "-rfE", *isolated_basetemp("suite"), "--ignore=tests/test_repo_discipline.py"]
-    rc, fatal = run_pytest(cmd)
-    if fatal:
+    suite_failed = False
+    try:
+        rc, fatal = run_pytest(cmd, stage="suite")
+    except GateStageError as e:
+        _report_stage_error("the test suite", e)
+        save_evidence(cmd, "suite", py_tag)
+        rc, fatal, failed, suite_failed = 1, [], True, True
+    if suite_failed:
+        pass
+    elif fatal:
         _report_fatal("the test suite", rc, fatal)
         save_evidence(cmd, "suite", py_tag)
         failed = True

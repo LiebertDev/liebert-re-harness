@@ -8,6 +8,8 @@ import shutil
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("_pre_push_gate", ROOT / "scripts" / "pre_push_gate.py")
 gate = importlib.util.module_from_spec(_spec)
@@ -38,14 +40,14 @@ def test_clean_output_has_no_findings():
 
 
 def test_run_gate_returns_one_on_fatal_text_despite_exit_zero(monkeypatch):
-    monkeypatch.setattr(gate, "run_pytest", lambda cmd: (0, [f"stderr line 3: {FATAL}"]))
+    monkeypatch.setattr(gate, "run_pytest", lambda cmd, **kw: (0, [f"stderr line 3: {FATAL}"]))
     monkeypatch.setattr(gate, "message_findings", lambda ranges: [])
     monkeypatch.setattr(gate, "run_contract_stage", lambda: False)
     assert gate.run_gate([["HEAD"]]) == 1
 
 
 def test_run_gate_still_blocks_on_nonzero_exit(monkeypatch):
-    monkeypatch.setattr(gate, "run_pytest", lambda cmd: (1, []))
+    monkeypatch.setattr(gate, "run_pytest", lambda cmd, **kw: (1, []))
     monkeypatch.setattr(gate, "message_findings", lambda ranges: [])
     monkeypatch.setattr(gate, "run_contract_stage", lambda: False)
     assert gate.run_gate([["HEAD"]]) == 1
@@ -102,7 +104,7 @@ def test_gate_has_four_numbered_stages_and_stays_green_when_all_pass(monkeypatch
 def test_a_red_contract_test_blocks_and_names_interpreter_and_test(monkeypatch, capsys):
     monkeypatch.setattr(gate, "find_contract_interpreters", lambda env=None: (_found("3.10", "3.12", "3.14"), {}))
 
-    def fake(cmd, failed=None):
+    def fake(cmd, failed=None, **kw):
         if "3.10" in cmd[0]:
             failed.append("tests/test_tools_ida.py::StatusTests::test_x")
             return 1, []
@@ -118,7 +120,7 @@ def test_a_red_contract_test_blocks_and_names_interpreter_and_test(monkeypatch, 
 
 def test_a_fatal_dump_in_the_contract_stage_blocks_even_with_exit_zero(monkeypatch, capsys):
     monkeypatch.setattr(gate, "find_contract_interpreters", lambda env=None: (_found("3.10", "3.12", "3.14"), {}))
-    monkeypatch.setattr(gate, "run_pytest", lambda cmd, failed=None: (0, [f"stderr line 1: {FATAL}"]))
+    monkeypatch.setattr(gate, "run_pytest", lambda cmd, failed=None, **kw: (0, [f"stderr line 1: {FATAL}"]))
     assert gate.run_contract_stage({}) is True
     assert "fatal-exception" in capsys.readouterr().err
 
@@ -129,7 +131,7 @@ def test_each_contract_interpreter_gets_its_own_basetemp(monkeypatch):
     monkeypatch.setattr(gate, "find_contract_interpreters", lambda env=None: (_found("3.10", "3.12", "3.14"), {}))
     seen = []
 
-    def fake(cmd, failed=None):
+    def fake(cmd, failed=None, **kw):
         assert cmd.count("--basetemp") == 1
         seen.append(cmd[cmd.index("--basetemp") + 1])
         return 0, []
@@ -146,7 +148,7 @@ def test_each_contract_interpreter_gets_its_own_basetemp(monkeypatch):
 def test_a_missing_interpreter_is_reported_loudly_not_skipped_silently(monkeypatch, capsys):
     why = {"3.10": ["/x/python: path does not exist"]}
     monkeypatch.setattr(gate, "find_contract_interpreters", lambda env=None: (_found("3.12", "3.14"), why))
-    monkeypatch.setattr(gate, "run_pytest", lambda cmd, failed=None: (0, []))
+    monkeypatch.setattr(gate, "run_pytest", lambda cmd, failed=None, **kw: (0, []))
     assert gate.run_contract_stage({}) is False           # a warning by default ...
     err = capsys.readouterr().err
     assert "no usable Python 3.10" in err and "DID NOT RUN" in err and "path does not exist" in err
@@ -255,3 +257,91 @@ def test_the_evidence_directory_is_gitignored():
     r = subprocess.run(["git", "-C", str(ROOT), "check-ignore", "-q", "--no-index",
                         str(gate.EVIDENCE_DIR / "x.log")])
     assert r.returncode == 0
+
+
+# --- a stage that cannot be judged BLOCKs with an honest status; the gate never hangs ---------------
+
+def _big_unicode_child(tmp_path) -> list[str]:
+    """A child that writes UTF-8 CJK and emoji, then far more than a pipe buffer holds. If the relay
+    thread dies on the first line, the child blocks on the full pipe and the run never ends."""
+    script = tmp_path / "child.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stdout.buffer.write(('ok \\u4e2d\\u6587 \\U0001F600 end\\n' + 'filler line\\n' * 300000)"
+        ".encode('utf-8'))\n", encoding="utf-8")
+    return [sys.executable, str(script)]
+
+
+def test_output_the_console_encoding_cannot_show_neither_kills_the_relay_nor_hangs(monkeypatch, tmp_path, capsys):
+    import io
+    sink = io.TextIOWrapper(io.BytesIO(), encoding="cp1254", errors="strict")
+    monkeypatch.setattr(sys, "stdout", sink)
+    rc, hits = gate.run_pytest(_big_unicode_child(tmp_path), timeout=120)
+    sink.flush()
+    shown = sink.buffer.getvalue().decode("cp1254")
+    assert rc == 0 and hits == []
+    bs = chr(92)
+    assert bs + "u4e2d" + bs + "u6587" in shown and bs + "U0001f600" in shown   # the loss is visible, as escapes
+    assert shown.count("filler line") == 300000                         # and nothing after it was dropped
+    assert "中文" in gate._LAST_RUN[2]                          # the evidence copy keeps the real text
+    assert "cannot show" in capsys.readouterr().err
+
+
+def test_a_dead_relay_thread_blocks_with_a_status_instead_of_waiting(monkeypatch, tmp_path):
+    class Dying:
+        encoding = "utf-8"
+
+        def write(self, s):
+            raise RuntimeError("relay thread killed on purpose")
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stdout", Dying())
+    with pytest.raises(gate.GateStageError) as ei:
+        gate.run_pytest(_big_unicode_child(tmp_path), timeout=120)
+    assert ei.value.status == "GATE_RELAY_FAILURE" and "killed on purpose" in ei.value.detail
+
+
+def test_a_stage_past_its_ceiling_is_killed_and_reported_not_waited_for():
+    import time
+    t0 = time.monotonic()
+    with pytest.raises(gate.GateStageError) as ei:
+        gate.run_pytest(_child("import time; time.sleep(120)"), timeout=2)
+    assert ei.value.status == "GATE_STAGE_TIMEOUT"
+    assert time.monotonic() - t0 < 30
+
+
+def test_every_stage_has_a_finite_ceiling_above_its_typical_run():
+    assert gate.stage_timeout("suite", {}) >= 300          # suite runs 86-92 s
+    assert gate.stage_timeout("contract", {}) >= 60        # one interpreter runs about 8 s
+    assert gate.stage_timeout("nonexistent", {}) > 0
+    assert gate.stage_timeout("suite", {"LIEBERT_GATE_STAGE_TIMEOUT": "7"}) == 7
+    assert gate.stage_timeout("suite", {"LIEBERT_GATE_STAGE_TIMEOUT": "junk"}) == gate.STAGE_TIMEOUTS["suite"]
+
+
+@pytest.mark.parametrize("stage_hit", ["discipline", "suite"])
+def test_run_gate_blocks_when_a_stage_cannot_be_judged(monkeypatch, capsys, stage_hit):
+    def fake(cmd, **kw):
+        if kw.get("stage") == stage_hit:
+            raise gate.GateStageError("GATE_STAGE_TIMEOUT", "boom")
+        return 0, []
+    monkeypatch.setattr(gate, "run_pytest", fake)
+    monkeypatch.setattr(gate, "message_findings", lambda ranges: [])
+    monkeypatch.setattr(gate, "run_contract_stage", lambda: False)
+    assert gate.run_gate([["HEAD"]]) == 1
+    assert "GATE_STAGE_TIMEOUT" in capsys.readouterr().err
+
+
+def test_a_contract_stage_that_cannot_be_judged_blocks_and_still_runs_the_other_interpreters(monkeypatch, capsys):
+    monkeypatch.setattr(gate, "find_contract_interpreters", lambda env=None: (_found("3.10", "3.12", "3.14"), {}))
+    calls = []
+
+    def fake(cmd, failed=None, **kw):
+        calls.append(cmd)
+        if len(calls) == 1:
+            raise gate.GateStageError("GATE_RELAY_FAILURE", "x")
+        return 0, []
+    monkeypatch.setattr(gate, "run_pytest", fake)
+    assert gate.run_contract_stage() is True
+    assert len(calls) == 3 and "GATE_RELAY_FAILURE" in capsys.readouterr().err
