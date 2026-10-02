@@ -14,7 +14,9 @@ import os
 import shutil
 import tarfile
 import unittest
+import unittest.mock
 import zipfile
+import zlib
 from pathlib import Path
 
 import liebert_re.workspace as tools_workspace
@@ -415,6 +417,91 @@ class TestExtractOutcomes(_ScratchGuard):
         self.assertTrue(result["executable_content_detected"])
         self.assertTrue(Path(dest).is_file())
         self.assertEqual(Path(dest).read_bytes(), data)
+
+class ReadOperationPasswordAndIoTests(_ScratchGuard):
+    """`read` mirrors `extract`: the password reaches the library, and an
+    operating-system error is its own status, never corruption."""
+
+    def _enc(self, name="enc_read.zip", data=b"the real content", seed=_FIXTURE_SEED):
+        archive = _SCRATCH / name
+        _make_zip_traditional_encrypted(archive, "secret.txt", data, "s3cr3t", seed=seed)
+        return archive
+
+    def _read(self, archive, member="secret.txt", **kwargs):
+        return json.loads(archive_inspect(str(archive), operation="read", member=member, **kwargs))
+
+    def test_read_with_the_correct_password_returns_the_content(self):
+        result = self._read(self._enc(), password="s3cr3t")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["content"], "the real content")
+
+    def test_read_of_an_encrypted_member_without_a_password_is_password_required(self):
+        result = self._read(self._enc())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "PASSWORD_REQUIRED")
+
+    def test_read_with_a_wrong_password_is_bad_password(self):
+        result = self._read(self._enc(), password="wrong-password")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "BAD_PASSWORD")
+
+    def test_read_wrong_password_that_slips_past_the_check_is_not_claimed_as_bad_password(self):
+        result = self._read(self._enc("enc_read_collide.zip", seed=_COLLIDING_SEED), password="wrong-password")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "BAD_PASSWORD_OR_CORRUPT_DATA")
+
+    def test_read_tar_with_a_password_is_not_supported_like_extract(self):
+        archive = _SCRATCH / "read.tar"
+        data = b"plain text member"
+        with tarfile.open(str(archive), "w") as t:
+            info = tarfile.TarInfo(name="a.txt")
+            info.size = len(data)
+            t.addfile(info, io.BytesIO(data))
+        result = self._read(archive, member="a.txt", password="whatever")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "PASSWORD_NOT_SUPPORTED_FOR_TAR")
+        self.assertTrue(self._read(archive, member="a.txt")["ok"])
+
+    def test_an_os_error_while_reading_is_not_reported_as_corruption_or_a_password_problem(self):
+        archive = _SCRATCH / "io.zip"
+        _make_zip(archive, {"a.txt": b"fine data"})
+        enc = self._enc("io_enc.zip")
+        boom = OSError(5, "Input/output error")
+        for operation, target, kwargs in (
+            ("read", archive, {"member": "a.txt"}),
+            ("extract", archive, {"member": "a.txt", "dest_path": self._dest("io_out.txt")}),
+            ("read", enc, {"member": "secret.txt", "password": "s3cr3t"}),
+            ("extract", enc, {"member": "secret.txt", "password": "s3cr3t", "dest_path": self._dest("io_out2.txt")}),
+        ):
+            with self.subTest(operation=operation, archive=target.name):
+                with unittest.mock.patch.object(zipfile.ZipFile, "read", side_effect=boom):
+                    result = json.loads(archive_inspect(str(target), operation=operation, **kwargs))
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["error"], "MEMBER_READ_IO_ERROR")
+                self.assertEqual(result["status"], "READ_FAILED")
+                self.assertEqual(result["errno"], 5)
+                self.assertEqual(result["error_type"], "OSError")
+        self.assertFalse((_SCRATCH / "io_out.txt").exists())
+
+    def test_an_os_error_on_a_tar_member_read_is_its_own_status(self):
+        archive = _SCRATCH / "io.tar"
+        data = b"plain text member"
+        with tarfile.open(str(archive), "w") as t:
+            info = tarfile.TarInfo(name="a.txt")
+            info.size = len(data)
+            t.addfile(info, io.BytesIO(data))
+        with unittest.mock.patch.object(tarfile.TarFile, "extractfile", side_effect=OSError(110, "Connection timed out")):
+            result = self._read(archive, member="a.txt")
+        self.assertEqual((result["error"], result["errno"]), ("MEMBER_READ_IO_ERROR", 110))
+
+    def test_genuine_corruption_signals_keep_their_corruption_status(self):
+        archive = _SCRATCH / "still_corrupt.zip"
+        _make_zip(archive, {"a.txt": b"fine data"})
+        for exc in (zipfile.BadZipFile("Bad CRC-32 for file"), zlib.error("bad data"), EOFError("short")):
+            with self.subTest(exc=type(exc).__name__):
+                with unittest.mock.patch.object(zipfile.ZipFile, "read", side_effect=exc):
+                    result = self._read(archive, member="a.txt")
+                self.assertEqual(result["error"], "CORRUPT_MEMBER")
 
 
 if __name__ == "__main__":
