@@ -45,6 +45,7 @@ import os
 import re
 import shutil
 import time
+import uuid
 import zlib
 from pathlib import Path
 
@@ -1819,4 +1820,327 @@ def rizin_functions(
         "analysis_completeness": completeness,
         "load_probe": load_probe,
         "analysis_wall_clock_seconds": round(elapsed, 3),
+    })
+
+
+# ---------------------------------------------------------------------------
+# rz-bin: the structural reader that ships next to rizin.exe. Four read-only
+# operations (imports, sections, headers, relocations) plus a status probe,
+# all driven through one shared runner so that the sub-tool lookup, path
+# gate, bounded run, status vocabulary, environment-error reporting and
+# evidence write cannot drift between them. The runner lives on a class on
+# purpose: the layout pin counts top-level function names, and only the five
+# public entry points below are meant to be published surface.
+#
+# Measured on rizin 0.9.1 (rz-bin.exe sits in the install ROOT, not in bin/):
+#   -j -i  -> {"imports":[{ordinal,bind,type,name,libname,plt}]}
+#   -j -S  -> {"sections":[{name,size,vsize,perm,flags,paddr,vaddr}]}
+#   -j -H  -> {"fields":[{name,vaddr,paddr,comment,format,pf}]}
+#   -j -R  -> {"relocs":[{name,type,vaddr,paddr,sym_va,is_ifunc}]}
+# rz-bin exits 0 with an EMPTY list on a file it did not recognise as a
+# binary ({"imports":[]} for a text file), exactly the trap rizin_functions
+# guards against, so an empty list is only reported as a real zero after
+# `-j -I` confirms a bintype. `-S` carries no entropy field; section entropy
+# is die_entropy's job and is reported here as absent, not invented.
+# ---------------------------------------------------------------------------
+_RZ_BIN_OPERATIONS = ("rz_bin_imports", "rz_bin_sections", "rz_bin_headers", "rz_bin_relocations")
+
+
+class _RzBin:
+    @staticmethod
+    def binary() -> str | None:
+        """env (RIZIN_HOME: file, root dir or bin dir) -> PATH. Never raises.
+        Like the other rizin lookups there is no embedded install path."""
+        names = ("rz-bin.exe", "rz-bin")
+        explicit = os.getenv("RIZIN_HOME", "").strip()
+        if explicit:
+            try:
+                p = Path(explicit)
+                if p.is_file():
+                    p = p.parent
+                for name in names:
+                    for candidate in (p / name, p / "bin" / name):
+                        if candidate.is_file():
+                            return str(candidate)
+            except OSError:
+                pass
+        return shutil.which("rz-bin") or shutil.which("rz-bin.exe")
+
+    @staticmethod
+    def missing(tool: str) -> str:
+        return _j({
+            "ok": False, "tool": tool, "status": "TOOL_MISSING",
+            "required_capability": "rizin (rz-bin.exe)",
+            "detail": "rz-bin was not found. Set RIZIN_HOME to the rizin install directory (the folder "
+                      "holding rz-bin.exe, or its bin subfolder) or put rz-bin on PATH.",
+        })
+
+    @staticmethod
+    def env_failure(tool: str, exc: BaseException, error: str) -> str:
+        if isinstance(exc, OSError):
+            return _j({
+                "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": error,
+                "environment_error": {
+                    "type": type(exc).__name__, "errno": getattr(exc, "errno", None),
+                    "strerror": getattr(exc, "strerror", None) or type(exc).__name__,
+                },
+                "detail": "A local operating-system error stopped this call before rz-bin produced a "
+                          "result. It describes this machine's environment, not the input file or rz-bin's "
+                          "findings; no answer was produced.",
+            })
+        return _j({
+            "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "RZ_BIN_UNEXPECTED_ERROR",
+            "detail": f"{type(exc).__name__}: {exc}",
+        })
+
+    @staticmethod
+    def run(tool, op, flags, key, shape, rollup, path, timeout_seconds, max_items, cancellation_token):
+        exe = _RzBin.binary()
+        if not exe:
+            return _RzBin.missing(tool)
+        try:
+            p = safe_path(path)
+        except PermissionError as exc:
+            return _j({"ok": False, "tool": tool, "status": "PATH_REFUSED", "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001 - the contract is a JSON string, never an exception
+            return _RzBin.env_failure(tool, exc, "RZ_BIN_PATH_CHECK_FAILED")
+        try:
+            is_file = p.is_file()
+        except OSError as exc:
+            return _RzBin.env_failure(tool, exc, "RZ_BIN_PATH_CHECK_FAILED")
+        if not is_file:
+            return _j({"ok": False, "tool": tool, "status": "NOT_FOUND", "path": str(path)})
+        try:
+            timeout_seconds = max(_MIN_TIMEOUT_SECONDS, min(int(timeout_seconds), _MAX_TIMEOUT_SECONDS))
+            max_items = max(1, min(int(max_items), _MAX_FUNCTIONS_RETURNED))
+        except (TypeError, ValueError):
+            return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
+                       "error": "RZ_BIN_BAD_NUMERIC_ARGUMENT"})
+
+        def run_once(argv):
+            return run_bounded_process(
+                [exe, *argv, str(p)], timeout_seconds=timeout_seconds,
+                cancellation_token=cancellation_token, max_output_chars=_MAX_OUTPUT_CHARS,
+            )
+
+        try:
+            started = time.monotonic()
+            cp = run_once(flags)
+            elapsed = time.monotonic() - started
+        except Exception as exc:  # noqa: BLE001
+            return _RzBin.env_failure(tool, exc, "RZ_BIN_COULD_NOT_START")
+        if cp.cancelled:
+            return _j({"ok": False, "tool": tool, "status": "CANCELLED",
+                       "error": "RZ_BIN_CANCELLED_PROCESS_TREE_TERMINATED"})
+        if cp.timed_out:
+            return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "timeout_seconds": timeout_seconds,
+                       "error": "RZ_BIN_TIMEOUT_PROCESS_TREE_TERMINATED"})
+        stdout = cp.stdout or ""
+        if cp.returncode not in (0, None) or not stdout.strip():
+            return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
+                       "exit_code": cp.returncode, "error": "RZ_BIN_FAILED_OR_EMPTY_OUTPUT",
+                       "stderr_tail": (cp.stderr or "")[-2000:], "stdout_tail": stdout[-500:]})
+        if getattr(cp, "output_truncated", False):
+            return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
+                       "error": "RZ_BIN_OUTPUT_TRUNCATED_AT_CAP", "output_truncated": True,
+                       "max_output_chars": _MAX_OUTPUT_CHARS})
+        try:
+            raw = json.loads(stdout)
+            items = raw[key] if isinstance(raw, dict) else None
+        except (ValueError, KeyError) as exc:
+            return _j({"ok": False, "tool": tool, "status": "RESULT_PARSE_FAILED",
+                       "error": f"{type(exc).__name__}: {exc}", "stdout_tail": stdout[-500:]})
+        if not isinstance(items, list):
+            return _j({"ok": False, "tool": tool, "status": "RESULT_PARSE_FAILED",
+                       "error": f"RZ_BIN_OUTPUT_MISSING_{key.upper()}_LIST"})
+
+        load_probe = "BINARY_LOADED"
+        if not items:
+            # Empty is only a real zero if rz-bin says it recognised a binary.
+            load_probe = "PROBE_UNAVAILABLE"
+            try:
+                info = run_once(["-j", "-I"])
+                parsed = json.loads(info.stdout or "")["info"] if info.returncode in (0, None) else None
+                if isinstance(parsed, dict):
+                    load_probe = "BINARY_LOADED" if parsed.get("bintype") else "NO_BINARY_LOADED"
+            except Exception:  # noqa: BLE001 - an unanswered probe stays PROBE_UNAVAILABLE
+                pass
+            if load_probe != "BINARY_LOADED":
+                return _j({
+                    "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
+                    "error": "RZ_BIN_EMPTY_RESULT_WITHOUT_LOADED_BINARY", "load_probe": load_probe,
+                    "path": relative(p),
+                    "detail": "rz-bin returned an empty list and its own binary-info probe does not confirm "
+                              "it recognised this file, so the count is unknown, not zero.",
+                })
+
+        # Full unmodified rz-bin JSON as evidence, written best-effort.
+        evidence_name, evidence_error = None, None
+        try:
+            directory = EVIDENCE.parent / "rz_bin"
+            directory.mkdir(parents=True, exist_ok=True)
+            stem = re.sub(r"[^A-Za-z0-9._-]", "_", p.stem)[:80] or "input"
+            out = directory / f"{stem}_{uuid.uuid4().hex[:8]}_{op}.json"
+            out.write_text(stdout, encoding="utf-8")
+            evidence_name = out.name
+            try:
+                _evidence_index_record_write(out)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as exc:  # noqa: BLE001 - an evidence failure never blocks the result
+            evidence_error = f"{type(exc).__name__}: {exc}"
+
+        total = len(items)
+        shaped = [shape(i) for i in items[:max_items] if isinstance(i, dict)]
+        return _j({
+            "ok": True, "tool": tool, "status": "OK", "path": relative(p),
+            "engine": "rz-bin", "engine_version": "0.9.1",
+            "count": total, "returned": len(shaped),
+            "truncated": total > len(shaped),
+            "analysis_completeness": (
+                "LIST_CAPPED_AT_MAX_ITEMS" if total > len(shaped)
+                else ("COMPLETE_NONE_FOUND" if total == 0 else "COMPLETE")
+            ),
+            key: shaped,
+            **rollup(items),
+            "load_probe": load_probe,
+            "wall_clock_seconds": round(elapsed, 3),
+            "internal_evidence_name": evidence_name,
+            "evidence_write_error": evidence_error,
+        })
+
+
+def rz_bin_imports(path, timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+                   max_items: int = _MAX_FUNCTIONS_RETURNED, cancellation_token=None) -> str:
+    """Import table via `rz-bin -j -i`: name, library, per-library ordinal, address.
+    `address` is rz-bin's `plt` value, the import's slot address in the loaded image.
+    `ordinal` is rz-bin's per-library index, not the DLL's export ordinal. Counts are
+    of the full table; `max_items` only caps the listed entries (`truncated`).
+    Status: OK, TOOL_MISSING, PATH_REFUSED, NOT_FOUND, CANCELLED, TIMEOUT,
+    ANALYSIS_LIMITED (failure, empty output, truncated output, an environment error
+    carrying `environment_error`, or an empty list rz-bin cannot confirm it loaded),
+    RESULT_PARSE_FAILED."""
+    def shape(i):
+        plt = i.get("plt")
+        return {"name": i.get("name"), "library": i.get("libname"), "ordinal": i.get("ordinal"),
+                "address": plt, "address_hex": hex(plt) if isinstance(plt, int) else None,
+                "type": i.get("type"), "bind": i.get("bind")}
+
+    def rollup(items):
+        libs: dict = {}
+        for i in items:
+            if isinstance(i, dict):
+                lib = i.get("libname") or "(none)"
+                libs[lib] = libs.get(lib, 0) + 1
+        return {"library_count": len(libs), "imports_per_library": dict(sorted(libs.items()))}
+
+    return _RzBin.run("rz_bin_imports", "imports", ["-j", "-i"], "imports", shape, rollup,
+                      path, timeout_seconds, max_items, cancellation_token)
+
+
+def rz_bin_sections(path, timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+                    max_items: int = _MAX_FUNCTIONS_RETURNED, cancellation_token=None) -> str:
+    """Section table via `rz-bin -j -S`: name, file size, virtual size, file offset,
+    virtual address, permissions and flags. rz-bin 0.9.1 reports no entropy, so none is
+    given (`entropy_available` is false); use die_entropy for that. Sections that are
+    both writable and executable are listed under `writable_executable_sections`.
+    Same status vocabulary as rz_bin_imports."""
+    def shape(s):
+        va = s.get("vaddr")
+        return {"name": s.get("name"), "size": s.get("size"), "virtual_size": s.get("vsize"),
+                "file_offset": s.get("paddr"), "virtual_address": va,
+                "virtual_address_hex": hex(va) if isinstance(va, int) else None,
+                "permissions": s.get("perm"), "flags": s.get("flags") or []}
+
+    def rollup(items):
+        wx = [s.get("name") for s in items if isinstance(s, dict)
+              and "w" in str(s.get("perm") or "") and "x" in str(s.get("perm") or "")]
+        return {"writable_executable_sections": wx, "entropy_available": False}
+
+    return _RzBin.run("rz_bin_sections", "sections", ["-j", "-S"], "sections", shape, rollup,
+                      path, timeout_seconds, max_items, cancellation_token)
+
+
+def rz_bin_headers(path, timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+                   max_items: int = _MAX_FUNCTIONS_RETURNED, cancellation_token=None) -> str:
+    """Header fields via `rz-bin -j -H` (PE: Rich entries, DOS/NT/optional header).
+    `value` is rz-bin's own rendered `comment` text (e.g. "0x00000102"); the raw
+    `pf` decode rz-bin 0.9.1 attaches is dropped because it is wrong for many
+    fields (all-ones hex values, empty strings). `rich_entries` groups the
+    RICH_ENTRY_* rows; `named` maps each single-occurrence field name to its value.
+    Same status vocabulary as rz_bin_imports."""
+    def shape(f):
+        return {"name": str(f.get("name") or "").strip(), "file_offset": f.get("paddr"),
+                "virtual_address": f.get("vaddr"), "value": f.get("comment"), "format": f.get("format")}
+
+    def rollup(items):
+        rich, named, seen = [], {}, {}
+        for f in items:
+            if not isinstance(f, dict):
+                continue
+            name = str(f.get("name") or "").strip()
+            if name.startswith("RICH_ENTRY_"):
+                if name == "RICH_ENTRY_NAME" or not rich:
+                    rich.append({})
+                rich[-1][name[len("RICH_ENTRY_"):].lower()] = f.get("comment")
+                continue
+            seen[name] = seen.get(name, 0) + 1
+            named[name] = f.get("comment")
+        return {"rich_entries": rich,
+                "named": {k: v for k, v in named.items() if seen[k] == 1}}
+
+    return _RzBin.run("rz_bin_headers", "headers", ["-j", "-H"], "fields", shape, rollup,
+                      path, timeout_seconds, max_items, cancellation_token)
+
+
+def rz_bin_relocations(path, timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+                       max_items: int = _MAX_FUNCTIONS_RETURNED, cancellation_token=None) -> str:
+    """Relocation table via `rz-bin -j -R`: name, type, virtual address, file offset,
+    target (`sym_va`). `by_type` counts the full table. An empty table on a recognised
+    binary is a real zero (many images are linked without relocations).
+    Same status vocabulary as rz_bin_imports."""
+    def shape(r):
+        return {"name": r.get("name"), "type": r.get("type"), "virtual_address": r.get("vaddr"),
+                "file_offset": r.get("paddr"), "target_address": r.get("sym_va"),
+                "is_ifunc": r.get("is_ifunc")}
+
+    def rollup(items):
+        by_type: dict = {}
+        for r in items:
+            if isinstance(r, dict):
+                t = r.get("type") or "(none)"
+                by_type[t] = by_type.get(t, 0) + 1
+        return {"by_type": dict(sorted(by_type.items()))}
+
+    return _RzBin.run("rz_bin_relocations", "relocations", ["-j", "-R"], "relocs", shape, rollup,
+                      path, timeout_seconds, max_items, cancellation_token)
+
+
+def rz_bin_status() -> str:
+    """rz-bin reachability, resolution source and version. A separate probe from
+    rizin_status on purpose: rizin_status answers about rizin.exe in a fixed
+    two-key shape existing callers and tests rely on, while rz-bin is its own
+    executable that can be missing while rizin.exe is present (or the reverse)."""
+    tool = "rz_bin_status"
+    exe = _RzBin.binary()
+    if not exe:
+        return _RzBin.missing(tool)
+    try:
+        cp = run_bounded_process([exe, "-v"], timeout_seconds=_MIN_TIMEOUT_SECONDS, max_output_chars=4096)
+    except Exception as exc:  # noqa: BLE001
+        return _RzBin.env_failure(tool, exc, "RZ_BIN_COULD_NOT_START")
+    if cp.timed_out:
+        return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "error": "RZ_BIN_VERSION_TIMEOUT"})
+    lines = ((cp.stdout or "") + (cp.stderr or "")).strip().splitlines()
+    if cp.returncode not in (0, None) or not lines:
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "exit_code": cp.returncode,
+                   "error": "RZ_BIN_VERSION_FAILED", "stderr_tail": (cp.stderr or "")[-500:]})
+    from_env = bool(os.getenv("RIZIN_HOME", "").strip()) and not (shutil.which("rz-bin") == exe
+                                                                  or shutil.which("rz-bin.exe") == exe)
+    return _j({
+        "ok": True, "tool": tool, "status": "OK", "binary": exe,
+        "version": lines[0],
+        "resolved_by": "RIZIN_HOME" if from_env else "PATH",
+        "operations": list(_RZ_BIN_OPERATIONS) + ["rz_bin_status"],
+        "not_wrapped": ["-z strings", "-K checksums", "-P pdb"],
     })

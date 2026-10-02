@@ -84,6 +84,12 @@ Module paths are relative to `liebert_re/`.
 - Bounded LZMA1 decode: `recover/lzma1_range_decoder.py`, `tools/lzma1_decode.py`.
 - Byte patch planning/apply and closed-form CRC-32 correction, via rizin and
   keystone: `tools/rizin.py`.
+- Structure reads through `rz-bin` (rizin's own binary reader): import table,
+  section table, header fields and relocations, as `rz_bin_imports`,
+  `rz_bin_sections`, `rz_bin_headers`, `rz_bin_relocations` and `rz_bin_status`
+  in `tools/rizin.py`. rz-bin reports no section entropy (use `die_entropy`),
+  and an empty list from a file rz-bin did not recognise is refused rather than
+  reported as zero. Not wrapped: `-z` strings, `-K` checksums, `-P` PDB.
 - Packer identification (Detect It Easy) and rule scanning (YARA-X):
   `tools/die.py`, `tools/yara_x.py`.
 
@@ -109,7 +115,7 @@ Module paths are relative to `liebert_re/`.
 
 ### External-engine wrappers actually present
 
-rizin (listing, function inventory, patching), Detect It Easy, YARA-X, capa, IDA (read-only, see above), UPX,
+rizin (listing, function inventory, patching, rz-bin structure reads), Detect It Easy, YARA-X, capa, IDA (read-only, see above), UPX,
 JADX, Il2CppDumper, and the API Monitor catalogue only. All are optional and
 return a named tool-missing status when absent. Function inventory
 (`rizin_functions`) needs rizin; it is not pure Python.
@@ -126,7 +132,7 @@ return a named tool-missing status when absent. Function inventory
   nothing in the package produces an IR from a binary.
 - Workspace path sandbox, bounded subprocess with process-tree teardown, and a
   `liebert-re` CLI (`identify`, `probe`, `pe`, `disasm`, `packer`, `die`, `diestatus`,
-  `capa`, `capastatus`, `ida`, `idastatus`, `unpack`, `scan`, `minidump`, `capabilities`):
+  `capa`, `capastatus`, `ida`, `idastatus`, `rzbin`, `rzbinstatus`, `unpack`, `scan`, `minidump`, `capabilities`):
   `workspace.py`, `bounded_subprocess.py`, `cli.py`.
 
 ### Dynamic and emulation

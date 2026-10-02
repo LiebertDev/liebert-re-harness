@@ -186,6 +186,16 @@ def _capa_status(a):
     return _load("liebert_re.tools.capa", "capa_status")()
 
 
+def _rzbin(a):
+    name = {"imports": "rz_bin_imports", "sections": "rz_bin_sections",
+            "headers": "rz_bin_headers", "relocations": "rz_bin_relocations"}[a.mode]
+    return _load("liebert_re.tools.rizin", name)(a.path, timeout_seconds=a.timeout)
+
+
+def _rzbin_status(a):
+    return _load("liebert_re.tools.rizin", "rz_bin_status")()
+
+
 def _unpack(a):
     return _load("liebert_re.tools.upx", "upx_unpack")(a.path, timeout_seconds=a.timeout)
 
@@ -335,6 +345,12 @@ def _build_parser():
         ("--sigdb", "sigdb", "which signature database answered, and its size"),
     ):
         g.add_argument(flag, dest="mode", action="store_const", const=mode, help=helptext)
+    sp = add("rzbin", _rzbin, "read a binary's structure with rz-bin (choose exactly one mode)")
+    sp.add_argument("--timeout", type=int, default=120, help="seconds, clamped to 10-600")
+    g = sp.add_mutually_exclusive_group(required=True)
+    for m in ("imports", "sections", "headers", "relocations"):
+        g.add_argument(f"--{m}", dest="mode", action="store_const", const=m)
+    add("rzbinstatus", _rzbin_status, "report whether rz-bin is reachable, from where, and its version", path=False)
     add("diestatus", _die_status, "report whether Detect It Easy is reachable, from where, and its version", path=False)
     # capa's default backend takes MINUTES (measured 3m48s for a 1.2 MB PE), so the
     # default timeout is minutes too; --functions is how to bound a run instead.

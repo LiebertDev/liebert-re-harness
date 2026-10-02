@@ -72,7 +72,13 @@ def test_published_tool_name_set_is_unchanged():
     # the digest too; only the two public names are a claim about the published surface.
     # The IDAPython worker it drives is a data file (ida_scripts/query_program.idapy), not a
     # module, so it adds no names here.
+    #
+    # Updated again: liebert_re/tools/rizin.py gained the rz-bin reads. The public functions
+    # added on purpose are rz_bin_imports, rz_bin_sections, rz_bin_headers, rz_bin_relocations
+    # and rz_bin_status, registered in tool_families.FAMILIES["native"]; the CLI reaches them as
+    # `rzbin` and `rzbinstatus`. The shared runner is a private class (_RzBin) rather than
+    # top-level functions, so no underscore helper joined the pinned set.
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "424c827ea212c8c68ba8ddc66b838cf14138c6c4998d70ef4b59d626fd9fa708"
+    assert digest == "e0c5d04a37e5dadb7b4a045dc38dbd539b7e11f45dd38b134a35861a3d9406de"
