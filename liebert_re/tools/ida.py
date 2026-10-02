@@ -574,12 +574,14 @@ def _enforce_cache_budget(keep):
     (evicted_slot_names, evicted_bytes, budget_bytes)."""
     budget = _cache_budget_bytes()
     root = _cache_root()
-    if not root.is_dir():
+    if not os.path.isdir(root):
         return [], 0, budget
     slots = []
     total = 0
+    # os.path.isdir, not Path.is_dir: before Python 3.13 Path.is_dir re-raises a
+    # PermissionError from stat(); os.path.isdir treats any OSError as "not a directory".
     for child in root.iterdir():
-        if not (child.is_dir() and _SLOT_NAME.match(child.name)):
+        if not (os.path.isdir(child) and _SLOT_NAME.match(child.name)):
             continue
         size = _dir_bytes(child)
         total += size
@@ -604,9 +606,9 @@ def _cache_summary():
     root = _cache_root()
     slots = 0
     total = 0
-    if root.is_dir():
+    if os.path.isdir(root):
         for child in root.iterdir():
-            if child.is_dir() and _SLOT_NAME.match(child.name):
+            if os.path.isdir(child) and _SLOT_NAME.match(child.name):
                 slots += 1
                 total += _dir_bytes(child)
     return {"root": _display_cache_root(), "slot_count": slots, "total_bytes": total,
