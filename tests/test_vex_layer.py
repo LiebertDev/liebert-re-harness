@@ -27,6 +27,8 @@ from __future__ import annotations
 import contextlib
 import faulthandler
 import functools
+import subprocess
+import sys as _sys
 import unittest
 
 import pytest
@@ -51,8 +53,8 @@ import liebert_re.recover.vex as vex  # noqa: E402
 # (top frame unicorn.py `mem_map`) each time: 30 per full run, with every test passing and exit 0.
 # It reproduces outside this repo with three lines (`Uc(UC_ARCH_X86, UC_MODE_64).mem_map(0x1000,
 # 0x4000)` under `python -X faulthandler`), so it is engine behaviour, not something a test does.
-# Some of those calls are in production code (`vex.self_check`), so they are wrapped here at the
-# class, not in a test helper. The pre-push gate scans for fatal reports unconditionally, so the
+# Production `vex.self_check` silences its own call with the shared helper; the calls made by
+# these tests are wrapped here at the class, through that same helper. The pre-push gate scans for fatal reports unconditionally, so the
 # noise has to stop at the source. The silence is scoped as tightly as possible: faulthandler is
 # off only for the duration of each `mem_map` call and is restored in a `finally`, never off
 # for the file, and never off globally (no `-p no:faulthandler`). A crash anywhere else in these
@@ -60,25 +62,18 @@ import liebert_re.recover.vex as vex  # noqa: E402
 # fixture, so it cannot leak; tests/test_zz_vex_patch_does_not_leak.py locks that.
 
 
-def _restore_faulthandler(fd):
-    faulthandler.enable(file=fd) if fd is not None else faulthandler.enable()
-
-
 @contextlib.contextmanager
 def mem_map_silenced(fd=None):
-    """Patch `Uc.mem_map` so faulthandler is off only while the call runs; undo on exit."""
+    """Patch `Uc.mem_map` so faulthandler is off only while the call runs; undo on exit.
+
+    The off/restore logic is `vex._run_with_faulthandler_off`, the same one production
+    `self_check` uses, so there is one copy of it."""
     import unicorn
     original = unicorn.Uc.mem_map
 
     @functools.wraps(original)
     def quiet(self, *args, **kwargs):
-        was_on = faulthandler.is_enabled()
-        faulthandler.disable()
-        try:
-            return original(self, *args, **kwargs)
-        finally:
-            if was_on:
-                _restore_faulthandler(fd)
+        return vex._run_with_faulthandler_off(original, self, *args, fd=fd, **kwargs)
 
     unicorn.Uc.mem_map = quiet
     try:
@@ -385,6 +380,61 @@ class WideTests(unittest.TestCase):
         layer = vex.VexLayer(uc, 64)
         uc.hook_add(UC_HOOK_CODE, lambda u, a, s, d: layer.step(a, s))
         return uc, layer
+
+
+def _pytest_fd(request):
+    try:
+        from _pytest.faulthandler import fault_handler_stderr_fd_key
+        return request.config.stash.get(fault_handler_stderr_fd_key, None)
+    except Exception:  # pragma: no cover
+        return None
+
+
+@pytest.mark.skipif(not ENGINE, reason="needs unicorn")
+class TestSelfCheckFaulthandler:
+    def test_a_failing_mem_map_propagates_unchanged_through_self_check(self, monkeypatch, request):
+        import unicorn
+        boom = unicorn.UcError(unicorn.UC_ERR_NOMEM)
+
+        class Failing:
+            def __init__(self, *a, **k):
+                pass
+
+            def mem_map(self, *a, **k):
+                raise boom
+
+        monkeypatch.setattr(unicorn, "Uc", Failing)
+        fd = _pytest_fd(request)
+        try:
+            with pytest.raises(unicorn.UcError) as info:
+                vex.self_check()
+        finally:
+            if fd is not None and not faulthandler.is_enabled():
+                faulthandler.enable(file=fd)
+        assert info.value is boom
+
+    def test_helper_restores_faulthandler_after_success_and_after_failure(self, request):
+        fd = _pytest_fd(request)
+        if not request.config.pluginmanager.has_plugin("faulthandler"):
+            pytest.skip("pytest faulthandler plugin is not active")
+        seen = []
+        assert vex._run_with_faulthandler_off(
+            lambda: seen.append(faulthandler.is_enabled()) or 7, fd=fd) == 7
+        assert seen == [False] and faulthandler.is_enabled()
+        with pytest.raises(ValueError, match="x"):
+            vex._run_with_faulthandler_off(lambda: (_ for _ in ()).throw(ValueError("x")), fd=fd)
+        assert faulthandler.is_enabled()
+
+    def test_a_successful_self_check_prints_no_dump_and_leaves_faulthandler_on(self):
+        code = ("import faulthandler, liebert_re.recover.vex as v;"
+                "r = v.self_check(); print(r['layer_correct'], faulthandler.is_enabled())")
+        out = subprocess.run([_sys.executable, "-X", "faulthandler", "-c", code],
+                             capture_output=True, text=True, timeout=120,
+                             cwd=str(Path(__file__).resolve().parents[1]))
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.split() == ["True", "True"]
+        assert "fatal exception" not in out.stderr and "access violation" not in out.stderr
+        assert out.stderr == ""
 
 
 class GenericityTests(unittest.TestCase):

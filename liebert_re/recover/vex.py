@@ -19,6 +19,7 @@ the run. A wrong answer that looks plausible is the failure mode this exists to
 prevent, so falling through to the engine is never an option.
 """
 
+import faulthandler
 import math
 import struct
 
@@ -669,6 +670,29 @@ _GENERIC = {
 }
 
 
+def _run_with_faulthandler_off(fn, *args, fd=None, **kwargs):
+    """Call ``fn(*args, **kwargs)`` with faulthandler off only for the call's duration.
+
+    Unicorn 2.1.4 on Windows raises one harmless first-chance access violation inside
+    every ``Uc.mem_map``, so faulthandler prints a "Windows fatal exception: access
+    violation" dump even though the call succeeds. It reproduces outside this repo
+    with three lines (``Uc(UC_ARCH_X86, UC_MODE_64).mem_map(0x1000, 0x4000)`` under
+    ``python -X faulthandler``); it is engine behaviour. That is stderr noise from a
+    healthy operation, which reads as a crash, so it is silenced at the call.
+
+    This changes faulthandler state and nothing else: the return value and any
+    exception from ``fn`` pass through unchanged, and faulthandler is re-enabled in a
+    ``finally`` (on ``fd`` when given, else its default stderr) only if it was on.
+    """
+    was_on = faulthandler.is_enabled()
+    faulthandler.disable()
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        if was_on:
+            faulthandler.enable(file=fd) if fd is not None else faulthandler.enable()
+
+
 def self_check():
     """Run the four instructions that exposed the defect and report the verdict.
 
@@ -693,7 +717,7 @@ def self_check():
     for label, encoding, reg, want in probes:
         for intercepted in (False, True):
             uc = Uc(UC_ARCH_X86, UC_MODE_64)
-            uc.mem_map(0x1000, 0x1000)
+            _run_with_faulthandler_off(uc.mem_map, 0x1000, 0x1000)
             blob = bytes.fromhex(encoding)
             uc.mem_write(0x1000, blob + b"\x90" * 8)
             uc.reg_write(UX.UC_X86_REG_XMM0, int.from_bytes(state, "little"))

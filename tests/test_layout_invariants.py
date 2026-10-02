@@ -78,7 +78,12 @@ def test_published_tool_name_set_is_unchanged():
     # and rz_bin_status, registered in tool_families.FAMILIES["native"]; the CLI reaches them as
     # `rzbin` and `rzbinstatus`. The shared runner is a private class (_RzBin) rather than
     # top-level functions, so no underscore helper joined the pinned set.
+    #
+    # Updated again: liebert_re/recover/vex.py gained one top-level helper on purpose,
+    # _run_with_faulthandler_off. It is the single shared copy of the faulthandler-off-around-a-call
+    # logic that self_check uses around Uc.mem_map and that tests/test_vex_layer.py reuses; it is
+    # private and not a published tool, and it is a top-level def (not nested) so the pin counts it.
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "e0c5d04a37e5dadb7b4a045dc38dbd539b7e11f45dd38b134a35861a3d9406de"
+    assert digest == "8fd0557923258a4ae7d50adfb573d0f528324af77ac145ddd47ef3aebad814ad"
