@@ -109,6 +109,18 @@ class TestStatusProbeContract:
             data = _call(name)
         assert data["status"] == "OK" and data["resolved_by"] == env
 
+    @pytest.mark.parametrize("name", ["dex", "jvm"])
+    def test_env_source_is_kept_when_which_would_refuse_the_file(self, name, tmp_path):
+        # shutil.which rejects a file with no executable bit/extension (3.12+ on Windows, every
+        # Python on Linux), so the attribution must not depend on which() accepting JADX_EXE.
+        # which() is forced to refuse here so the case is the same on every interpreter and OS.
+        module, _fn, resolver, env, _tool = PROBES[name]
+        exe = tmp_path / "jadx-launcher"
+        exe.write_bytes(b"")
+        with mock.patch.dict(os.environ, {env: str(exe)}),              mock.patch.object(module, resolver, return_value=str(exe)),              mock.patch.object(module.shutil, "which", return_value=None),              mock.patch.object(module, "run_bounded_process", return_value=_result(GOOD_OUTPUT[name][0])):
+            data = _call(name)
+        assert data["status"] == "OK" and data["resolved_by"] == env
+
     @pytest.mark.parametrize("name", sorted(PROBES))
     def test_file_that_does_not_run_is_analysis_limited_not_ok(self, name, tmp_path):
         module, _fn, resolver, *_ = PROBES[name]

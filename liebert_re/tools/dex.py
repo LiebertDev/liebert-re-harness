@@ -158,7 +158,7 @@ def dex_status():
 
         explicit = os.getenv("JADX_EXE", "").strip()
         resolved_by = "bundled_fallback"
-        if explicit and shutil.which(explicit) and _same(exe, shutil.which(explicit)):
+        if explicit and any(_same(exe, c) for c in (explicit, shutil.which(explicit) or explicit)):
             resolved_by = "JADX_EXE"
         else:
             on_path = shutil.which("jadx")
