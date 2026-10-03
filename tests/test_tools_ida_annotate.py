@@ -295,7 +295,7 @@ class RoundTripTests(AnnotateCase):
 
     def test_the_first_apply_builds_the_pristine_analysis_and_never_writes_it(self):
         self.write()
-        pristine = list(self.cache.glob("*.p0v1/db.i64"))
+        pristine = list(self.cache.glob("*.p0v1.*/db.i64"))
         self.assertEqual(len(pristine), 1)
         self.assertEqual(pristine[0].read_bytes(), b"IDA-DB" * 100, "the cached pristine database is untouched")
 
@@ -874,7 +874,7 @@ class CacheSeparationTests(AnnotateCase):
         again = self.plan([{"address": START, "new_name": "after_the_wipe"}])
         self.assertEqual((again["ok"], again["plan"]["base_version"], again["plan"]["items"][0]["expect_name"]),
                          (True, 1, "liebert_start"))
-        self.assertFalse(self.cache.exists() and list(self.cache.glob("*.p0v1")), "no pristine analysis was needed")
+        self.assertFalse(self.cache.exists() and list(self.cache.glob("*.p0v1.*")), "no pristine analysis was needed")
 
     def test_the_cache_lifecycle_helpers_never_see_an_annotated_path(self):
         self.write()
@@ -1422,7 +1422,7 @@ class AnnotateRealInstallTests(unittest.TestCase):
         return json.loads(ti.ida_annotations_apply(str(self.pe), dict(plan_answer["plan"], plan_sha256=plan_answer["plan_sha256"]), **kwargs))
 
     def pristine(self):
-        return next(self.cache.glob("*.p0v1/db.i64"))
+        return next(self.cache.glob("*.p0v1.*/db.i64"))
 
     def read_back_in_a_fresh_engine(self, version, items):
         """An independent read of the stored version: a copy of the file, opened in a new idat process."""
@@ -1511,7 +1511,7 @@ class AnnotateRealInstallTests(unittest.TestCase):
                   if p.is_file() and not p.name.endswith(".lock")}
         with mock.patch.dict(os.environ, {"LIEBERT_IDA_CACHE_BYTES": "1"}), mock.patch.object(ti, "_EVICT_SKIP_RECENT_SECONDS", 0):
             ti._enforce_cache_budget(None)                      # the cache evicts every slot it may
-        self.assertEqual(list(self.cache.glob("*.p0v1")), [], "the pristine slot WAS evicted")
+        self.assertEqual(list(self.cache.glob("*.p0v1.*")), [], "the pristine slot WAS evicted")
         shutil.rmtree(self.cache)
         after = {p.relative_to(self.annotated).as_posix(): ti._file_sha256(p)[0] for p in self.annotated.rglob("*")
                  if p.is_file() and not p.name.endswith(".lock")}
@@ -1522,7 +1522,7 @@ class AnnotateRealInstallTests(unittest.TestCase):
         plan = self.plan([{"address": "0x140001000", "new_name": "after_eviction"}])
         self.assertEqual((plan["ok"], plan["plan"]["base_version"], plan["plan"]["items"][0]["expect_name"]),
                          (True, 1, "liebert_start"))
-        self.assertFalse(list(self.cache.glob("*.p0v1")) if self.cache.exists() else [], "no pristine analysis was rebuilt")
+        self.assertFalse(list(self.cache.glob("*.p0v1.*")) if self.cache.exists() else [], "no pristine analysis was rebuilt")
 
     def test_the_reader_sees_what_the_writer_journalled(self):
         self.apply(self.plan([{"address": "0x140001000", "new_name": "liebert_start"}]))
