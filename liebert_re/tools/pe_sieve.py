@@ -318,7 +318,11 @@ class _PeSieve:
         """Attach the gate record to a result and finish its evidence with the exact command."""
         result = json.loads(out)
         outcome = {"status": result.get("status"), "ok": result.get("ok"), "error": result.get("error")}
-        error = LabGate.finish(gate, result.get("invoked_argv"), outcome)
+        # The gate RECORD (the evidence file) carries the full result beside the short outcome; the
+        # RESPONSE keeps the short outcome only (the full result is already the response body, and a
+        # result is still withheld when this record cannot be written).
+        error = LabGate.finish(gate, result.get("invoked_argv"), {**outcome, "full_result": dict(result)})
+        gate["result"] = outcome
         gate["evidence_finalize_error"] = error
         if error:
             # The operation already ran and cannot be undone; the result is what can still be refused.
@@ -569,7 +573,9 @@ def pe_sieve_scan(pid=None, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS, cancellati
             result = {"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
                       "error": "PE_SIEVE_UNEXPECTED_ERROR", "detail": f"{type(exc).__name__}: {exc}"}
         if gate is not None and gate.get("ok"):
-            error = LabGate.finish(gate, None, {"status": result["status"], "error": result["error"]})
+            outcome = {"status": result["status"], "error": result["error"]}
+            error = LabGate.finish(gate, None, {**outcome, "full_result": dict(result)})
+            gate["result"] = outcome
             gate["evidence_finalize_error"] = error
             if error:
                 return _j(LabGate.withheld(tool, number if isinstance(number, int) else None, gate, error, None, {}))

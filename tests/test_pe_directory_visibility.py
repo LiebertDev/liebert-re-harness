@@ -8,6 +8,7 @@ and prove the two cases now differ.
 import struct
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import liebert_re.workspace as tools_workspace
 from liebert_re.recover.owned_binary_fixtures import build_owned_pe_with_rsds
@@ -69,6 +70,76 @@ class PeDirectoryVisibilityTests(unittest.TestCase):
                      export_dir=(0x90000000, 40))
         self.assertNotEqual(pe_imports(str(good)), pe_imports(str(bad)))
         self.assertNotEqual(pe_exports(str(good)), pe_exports(str(bad)))
+
+
+class TruncationMarkerTests(unittest.TestCase):
+    """A list cut at its cap says so: that it was cut, what came back, the cap and the total."""
+
+    def setUp(self):
+        import tempfile
+        self._td = tempfile.TemporaryDirectory(dir=tools_workspace.WORKSPACE)
+        self.addCleanup(self._td.cleanup)
+        self.dir = Path(self._td.name)
+
+    def test_strings_over_the_cap_carry_a_marker_with_the_true_total(self):
+        from liebert_re.tools.binary import binary_strings
+        p = self.dir / "s.bin"
+        p.write_bytes(b"\x00".join(b"string_number_%03d" % i for i in range(12)))
+        cut = binary_strings(str(p), max_results=5)
+        self.assertIn("[limit:5; truncated=true; returned=5; total=12]", cut)
+        self.assertEqual(len([ln for ln in cut.splitlines() if ln.startswith("0x")]), 5)
+        whole = binary_strings(str(p), max_results=12)
+        self.assertNotIn("truncated", whole)
+
+    def test_binary_and_byte_searches_mark_a_cut_and_only_a_cut(self):
+        from liebert_re.tools.binary import find_binaries, search_binary_bytes
+        for i in range(4):
+            (self.dir / f"b{i}.exe").write_bytes(b"MZ" * 4)
+        cut = find_binaries(str(self.dir), max_results=3)
+        self.assertIn("[limit:3; truncated=true; returned=3; total=unknown (more exist)]", cut)
+        self.assertNotIn("truncated", find_binaries(str(self.dir), max_results=4))
+        p = self.dir / "b0.exe"
+        self.assertIn("truncated=true; returned=2", search_binary_bytes(str(p), "4D 5A", max_results=2))
+        self.assertNotIn("truncated", search_binary_bytes(str(p), "4D 5A", max_results=4))
+
+    def test_exports_over_the_cap_carry_a_marker_with_the_total(self):
+        import liebert_re.tools.binary as binary
+
+        class Symbol:
+            def __init__(self, i):
+                self.name, self.address, self.ordinal = b"fn%d" % i, 0x1000 + i, i
+
+        class Export:
+            symbols = [Symbol(i) for i in range(7)]
+
+        class FakePe:
+            DIRECTORY_ENTRY_EXPORT = Export()
+
+        with mock.patch.object(binary, "_pe", return_value=FakePe()), \
+                mock.patch.object(binary, "_parse_directories", return_value=None), \
+                mock.patch.object(binary, "_directory_problem", return_value=None):
+            cut = binary.pe_exports(str(self.dir), max_results=3)
+            whole = binary.pe_exports(str(self.dir), max_results=7)
+        self.assertIn("[limit:3; truncated=true; returned=3; total=7]", cut)
+        self.assertEqual(len(whole.splitlines()), 7)
+        self.assertNotIn("truncated", whole)
+
+    def test_workspace_listings_mark_a_cut(self):
+        for i in range(12):
+            (self.dir / f"f{i}.txt").write_text("x", encoding="utf-8")
+        with mock.patch.object(tools_workspace, "MAX_FIND_RESULTS", 5):
+            cut = tools_workspace.find_files("*.txt", str(self.dir))
+        self.assertIn("[limit:5; truncated=true; returned=5; total=unknown (more exist)]", cut)
+        paths = [str(self.dir / f"f{i}.txt") for i in range(12)]
+        text = tools_workspace.read_files(paths)
+        self.assertIn("[limit:10; truncated=true; returned=10; total=12]", text)
+        self.assertNotIn("truncated", tools_workspace.read_files(paths[:10]))
+
+    def test_msf_unresolved_symbols_report_their_true_count(self):
+        from liebert_re.recover.msf_pdb import resolve_public_symbol_rvas
+        symbols = [{"name": f"s{i}", "segment": 9, "offset": i} for i in range(70)]
+        result = resolve_public_symbol_rvas(symbols, [])
+        self.assertEqual((len(result["unresolved"]), result["unresolved_count"], result["unresolved_truncated"]), (64, 70, True))
 
 
 if __name__ == "__main__":

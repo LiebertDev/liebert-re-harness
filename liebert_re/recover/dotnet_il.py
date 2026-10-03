@@ -173,9 +173,13 @@ def parse_dotnet_metadata(path: str | Path) -> dict:
         "assembly": assembly,
         "types": types[:200],
         "type_count": len(types),
+        "types_truncated": len(types) > 200,
         "methods": methods[:400],
         "method_count": len(methods),
+        "methods_truncated": len(methods) > 400,
         "references": refs[:100],
+        "reference_count": len(refs),
+        "references_truncated": len(refs) > 100,
         "claims_ceiling": {"metadata": "PROVEN", "il": "UNKNOWN", "decompile": "UNKNOWN"},
         "execution_performed": False,
     }
@@ -276,6 +280,8 @@ def parse_il_body(data: bytes, file_offset: int) -> dict:
         "init_locals": init_locals,
         "instructions": instructions,
         "errors": errors[:32],
+        "error_count": len(errors),
+        "errors_truncated": len(errors) > 32,
         "unsupported_opcodes": sum(1 for e in errors if e.get("error") == "UNSUPPORTED_OPCODE"),
     }
 

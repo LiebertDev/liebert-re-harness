@@ -520,6 +520,8 @@ def parse_pub32_symbols(blob: bytes | None) -> dict:
         "status": status if not errors or symbols else "ANALYSIS_LIMITED",
         "symbols": symbols,
         "errors": errors[:32],
+        "error_count": len(errors),
+        "errors_truncated": len(errors) > 32,
     }
 
 
@@ -567,6 +569,8 @@ def resolve_public_symbol_rvas(symbols: list[dict], sections: list[dict] | None)
         "status": "RESOLVED" if resolved and not unresolved else "PARTIAL" if resolved else "SECTION_MAP_REQUIRED",
         "symbols": resolved,
         "unresolved": unresolved[:64],
+        "unresolved_count": len(unresolved),
+        "unresolved_truncated": len(unresolved) > 64,
     }
 
 
@@ -744,8 +748,12 @@ def find_owned_native_msf_pdbs(root: str | Path, *, max_files: int = 8000) -> di
         "found": candidates,
         "count": len(candidates),
         "skipped_synthetic": skipped_synthetic[:50],
+        "skipped_synthetic_count": len(skipped_synthetic),
         "skipped_non_msf": skipped_non_msf[:50],
+        "skipped_non_msf_count": len(skipped_non_msf),
         "parse_failures": parse_failures[:50],
+        "parse_failure_count": len(parse_failures),
+        "lists_truncated": max(len(skipped_synthetic), len(skipped_non_msf), len(parse_failures)) > 50,
         "status": "FOUND" if candidates else "NOT_EXECUTED_NO_REAL_OWNED_NATIVE_PDB",
     }
 

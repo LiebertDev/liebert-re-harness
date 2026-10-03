@@ -6,11 +6,27 @@ import hashlib
 import json
 import math
 import re
+import uuid
 from collections import Counter
 from pathlib import Path
 
 from liebert_re.tools.formats import file_identity
+from liebert_re.workspace import PROJECT_ROOT as APP_DIR
 from liebert_re.workspace import relative, safe_path
+
+try:
+    from liebert_re.evidence.index import _evidence_uid_for_path
+    from liebert_re.evidence.index import record_write as _evidence_index_record_write
+except ImportError:  # pragma: no cover - an indexing dependency must never block the probe
+    def _evidence_uid_for_path(*_args, **_kwargs):
+        return None
+
+    def _evidence_index_record_write(*_args, **_kwargs):
+        return {"ok": False, "error": "EVIDENCE_INDEX_UNAVAILABLE"}
+
+# Module attribute deliberately named EVIDENCE (tests/conftest.py redirects every
+# module's EVIDENCE away from the real ledger for the duration of a test).
+EVIDENCE = APP_DIR / "dataset" / "evidence" / "generic_static_probe"
 
 
 MAX_SAMPLE_BYTES = 256 * 1024
@@ -143,7 +159,32 @@ def generic_static_probe(path: str, max_strings: int = MAX_STRINGS) -> str:
         "execution_performed": False,
         "full_file_loaded_to_memory": False,
     }
+    _attach_evidence(result, target)
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _attach_evidence(result: dict, target: Path) -> None:
+    """Write the probe result to the evidence ledger and bind its identity into the result.
+    The identity (``EVX-...``) is the one the evidence index gives that file, derived from its
+    path, so it is quoted before the result is written and the file carries it too. When the file
+    cannot be written the result says so and ``evidence_id`` stays None: an id is never invented."""
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", target.stem)[:60] or "input"
+    out = Path(EVIDENCE) / f"{stem}_{uuid.uuid4().hex[:8]}_generic_static_probe.json"
+    evidence_id = _evidence_uid_for_path(out)
+    if evidence_id is None:
+        result["evidence_error"] = "EVIDENCE_PATH_OUTSIDE_INDEX_ROOT: no evidence identity can be derived for this path"
+        return
+    result["evidence_id"] = evidence_id
+    result["evidence_file"] = out.name
+    try:
+        Path(EVIDENCE).mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        result["evidence_id"] = None
+        result.pop("evidence_file", None)
+        result["evidence_error"] = f"EVIDENCE_NOT_WRITTEN: {type(exc).__name__}"
+        return
+    _evidence_index_record_write(out)
 
 
 if __name__ == "__main__":

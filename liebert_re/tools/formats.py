@@ -224,7 +224,7 @@ def archive_inspect(path,operation='summary',query='',member='',max_results=200,
         if any(x['compressed_size'] and x['size']/max(1,x['compressed_size'])>200 for x in items):warnings.append('HIGH_COMPRESSION_RATIO')
         manifests=[x['name'] for x in items if Path(x['name']).name.lower() in {'androidmanifest.xml','manifest.mf','package.json','info.plist','appxmanifest.xml','metadata.json'}]
         nested=[x['name'] for x in items if Path(x['name']).suffix.lower() in {'.zip','.jar','.apk','.ipa','.whl','.nupkg','.tar','.gz','.7z','.rar'}]
-        base={'ok':True,'tool':'archive_inspect','path':relative(p),'kind':kind,'member_count':len(items),'total_uncompressed_bytes':total,'manifest_candidates':manifests[:100],'nested_candidates':nested[:100],'warnings':warnings,'limits':{'max_members':MAX_ARCHIVE_MEMBERS,'max_total_bytes':MAX_ARCHIVE_TOTAL,'max_member_bytes':MAX_ARCHIVE_MEMBER},'truncated':len(items)>max_results}
+        base={'ok':True,'tool':'archive_inspect','path':relative(p),'kind':kind,'member_count':len(items),'total_uncompressed_bytes':total,'manifest_candidates':manifests[:100],'manifest_candidates_total':len(manifests),'manifest_candidates_truncated':len(manifests)>100,'nested_candidates':nested[:100],'nested_candidates_total':len(nested),'nested_candidates_truncated':len(nested)>100,'warnings':warnings,'limits':{'max_members':MAX_ARCHIVE_MEMBERS,'max_total_bytes':MAX_ARCHIVE_TOTAL,'max_member_bytes':MAX_ARCHIVE_MEMBER},'truncated':len(items)>max_results}
         selected=items
         if query:selected=[x for x in items if query.lower() in x['name'].lower()]
         if operation in {'summary','list','find'}: base['members']=selected[:max_results]; return _json(base)
@@ -425,11 +425,28 @@ def _config_schema(p,max_results=100):
                   'max_key_names_returned':max_keys,'max_sections_returned':MAX_CONFIG_SCHEMA_SECTIONS},
         'truncated':len(lines)>MAX_CONFIG_SCHEMA_LINES or unique_key_count>returned_keys or section_count>len(visible_sections),
     }
-def _load_structured(p):
+MAX_STRUCTURED_ROWS=5000
+MAX_STRUCTURED_BAD_LINES_REPORTED=20
+def _load_structured(p,notes=None):
+    """Load a structured file. For row formats (.jsonl, .csv) `notes`, when given, is filled with
+    the row cap, how many rows were read and how many existed, so a cut list is not read as the whole.
+    A bad JSONL line costs only that line: its number is listed and the other lines are kept."""
     if p.stat().st_size>MAX_STRUCTURED_BYTES:raise ValueError('STRUCTURED_FILE_TOO_LARGE')
     ext=p.suffix.lower(); text=text_of(p)
     if ext=='.json':return json.loads(text)
-    if ext=='.jsonl':return [json.loads(x) for x in text.splitlines()[:5000] if x.strip()]
+    if ext=='.jsonl':
+        rows=[]; bad=[]; skipped=0
+        for n,x in enumerate(text.splitlines(),1):
+            if not x.strip():continue
+            if len(rows)>=MAX_STRUCTURED_ROWS:skipped+=1;continue
+            try:rows.append(json.loads(x))
+            except ValueError as e:bad.append({'line':n,'error':str(e)[:100]})
+        if notes is not None:
+            notes.update(row_limit=MAX_STRUCTURED_ROWS,rows_returned=len(rows),unread_lines_past_limit=skipped,
+                         rows_total=None if skipped else len(rows),bad_line_count=len(bad),
+                         bad_lines=bad[:MAX_STRUCTURED_BAD_LINES_REPORTED],row_truncated=skipped>0)
+        if not rows and bad:raise ValueError('JSONL_NO_LINE_PARSED: line %d: %s'%(bad[0]['line'],bad[0]['error']))
+        return rows
     if ext in {'.yaml','.yml'}:
         import yaml; return yaml.safe_load(text)
     if ext=='.toml':
@@ -439,7 +456,11 @@ def _load_structured(p):
     if ext in {'.ini','.cfg'}:
         c=configparser.ConfigParser(); c.read_string(text); return {s:dict(c[s]) for s in c.sections()}
     if ext=='.csv':
-        return list(csv.DictReader(io.StringIO(text)))[:5000]
+        all_rows=list(csv.DictReader(io.StringIO(text)))
+        if notes is not None:
+            notes.update(row_limit=MAX_STRUCTURED_ROWS,rows_returned=min(len(all_rows),MAX_STRUCTURED_ROWS),rows_total=len(all_rows),
+                         row_truncated=len(all_rows)>MAX_STRUCTURED_ROWS)
+        return all_rows[:MAX_STRUCTURED_ROWS]
     if ext=='.xml':
         root=ET.fromstring(text); return {'root':root.tag,'attributes':root.attrib,'element_counts':dict(Counter(x.tag for x in root.iter()))}
     raise ValueError('UNSUPPORTED_STRUCTURED_FORMAT')
@@ -450,9 +471,11 @@ def structured_inspect(path,operation='summary',query='',max_results=100):
             return _json({'ok':False,'tool':'structured_inspect','path':relative(p),'operation':'schema','error':'CONFIG_SCHEMA_REQUIRES_INI_OR_CFG'})
         try:return _json(_config_schema(p,max_results))
         except Exception as e:return _json({'ok':False,'tool':'structured_inspect','path':relative(p),'operation':'schema','error':str(e)})
-    try:data=_load_structured(p)
+    notes={}
+    try:data=_load_structured(p,notes)
     except Exception as e:return _json({'ok':False,'tool':'structured_inspect','path':relative(p),'error':str(e)})
-    out={'ok':True,'tool':'structured_inspect','path':relative(p),'format':p.suffix.lower(),'shape':_shape(data),'truncated':False}
+    out={'ok':True,'tool':'structured_inspect','path':relative(p),'format':p.suffix.lower(),'shape':_shape(data),'truncated':bool(notes.get('row_truncated'))}
+    if notes:out['rows']=notes
     if out['format']=='.toml':
         try:import tomllib as _t;out['toml_parser']=_t.__name__
         except ImportError:out['toml_parser']='tomli (fallback: tomllib unavailable)'
@@ -467,7 +490,7 @@ def structured_inspect(path,operation='summary',query='',max_results=100):
             elif isinstance(v,list):
                 for i,x in enumerate(v):walk(x,f'{loc}[{i}]')
             elif query.lower() in str(v).lower():hits.append({'location':loc,'preview':str(v)[:300]})
-        walk(data); out['hits']=hits; out['truncated']=len(hits)>=max_results
+        walk(data); out['hits']=hits; out['truncated']=out['truncated'] or len(hits)>=max_results
     return _json(out)
 
 MAX_HAR_STREAM_ENTRIES=2_000_000
@@ -545,7 +568,7 @@ def sqlite_inspect(path,operation='summary',table='',query='',max_rows=100):
     p=safe_path(path); uri=p.as_uri()+'?mode=ro&immutable=1'; max_rows=max(1,min(int(max_rows),500)); con=sqlite3.connect(uri,uri=True); con.row_factory=sqlite3.Row
     try:
         tables=[dict(x) for x in con.execute("SELECT name,type,sql FROM sqlite_master WHERE type IN ('table','view') ORDER BY name").fetchall()]
-        out={'ok':True,'tool':'sqlite_inspect','path':relative(p),'tables':tables[:200],'table_count':len(tables),'read_only':True}
+        out={'ok':True,'tool':'sqlite_inspect','path':relative(p),'tables':tables[:200],'table_count':len(tables),'tables_truncated':len(tables)>200,'read_only':True}
         if operation=='schema' and table:
             if table not in {x['name'] for x in tables}:return _json({**out,'ok':False,'error':'TABLE_NOT_FOUND'})
             out['columns']=[dict(x) for x in con.execute(f'PRAGMA table_info("{table.replace(chr(34),chr(34)*2)}")')]

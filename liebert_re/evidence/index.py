@@ -335,6 +335,97 @@ def _summarize_json(payload, max_chars=280):
     return summary[:max_chars]
 
 
+# Field names a JSONL event record is read for. Chosen from the one JSONL the
+# harness itself writes (the lock-reclaim log: ``reason``, ``reclaimed_by_pid``,
+# ``reclaimed_at``) plus the common event-log spellings; a record that carries
+# none of them contributes nothing for that field.
+_JSONL_EVENT_KEYS = ("event", "event_type", "type", "kind", "reason")
+_JSONL_PID_KEYS = ("pid", "process_id", "reclaimed_by_pid")
+_JSONL_TIME_KEYS = ("timestamp", "time", "ts", "at", "reclaimed_at", "created_at")
+MAX_JSONL_BAD_LINES_REPORTED = 5
+_NL = chr(10)
+
+
+def _parse_jsonl(text, truncated):
+    """Read JSONL one line at a time. A bad line costs only that line: the
+    result names WHICH lines failed and how many were read. Blank lines are
+    skipped. When the bounded read was cut, the last line is a fragment and is
+    dropped and counted rather than reported as a parse failure."""
+    lines = text.split(_NL)
+    dropped_tail = False
+    if truncated and lines:
+        lines.pop()
+        dropped_tail = True
+    records, bad = [], []
+    non_blank = 0
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        non_blank += 1
+        try:
+            records.append(json.loads(line))
+        except ValueError as exc:
+            bad.append((number, f"{type(exc).__name__}: {exc}"[:120]))
+    return {"records": records, "non_blank": non_blank, "bad": bad, "dropped_tail": dropped_tail}
+
+
+def _jsonl_field_values(records, keys):
+    seen = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for key in keys:
+            value = record.get(key)
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool) and str(value):
+                if str(value) not in seen:
+                    seen.append(str(value))
+                break
+    return seen
+
+
+def _summarize_jsonl(parsed, max_chars=280):
+    records, bad = parsed["records"], parsed["bad"]
+    bits = [f"jsonl lines_ok={len(records)}/{parsed['non_blank']}"]
+    if bad:
+        more = f",+{len(bad) - MAX_JSONL_BAD_LINES_REPORTED} more" if len(bad) > MAX_JSONL_BAD_LINES_REPORTED else ""
+        bits.append("bad_lines=" + ",".join(str(n) for n, _ in bad[:MAX_JSONL_BAD_LINES_REPORTED]) + more)
+    if parsed["dropped_tail"]:
+        bits.append("partial_last_line_dropped")
+    events = _jsonl_field_values(records, _JSONL_EVENT_KEYS)
+    pids = _jsonl_field_values(records, _JSONL_PID_KEYS)
+    times = _jsonl_field_values(records, _JSONL_TIME_KEYS)
+    if events:
+        bits.append("events=" + ",".join(events[:4]))
+    if pids:
+        bits.append("pids=" + ",".join(pids[:4]))
+    if times:
+        bits.append(f"time={times[0]}..{times[-1]}")
+    return " ".join(bits)[:max_chars]
+
+
+def _jsonl_row_fields(text, read_error):
+    """status/summary/parse_error/target_hash/session_id/anchors for a JSONL body."""
+    parsed = _parse_jsonl(text, read_error == "TRUNCATED")
+    bad, records = parsed["bad"], parsed["records"]
+    parse_error = None
+    if bad or (parsed["non_blank"] == 0 and text.strip()):
+        status = "json_malformed" if not records else "jsonl_partial"
+        first = bad[0] if bad else (1, "no complete line in the bounded read")
+        parse_error = (f"line {first[0]}: {first[1]}; {len(bad)} bad line(s), "
+                       f"{len(records)} of {parsed['non_blank']} read")[:300]
+    else:
+        status = "json_ok"
+        if parsed["dropped_tail"]:
+            parse_error = "TRUNCATED: bounded read; last partial line dropped"
+    target_hash = session_id = None
+    for record in records:
+        if isinstance(record, dict):
+            target_hash = target_hash or _extract_target_hash(record)
+            session_id = session_id or _extract_session_id(record)
+    return {"status": status, "summary": _summarize_jsonl(parsed), "parse_error": parse_error,
+            "target_hash": target_hash, "session_id": session_id, "anchors": _extract_anchors(None, text)}
+
+
 class EvidenceIndex:
     """Query surface over ``dataset/evidence/``. Never mutates the corpus
     itself -- read-only over the evidence tree, all writes go to this
@@ -468,7 +559,7 @@ class EvidenceIndex:
             # records_ad trigger.
             db.execute("DELETE FROM records WHERE id=?", (old_row["id"],))
         row = self._build_row(full, rel, stat)
-        malformed = row.get("status") == "json_malformed"
+        malformed = row.get("status") in ("json_malformed", "jsonl_partial")
         record_id = _deterministic_record_id(rel)
         evidence_uid = _evidence_uid(rel)
         db.execute(
@@ -658,6 +749,14 @@ class EvidenceIndex:
             text, read_error = _read_bounded(full, MAX_CONTENT_BYTES)
             if text is None:
                 status, summary, parse_error = "read_error", "unreadable", read_error
+            elif ext == ".jsonl":
+                # line by line: one bad line must not discard the lines that parse
+                body_excerpt = text
+                fields = _jsonl_row_fields(text, read_error)
+                status, summary, parse_error = fields["status"], fields["summary"], fields["parse_error"]
+                target_hash = fields["target_hash"]
+                session_id = session_id or fields["session_id"]
+                anchors = fields["anchors"]
             else:
                 body_excerpt = text
                 try:
@@ -702,6 +801,7 @@ class EvidenceIndex:
                 "records": db.execute("SELECT COUNT(*) FROM records").fetchone()[0],
                 "json_ok": db.execute("SELECT COUNT(*) FROM records WHERE status='json_ok'").fetchone()[0],
                 "malformed": db.execute("SELECT COUNT(*) FROM records WHERE status='json_malformed'").fetchone()[0],
+                "jsonl_partial": db.execute("SELECT COUNT(*) FROM records WHERE status='jsonl_partial'").fetchone()[0],
                 "non_json": db.execute("SELECT COUNT(*) FROM records WHERE status='non_json'").fetchone()[0],
                 "distinct_targets": db.execute("SELECT COUNT(DISTINCT target) FROM records WHERE target IS NOT NULL").fetchone()[0],
                 "distinct_tools": db.execute("SELECT COUNT(DISTINCT tool) FROM records WHERE tool IS NOT NULL").fetchone()[0],
@@ -1041,6 +1141,18 @@ def record_write(path, root=None, db_path=None, lock_timeout_seconds=5):
         return index.index_one(path, lock_timeout_seconds=lock_timeout_seconds)
     except Exception as exc:  # noqa: BLE001 - see docstring: this must never propagate
         return {"ok": False, "tool": "evidence_index", "operation": "index_one", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _evidence_uid_for_path(path, root=None):
+    """The stable identity (``EVX-...``) the index gives the record at ``path``,
+    derived from its path under the evidence root alone, so a writer can quote
+    it before or without the index having run. None when the path is outside
+    the root; never raises."""
+    try:
+        base = Path(root).expanduser().resolve() if root else EVIDENCE_ROOT_DEFAULT.resolve()
+        return _evidence_uid(Path(path).resolve().relative_to(base).as_posix())
+    except (OSError, ValueError):
+        return None
 
 
 def evidence_index(operation="status", root=None, target="", tool="", query="", record_id=None, path="",

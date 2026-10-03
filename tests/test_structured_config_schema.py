@@ -118,5 +118,40 @@ class StructuredConfigSchemaTests(unittest.TestCase):
             result = self.parse(structured_inspect(str(path)))
         self.assertFalse(result["ok"])
 
+
+class StructuredRowsTests(unittest.TestCase):
+    def _inspect(self, name, body, **kw):
+        import tempfile
+        import liebert_re.workspace as tools_workspace
+        with tempfile.TemporaryDirectory(dir=tools_workspace.WORKSPACE) as td:
+            path = Path(td) / name
+            path.write_bytes(body)
+            return json.loads(structured_inspect(str(path), **kw))
+
+    def test_jsonl_with_a_bad_line_keeps_the_good_lines_and_names_the_bad_one(self):
+        result = self._inspect("e.jsonl", b'{"a": 1}\nnot json\n{"a": 2}\n\n{"a": 3}\n')
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["rows"]["rows_returned"], 3)
+        self.assertEqual(result["rows"]["bad_line_count"], 1)
+        self.assertEqual(result["rows"]["bad_lines"][0]["line"], 2)
+        self.assertFalse(result["truncated"])
+
+    def test_jsonl_with_no_parsable_line_fails_naming_the_line(self):
+        result = self._inspect("e.jsonl", b"nope\n")
+        self.assertFalse(result["ok"])
+        self.assertIn("line 1", result["error"])
+
+    def test_row_cap_is_reported_not_silent(self):
+        import liebert_re.tools.formats as formats
+        from unittest import mock
+        with mock.patch.object(formats, "MAX_STRUCTURED_ROWS", 3):
+            jsonl = self._inspect("e.jsonl", b"".join(b'{"i": %d}\n' % i for i in range(5)))
+            csv_result = self._inspect("e.csv", b"i\n" + b"".join(b"%d\n" % i for i in range(5)))
+        self.assertTrue(jsonl["truncated"])
+        self.assertEqual((jsonl["rows"]["rows_returned"], jsonl["rows"]["row_limit"], jsonl["rows"]["unread_lines_past_limit"]), (3, 3, 2))
+        self.assertTrue(csv_result["truncated"])
+        self.assertEqual((csv_result["rows"]["rows_returned"], csv_result["rows"]["rows_total"]), (3, 5))
+
+
 if __name__ == "__main__":
     unittest.main()

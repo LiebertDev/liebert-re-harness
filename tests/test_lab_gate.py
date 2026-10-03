@@ -327,6 +327,19 @@ class TestPeSieveBehindTheGate:
         assert record["result"]["error"] == "PE_SIEVE_NO_JSON_OUTPUT"
         assert record["target_identity_unchanged_after_run"] is True
 
+    def test_the_gate_record_holds_the_full_result_but_the_response_gate_keeps_the_short_outcome(self, scan, child, image_sha, lab_open):
+        data = json.loads(ps.pe_sieve_scan(child.pid, authorization=_auth(child.pid), sample_sha256=image_sha,
+                                           timeout_seconds=30))
+        gate = data["lab_gate"]
+        record = json.loads((lg.EVIDENCE / gate["evidence_name"]).read_text(encoding="utf-8"))
+        full = record["result"]["full_result"]
+        assert full["error"] == "PE_SIEVE_NO_JSON_OUTPUT" and full["tool"] == data["tool"]
+        assert full["invoked_argv"] == data["invoked_argv"]
+        assert "lab_gate" not in full, "the record keeps the scan result, not a copy of the gate inside itself"
+        # the response is unchanged: its gate carries the short outcome, never the full result
+        assert set(gate["result"]) == {"status", "ok", "error"}
+        assert "full_result" not in gate["result"]
+
     def test_memory_limit_outcomes_are_not_findings(self, scan, child, image_sha, lab_open):
         kw = {"authorization": _auth(child.pid), "sample_sha256": image_sha}
         scan.return_value = BoundedProcessResult(None, "", "", resource_limit_unavailable=True)
