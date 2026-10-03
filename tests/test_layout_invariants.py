@@ -20,7 +20,8 @@ import liebert_re.report.tool_families as tool_families
 # duplicates it.
 EVIDENCE_OWNERS = {
     "liebert_re.dynamic.apimonitor", "liebert_re.dynamic.lab_gate", "liebert_re.tools.binary", "liebert_re.tools.capa",
-    "liebert_re.tools.die", "liebert_re.tools.ida", "liebert_re.tools.pe_sieve", "liebert_re.tools.rizin",
+    "liebert_re.tools.die", "liebert_re.tools.generic_static_probe", "liebert_re.tools.ida",
+    "liebert_re.tools.pe_sieve", "liebert_re.tools.rizin",
     "liebert_re.tools.upx", "liebert_re.tools.yara_x",
 }
 
@@ -130,7 +131,18 @@ def test_published_tool_name_set_is_unchanged():
     # 644 -> 655, and the digest was recomputed from the source, not edited by hand. The resolver
     # logic for "where was it found" lives nested inside each status function, so no private
     # helper joined the set. No module was added: the CI module count stays 70.
+    #
+    # Updated again, once for three merged branches (655 -> 667, twelve top-level names, digest
+    # recomputed from the source). IDA read/plan branch, three public functions in
+    # liebert_re/tools/ida.py: ida_annotations (annotation reader), ida_type_member_offset (type
+    # member offset) and ida_patch_plan (patch plan; nothing persists). Evidence-chain branch,
+    # private top-level helpers that the pin counts because they are top-level defs: _parse_jsonl,
+    # _jsonl_row_fields, _jsonl_field_values, _summarize_jsonl (line-by-line JSONL evidence),
+    # _limit_marker (marks truncated lists), _attach_evidence and _evidence_uid_for_path (bind probe
+    # and gate evidence) and _engine_tag (IDA cache key carries the engine version).
+    # API monitor refusals branch: _working_operations_note. The new patch_plan.idapy is a data
+    # file, not a module: the CI module count stays 70.
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "0bcd457fdaf602a6d679d486a16b1dc6985722603b2df3923c8abab5b3217e58"
+    assert digest == "68a069615268a853a6f36d1587cfae25512e664d5ee09fd48b56a54a639b0c45"
