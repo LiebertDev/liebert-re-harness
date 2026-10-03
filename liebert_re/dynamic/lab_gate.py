@@ -33,7 +33,15 @@ established is a refusal, never a pass):
   record cannot be written the run is refused (``ANALYSIS_LIMITED`` with
   ``environment_error``). An observation made from an elevated context is not the same
   observation as one from a normal context; ``privilege.elevated`` records which it was. The
-  gate never elevates anything and never raises the target's rights.
+  gate never elevates anything and never raises the target's rights. The record's file name
+  never contains the caller's operation text (it is reduced to ``[A-Za-z0-9_]``; the raw text
+  stays INSIDE the record) and a path that resolves outside the evidence folder is refused.
+  The operation cannot be undone once it ran, so a final record that cannot be written means
+  the RESULT is withheld: the response is ``EVIDENCE_FINALIZE_FAILED`` and says the operation ran.
+* IDENTITY, TWICE. Immediately before the operation starts the target's PID, creation time and
+  image path are read again; a target that no longer matches what the gate approved is not
+  started (``TARGET_IDENTITY_DRIFTED``). The same check after the run is kept and reported. The
+  window between the last check and the start is narrowed, not closed.
 
 NOT ENFORCED, and reported as not verified every time (``isolation_verified: false``): an
 isolated, single-use guest; a known snapshot and rollback path; network off or allow-listed.
@@ -227,11 +235,20 @@ class LabGate:
         return None
 
     @staticmethod
+    def safe_name(text):
+        """A file-name part from caller text: ``[A-Za-z0-9_]`` only, bounded, never empty."""
+        return re.sub(r"[^A-Za-z0-9_]", "_", text)[:48] if isinstance(text, str) and text else "none"
+
+    @staticmethod
     def write(name, record):
         """None on success, else an environment_error dict."""
         try:
             EVIDENCE.mkdir(parents=True, exist_ok=True)
-            (EVIDENCE / name).write_text(json.dumps(record, ensure_ascii=False, default=str), encoding="utf-8")
+            destination = EVIDENCE / name
+            if destination.resolve().parent != EVIDENCE.resolve():
+                return {"type": "EvidencePathEscape", "errno": None,
+                        "strerror": "the evidence file would resolve outside the evidence folder; nothing was written"}
+            destination.write_text(json.dumps(record, ensure_ascii=False, default=str), encoding="utf-8")
             return None
         except OSError as exc:
             return {"type": type(exc).__name__, "errno": exc.errno, "strerror": exc.strerror or type(exc).__name__}
@@ -267,7 +284,7 @@ class LabGate:
                 checks.append({"check": later, "result": "not_evaluated"})
             decision.update(ok=False, decision="REFUSE", status=status, error=error, detail=detail,
                             enforced=[c["check"] for c in checks if c["result"] == "passed"])
-            name_out = f"{decision['operation']}_pid{number}_{uuid.uuid4().hex[:8]}_gate_refused.json"
+            name_out = f"{LabGate.safe_name(decision['operation'])}_pid{number}_{uuid.uuid4().hex[:8]}_gate_refused.json"
             decision["evidence_name"] = name_out
             decision["evidence_write_error"] = LabGate.write(name_out, decision)
             return decision
@@ -356,22 +373,60 @@ class LabGate:
         return decision
 
     @staticmethod
+    def same_identity(identity):
+        """True only if the process with this PID still has the approved creation time and image."""
+        now, _bad = LabGate.target(identity["pid"])
+        return bool(now and now["create_time"] == identity.get("create_time")
+                    and os.path.normcase(now["image"]) == os.path.normcase(identity["image"]))
+
+    @staticmethod
+    def recheck_identity(decision):
+        """Run immediately before the operation starts. None if the target is still the approved
+        process; else a refusal dict, and the gate record says the re-check failed."""
+        identity = decision.get("target") or {}
+        if not identity.get("pid") or not identity.get("image"):
+            same = False
+        else:
+            same = LabGate.same_identity(identity)
+        decision["checks"].append({"check": "identity_recheck", "result": "passed" if same else "failed",
+                                   "detail": "pid, creation time and image path unchanged since the gate passed"
+                                             if same else "pid, creation time or image path differs from what the gate approved, or the process is gone"})
+        if same:
+            decision["enforced"] = [c["check"] for c in decision["checks"] if c["result"] == "passed"]
+            return None
+        detail = ("the target is no longer the process the gate approved (pid, creation time or image path "
+                  "changed, or it is gone); the operation was not started")
+        decision.update(ok=False, decision="REFUSE", status="TARGET_IDENTITY_DRIFTED",
+                        error="TARGET_IDENTITY_DRIFTED_BEFORE_START", detail=detail)
+        return {"status": "TARGET_IDENTITY_DRIFTED", "error": "TARGET_IDENTITY_DRIFTED_BEFORE_START", "detail": detail}
+
+    @staticmethod
     def finish(decision, command, outcome):
         """Complete the evidence record with the exact command and the result, and note whether the
         target was still the same process afterwards. Returns an error dict or None."""
         try:
             identity = decision.get("target") or {}
-            same = None
-            if identity.get("pid"):
-                now, _bad = LabGate.target(identity["pid"])
-                same = bool(now and now["create_time"] == identity.get("create_time")
-                            and os.path.normcase(now["image"]) == os.path.normcase(identity["image"]))
+            same = LabGate.same_identity(identity) if identity.get("pid") else None
             decision.update(invoked_argv=command, result=outcome,
                             finished_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                             target_identity_unchanged_after_run=same)
             return LabGate.write(decision["evidence_name"], decision)
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, TypeError, ValueError, KeyError) as exc:
             return {"type": type(exc).__name__, "errno": None, "strerror": str(exc)}
+
+    @staticmethod
+    def withheld(tool, pid, gate, error, operation_ran, result):
+        """The response when the final evidence record could not be written: the result is NOT
+        returned. It says the operation ran (or may have) and that it was not recorded."""
+        return {"ok": False, "tool": tool, "pid": pid, "status": "EVIDENCE_FINALIZE_FAILED",
+                "error": "RESULT_WITHHELD_EVIDENCE_NOT_WRITTEN", "operation_ran": operation_ran,
+                "result_withheld": True, "evidence_finalize_error": error,
+                "environment_error": error, "invoked_argv": result.get("invoked_argv"),
+                "lab_gate": {k: v for k, v in gate.items() if k != "result"},
+                "detail": "the operation " + ("ran" if operation_ran else "may have run" if operation_ran is None
+                                              else "did not start") +
+                          ", but its final evidence record could not be written, so its result is withheld; a "
+                          "result without evidence is not returned. This describes this machine, not the target."}
 
 
 def dynamic_lab_gate(operation=None, pid=None, authorization=None, sample_sha256=None,
@@ -382,7 +437,9 @@ def dynamic_lab_gate(operation=None, pid=None, authorization=None, sample_sha256
     ``ISOLATION_REQUIRED``, ``AUTHORIZATION_REQUIRED``, ``PID_REQUIRED``, ``PROCESS_NOT_OWNED``,
     ``OWNERSHIP_UNVERIFIABLE``, ``SAMPLE_HASH_REQUIRED``, ``SAMPLE_HASH_MISMATCH``,
     ``SAMPLE_HASH_UNVERIFIABLE``, ``BOUNDS_REQUIRED``, ``RESOURCE_LIMIT_UNAVAILABLE`` or
-    ``ANALYSIS_LIMITED`` (with ``environment_error``). Every response carries ``checks`` (each
+    ``ANALYSIS_LIMITED`` (with ``environment_error``). An operation that runs behind the gate adds
+    ``TARGET_IDENTITY_DRIFTED`` (re-check before the start failed; nothing started) and
+    ``EVIDENCE_FINALIZE_FAILED`` (it ran, the final record could not be written, result withheld). Every response carries ``checks`` (each
     check passed, failed or not_evaluated), ``enforced``, ``isolation_verified`` (always false
     today) and ``isolation.unmet_prerequisites``. A pass here authorizes nothing by itself; the
     operation re-runs the gate before it starts.

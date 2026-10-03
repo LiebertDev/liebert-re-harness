@@ -318,14 +318,26 @@ class _PeSieve:
         """Attach the gate record to a result and finish its evidence with the exact command."""
         result = json.loads(out)
         outcome = {"status": result.get("status"), "ok": result.get("ok"), "error": result.get("error")}
-        gate["evidence_finalize_error"] = LabGate.finish(gate, result.get("invoked_argv"), outcome)
+        error = LabGate.finish(gate, result.get("invoked_argv"), outcome)
+        gate["evidence_finalize_error"] = error
+        if error:
+            # The operation already ran and cannot be undone; the result is what can still be refused.
+            return _j(LabGate.withheld(result.get("tool", "pe_sieve_scan"), result.get("pid"), gate, error,
+                                       bool(result.get("invoked_argv")), result))
         result["lab_gate"] = gate
+        same = gate.get("target_identity_unchanged_after_run")
+        result["target_identity_unchanged_after_run"] = same
+        if same is False:
+            result["identity_drift_after_run"] = ("the process with this pid no longer has the creation time or "
+                                                  "image the gate approved; this result may describe another process")
         return _j(result)
 
     @staticmethod
     def execute(tool, number, iat, shellcode, obfuscation, data, dotnet_policy, threads,
-                timeout_seconds, cancellation_token):
-        """Everything that happens AFTER the lab gate passed. Returns the JSON string."""
+                timeout_seconds, cancellation_token, gate=None):
+        """Everything that happens AFTER the lab gate passed. Returns the JSON string. When the
+        gate's decision is passed in, the target's identity is re-read immediately before the
+        scanner starts and a drifted target is not scanned."""
         tail_args, flags, bad = _PeSieve.options(iat, shellcode, obfuscation, data, dotnet_policy, threads)
         if bad:
             return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
@@ -340,6 +352,11 @@ class _PeSieve:
         env = {**os.environ, "MSYS_NO_PATHCONV": "1", "MSYS2_ARG_CONV_EXCL": "*"}
         base = {"tool": tool, "pid": number, "scanner": exe, "scanner_bitness": _PeSieve.bitness(exe),
                 "resolved_by": how, "invoked_argv": argv, "scan_flags": flags}
+        if gate is not None:
+            drift = LabGate.recheck_identity(gate)
+            if drift:
+                return _j({"ok": False, "tool": tool, "pid": number, "status": drift["status"], "error": drift["error"],
+                           "detail": drift["detail"] + ". Nothing was started."})
         cp = run_bounded_process(argv, timeout_seconds=timeout_seconds, cancellation_token=cancellation_token,
                                  environment=env, max_output_chars=_MAX_OUTPUT_CHARS,
                                  max_memory_bytes=_MAX_SCANNER_MEMORY_BYTES)
@@ -516,6 +533,11 @@ def pe_sieve_scan(pid=None, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS, cancellati
     * `AUTHORIZATION_REQUIRED`, `SAMPLE_HASH_REQUIRED`, `SAMPLE_HASH_MISMATCH`,
       `SAMPLE_HASH_UNVERIFIABLE`, `PROCESS_NOT_OWNED`, `OWNERSHIP_UNVERIFIABLE`,
       `RESOURCE_LIMIT_UNAVAILABLE`: refused by the lab gate before anything started.
+    * `TARGET_IDENTITY_DRIFTED`  the target's pid, creation time or image path no longer matched
+                       what the gate approved when it was re-read just before the scanner
+                       would start; nothing was started.
+    * `EVIDENCE_FINALIZE_FAILED`  the scan ran but its final evidence record could not be
+                       written, so the result is withheld (`operation_ran`, `result_withheld`).
     * `PID_REQUIRED`, `TOOL_MISSING`, `TIMEOUT`, `CANCELLED`, `ANALYSIS_LIMITED`
       (including `environment_error` for a local OS failure),
       `RESULT_PARSE_FAILED`.
@@ -538,7 +560,7 @@ def pe_sieve_scan(pid=None, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS, cancellati
                 refused["environment_error"] = gate["environment_error"]
             return _j(refused)
         out = _PeSieve.execute(tool, number, iat, shellcode, obfuscation, data, dotnet_policy, threads,
-                               timeout_seconds, cancellation_token)
+                               timeout_seconds, cancellation_token, gate)
         return _PeSieve.with_gate(out, gate)
     except Exception as exc:  # noqa: BLE001 - the contract is a JSON string, never an exception
         if isinstance(exc, OSError):
@@ -547,6 +569,9 @@ def pe_sieve_scan(pid=None, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS, cancellati
             result = {"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
                       "error": "PE_SIEVE_UNEXPECTED_ERROR", "detail": f"{type(exc).__name__}: {exc}"}
         if gate is not None and gate.get("ok"):
+            error = LabGate.finish(gate, None, {"status": result["status"], "error": result["error"]})
+            gate["evidence_finalize_error"] = error
+            if error:
+                return _j(LabGate.withheld(tool, number if isinstance(number, int) else None, gate, error, None, {}))
             result["lab_gate"] = gate
-            gate["evidence_finalize_error"] = LabGate.finish(gate, None, {"status": result["status"], "error": result["error"]})
         return _j(result)

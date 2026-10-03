@@ -348,6 +348,88 @@ class TestPeSieveBehindTheGate:
         assert data["status"] == "ANALYSIS_LIMITED" and data["environment_error"]["type"] and not scan.called
 
 
+class TestAuditFixes:
+    """The three defects the adversarial audit found. No real process: the gate's decision and the
+    target lookup are faked, only the code under test is real."""
+
+    IDENTITY = {"pid": 4242, "create_time": 1000.5, "image": r"C:ake	arget.exe", "parent_pid": 1, "state": "running"}
+
+    @pytest.fixture()
+    def passed_gate(self, tmp_path):
+        def fake_check(*_a, **_k):
+            return {"ok": True, "decision": "ALLOW", "status": "GATE_PASSED", "isolation_verified": False,
+                    "target": dict(self.IDENTITY), "checks": [{"check": "evidence_writable", "result": "passed"}],
+                    "enforced": ["evidence_writable"], "evidence_name": "pe_sieve_scan_pid4242_fake_gate.json"}
+        with mock.patch.object(lg, "EVIDENCE", tmp_path),              mock.patch.object(lg.LabGate, "check", side_effect=fake_check),              mock.patch.object(ps, "EVIDENCE", tmp_path / "ps"),              mock.patch.object(ps._PeSieve, "candidates", return_value=[(r"C:ake\pe-sieve64.exe", "PATH")]),              mock.patch.object(ps, "run_bounded_process") as run:
+            run.return_value = BoundedProcessResult(1, "", "no json here")
+            yield run
+
+    def _scan(self):
+        return json.loads(ps.pe_sieve_scan(4242, authorization=_auth(4242), sample_sha256="0" * 64))
+
+    def test_a_path_escaping_operation_name_cannot_leave_the_evidence_folder(self, tmp_path):
+        evidence = tmp_path / "evidence"
+        hostile = ("..", "..\\", "../../outside", "a/../../b", r"x\..\..\y", r"C:\abs", "\x00bad", "")
+        with mock.patch.object(lg, "EVIDENCE", evidence):
+            for operation in hostile:
+                data = json.loads(lg.dynamic_lab_gate(operation=operation, pid=1))
+                assert data["status"] == "UNKNOWN_OPERATION" and data["evidence_write_error"] is None
+                written = (evidence / data["evidence_name"]).resolve()
+                assert written.parent == evidence.resolve() and written.is_file()
+                assert data["evidence_name"].isascii() and not any(c in data["evidence_name"] for c in "/\\:")
+                record = json.loads(written.read_text(encoding="utf-8"))
+                assert record["operation"] == operation  # the raw text stays in the record
+        assert [p for p in tmp_path.rglob("*.json") if evidence.resolve() not in p.resolve().parents] == []
+
+    def test_write_refuses_a_name_that_resolves_outside_the_evidence_folder(self, tmp_path):
+        evidence = tmp_path / "evidence"
+        with mock.patch.object(lg, "EVIDENCE", evidence):
+            error = lg.LabGate.write("../escaped.json", {"x": 1})
+        assert error and error["type"] == "EvidencePathEscape" and not (tmp_path / "escaped.json").exists()
+
+    def test_a_final_record_that_cannot_be_written_withholds_the_result(self, passed_gate):
+        with mock.patch.object(lg.LabGate, "target", return_value=(dict(self.IDENTITY), None)),              mock.patch.object(lg.LabGate, "write", return_value={"type": "OSError", "errno": 28, "strerror": "disk full"}):
+            data = self._scan()
+        assert passed_gate.called  # the scanner did run: it cannot be undone
+        assert data["ok"] is False and data["status"] == "EVIDENCE_FINALIZE_FAILED"
+        assert data["operation_ran"] is True and data["result_withheld"] is True
+        assert data["evidence_finalize_error"]["strerror"] == "disk full"
+        assert data["lab_gate"]["evidence_finalize_error"]["errno"] == 28
+        assert "anomalies_found" not in data and "PE_SIEVE_NO_JSON_OUTPUT" not in json.dumps(data)
+
+    def test_an_exception_path_also_withholds_when_the_record_cannot_be_written(self, passed_gate):
+        passed_gate.side_effect = RuntimeError("boom")
+        with mock.patch.object(lg.LabGate, "target", return_value=(dict(self.IDENTITY), None)),              mock.patch.object(lg.LabGate, "write", return_value={"type": "OSError", "errno": 5, "strerror": "io"}):
+            data = self._scan()
+        assert data["status"] == "EVIDENCE_FINALIZE_FAILED" and data["operation_ran"] is None
+
+    def test_a_target_that_drifted_before_the_start_is_not_scanned(self, passed_gate):
+        for drifted in ({**self.IDENTITY, "create_time": 2000.0}, {**self.IDENTITY, "image": r"C:\other.exe"}):
+            with mock.patch.object(lg.LabGate, "target", return_value=(drifted, None)):
+                data = self._scan()
+            assert not passed_gate.called
+            assert data["ok"] is False and data["status"] == "TARGET_IDENTITY_DRIFTED"
+            assert "Nothing was started" in data["detail"]
+            assert data["lab_gate"]["checks"][-1] == {**data["lab_gate"]["checks"][-1], "check": "identity_recheck", "result": "failed"}
+        with mock.patch.object(lg.LabGate, "target", return_value=(None, ("PROCESS_NOT_OWNED", "gone"))):
+            assert self._scan()["status"] == "TARGET_IDENTITY_DRIFTED" and not passed_gate.called
+
+    def test_without_drift_the_normal_flow_is_unchanged(self, passed_gate):
+        with mock.patch.object(lg.LabGate, "target", return_value=(dict(self.IDENTITY), None)):
+            data = self._scan()
+        assert passed_gate.called and data["status"] == "ANALYSIS_LIMITED" and data["error"] == "PE_SIEVE_NO_JSON_OUTPUT"
+        assert data["target_identity_unchanged_after_run"] is True and "identity_drift_after_run" not in data
+        assert data["lab_gate"]["evidence_finalize_error"] is None
+        assert [c["result"] for c in data["lab_gate"]["checks"] if c["check"] == "identity_recheck"] == ["passed"]
+
+    def test_drift_after_the_run_is_still_detected_and_carried_in_the_result(self, passed_gate):
+        drifted = {**self.IDENTITY, "create_time": 2000.0}
+        with mock.patch.object(lg.LabGate, "target", side_effect=[(dict(self.IDENTITY), None), (drifted, None)]):
+            data = self._scan()
+        assert passed_gate.called and data["target_identity_unchanged_after_run"] is False
+        assert "identity_drift_after_run" in data and data["lab_gate"]["target_identity_unchanged_after_run"] is False
+
+
 class TestCli:
     def _run(self, *argv):
         buf = io.StringIO()
