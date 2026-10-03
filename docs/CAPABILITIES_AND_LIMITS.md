@@ -168,7 +168,13 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
   one manifest pointer and journals `batch_committed`. Annotated data lives in its own root
   (`dataset/ida_annotated/`, never inside the cache, never evicted; byte ceiling `LIEBERT_IDA_ANNOTATED_BYTES`,
   default 2 GiB) with its own locks. A candidate whose promotion failed is kept. Atomic is the default;
-  `allow_partial=True` is an explicit choice. Comments are not written yet; there is no purge operation yet.
+  `allow_partial=True` is an explicit choice. Comments are not written yet.
+- `ida_annotations_purge`: the only deletion of annotated data. Called without a confirmation it deletes nothing
+  and reports what the scope holds and what the named targets would free; the report carries a token bound to
+  the input hash, label, the exact targets and their measured state, and a changed scope is
+  `STALE_CONFIRMATION`. Targets are exact names (versions, kept candidates, leftover work directories, and
+  `unverified-state`, which clears an unverified scope and says it did); there is no wildcard and no "all".
+  It reaches only the annotated root and journals every deletion.
 - Not here: comments, disassembly listing, and any
   Ghidra wrapper.
 

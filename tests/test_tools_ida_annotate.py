@@ -893,7 +893,7 @@ class CacheSeparationTests(AnnotateCase):
             if fn.name != "_copy_pristine":
                 self.assertNotIn("_enforce_cache_budget", names, fn.name)
                 self.assertNotIn("_slot_dir", _referenced_names(fn), fn.name)
-            if fn.name != "_remove_owned_work":
+            if fn.name not in ("_remove_owned_work", "_purge_remove"):
                 self.assertNotIn("rmtree", names, fn.name)
         copy_pristine = next(fn for fn in inside if fn.name == "_copy_pristine")
         self.assertNotIn("rmtree", _called_names(copy_pristine))
@@ -1126,6 +1126,262 @@ class WorkerLogicTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # the real engine
 # ---------------------------------------------------------------------------
+class PurgeCase(AnnotateCase):
+    def purge(self, targets=None, token=None, label="first-pass", path=None):
+        return json.loads(ti.ida_annotations_purge(str(path or self.sample), label, targets, token))
+
+    def confirmed(self, targets, label="first-pass"):
+        report = self.purge(targets, label=label)
+        self.assertEqual(report["status"], "REPORT_ONLY", report)
+        return self.purge(targets, report["confirm_token"], label=label)
+
+    def keep_a_candidate(self):
+        real = ti._replace_file
+        with mock.patch.object(ti, "_replace_file",
+                               side_effect=lambda s, d: "PermissionError" if Path(s).name == ti._DB_NAME else real(s, d)):
+            return self.write()["write_id"]
+
+    def two_versions(self):
+        self.write()
+        self.write([{"address": START, "new_name": "second_name"}])
+
+
+class PurgeTests(PurgeCase):
+    @pytest.mark.contract
+    def test_a_call_without_confirmation_reports_and_deletes_nothing(self):
+        self.two_versions()
+        wid = self.keep_a_candidate()
+        before = self.snapshot()
+        report = self.purge(["version:1", f"candidate:{wid}"])
+        self.assertEqual((report["ok"], report["status"], report["deleted"]), (True, "REPORT_ONLY", False))
+        self.assertEqual({e["target"] for e in report["inventory"]}, {"version:1", "published:2", f"candidate:{wid}"})
+        self.assertEqual([w["target"] for w in report["would_delete"]], ["version:1", f"candidate:{wid}"])
+        self.assertGreater(report["would_free_bytes"], 0)
+        self.assertEqual((report["published_version"], report["inventory_cut"]), (2, False))
+        self.assertEqual(self.snapshot(), before)
+        self.assertIsNone(self.purge()["confirm_token"])
+
+    @pytest.mark.contract
+    def test_the_confirmation_is_bound_to_the_named_targets(self):
+        self.two_versions()
+        wid = self.keep_a_candidate()
+        report = self.purge(["version:1"])
+        before = self.snapshot()
+        for other in (["version:1", f"candidate:{wid}"], [f"candidate:{wid}"]):
+            out = self.purge(other, report["confirm_token"])
+            self.assertEqual((out["ok"], out["status"], out["deleted"], out["fixable"]), (False, "STALE_CONFIRMATION", False, True))
+        self.assertEqual(self.snapshot(), before)
+        done = self.purge(["version:1"], report["confirm_token"])
+        self.assertEqual((done["ok"], done["status"], done["deleted"]), (True, "OK", True))
+        self.assertFalse(ti._version_file(self.label_dir(), 1).exists())
+
+    @pytest.mark.contract
+    def test_a_confirmation_made_stale_by_a_later_change_deletes_nothing(self):
+        self.write()
+        report = self.purge(["published:1"])
+        self.write([{"address": START, "new_name": "second_name"}])     # the scope changed after the report
+        before = self.snapshot()
+        out = self.purge(["published:1"], report["confirm_token"])
+        self.assertEqual((out["status"], out["deleted"]), ("STALE_CONFIRMATION", False))
+        self.assertEqual(self.snapshot(), before)
+
+    @pytest.mark.contract
+    def test_a_token_without_targets_or_for_another_scope_is_not_accepted(self):
+        self.write()
+        out = self.purge(None, "abc")
+        self.assertEqual((out["error"], out["field"], out["fixable"]), ("CONFIRMATION_NEEDS_TARGETS", "confirm_token", True))
+        self.write([{"address": START, "new_name": "other"}], label="second-scope")
+        report = self.purge(["published:1"], label="second-scope")
+        self.assertEqual(self.purge(["published:1"], report["confirm_token"], label="first-pass")["status"], "STALE_CONFIRMATION")
+
+    @pytest.mark.contract
+    def test_wildcards_and_everything_forms_are_refused_and_every_name_must_be_exact(self):
+        self.write()
+        for given in ("*", "all", "version:*", "version:1?", "candidate:*", "version:[1-2]", "ALL"):
+            with self.subTest(given):
+                out = self.purge([given])
+                self.assertEqual((out["ok"], out["error"], out["fixable"]), (False, "WILDCARD_REFUSED", True))
+                self.assertIn("accepted", out)
+        for given in ("version:0", "version:01", "version:1 ", "candidate:xyz", "scratch:1", "version", "../x", "published:"):
+            with self.subTest(given):
+                self.assertEqual(self.purge([given])["error"], "TARGET_NAME_INVALID")
+        self.assertEqual(self.purge(["version:1", "version:1"])["error"], "DUPLICATE_TARGET")
+        self.assertEqual(self.purge("version:1")["error"], "TARGETS_INVALID")
+        self.assertEqual(self.purge(["version:9"])["error"], "TARGET_NOT_FOUND")
+        self.assertTrue(ti._version_file(self.label_dir(), 1).exists())
+
+    @pytest.mark.contract
+    def test_the_published_version_is_protected_unless_named_as_published(self):
+        self.two_versions()
+        out = self.purge(["version:2"])
+        self.assertEqual((out["error"], out["fixable"]), ("PUBLISHED_VERSION_PROTECTED", True))
+        self.assertIn("published:<N>", out["fix"])
+        self.assertTrue(ti._version_file(self.label_dir(), 2).exists())
+        done = self.confirmed(["published:2"])
+        self.assertEqual((done["status"], done["published_version_after"]), ("OK", 0))
+        self.assertIsNone(self.manifest(), "the pointer went first")
+        self.assertFalse(ti._version_file(self.label_dir(), 2).exists())
+        self.assertTrue(ti._version_file(self.label_dir(), 1).exists(), "an older version stays unless it is named")
+        self.assertEqual(self.plan()["plan"]["base_version"], 0, "a new plan starts from the pristine analysis")
+
+    @pytest.mark.contract
+    def test_a_kept_candidate_is_deleted_by_name_and_frees_the_budget(self):
+        wid = self.keep_a_candidate()
+        held = ti._annotated_total_bytes() - ti._journal_path(self.sha).stat().st_size
+        report = self.purge([f"candidate:{wid}"])
+        self.assertEqual(report["would_delete"][0]["state"], "kept candidate (never promoted)")
+        done = self.purge([f"candidate:{wid}"], report["confirm_token"])
+        self.assertEqual((done["status"], done["deleted"]), ("OK", True))
+        self.assertEqual(ti._annotated_total_bytes() - ti._journal_path(self.sha).stat().st_size, held - report["would_free_bytes"])
+        self.assertFalse((self.label_dir() / "recovery" / wid).exists())
+
+    @pytest.mark.contract
+    def test_every_deletion_leaves_a_journal_trace_before_and_after(self):
+        self.write()
+        self.confirmed(["published:1"])
+        records = ti._journal_records(self.sha)[0]
+        self.assertEqual([r["event"] for r in records][-2:], ["purge_prepared", "purge_committed"])
+        self.assertEqual(records[-2]["targets"], ["published:1"])
+        self.assertEqual(records[-1]["results"][0]["deleted"], True)
+        data = json.loads(ti.ida_annotations(str(self.sample)))
+        self.assertEqual((data["status"], data["unreadable_lines"]), ("OK", 0))
+
+    @pytest.mark.contract
+    def test_a_journal_that_cannot_be_written_blocks_the_deletion(self):
+        self.write()
+        report = self.purge(["published:1"])
+        with mock.patch.object(ti, "_journal_append", return_value=(False, "PermissionError")):
+            out = self.purge(["published:1"], report["confirm_token"])
+        self.assertEqual((out["ok"], out["status"], out["deleted"], out["fixable"]), (False, "JOURNAL_UNWRITABLE", False, "retry_later"))
+        self.assertTrue(ti._version_file(self.label_dir(), 1).exists())
+        real = ti._journal_append
+        with mock.patch.object(ti, "_journal_append",
+                               side_effect=lambda s, r: (False, "OSError") if r["event"] == "purge_committed" else real(s, r)):
+            out = self.purge(["published:1"], report["confirm_token"])
+        self.assertEqual((out["ok"], out["commit_record_pending"]), (True, True))
+
+    @pytest.mark.contract
+    def test_an_unverified_scope_is_cleared_only_by_name_and_the_answer_says_so(self):
+        self.write()
+        (self.label_dir() / "manifest.json").write_text("{torn", encoding="utf-8")
+        self.assertEqual(self.plan()["error"], "ANNOTATED_STATE_UNVERIFIED")
+        report = self.purge(["unverified-state"])
+        self.assertEqual((report["scope_unverified"], report["unverified_reason"]), (True, "MANIFEST_MALFORMED"))
+        self.assertEqual(self.plan()["error"], "ANNOTATED_STATE_UNVERIFIED", "a report changes nothing")
+        done = self.purge(["unverified-state"], report["confirm_token"])
+        self.assertEqual((done["ok"], done["status"], done["unverified_cleared"], done["unverified_reason_was"]),
+                         (True, "OK", True, "MANIFEST_MALFORMED"))
+        self.assertIn("cleared by this call", done["note"])
+        self.assertTrue(done["results"][0]["removed_manifest_sha256"])
+        self.assertTrue(self.plan()["ok"])
+        self.assertTrue(ti._version_file(self.label_dir(), 1).exists(), "the version file stays until it is named")
+        self.assertIn(done["results"][0]["target"], ti._journal_records(self.sha)[0][-2]["targets"])
+
+    @pytest.mark.contract
+    def test_an_open_write_record_that_blocks_a_scope_is_closed_by_the_clearing(self):
+        with mock.patch.object(ti, "_manifest_write", side_effect=RuntimeError("simulated crash")):
+            with self.assertRaises(RuntimeError):
+                self.write()
+        ti._manifest_write(self.label_dir(), {"schema": 1, "sha256": self.sha, "label": "first-pass", "version": 5,
+                                             "write_id": "x", "db_sha256": "0" * 64, "db_bytes": 1})
+        self.assertEqual(self.plan()["error"], "ANNOTATED_STATE_UNVERIFIED")
+        self.assertTrue(self.confirmed(["unverified-state"])["unverified_cleared"])
+        self.assertTrue(self.plan()["ok"])
+
+    @pytest.mark.contract
+    def test_a_damaged_journal_is_not_clearable_by_purge(self):
+        self.write()
+        ti._journal_path(self.sha).unlink()
+        ti._journal_path(self.sha).mkdir()
+        out = self.purge(["unverified-state"])
+        self.assertEqual((out["ok"], out["error"], out["fixable"]), (False, "JOURNAL_NOT_CLEARABLE", False))
+
+    @pytest.mark.contract
+    def test_a_scope_that_is_fine_has_no_unverified_state_to_clear(self):
+        self.write()
+        self.assertEqual(self.purge(["unverified-state"])["error"], "TARGET_NOT_FOUND")
+
+    @pytest.mark.contract
+    def test_a_long_inventory_says_it_was_cut(self):
+        self.write()
+        versions = self.label_dir() / "versions"
+        for n in range(2, ti._PURGE_INVENTORY_LIMIT + 6):
+            (versions / f"v{n:06d}").mkdir()
+            (versions / f"v{n:06d}" / ti._DB_NAME).write_bytes(b"x")
+        report = self.purge()
+        self.assertEqual((report["inventory_cut"], len(report["inventory"])), (True, ti._PURGE_INVENTORY_LIMIT))
+        self.assertIn("cut at", report["inventory_note"])
+        self.assertGreater(report["inventory_total"], ti._PURGE_INVENTORY_LIMIT)
+
+    @pytest.mark.contract
+    def test_the_guard_refuses_a_delete_outside_one_scopes_named_artifacts(self):
+        self.write()
+        scope = self.label_dir()
+        outside = [self.cache, self.root, self.annotated, scope, scope / "versions", scope / "manifest.json",
+                   self.annotated / self.sha, scope.parent / "other"]
+        victim = self.root / "ev_victim"
+        victim.mkdir()
+        (victim / "f").write_bytes(b"x")
+        for target in outside + [victim]:
+            with self.subTest(target=str(target)[-12:]):
+                self.assertFalse(ti._purge_remove(target, scope))
+        self.assertFalse(ti._purge_remove(scope / "versions" / "v000001", self.root), "a scope that is not under the root")
+        self.assertTrue(ti._version_file(scope, 1).exists())
+        self.assertTrue((victim / "f").exists())
+
+    @pytest.mark.contract
+    def test_purge_reaches_nothing_outside_the_annotated_root(self):
+        """The mirror of the Z1 test: the pristine cache, a stand-in slot and the evidence directory are
+        byte-identical after a purge that really deletes."""
+        self.two_versions()
+        wid = self.keep_a_candidate()
+        self.ev.mkdir(exist_ok=True)
+        (self.ev / "kept.json").write_text("{}", encoding="utf-8")
+        outside = {"cache": self.snapshot(self.cache), "evidence": self.snapshot(self.ev)}
+        self.assertTrue(outside["cache"] and outside["evidence"])
+        done = self.confirmed(["version:1", f"candidate:{wid}", "published:2"])
+        self.assertEqual((done["status"], done["deleted"]), ("OK", True))
+        self.assertEqual({"cache": self.snapshot(self.cache), "evidence": self.snapshot(self.ev)}, outside)
+        self.assertEqual(sorted(p.name for p in self.ev.glob("*")), sorted(outside["evidence"]))
+
+    @pytest.mark.contract
+    def test_an_overlapping_configuration_refuses_purge(self):
+        with mock.patch.object(ti, "ANNOTATED_ROOT", self.cache / "inside"):
+            out = self.purge()
+        self.assertEqual(out["error"], "ANNOTATED_ROOT_OVERLAPS_CACHE")
+
+    @pytest.mark.contract
+    def test_the_label_and_the_input_are_checked_like_the_other_operations(self):
+        self.assertEqual(self.purge(label="bad label")["error"], "LABEL_REQUIRED")
+        self.assertEqual(self.purge(path=self.root / "missing.exe")["status"], "NOT_FOUND")
+
+    @pytest.mark.contract
+    def test_target_name_and_path_do_not_leak(self):
+        self.write()
+        report = self.purge(["published:1"])
+        done = self.purge(["published:1"], report["confirm_token"])
+        for text in (json.dumps(report), json.dumps(done), ti._journal_path(self.sha).read_text(encoding="utf-8")):
+            self.assertNoTargetLeak(text)
+
+    def test_the_purge_source_never_references_the_cache_slots_pristine_databases_or_evidence(self):
+        inside, _cache_side = _section_functions()
+        purge_functions = [fn for fn in inside if fn.name in ("ida_annotations_purge", "_purge_locked", "_purge_remove",
+                                                              "_purge_inventory", "_purge_confirmation", "_tree_bytes")]
+        self.assertEqual(len(purge_functions), 6)
+        forbidden = {"_cache_root", "CACHE_ROOT", "_slot_dir", "_slot_is_healthy", "_evict_slot", "_enforce_cache_budget",
+                     "_write_evidence", "EVIDENCE", "EVIDENCE_RENAME_PLAN", "EVIDENCE_ANNOTATE_APPLY", "EVIDENCE_ANNOTATIONS",
+                     "_copy_pristine", "_query_locked"}
+        for fn in purge_functions:
+            self.assertEqual(forbidden & (_referenced_names(fn) | _called_names(fn)), set(), fn.name)
+
+    def test_it_is_a_published_name_distinct_from_the_apply_and_the_plan(self):
+        published = tool_families.published_tools("native")
+        self.assertIn("ida_annotations_purge", published)
+        self.assertEqual(len({"ida_rename_plan", "ida_annotations_apply", "ida_annotations_purge"} & set(published)), 3)
+
+
+
+
 @pytest.mark.heavy
 class AnnotateRealInstallTests(unittest.TestCase):
     """Needs a licensed IDA Pro 9.x; skips when idat is not found. Builds its own tiny synthetic x86-64 PE."""
@@ -1283,6 +1539,70 @@ class AnnotateRealInstallTests(unittest.TestCase):
         out = json.loads(ti.ida_annotations_apply(str(self.pe), sealed))
         self.assertEqual((out["status"], out["written"]), ("ABORTED_ATOMIC", False))
         self.assertIsNone(ti._manifest_read(ti._label_dir(self.sha, "first-pass"))[0])
+
+
+    # -- purge against the real engine -----------------------------------------------------------
+    def purge(self, targets=None, token=None, label="first-pass"):
+        return json.loads(ti.ida_annotations_purge(str(self.pe), label, targets, token))
+
+    def test_purge_deletes_a_real_version_and_a_kept_candidate_and_the_next_plan_follows(self):
+        first = self.apply(self.plan([{"address": "0x140001000", "new_name": "liebert_start"}]))
+        second = self.apply(self.plan([{"address": "0x140001000", "new_name": "second_name"}]))
+        real = ti._replace_file
+        with mock.patch.object(ti, "_replace_file",
+                               side_effect=lambda s, d: "PermissionError" if Path(s).name == ti._DB_NAME else real(s, d)):
+            kept = self.apply(self.plan([{"address": "0x140001000", "new_name": "third_name"}]))
+        self.assertEqual((first["version"], second["version"], kept["status"]), (1, 2, "ANNOTATED_PROMOTION_BLOCKED"))
+        journal = ti._journal_path(self.sha)
+        held_before = ti._annotated_total_bytes() - journal.stat().st_size
+        names = ["version:1", f"candidate:{kept['write_id']}"]
+        report = self.purge(names)
+        self.assertEqual(report["status"], "REPORT_ONLY")
+        self.assertEqual(ti._annotated_total_bytes() - journal.stat().st_size, held_before, "the report deleted nothing")
+        self.assertGreater(report["would_free_bytes"], 100000)         # two real databases
+        done = self.purge(names, report["confirm_token"])
+        self.assertEqual((done["status"], done["deleted"], done["freed_bytes"]), ("OK", True, report["would_free_bytes"]))
+        self.assertEqual(ti._annotated_total_bytes() - journal.stat().st_size, held_before - report["would_free_bytes"])
+        scope = ti._label_dir(self.sha, "first-pass")
+        self.assertFalse(ti._version_file(scope, 1).exists())
+        self.assertFalse((scope / "recovery" / kept["write_id"]).exists())
+        self.assertTrue(ti._version_file(scope, 2).is_file())
+        records = ti._journal_records(self.sha)[0]
+        self.assertEqual([r["event"] for r in records][-2:], ["purge_prepared", "purge_committed"])
+        # the next plan still reads the published version 2 (names of version 2, not of the deleted one)
+        plan = self.plan([{"address": "0x140001000", "new_name": "fourth_name"}])
+        self.assertEqual((plan["ok"], plan["plan"]["base_version"], plan["plan"]["items"][0]["expect_name"]), (True, 2, "second_name"))
+        # deleting the published version removes the pointer; planning then starts from the pristine analysis again
+        gone = self.purge(["published:2"])
+        self.assertEqual(self.purge(["published:2"], gone["confirm_token"])["status"], "OK")
+        again = self.plan([{"address": "0x140001000", "new_name": "fresh_start"}])
+        self.assertEqual((again["plan"]["base_version"], again["plan"]["items"][0]["expect_name"]), (0, "start"))
+        self.assertEqual(self.apply(again)["version"], 4, "version numbers are never reused (3 was prepared by the kept candidate)")
+
+    def test_purge_touches_nothing_outside_the_annotated_root_in_a_real_run(self):
+        self.apply(self.plan([{"address": "0x140001000", "new_name": "liebert_start"}]))
+        evidence = self.base / "e"
+        evidence_before = {p.name: ti._file_sha256(p)[0] for p in evidence.glob("*") if p.is_file()}
+        cache_before = {p.relative_to(self.cache).as_posix(): ti._file_sha256(p)[0] for p in self.cache.rglob("*") if p.is_file()}
+        self.assertTrue(evidence_before and cache_before)
+        report = self.purge(["published:1"])
+        done = self.purge(["published:1"], report["confirm_token"])
+        self.assertEqual(done["status"], "OK")
+        self.assertEqual({p.name: ti._file_sha256(p)[0] for p in evidence.glob("*") if p.is_file()}, evidence_before)
+        self.assertEqual({p.relative_to(self.cache).as_posix(): ti._file_sha256(p)[0] for p in self.cache.rglob("*") if p.is_file()},
+                         cache_before, "the pristine cache, its meta and the slot are byte-identical")
+
+    def test_purge_clears_a_real_unverified_scope_and_says_so(self):
+        out = self.apply(self.plan([{"address": "0x140001000", "new_name": "liebert_start"}]))
+        stored = ti._version_file(ti._label_dir(self.sha, "first-pass"), 1)
+        stored.write_bytes(stored.read_bytes() + b"x")                 # the file no longer matches its pointer
+        self.assertEqual(self.plan([{"address": "0x140001000", "new_name": "x_name"}])["error"], "ANNOTATED_STATE_UNVERIFIED")
+        report = self.purge(["unverified-state"])
+        done = self.purge(["unverified-state"], report["confirm_token"])
+        self.assertEqual((done["status"], done["unverified_cleared"], done["unverified_reason_was"]),
+                         ("OK", True, "VERSION_FILE_HASH_MISMATCH"))
+        self.assertTrue(self.plan([{"address": "0x140001000", "new_name": "x_name"}])["ok"])
+        self.assertNotEqual(out["db_sha256"], ti._file_sha256(stored)[0])
 
 
 if __name__ == "__main__":

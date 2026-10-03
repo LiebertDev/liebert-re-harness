@@ -91,7 +91,7 @@ hidden feature.
   journal, read-back in a separate engine process).
   **Still open:** `ida_disasm_listing` (read-only, next
   round), the comment write (`ida_set_comments`, which will follow the rename pair's plan/apply
-  shape) and an annotation purge, a Ghidra
+  shape), a Ghidra
   wrapper (the more approachable half, since `analyzeHeadless` is scriptable and free to
   install), and normalising answers across engines.
 - **Function-boundary recovery from exception-directory unwind data**, with

@@ -109,7 +109,8 @@ contains write calls.
 
 Scope of this module: `ida_query`, `ida_microcode_cfg`, `ida_type_member_offset`, `ida_patch_plan`
 and `ida_annotations` (none of them writes the input or persists anything), `ida_rename_plan` and
-`ida_annotations_apply` (the one persistent write path; comments are not here yet) and `ida_status`.
+`ida_annotations_apply` (the one persistent write path; comments are not here yet), `ida_annotations_purge`
+(the only deletion of annotated data: named targets, report first, a confirmation bound to what it reports) and `ida_status`.
 """
 from __future__ import annotations
 
@@ -2717,8 +2718,12 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
     deadline = time.monotonic() + total
     label_dir = state["label_dir"]
     write_id = uuid.uuid4().hex[:12]
-    version = max([state["version"]] + [int(m.group(1)) for d in (label_dir / "versions").glob("v*")
-                                        if (m := _VERSION_DIR.fullmatch(d.name))]) + 1
+    # Never reuse a number: not one a directory holds, and not one the journal ever prepared (a purged
+    # version's number stays taken, so a record's version always means one write).
+    journalled = [r["version"] for r in _journal_records(sha256)[0] if r.get("event") == "batch_prepared"
+                  and r.get("label") == label and isinstance(r.get("version"), int)]
+    version = max([state["version"]] + journalled + [int(m.group(1)) for d in (label_dir / "versions").glob("v*")
+                                                      if (m := _VERSION_DIR.fullmatch(d.name))]) + 1
     rdir = label_dir / "recovery" / write_id
     verify_dir = label_dir / f"scratch-{uuid.uuid4().hex[:8]}"
     journal = {"prepared": None, "committed": None}
@@ -2894,6 +2899,306 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
 
 
 # --------------------------------------------------------------------------
+# ida_annotations_purge: the only way annotated data is ever deleted
+# --------------------------------------------------------------------------
+#
+# Mirror of the cache separation: this operation reaches ONLY the annotated root. It never references
+# the cache root, a cache slot, the evidence directories or a pristine database (a test reads its source
+# and pins that), writes no evidence file (the journal is its trace) and deletes only artifacts that are
+# NAMED in the call and that the call's confirmation token was issued for.
+
+_PURGE_MAX_TARGETS = 50
+_PURGE_INVENTORY_LIMIT = 100
+_PURGE_TARGET = re.compile(r"(?:version|published):[1-9][0-9]{0,5}|candidate:[0-9a-f]{12}|scratch:[0-9a-f]{8}|unverified-state")
+_PURGE_ACCEPTED = ["version:<N> (an unpublished or older version)", "published:<N> (the published version; removes the pointer first)",
+                   "candidate:<12 hex> (a kept candidate under recovery/)", "scratch:<8 hex> (a leftover work directory)",
+                   "unverified-state (clears an unverified scope; says so)"]
+
+
+def _tree_bytes(path):
+    """Bytes under `path`, or None when any entry cannot be measured (never a partial count)."""
+    total, problems = 0, []
+    if os.path.isfile(path):
+        try:
+            return os.stat(path).st_size
+        except OSError:
+            return None
+    for directory, _dirs, files in os.walk(path, onerror=problems.append):
+        for name in files:
+            try:
+                total += os.stat(os.path.join(directory, name)).st_size
+            except OSError:
+                return None
+    return None if problems else total
+
+
+def _purge_remove(path, label_dir):
+    """Delete one NAMED artifact of one scope: exactly `versions/vNNNNNN`, `recovery/<id>` or `scratch-<id>`
+    directly under that scope's directory, which itself must sit two levels under the annotated root.
+    Anything else is refused. The second recursive delete of the annotated section, with its own guard."""
+    try:
+        target = Path(os.path.realpath(path))
+        scope = Path(os.path.realpath(label_dir))
+        root = Path(os.path.realpath(_annotated_root()))
+    except (OSError, ValueError):
+        return False
+    shaped = (scope.parent.parent == root and re.fullmatch(r"[0-9a-f]{64}", scope.parent.name) is not None)
+    named = ((target.parent == scope / "versions" and _VERSION_DIR.fullmatch(target.name) is not None)
+             or (target.parent == scope / "recovery" and re.fullmatch(r"[0-9a-f]{12}", target.name) is not None)
+             or (target.parent == scope and re.fullmatch(r"scratch-[0-9a-f]{8}", target.name) is not None))
+    if not (shaped and named):
+        return False
+    shutil.rmtree(target, ignore_errors=True)
+    return not target.exists()
+
+
+def _purge_inventory(sha256, label, state, problem):
+    """What this scope holds, measured: (inventory, fingerprints keyed by target name). None for a value
+    that could not be measured is reported as such, never as zero."""
+    label_dir = _label_dir(sha256, label)
+    published = state["version"] if state else None
+    entries, prints = [], {}
+    versions = label_dir / "versions"
+    for d in sorted(versions.glob("v*")) if versions.is_dir() else []:
+        match = _VERSION_DIR.fullmatch(d.name)
+        if not (d.is_dir() and match):
+            continue
+        number = int(match.group(1))
+        digest, _err = _file_sha256(d / _DB_NAME)
+        size = _tree_bytes(d)
+        kind = "published" if number == published else "version"
+        entries.append({"target": f"{kind}:{number}", "kind": kind, "bytes": size,
+                        "state": "published" if kind == "published" else (
+                            "older version" if published and number < published else "unpublished (never verified or aborted)")})
+        prints[f"{kind}:{number}"] = [digest, size]
+    recovery = label_dir / "recovery"
+    for d in sorted(recovery.glob("*")) if recovery.is_dir() else []:
+        if d.is_dir() and re.fullmatch(r"[0-9a-f]{12}", d.name):
+            digest, _err = _file_sha256(d / _DB_NAME)
+            size = _tree_bytes(d)
+            entries.append({"target": f"candidate:{d.name}", "kind": "candidate", "bytes": size,
+                            "state": "kept candidate (never promoted)"})
+            prints[f"candidate:{d.name}"] = [digest, size]
+    for d in sorted(label_dir.glob("scratch-*")) if label_dir.is_dir() else []:
+        if d.is_dir() and re.fullmatch(r"scratch-[0-9a-f]{8}", d.name):
+            size = _tree_bytes(d)
+            entries.append({"target": f"scratch:{d.name[8:]}", "kind": "scratch", "bytes": size, "state": "leftover work directory"})
+            prints[f"scratch:{d.name[8:]}"] = [None, size]
+    if problem:
+        manifest_digest, _err = _file_sha256(label_dir / "manifest.json")
+        entries.append({"target": "unverified-state", "kind": "unverified-state", "bytes": 0,
+                        "state": "scope is unverified: " + str(problem["reason"])})
+        prints["unverified-state"] = [str(problem["reason"]), manifest_digest]
+    return entries, prints
+
+
+def _purge_confirmation(sha256, label, names, prints, published):
+    return _sha256_text(_canonical({"purge": 1, "target_sha256": sha256, "label": label, "targets": sorted(names),
+                                    "published_version": published, "fingerprints": {n: prints.get(n) for n in sorted(names)}}))
+
+
+def ida_annotations_purge(path, label=None, targets=None, confirm_token=None, cancellation_token=None):
+    """Report, and on explicit confirmation delete, NAMED annotated artifacts of one scope (`path`'s input
+    hash plus `label`). Nothing is deleted by default; the call without `confirm_token` is the dry run and
+    its answer is the report (`status: REPORT_ONLY`).
+
+    `targets` is a list of exact names, never a pattern: `version:<N>`, `published:<N>`, `candidate:<12 hex>`,
+    `scratch:<8 hex>` and `unverified-state`. A wildcard or `all` is refused. The report lists everything
+    the scope holds (`inventory`, cut at 100 entries and saying so), measures what the named targets
+    would free, and returns a `confirm_token` bound to this input hash, this label, exactly these targets
+    and their measured state (file digests and sizes, the published version). Pass the same targets and the
+    token back to delete. If anything changed in between, the answer is `STALE_CONFIRMATION` and nothing is
+    deleted. A published version is deleted only by naming it as `published:<N>`; its pointer is removed
+    first. `version:<N>` refuses the published one.
+
+    `unverified-state` clears a scope whose recorded state could not be confirmed (a pointer that does not
+    match its file, an interrupted write that cannot be reconciled): it removes the pointer, closes the open
+    write records with an abort record, and says `unverified_cleared: true` with the reason it cleared. The
+    versions stay (name them to delete them). A damaged or unreadable JOURNAL is not clearable here.
+
+    Only the annotated root is touched: never the cache, a pristine database or the evidence directories.
+    Every deletion is journalled (`purge_prepared`, synced, before the first delete; `purge_committed` after).
+    Statuses: REPORT_ONLY, OK, PARTIAL_FAILURE, STALE_CONFIRMATION, JOURNAL_UNWRITABLE, ANALYSIS_LIMITED
+    (named error, `fixable`), PATH_REFUSED, NOT_FOUND, READ_FAILED.
+    """
+    tool = "ida_annotations_purge"
+    if not _valid_label(label):
+        return _label_refusal(tool, label)
+    names = []
+    if targets is not None:
+        if not isinstance(targets, list) or len(targets) > _PURGE_MAX_TARGETS or not all(isinstance(t, str) for t in targets):
+            return _refuse(tool, "ANALYSIS_LIMITED", "TARGETS_INVALID", fixable=True, field="targets",
+                           accepted=_PURGE_ACCEPTED, fix=f"`targets` is a list of at most {_PURGE_MAX_TARGETS} exact names, or omitted for the report.")
+        for entry in targets:
+            if entry.strip().lower() in ("all", "*") or any(c in entry for c in "*?[]"):
+                return _refuse(tool, "ANALYSIS_LIMITED", "WILDCARD_REFUSED", fixable=True, field="targets", given=entry[:40],
+                               accepted=_PURGE_ACCEPTED,
+                               fix="There is no 'delete everything' form. Run the report and name each thing to delete.")
+            if not _PURGE_TARGET.fullmatch(entry):
+                return _refuse(tool, "ANALYSIS_LIMITED", "TARGET_NAME_INVALID", fixable=True, field="targets", given=entry[:40],
+                               accepted=_PURGE_ACCEPTED, fix="Use the exact `target` names the report lists.")
+            if entry in names:
+                return _refuse(tool, "ANALYSIS_LIMITED", "DUPLICATE_TARGET", fixable=True, field="targets", given=entry,
+                               fix="Name each target once.")
+            names.append(entry)
+    if confirm_token is not None and (not isinstance(confirm_token, str) or not names):
+        return _refuse(tool, "ANALYSIS_LIMITED", "CONFIRMATION_NEEDS_TARGETS", fixable=True, field="confirm_token",
+                       accepted="the `confirm_token` string of a report, with the same `targets`",
+                       fix="A confirmation is bound to the targets it was issued for: pass the same `targets` list with it.")
+    p, fail = _checked_path(path, tool, echo_path=False)
+    if fail:
+        return fail
+    try:
+        sha256 = _sha256_md5(p)[0]
+    except OSError as exc:
+        return _j({"ok": False, "tool": tool, "status": "READ_FAILED", "error": "IDA_INPUT_UNREADABLE",
+                   "environment_error": {"type": type(exc).__name__, "errno": exc.errno, "strerror": _redact(exc.strerror or type(exc).__name__)},
+                   "detail": "The input file could not be read; nothing was deleted."})
+    overlap = _overlap_refusal(tool)
+    if overlap:
+        return overlap
+    lock, busy = _lock_annotated(tool, sha256, cancellation_token)
+    if busy:
+        return busy
+    try:
+        return _purge_locked(tool, sha256, label, names, confirm_token)
+    except OSError as exc:
+        return _j(_EnvironmentFailure("IDA_ANNOTATED_IO_ERROR", exc).body(tool, target_sha256=sha256))
+    finally:
+        _release_slot_lock(lock)
+
+
+def _purge_locked(tool, sha256, label, names, confirm_token):
+    unverified, _actions = _recover_pending(sha256)
+    if "*" in unverified:
+        return _refuse(tool, "ANALYSIS_LIMITED", "JOURNAL_NOT_CLEARABLE", fixable=False, reason=unverified["*"], target_sha256=sha256,
+                       fix="The audit journal itself is damaged or unreadable. Purge does not clear that: an operator must "
+                           "inspect the annotated root. Nothing was deleted.")
+    state, problem = _annotated_state(sha256, label)
+    if state is None and label in unverified and problem is None:
+        problem = {"error": _ANNOTATED_STATE_UNVERIFIED, "reason": unverified[label]}
+    if state is None and problem is None:
+        problem = {"error": _ANNOTATED_STATE_UNVERIFIED, "reason": "UNKNOWN"}
+    if state is not None and label in unverified:
+        state, problem = None, {"error": _ANNOTATED_STATE_UNVERIFIED, "reason": unverified[label]}
+    label_dir = _label_dir(sha256, label)
+    published = state["version"] if state else None
+    if state is None and _manifest_read(label_dir)[0]:
+        published = None
+    entries, prints = _purge_inventory(sha256, label, state, problem)
+    if any(e["bytes"] is None for e in entries):
+        return _refuse(tool, "ANALYSIS_LIMITED", "SIZES_UNVERIFIABLE", fixable=False, target_sha256=sha256,
+                       fix="An entry under this scope could not be measured, so no honest report or token can be made. Nothing was deleted.")
+    by_name = {e["target"]: e for e in entries}
+    for name in names:
+        if name.startswith("version:") and f"published:{name.split(':')[1]}" in by_name:
+            return _refuse(tool, "ANALYSIS_LIMITED", "PUBLISHED_VERSION_PROTECTED", fixable=True, field="targets", given=name,
+                           fix="That version is the published one. To delete it, name it `published:<N>`; its pointer is removed first.")
+        if name not in by_name and confirm_token is not None:
+            # a confirmed target that is no longer there: the scope changed since the report
+            return _j({"ok": False, "tool": tool, "status": "STALE_CONFIRMATION", "error": "STALE_CONFIRMATION", "deleted": False,
+                       "fixable": True, "target_sha256": sha256, "label": label, "missing_target": name,
+                       "inventory": entries[:_PURGE_INVENTORY_LIMIT], "inventory_cut": len(entries) > _PURGE_INVENTORY_LIMIT,
+                       "fix": "A named target is no longer in the scope, so the confirmation is stale. Nothing was deleted. "
+                              "Run the report again and confirm with its new `confirm_token`."})
+        if name not in by_name:
+            return _refuse(tool, "ANALYSIS_LIMITED", "TARGET_NOT_FOUND", fixable=True, field="targets", given=name,
+                           accepted=sorted(by_name)[:_PURGE_INVENTORY_LIMIT],
+                           fix="Name only what the report lists for this scope; the scope may have changed since.")
+    if problem and any(n.startswith("published:") for n in names):
+        return _refuse(tool, "ANALYSIS_LIMITED", "PUBLISHED_NAME_NOT_AVAILABLE", fixable=True,
+                       fix="The scope is unverified, so no version is known to be the published one. Clear the state with "
+                           "`unverified-state` first, then name versions with `version:<N>`.")
+    selected = [by_name[n] for n in names]
+    freed = sum(e["bytes"] for e in selected)
+    token = _purge_confirmation(sha256, label, names, prints, published) if names else None
+    shown = entries[:_PURGE_INVENTORY_LIMIT]
+    held, budget = _annotated_total_bytes(), _annotated_budget_bytes()
+    report = {"target_sha256": sha256, "label": label, "published_version": published,
+              "inventory": shown, "inventory_total": len(entries), "inventory_cut": len(entries) > len(shown),
+              "annotated_bytes_held": held, "annotated_budget_bytes": budget,
+              "would_delete": [{"target": e["target"], "bytes": e["bytes"], "state": e["state"]} for e in selected],
+              "would_free_bytes": freed, "scope_unverified": bool(problem),
+              "unverified_reason": problem["reason"] if problem else None}
+    if report["inventory_cut"]:
+        report["inventory_note"] = f"the inventory is cut at {_PURGE_INVENTORY_LIMIT} of {len(entries)} entries"
+    if confirm_token is None:
+        return _j({"ok": True, "tool": tool, "status": "REPORT_ONLY", "deleted": False, **report, "confirm_token": token,
+                   "note": ("Nothing was deleted. " + ("To delete exactly the targets named in `would_delete`, call again with "
+                            "the same `targets` and this `confirm_token`." if names else "Name targets from `inventory` to get a "
+                            "confirmation token for them."))})
+    if confirm_token != token:
+        return _j({"ok": False, "tool": tool, "status": "STALE_CONFIRMATION", "error": "STALE_CONFIRMATION", "deleted": False,
+                   "fixable": True, **report, "confirm_token": token,
+                   "fix": "The confirmation does not match the scope as it is now (a different token, other targets, or a change "
+                          "since the report). Nothing was deleted. Read this report and confirm with the new `confirm_token`."})
+    cleared = "unverified-state" in names
+    if cleared and str(problem["reason"]).startswith("JOURNAL_UNREADABLE"):
+        return _refuse(tool, "ANALYSIS_LIMITED", "JOURNAL_NOT_CLEARABLE", fixable=False, reason=problem["reason"])
+    ok, why = _journal_append(sha256, {"event": "purge_prepared", "label": label, "targets": names, "bytes": freed,
+                                       "published_version": published, "unverified_reason": problem["reason"] if cleared else None})
+    if not ok:
+        return _j({"ok": False, "tool": tool, "status": "JOURNAL_UNWRITABLE", "error": "PURGE_RECORD_NOT_WRITTEN", "deleted": False,
+                   "journal_error": why, "fixable": "retry_later",
+                   "fix": "The audit journal could not be written, so nothing was deleted. Fix its location or permissions and retry."})
+    results = []
+    for name in names:
+        entry = by_name[name]
+        if name == "unverified-state":
+            manifest = label_dir / "manifest.json"
+            digest = _file_sha256(manifest)[0]
+            done = True
+            try:
+                manifest.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                done = False
+            records = _journal_records(sha256)[0]
+            closed = {r.get("write_id") for r in records if r.get("event") in ("batch_committed", "batch_aborted")}
+            for r in records:
+                if r.get("event") == "batch_prepared" and r.get("label") == label and r.get("write_id") not in closed:
+                    done = _journal_append(sha256, {"event": "batch_aborted", "write_id": r["write_id"], "label": label,
+                                                    "reason": "cleared_by_purge", "retained": "none"})[0] and done
+            results.append({"target": name, "deleted": done, "removed_manifest_sha256": digest})
+            continue
+        path = label_dir / ("versions/v%06d" % int(name.split(":")[1]) if name.split(":")[0] in ("version", "published")
+                            else "recovery/" + name.split(":")[1] if name.startswith("candidate:") else "scratch-" + name.split(":")[1])
+        if name.startswith("published:"):
+            try:
+                (label_dir / "manifest.json").unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                results.append({"target": name, "deleted": False, "error": "POINTER_NOT_REMOVED"})
+                continue
+        results.append({"target": name, "deleted": _purge_remove(path, label_dir), "bytes": entry["bytes"]})
+    state_after, problem_after = _annotated_state(sha256, label)
+    deleted_all = all(r["deleted"] for r in results)
+    committed, commit_why = _journal_append(sha256, {"event": "purge_committed", "label": label, "results": results,
+                                                     "state_clean_after": problem_after is None})
+    body = {"ok": deleted_all, "tool": tool, "status": "OK" if deleted_all else "PARTIAL_FAILURE", "deleted": any(r["deleted"] for r in results),
+            "results": results, "freed_bytes": sum(r.get("bytes", 0) for r in results if r["deleted"]),
+            "target_sha256": sha256, "label": label, "journal": {"prepared": True, "committed": committed},
+            "published_version_after": state_after["version"] if state_after else None,
+            "scope_unverified_after": problem_after is not None}
+    if cleared:
+        body["unverified_cleared"] = deleted_all and problem_after is None
+        body["unverified_reason_was"] = problem["reason"]
+        body["note"] = ("The unverified state was cleared by this call: the pointer was removed (its digest is in the results and the "
+                        "journal), open write records were closed as `cleared_by_purge`, and the scope now has no published version. "
+                        "The version files that remain are unreferenced; name them to delete them.")
+        if problem_after is not None:
+            body["note"] = "The unverified state could NOT be cleared: " + str(problem_after["reason"])
+    if not committed:
+        body["commit_record_pending"] = True
+        body["journal"]["commit_error"] = commit_why
+    if not deleted_all:
+        body["fix"] = "Some targets were not deleted (a handle may hold them). Run the report again and retry what remains."
+    return _j(body)
+
+
+# --------------------------------------------------------------------------
 # ida_status
 # --------------------------------------------------------------------------
 
@@ -2956,7 +3261,8 @@ def ida_status():
             "network_lookup_detected": signals["network_lookup_detected"],
             "cache": _cache_summary(),
             "operations": ["ida_query", "ida_microcode_cfg", "ida_type_member_offset", "ida_patch_plan",
-                           "ida_annotations", "ida_rename_plan", "ida_annotations_apply", "ida_status"],
+                           "ida_annotations", "ida_rename_plan", "ida_annotations_apply", "ida_annotations_purge",
+                           "ida_status"],
             "query_operations": list(_ALLOWED_OPERATIONS),
             "note": (
                 "OK means idat launched headless and exited cleanly on an empty database; it does not "
