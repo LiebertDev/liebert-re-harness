@@ -142,7 +142,20 @@ def test_published_tool_name_set_is_unchanged():
     # and gate evidence) and _engine_tag (IDA cache key carries the engine version).
     # API monitor refusals branch: _working_operations_note. The new patch_plan.idapy is a data
     # file, not a module: the CI module count stays 70.
+    #
+    # IDA annotated write path and purge branch (two commits, recomputed once for their total effect
+    # by diffing the sorted top-level name lists of the two trees: 667 names before, 706 after, none
+    # removed, 39 added). Public: ida_rename_plan, ida_annotations_apply, ida_annotations_purge. The
+    # other 36 are private top-level helpers of the annotated subsystem in liebert_re/tools/ida.py:
+    # _annotated_budget_bytes, _annotated_root, _annotated_session, _annotated_state,
+    # _annotated_total_bytes, _apply_locked, _copy_into_budget, _copy_pristine, _file_sha256,
+    # _fsync_path, _journal_append, _journal_path, _journal_records, _label_dir, _label_refusal,
+    # _lock_annotated, _manifest_read, _manifest_write, _marker_matches, _opening_checks,
+    # _overlap_refusal, _plan_problem, _purge_confirmation, _purge_inventory, _purge_locked,
+    # _purge_remove, _recover_pending, _refuse, _remove_owned_work, _replace_file, _roots_apart,
+    # _sha256_text, _tree_bytes, _utc_now, _valid_label, _version_file. The new annotate_write.idapy
+    # is a data file, not a module: the CI module count stays 70.
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "68a069615268a853a6f36d1587cfae25512e664d5ee09fd48b56a54a639b0c45"
+    assert digest == "bf6a72f8973ddb1bcbb94b766c8a448f88587d67db8e7aa4ae1682926be27bec"
