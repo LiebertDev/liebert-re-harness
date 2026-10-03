@@ -93,13 +93,29 @@ the cache slots and never starts IDA. These three keep the target's name and pat
 answers and out of their evidence file names (the input hash names them), and each of the first two
 has its own reopen-session ceiling constant.
 
+**Annotations that persist (`ida_rename_plan`, `ida_annotations_apply`).** A plan and an apply are two
+operations with two names, not a flag: a flag can be closed with the wrong default, a separate name cannot.
+The plan reads the scope's current names and binds itself to the annotation version it read; the apply
+cannot be called without a plan, recomputes the plan's digest, refuses a stale plan, and writes a NEW
+immutable version (one manifest pointer publishes it) into the ANNOTATED root: its own tree beside, not
+inside, the cache, with its own locks, which the cache's eviction, slot deletion and scratch cleanup never
+see. The write happens in a session of a scratch COPY (never of the pristine cache database, never of a
+published version); the candidate is synced and kept in a recovery directory until promoted; an audit
+journal gets a `batch_prepared` record before the promotion and `batch_committed` after it; and a NEW
+engine process reads the stored version back (names and the annotation marker stored inside the database)
+before the pointer is published. Concurrent writers are blocked, not merged (`concurrency_policy` in every
+answer). The write worker is its own data file, `ida_scripts/annotate_write.idapy`, and the only one that
+contains write calls.
+
 Scope of this module: `ida_query`, `ida_microcode_cfg`, `ida_type_member_offset`, `ida_patch_plan`
-and `ida_annotations` (none of them writes the input or persists anything) and `ida_status`. The
-operations that persist annotations (rename, comments) are not here.
+and `ida_annotations` (none of them writes the input or persists anything), `ida_rename_plan` and
+`ida_annotations_apply` (the one persistent write path; comments are not here yet), `ida_annotations_purge`
+(the only deletion of annotated data: named targets, report first, a confirmation bound to what it reports) and `ida_status`.
 """
 from __future__ import annotations
 
 import collections
+import datetime
 import getpass
 import hashlib
 import json
@@ -130,6 +146,11 @@ EVIDENCE_MICROCODE.mkdir(parents=True, exist_ok=True)
 EVIDENCE_TYPE_MEMBER = APP_DIR / "dataset" / "evidence" / "ida_type_member_offset"
 EVIDENCE_PATCH_PLAN = APP_DIR / "dataset" / "evidence" / "ida_patch_plan"
 EVIDENCE_ANNOTATIONS = APP_DIR / "dataset" / "evidence" / "ida_annotations"
+EVIDENCE_RENAME_PLAN = APP_DIR / "dataset" / "evidence" / "ida_rename_plan"
+EVIDENCE_ANNOTATE_APPLY = APP_DIR / "dataset" / "evidence" / "ida_annotations_apply"
+# Annotated data has its OWN root, a sibling of the cache and never inside it: the cache evicts, rebuilds
+# and deletes whole slots, and a person's annotations are not re-derivable. Created lazily. Tests patch this name.
+ANNOTATED_ROOT = APP_DIR / "dataset" / "ida_annotated"
 # Created lazily, on first use: a status call on a machine without IDA must
 # not leave an empty directory behind. Tests patch this name.
 CACHE_ROOT = APP_DIR / "dataset" / "ida_cache"
@@ -137,6 +158,7 @@ CACHE_ROOT = APP_DIR / "dataset" / "ida_cache"
 _WORKER_SOURCE = Path(__file__).resolve().parent / "ida_scripts" / "query_program.idapy"
 _MICROCODE_WORKER_SOURCE = Path(__file__).resolve().parent / "ida_scripts" / "microcode_cfg.idapy"
 _PATCH_PLAN_WORKER_SOURCE = Path(__file__).resolve().parent / "ida_scripts" / "patch_plan.idapy"
+_ANNOTATE_WORKER_SOURCE = Path(__file__).resolve().parent / "ida_scripts" / "annotate_write.idapy"
 _JOB_ENV = "LIEBERT_IDA_JOB"
 _JOB_SCRIPT = "liebert_ida_job.py"
 _LOG_NAME = "ida.log"
@@ -175,6 +197,19 @@ _MAX_MICROCODE_TIMEOUT_SECONDS = 300
 # Exceeding one is TIMEOUT, never "no such member" or "no plan".
 _MAX_TYPE_MEMBER_TIMEOUT_SECONDS = 300
 _MAX_PATCH_PLAN_TIMEOUT_SECONDS = 300
+# The annotation write path's own session ceiling (one session: a plan read, the write, or the read-back
+# of the stored version; the first analysis of a file keeps the create ceiling). TIMEOUT, never "nothing written".
+_MAX_ANNOTATE_TIMEOUT_SECONDS = 300
+# The annotated byte ceiling: annotated data is never evicted, so a full budget refuses the next write
+# and asks for a decision. 2 GiB is a reasonable starting value, not a measured threshold.
+_ANNOTATED_BUDGET_DEFAULT = 2 * 1024 ** 3
+# How long a file move that Windows refuses because another handle is open is retried (100 ms apart).
+_PROMOTE_RETRY_SECONDS = 10
+_LABEL = re.compile(r"[A-Za-z0-9._-]{1,48}")
+_NEW_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,254}")
+_RENAME_MAX_ITEMS = 200
+_PLAN_SCHEMA = 1
+_VERSION_DIR = re.compile(r"v(\d{6})")
 # idat's own stdout/stderr is a few KB; the result travels in a file.
 _MAX_OUTPUT_CHARS = 1024 * 1024
 _MIN_RESPONSE_CHARS = 2000
@@ -226,7 +261,8 @@ _PATCH_PLAN_ERROR_STATUS = {name: name for name in (
     "INVALID_ADDRESS_KIND", "ADDRESS_OUTSIDE_SECTION", "ARCHITECTURE_NOT_SUPPORTED")}
 
 # The write log of annotations made through this package (one append-only JSON-lines file per input
-# hash, next to the cache slots). This module only READS it; it never starts IDA for that.
+# hash, in the annotated root; each record carries the scope label). `ida_annotations` only READS it and
+# never starts IDA for that; `ida_annotations_apply` is the one writer.
 _ANNOTATION_LOG_SUFFIX = ".writes.jsonl"
 _ANNOTATION_DEFAULT_MAXIMUM = 500
 _ANNOTATION_MAX_ENTRIES = 5000
@@ -1498,8 +1534,9 @@ def ida_annotations(path, max_results=_ANNOTATION_DEFAULT_MAXIMUM, max_chars=600
 
     `found: false` (no log for this hash) means this package recorded no annotation for this input.
     It does NOT mean the database has no names or comments of its own: IDA's analysis and any loaded
-    symbols are not logged here. This package has no operation that writes annotations yet, so no
-    log exists until one does. The answer carries the input's hash, not its name or path, and every
+    symbols are not logged here. The only operation that writes annotations is `ida_annotations_apply`,
+    so no log exists until one has been applied. The log lives in the annotated root (its own tree,
+    never inside the cache), one file per input hash; each record carries its scope label. The answer carries the input's hash, not its name or path, and every
     string from the log passes the same scrubbing as IDA's output (home paths, account name).
 
     Status vocabulary: OK, PARTIAL, PATH_REFUSED, NOT_FOUND, READ_FAILED, ANALYSIS_LIMITED.
@@ -1525,7 +1562,7 @@ def ida_annotations(path, max_results=_ANNOTATION_DEFAULT_MAXIMUM, max_chars=600
                    "environment_error": {"type": type(exc).__name__, "errno": exc.errno,
                                          "strerror": _redact(exc.strerror or type(exc).__name__)},
                    "detail": "The input file could not be read; no claim is made about its annotations."})
-    log = _cache_root() / f"{sha256}{_ANNOTATION_LOG_SUFFIX}"
+    log = _journal_path(sha256)       # the annotated root's journal, not the cache's: see ANNOTATED_ROOT
     kept = collections.deque(maxlen=limit)
     total = unreadable = oversized = 0
     present = True
@@ -1590,7 +1627,8 @@ def ida_annotations(path, max_results=_ANNOTATION_DEFAULT_MAXIMUM, max_chars=600
             "Annotations this package recorded for this input content; IDA's own names, comments and any "
             "loaded symbols are not in this log. "
             + ("" if present else "No log exists for this input hash: this package has recorded no annotation for it. "
-               "It has no operation that writes annotations yet, so a log does not exist until one does.")
+               "The only operation that writes annotations is ida_annotations_apply, so a log does not exist until "
+               "one has been applied.")
         ),
     }
     evidence = _write_evidence(p, "annotations", body, EVIDENCE_ANNOTATIONS, stem=sha256[:16])
@@ -1881,6 +1919,1312 @@ def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation
 
 
 # --------------------------------------------------------------------------
+# the annotation write path: ida_rename_plan + ida_annotations_apply
+# --------------------------------------------------------------------------
+#
+# Lifecycle (Z1): the annotated data lives in its OWN root (`ANNOTATED_ROOT`), never under the cache
+# root, with its own lock files. Nothing in this section calls the slot-eviction helper, the cache
+# budget enforcement or a recursive delete on a cache path, and nothing in the cache lifecycle is ever
+# handed a path under the annotated root; a test reads this section's source and pins both. The one
+# recursive delete here (`_remove_owned_work`) removes only work directories this call created itself
+# (`scratch-*` or `recovery/<write id>`), and only after a successful promotion or a plain refusal.
+#
+# Layout under ANNOTATED_ROOT:
+#   <sha256>.lock                       one writer at a time per input hash (the cache's lock class)
+#   <sha256>.writes.jsonl               the append-only audit journal (what `ida_annotations` reads)
+#   annotated-budget.lock               short lock around the byte-budget decision
+#   <sha256>/<label>/manifest.json      THE pointer: the one published version (written atomically)
+#   <sha256>/<label>/versions/vNNNNNN/db.i64     immutable once placed; never opened in place
+#   <sha256>/<label>/recovery/<write id>/        the candidate before promotion (kept if promotion fails)
+#   <sha256>/<label>/scratch-<id>/               a throwaway copy for a read session; deleted after
+
+_CONCURRENCY_POLICY = {
+    "policy": "base_version_precondition",
+    "merges": False,
+    "lost_updates": "blocked",
+    "summary": (
+        "A plan is bound to the annotation version it was read from (base_version and, after the first "
+        "write, that version's database hash). Writers of one input hash are serialised by one lock, and "
+        "an apply whose plan base is no longer the published version is refused with PRECONDITION_FAILED "
+        "(STALE_BASE_VERSION) and writes nothing. Two writers never merge and never silently replace each "
+        "other: the later one must plan again. Every item also carries its own `expect` precondition."
+    ),
+}
+_ANNOTATED_STATE_UNVERIFIED = "ANNOTATED_STATE_UNVERIFIED"
+
+
+def _annotated_root():
+    return Path(ANNOTATED_ROOT)
+
+
+def _roots_apart():
+    """The annotated root and the cache root are different, unrelated trees: neither is, contains or
+    sits inside the other. If they ever overlap the write path refuses to run, so a misconfiguration
+    cannot put annotated data back under the cache's eviction."""
+    try:
+        annotated = os.path.normcase(os.path.realpath(_annotated_root()))
+        cache = os.path.normcase(os.path.realpath(_cache_root()))
+    except (OSError, ValueError):
+        return False
+    return not (annotated == cache or annotated.startswith(cache + os.sep) or cache.startswith(annotated + os.sep))
+
+
+def _annotated_budget_bytes():
+    try:
+        return max(1, int(os.getenv("LIEBERT_IDA_ANNOTATED_BYTES", _ANNOTATED_BUDGET_DEFAULT)))
+    except (TypeError, ValueError):
+        return _ANNOTATED_BUDGET_DEFAULT
+
+
+def _annotated_total_bytes():
+    """Bytes under the annotated root, or None when that cannot be measured (an unreadable entry is
+    not skipped: a budget decision over a partial count would be a guess)."""
+    root = _annotated_root()
+    if not os.path.isdir(root):
+        return 0
+    total = 0
+    problems = []
+    for directory, _dirs, files in os.walk(root, onerror=problems.append):
+        for name in files:
+            try:
+                total += os.stat(os.path.join(directory, name)).st_size
+            except OSError:
+                return None
+    return None if problems else total
+
+
+def _journal_path(sha256):
+    return _annotated_root() / f"{sha256}{_ANNOTATION_LOG_SUFFIX}"
+
+
+def _utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _canonical(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _sha256_text(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _fsync_path(path):
+    """Flush a file's data to the disk. Returns an error name, or None."""
+    try:
+        with open(path, "r+b") as handle:
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        return type(exc).__name__
+    return None
+
+
+def _replace_file(source, destination):
+    """`os.replace` with the bounded retry the Windows sharing rules need: another handle on the target
+    (winerror 5) or on the source (winerror 32) makes it fail and a retry succeeds once the holder lets
+    go. Only those two codes are retried, for at most `_PROMOTE_RETRY_SECONDS`. Returns an error name or None."""
+    deadline = time.monotonic() + _PROMOTE_RETRY_SECONDS
+    while True:
+        try:
+            os.replace(source, destination)
+            return None
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) not in (5, 32) or time.monotonic() >= deadline:
+                return type(exc).__name__
+            time.sleep(0.1)
+        except OSError as exc:
+            return type(exc).__name__
+
+
+def _journal_append(sha256, record):
+    """Append one record to the audit journal: one JSON object per line, flushed and synced to disk
+    before this returns. Returns (True, None) or (False, error name); it never raises. A journal that
+    cannot be written is a failed write to the caller's answer, never a hidden one. This is NOT the
+    best-effort evidence writer: that one swallows its errors."""
+    body = {"schema": 1, "ts": _utc_now(), "target_sha256": sha256, **record}
+    body["record_sha256"] = _sha256_text(_canonical(body))
+    line = (_canonical(body) + "\n").encode("utf-8")
+    path = _journal_path(sha256)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torn = False
+        if path.exists() and path.stat().st_size > 0:
+            with open(path, "rb") as reader:
+                reader.seek(-1, os.SEEK_END)
+                torn = reader.read(1) != b"\n"
+        with open(path, "ab") as handle:
+            if torn:
+                handle.write(b"\n")     # a torn last line must not swallow this record
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        return False, type(exc).__name__
+    return True, None
+
+
+def _journal_records(sha256):
+    """(records in file order, count of unreadable lines, error name or None)."""
+    path = _journal_path(sha256)
+    records, unreadable = [], 0
+    try:
+        with open(path, "rb") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line.decode("utf-8"))
+                except (ValueError, RecursionError):
+                    unreadable += 1
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+                else:
+                    unreadable += 1
+    except FileNotFoundError:
+        return [], 0, None
+    except OSError as exc:
+        return [], 0, type(exc).__name__
+    return records, unreadable, None
+
+
+def _label_dir(sha256, label):
+    """One directory per (input hash, label), named by a digest of the label so that no label can be a
+    reserved device name, a dot name or a case variant of another on this file system; the full label is
+    stored in the manifest and compared on every access."""
+    return _annotated_root() / sha256 / hashlib.sha256(label.encode("utf-8")).hexdigest()[:12]
+
+
+def _version_file(label_dir, version):
+    return label_dir / "versions" / f"v{version:06d}" / _DB_NAME
+
+
+def _manifest_read(label_dir):
+    """(manifest, problem). Absent is (None, None); anything else that is not a well-formed manifest is
+    a named problem, never treated as 'absent'."""
+    path = label_dir / "manifest.json"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, None
+    except OSError:
+        return None, "MANIFEST_UNREADABLE"
+    try:
+        record = json.loads(text)
+    except ValueError:
+        return None, "MANIFEST_MALFORMED"
+    required = (("version", int), ("db_sha256", str), ("write_id", str), ("sha256", str), ("label", str))
+    if not isinstance(record, dict) or not all(isinstance(record.get(k), t) and not isinstance(record.get(k), bool)
+                                               for k, t in required) or record["version"] < 1:
+        return None, "MANIFEST_MALFORMED"
+    return record, None
+
+
+def _manifest_write(label_dir, record):
+    """Publish the pointer: write a private file, sync it, then replace the manifest in one step.
+    Returns an error name or None."""
+    temporary = label_dir / f"manifest.{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        temporary.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+    except OSError as exc:
+        return type(exc).__name__
+    error = _fsync_path(temporary) or _replace_file(temporary, label_dir / "manifest.json")
+    if error:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+    return error
+
+
+def _file_sha256(path):
+    """(hex digest, None) or (None, error name)."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        return None, type(exc).__name__
+    return digest.hexdigest(), None
+
+
+def _remove_owned_work(path):
+    """Delete a work directory this call created: `scratch-*` or `recovery/<write id>`, under the
+    annotated root, and nothing else. The only recursive delete in the annotated section."""
+    try:
+        target = Path(os.path.realpath(path))
+        root = Path(os.path.realpath(_annotated_root()))
+        inside = root in target.parents
+    except (OSError, ValueError):
+        return False
+    owned = target.name.startswith("scratch-") or target.parent.name == "recovery"
+    if not (inside and owned):
+        return False
+    shutil.rmtree(target, ignore_errors=True)
+    return not target.exists()
+
+
+def _refuse(tool, status, error, *, fixable, fix, **extra):
+    """A teaching refusal: the field or condition by name, what is accepted, and whether the caller can
+    correct it (`fixable` true), must wait and retry (`"retry_later"`) or cannot (`false`: the state or
+    the environment needs an operator)."""
+    body = {"ok": False, "tool": tool, "status": status, "error": error, "fixable": fixable, "fix": fix}
+    body.update(extra)
+    return _j(body)
+
+
+def _annotated_state(sha256, label):
+    """The published state of one (input hash, label): (state, None) or (None, refusal parts).
+    State: version (0 = nothing published yet), db path, db sha256, the manifest. The manifest is read
+    with the file it points at: the version file must exist and hash to the manifest's value, and the
+    manifest must name this exact hash and this exact label (not a prefix, not a case variant)."""
+    label_dir = _label_dir(sha256, label)
+    manifest, problem = _manifest_read(label_dir)
+    if problem:
+        return None, {"error": _ANNOTATED_STATE_UNVERIFIED, "reason": problem}
+    if manifest is None:
+        return {"version": 0, "db": None, "db_sha256": None, "manifest": None, "label_dir": label_dir}, None
+    if manifest["sha256"] != sha256 or manifest["label"] != label:
+        return None, {"error": _ANNOTATED_STATE_UNVERIFIED, "reason": "MANIFEST_NAMES_ANOTHER_SCOPE"}
+    db = _version_file(label_dir, manifest["version"])
+    digest, failure = _file_sha256(db)
+    if failure:
+        return None, {"error": _ANNOTATED_STATE_UNVERIFIED, "reason": "VERSION_FILE_UNREADABLE:" + failure}
+    if digest != manifest["db_sha256"]:
+        return None, {"error": _ANNOTATED_STATE_UNVERIFIED, "reason": "VERSION_FILE_HASH_MISMATCH"}
+    return {"version": manifest["version"], "db": db, "db_sha256": digest, "manifest": manifest,
+            "label_dir": label_dir}, None
+
+
+def _recover_pending(sha256):
+    """Write-ahead recovery, at the start of every operation that touches this input's annotated data,
+    under the lock. A `batch_prepared` record with no `batch_committed` / `batch_aborted` for its write
+    id is an interrupted write. The decision uses the files, never the clock:
+
+    * the manifest already publishes that write (same write id and hash): the commit record is all that
+      was missing; it is written (`recovered: true`);
+    * otherwise the manifest must still be the state the write started from. Then nothing was published:
+      the write is closed with an abort record, and the candidate stays where it is (in `recovery/` if it
+      was never promoted, in `versions/` if it was promoted but not published; a promoted but unpublished
+      version is NOT trusted, because its verification may not have run);
+    * a manifest that is neither makes that label `unverified`: reported by name, never repaired.
+
+    Returns {label: reason} for the labels left unverified, plus the list of actions taken."""
+    records, _unreadable, error = _journal_records(sha256)
+    if error:
+        return {"*": "JOURNAL_UNREADABLE:" + error}, []
+    closed = {r.get("write_id") for r in records if r.get("event") in ("batch_committed", "batch_aborted")}
+    unverified, actions = {}, []
+    for prepared in (r for r in records if r.get("event") == "batch_prepared" and r.get("write_id") not in closed):
+        label, write_id = prepared.get("label"), prepared.get("write_id")
+        if not (isinstance(label, str) and _LABEL.fullmatch(label) and isinstance(write_id, str)):
+            unverified["*"] = "PREPARED_RECORD_MALFORMED"
+            continue
+        label_dir = _label_dir(sha256, label)
+        manifest, problem = _manifest_read(label_dir)
+        if problem:
+            unverified[label] = problem
+            continue
+        if manifest and manifest["write_id"] == write_id and manifest["db_sha256"] == prepared.get("candidate_db_sha256"):
+            ok, why = _journal_append(sha256, {"event": "batch_committed", "write_id": write_id, "label": label,
+                                               "version": manifest["version"], "db_sha256": manifest["db_sha256"],
+                                               "recovered": True})
+            actions.append({"label": label, "write_id": write_id, "action": "commit_recorded" if ok else "commit_pending"})
+            if not ok:
+                unverified[label] = "JOURNAL_UNWRITABLE:" + str(why)
+            continue
+        current = manifest["version"] if manifest else 0
+        current_hash = manifest["db_sha256"] if manifest else None
+        if current != prepared.get("prior_version") or current_hash != prepared.get("prior_db_sha256"):
+            unverified[label] = "MANIFEST_DIFFERS_FROM_PRIOR_STATE"
+            continue
+        number = prepared.get("version")
+        promoted = _version_file(label_dir, number if isinstance(number, int) and not isinstance(number, bool) else 0)
+        retained = "versions" if promoted.exists() else (
+            "recovery" if (label_dir / "recovery" / write_id / _DB_NAME).exists() else "none")
+        ok, why = _journal_append(sha256, {"event": "batch_aborted", "write_id": write_id, "label": label,
+                                           "reason": "interrupted_before_publication", "retained": retained,
+                                           "recovered": True})
+        actions.append({"label": label, "write_id": write_id, "action": "abort_recorded" if ok else "abort_pending",
+                        "candidate_retained_in": retained})
+        if not ok:
+            unverified[label] = "JOURNAL_UNWRITABLE:" + str(why)
+    return unverified, actions
+
+
+def _lock_annotated(tool, sha256, cancellation_token):
+    """(lock, None) or (None, refusal JSON). One writer at a time per input hash, in the annotated root's
+    own lock file: the cache's locks are never taken for annotated data."""
+    try:
+        lock = _acquire_slot_lock(_annotated_root() / sha256, cancellation_token)
+    except OSError as exc:
+        return None, _j(_EnvironmentFailure("IDA_ANNOTATED_ROOT_UNUSABLE", exc).body(tool, target_sha256=sha256))
+    if lock is None:
+        return None, _refuse(tool, "ANALYSIS_LIMITED", "ANNOTATED_BUSY", fixable="retry_later",
+                             fix="Another call is writing or planning against this input's annotations; retry when it "
+                                 "finishes.", target_sha256=sha256)
+    return lock, None
+
+
+def _overlap_refusal(tool):
+    """Refusal JSON when the annotated and cache roots are not separate trees, else None."""
+    if _roots_apart():
+        return None
+    return _refuse(tool, "ANALYSIS_LIMITED", "ANNOTATED_ROOT_OVERLAPS_CACHE", fixable=False,
+                   fix="The annotated root and the cache root must be separate trees (the cache evicts and "
+                       "deletes; annotations are never evicted). Correct the configuration.")
+
+
+def _opening_checks(tool, sha256, label, unverified):
+    """The checks that precede every annotated operation. Returns a refusal JSON or None."""
+    reason = unverified.get(label) or unverified.get("*")
+    if reason:
+        return _refuse(tool, "ANALYSIS_LIMITED", _ANNOTATED_STATE_UNVERIFIED, fixable=False, reason=reason,
+                       target_sha256=sha256, label=label,
+                       fix="This scope's recorded state cannot be confirmed. It is not repaired automatically and "
+                           "is not served as if it were fine. No operation in this build clears it; an operator "
+                           "must inspect the annotated root and the journal.")
+    return None
+
+
+def _copy_pristine(exe, p, sha256, md5, destination, total_seconds, cancellation_token):
+    """Copy the analysed pristine database into `destination` (building it first when the slot is
+    absent or unhealthy), under the pristine slot's own lock. The pristine file is only read here."""
+    slot = _slot_dir(sha256)
+    try:
+        lock = _acquire_slot_lock(slot, cancellation_token)
+    except OSError as exc:
+        raise _StageFailure(_EnvironmentFailure("IDA_CACHE_ROOT_UNUSABLE", exc).body(
+            "ida_annotations_apply", target_sha256=sha256)) from exc
+    if lock is None:
+        raise _StageFailure({"ok": False, "tool": "ida_annotations_apply", "status": "ANALYSIS_LIMITED",
+                             "error": "IDA_CACHE_SLOT_BUSY", "target_sha256": sha256, "fixable": "retry_later",
+                             "fix": "Another process is analysing this exact file; retry when it finishes."})
+    try:
+        if not _slot_is_healthy(slot):
+            invocation = {"operation": "summary", "query": "", "max_results": 1, "offset": 0,
+                          "timeout_seconds": total_seconds}
+            # The shared first-analysis path writes an evidence file and an answer; here both are keyed by the
+            # input hash (`omit_path`, own evidence directory), so the target's name never reaches either.
+            outcome = _query_locked(exe, p, sha256, md5, slot, invocation, _MIN_RESPONSE_CHARS, cancellation_token,
+                                    {"tool": "ida_annotations_apply", "omit_path": True,
+                                     "evidence_dir": EVIDENCE_ANNOTATE_APPLY})
+            if not (isinstance(outcome, dict) and outcome.get("ok") is True):
+                raise _StageFailure(outcome if isinstance(outcome, dict) else {
+                    "ok": False, "tool": "ida_annotations_apply", "status": "ANALYSIS_LIMITED",
+                    "error": "PRISTINE_ANALYSIS_FAILED"})
+            _enforce_cache_budget(slot)
+        try:
+            shutil.copyfile(slot / _DB_NAME, destination)
+        except OSError as exc:
+            raise _StageFailure(_EnvironmentFailure("IDA_DATABASE_UNREADABLE", exc).body(
+                "ida_annotations_apply", target_sha256=sha256)) from exc
+        _touch_meta(slot, sha256)
+    finally:
+        _release_slot_lock(lock)
+
+
+def _copy_into_budget(source, destination, tool, sha256, cancellation_token):
+    """Copy a base database to its work location while the byte budget is decided: one short global
+    lock, the current total plus this copy against the ceiling, and the copy itself is the reservation
+    (it counts in every later total). Raises _StageFailure with a refusal body."""
+    try:
+        need = os.stat(source).st_size
+    except OSError as exc:
+        raise _StageFailure(_EnvironmentFailure("IDA_DATABASE_UNREADABLE", exc).body(tool, target_sha256=sha256)) from exc
+    try:
+        lock = _acquire_slot_lock(_annotated_root() / "annotated-budget", cancellation_token)
+    except OSError as exc:
+        raise _StageFailure(_EnvironmentFailure("IDA_ANNOTATED_ROOT_UNUSABLE", exc).body(tool, target_sha256=sha256)) from exc
+    if lock is None:
+        raise _StageFailure(json.loads(_refuse(tool, "ANALYSIS_LIMITED", "ANNOTATED_BUSY", fixable="retry_later",
+                                               fix="The annotated byte budget is being decided by another call; retry.")))
+    try:
+        total, budget = _annotated_total_bytes(), _annotated_budget_bytes()
+        if total is None:
+            raise _StageFailure(json.loads(_refuse(
+                tool, "ANALYSIS_LIMITED", "ANNOTATED_BUDGET_UNVERIFIABLE", fixable=False,
+                fix="The bytes held under the annotated root could not be measured (an entry could not be read), "
+                    "so no budget decision can be made and nothing was written. Fix the file-system problem.")))
+        if total + need > budget:
+            raise _StageFailure(json.loads(_refuse(
+                tool, "ANALYSIS_LIMITED", "ANNOTATED_BUDGET_EXHAUSTED", fixable=False,
+                fix="Annotated data is never evicted automatically, so a full budget needs an operator decision: "
+                    "raise LIEBERT_IDA_ANNOTATED_BYTES or remove scopes that are no longer needed. Nothing was written.",
+                annotated_bytes=total, needed_bytes=need, budget_bytes=budget)))
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+        except OSError as exc:
+            raise _StageFailure(_EnvironmentFailure("IDA_ANNOTATED_IO_ERROR", exc).body(tool, target_sha256=sha256)) from exc
+    finally:
+        _release_slot_lock(lock)
+
+
+def _annotated_session(exe, work, job, *, tool, sha256, md5, invocation, temporary, seconds, cancellation_token):
+    """One idat launch of the annotation worker over `work/db.i64`, with the four-signal verdict.
+    `temporary` sessions (plan, verify) must report the discard guarantee; the write session must report
+    that it did NOT discard (its changes are the point). Returns (data, signals, provenance) or raises
+    _StageFailure. Nothing here deletes a database: a failed session leaves its directory for the caller."""
+    operation = job["operation"]
+    job = {"output": str(work / _RESULT_NAME), "mode": "reopen" if temporary else "write",
+           "max_results": 1, "offset": 0, "query": "", **job}
+    try:
+        cp, _command = _launch(exe, work, job, mode="reopen", target=work / _DB_NAME, timeout_seconds=seconds,
+                               cancellation_token=cancellation_token, worker_source=_ANNOTATE_WORKER_SOURCE)
+    except _EnvironmentFailure as failure:
+        raise _StageFailure(failure.body(tool, invocation=invocation, target_sha256=sha256)) from failure
+    if cp.cancelled or cp.timed_out:
+        raise _StageFailure({
+            "ok": False, "tool": tool, "status": "CANCELLED" if cp.cancelled else "TIMEOUT",
+            "invocation": invocation, "target_sha256": sha256, "timeout_seconds": seconds,
+            "stage_ceiling_seconds": _MAX_ANNOTATE_TIMEOUT_SECONDS,
+            "error": "IDA_CANCELLED_PROCESS_TREE_TERMINATED" if cp.cancelled else "IDA_TIMEOUT_PROCESS_TREE_TERMINATED",
+            "detail": "Do not read this as 'no names' or 'nothing written'. A write that was cut off left its "
+                      "candidate in the recovery directory and published nothing.",
+        })
+    data, error, signals = _verdict(cp, work, work / _DB_NAME, expect_database=not temporary,
+                                    expect_operation=operation, require_discard=temporary)
+    if not error and not temporary and isinstance(data, dict) and data.get("ok") is True \
+            and data.get("database_changes_discarded") is not False:
+        error = "WRITE_SESSION_REPORTS_DISCARD"
+    if error:
+        extra = {"invocation": invocation, "target_sha256": sha256}
+        if isinstance(data, dict) and data.get("error"):
+            extra["worker_error"] = data.get("error")
+        raise _StageFailure(_failure_response(
+            tool, "RESULT_PARSE_FAILED" if error == "RESULT_PARSE_FAILED" else "ANALYSIS_LIMITED", error,
+            operation=operation, signals=signals, cp=cp, work=work, target=None, extra=extra))
+    provenance = _provenance(sha256, md5, data)
+    if provenance["status"] == "MISMATCH":
+        raise _StageFailure({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "IDA_INPUT_HASH_MISMATCH",
+                             "target_sha256": sha256, "provenance": provenance, "invocation": invocation,
+                             "detail": "The database's recorded input is not the file that was hashed; the result was refused."})
+    return data, signals, provenance
+
+
+def _marker_matches(marker, sha256, label, state):
+    """Does the annotation marker stored INSIDE the database say what the manifest says? This is the
+    provenance check that covers the annotation version, not only the input hash."""
+    if state["version"] == 0:
+        return marker is None
+    manifest = state["manifest"]
+    return (isinstance(marker, dict) and marker.get("version") == manifest["version"]
+            and marker.get("label") == label and marker.get("write_id") == manifest["write_id"]
+            and marker.get("target_sha256") == sha256)
+
+
+def _valid_label(value):
+    return isinstance(value, str) and bool(_LABEL.fullmatch(value))
+
+
+def _label_refusal(tool, value):
+    return _refuse(tool, "ANALYSIS_LIMITED", "LABEL_REQUIRED", fixable=True, field="label", given=repr(value)[:80],
+                   accepted=_LABEL.pattern,
+                   fix="`label` is required and explicit (it is never inferred): 1 to 48 characters from letters, "
+                       "digits, '.', '_' and '-'. It names the scope of the annotations, for example `first-pass`.")
+
+
+def ida_rename_plan(path, label=None, renames=None, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                    cancellation_token=None):
+    """PLAN renames of items in the analysis database of `path`; nothing is written. The plan is read
+    from the annotation scope `label` as it is now (the published annotation version, or the pristine
+    analysis when nothing has been published for that label), so each item carries the name it expects to
+    find. Apply it with `ida_annotations_apply`.
+
+    `label` is required and explicit: 1 to 48 characters of letters, digits, '.', '_', '-'. `renames` is
+    a list of 1 to 200 objects: `address` (an integer or a string such as "0x140001000"), `new_name`
+    (a C identifier of at most 255 characters), and optionally `address_kind` (`va` default, `rva` or
+    `file_offset`). The address must be the start of an item, and the name must differ from the current one.
+
+    The answer carries `plan` and `plan_sha256` (a digest over the canonical plan: input hash, label, base
+    version and database hash, and every item with its precondition). The digest catches an altered or
+    mixed-up plan; it is not a signature and not an authorisation. The plan states the concurrency policy
+    in `concurrency_policy`: it is bound to a base version, and a later write to the same scope makes it
+    stale (it is refused at apply, not merged).
+
+    The database is read through a throwaway COPY in a temporary session (nothing it does is saved). When
+    a version has been published, the copy is of that version, and the answer says which annotation
+    version it read (`annotated_view`), checked against the marker stored inside the database as well
+    as the manifest. The answer carries the input's hash, not its name or path. Every list in the answer is
+    complete (`items_listed_complete: true`); an input over 200 renames is refused, not cut.
+
+    Status vocabulary: OK, TOOL_MISSING, PATH_REFUSED, NOT_FOUND, TIMEOUT, CANCELLED, ANALYSIS_LIMITED
+    (every refusal names the field, what is accepted, and `fixable`), RESULT_PARSE_FAILED.
+    """
+    tool = "ida_rename_plan"
+    if not _valid_label(label):
+        return _label_refusal(tool, label)
+    if not isinstance(renames, list) or not 1 <= len(renames) <= _RENAME_MAX_ITEMS:
+        return _refuse(tool, "ANALYSIS_LIMITED", "RENAMES_REQUIRED", fixable=True, field="renames",
+                       given=f"{type(renames).__name__}" + (f" of {len(renames)}" if isinstance(renames, list) else ""),
+                       accepted=f"a list of 1 to {_RENAME_MAX_ITEMS} objects with address and new_name",
+                       fix="Pass the renames as a list of objects; a longer list is refused rather than cut, so split it.")
+    items, seen_addresses, seen_names = [], set(), set()
+    for index, entry in enumerate(renames):
+        problem = None
+        if not isinstance(entry, dict):
+            problem = ("RENAME_ITEM_NOT_AN_OBJECT", None)
+        elif set(entry) - {"address", "new_name", "address_kind"}:
+            problem = ("RENAME_ITEM_UNKNOWN_FIELD", sorted(set(entry) - {"address", "new_name", "address_kind"})[:5])
+        elif isinstance(entry.get("address"), bool) or not isinstance(entry.get("address"), (int, str)) \
+                or (isinstance(entry.get("address"), int) and not 0 <= entry["address"] < 1 << 64):
+            problem = ("RENAME_ITEM_ADDRESS_INVALID", None)
+        elif not isinstance(entry.get("new_name"), str) or not _NEW_NAME.fullmatch(entry["new_name"]):
+            problem = ("RENAME_ITEM_NAME_INVALID", None)
+        elif entry.get("address_kind", "va") not in _PATCH_ADDRESS_KINDS:
+            problem = ("INVALID_ADDRESS_KIND", list(_PATCH_ADDRESS_KINDS))
+        if problem is None:
+            try:
+                value = entry["address"] if isinstance(entry["address"], int) else int(entry["address"].strip(), 0)
+                if not 0 <= value < 1 << 64:
+                    raise ValueError
+            except ValueError:
+                problem = ("RENAME_ITEM_ADDRESS_INVALID", None)
+        if problem is None:
+            key = (entry.get("address_kind", "va"), value)
+            if key in seen_addresses:
+                problem = ("DUPLICATE_ADDRESS", None)
+            elif entry["new_name"] in seen_names:
+                problem = ("DUPLICATE_NEW_NAME", None)
+            seen_addresses.add(key)
+            seen_names.add(entry["new_name"])
+        if problem:
+            return _refuse(tool, "ANALYSIS_LIMITED", problem[0], fixable=True, field="renames", item_index=index,
+                           accepted=problem[1] if problem[1] else {
+                               "address": "an integer or a string like \"0x140001000\"",
+                               "new_name": _NEW_NAME.pattern, "address_kind": list(_PATCH_ADDRESS_KINDS)},
+                           fix="Correct that item and plan again; nothing was read.")
+        items.append({"address": hex(value), "address_kind": entry.get("address_kind", "va"), "new_name": entry["new_name"]})
+    p, fail = _checked_path(path, tool, echo_path=False)
+    if fail:
+        return fail
+    if p.suffix.lower() in _DATABASE_SUFFIXES:
+        return _refuse(tool, "ANALYSIS_LIMITED", "DATABASE_INPUT_NOT_SUPPORTED", fixable=True,
+                       fix="Pass the original binary: the cache and the annotation versions key on that file's hash.")
+    exe = _ida_binary()
+    if not exe:
+        return _tool_missing(tool)
+    if not (_ANNOTATE_WORKER_SOURCE.is_file() and _WORKER_SOURCE.is_file()):
+        return _refuse(tool, "ANALYSIS_LIMITED", "IDA_WORKER_MISSING", fixable=False,
+                       fix="A packaged IDAPython worker is absent from this install (a packaging defect, not an IDA problem).")
+    total = _clamp(timeout_seconds, _MIN_TIMEOUT_SECONDS, _MAX_CREATE_TIMEOUT_SECONDS, _DEFAULT_TIMEOUT_SECONDS)
+    try:
+        sha256, md5 = _sha256_md5(p)
+    except OSError as exc:
+        return _j({"ok": False, "tool": tool, "status": "READ_FAILED", "error": "IDA_INPUT_UNREADABLE",
+                   "environment_error": {"type": type(exc).__name__, "errno": exc.errno,
+                                         "strerror": _redact(exc.strerror or type(exc).__name__)},
+                   "detail": "The input file could not be read; no plan was made."})
+    invocation = {"operation": "rename_plan", "label": label, "item_count": len(items), "timeout_seconds": total}
+    overlap = _overlap_refusal(tool)
+    if overlap:
+        return overlap
+    lock, busy = _lock_annotated(tool, sha256, cancellation_token)
+    if busy:
+        return busy
+    work = None
+    try:
+        unverified, _actions = _recover_pending(sha256)
+        refusal = _opening_checks(tool, sha256, label, unverified)
+        if refusal:
+            return refusal
+        state, problem = _annotated_state(sha256, label)
+        if problem:
+            return _refuse(tool, "ANALYSIS_LIMITED", problem["error"], fixable=False, reason=problem["reason"],
+                           target_sha256=sha256, label=label,
+                           fix="The published state of this scope cannot be confirmed; it is neither repaired nor "
+                               "served. An operator must inspect the annotated root.")
+        deadline = time.monotonic() + total
+        work = state["label_dir"] / f"scratch-{uuid.uuid4().hex[:8]}"
+        work.mkdir(parents=True)
+        try:
+            if state["version"] > 0:
+                shutil.copyfile(state["db"], work / _DB_NAME)
+            else:
+                _copy_pristine(exe, p, sha256, md5, work / _DB_NAME, total, cancellation_token)
+            left = int(deadline - time.monotonic())
+            if left < 1:
+                raise _StageFailure({"ok": False, "tool": tool, "status": "TIMEOUT", "invocation": invocation,
+                                     "target_sha256": sha256, "error": "IDA_TIMEOUT_BUDGET_EXHAUSTED"})
+            data, signals, provenance = _annotated_session(
+                exe, work, {"operation": "rename_plan", "write_mode": "plan", "items": items}, tool=tool,
+                sha256=sha256, md5=md5, invocation=invocation, temporary=True,
+                seconds=min(left, _MAX_ANNOTATE_TIMEOUT_SECONDS), cancellation_token=cancellation_token)
+        except OSError as exc:
+            return _j(_EnvironmentFailure("IDA_ANNOTATED_IO_ERROR", exc).body(tool, target_sha256=sha256, invocation=invocation))
+        except _StageFailure as failure:
+            return _j(failure.body)
+        if data.get("ok") is False:
+            refusal = {"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": data.get("error", "UNKNOWN_ERROR"),
+                       **{k: v for k, v in data.items() if k in ("item_index", "item_error", "given", "accepted",
+                                                                  "current_name", "item_start", "address_kind")},
+                       "target_sha256": sha256, "label": label, "invocation": invocation, "fixable": True,
+                       "fix": "Correct the item named by item_index and plan again. This is about the database as it is "
+                              "now, not about the program."}
+            return _j(refusal)
+        marker = data.get("annotation_marker")
+        if not _marker_matches(marker, sha256, label, state):
+            return _refuse(tool, "ANALYSIS_LIMITED", "ANNOTATION_VERSION_MISMATCH", fixable=False, target_sha256=sha256,
+                           label=label, manifest_version=state["version"],
+                           marker_version=marker.get("version") if isinstance(marker, dict) else None,
+                           fix="The annotation marker stored inside the database does not match the published "
+                               "manifest, so what was read is not the version the manifest names. Nothing is planned "
+                               "from it; an operator must inspect the scope.")
+        rows = data.get("plan_items") or []
+        if len(rows) != len(items) or len({r["address"]["va"] for r in rows}) != len(rows):
+            return _refuse(tool, "ANALYSIS_LIMITED", "DUPLICATE_ADDRESS_AFTER_RESOLUTION", fixable=True,
+                           fix="Two items resolve to the same address. Give each item one address and plan again.")
+        plan = {"schema": _PLAN_SCHEMA, "kind": "rename", "target_sha256": sha256, "label": label,
+                "base_version": state["version"], "base_db_sha256": state["db_sha256"],
+                "items": [{"index": r["index"], "address": r["address"]["va"], "address_kind": "va",
+                           "new_name": r["new_name"], "expect_name": r["old_name"]} for r in rows]}
+        body = {
+            "ok": True, "tool": tool, "status": "OK", "target_sha256": sha256, "label": label,
+            "plan": plan, "plan_sha256": _sha256_text(_canonical(plan)), "item_count": len(rows),
+            "items_detail": rows, "items_listed_complete": True,
+            "annotated_view": {"state": "verified", "version": state["version"],
+                               "read_from": "published annotation version" if state["version"] else "pristine analysis",
+                               "marker_checked": True},
+            "concurrency_policy": _CONCURRENCY_POLICY, "provenance": provenance, "signals": signals,
+            "invocation": invocation,
+            "note": ("A PLAN: nothing was written. It binds to the annotation version it read; if another write "
+                     "to this scope lands first, applying it is refused as stale. Apply with ida_annotations_apply."),
+        }
+        body["internal_evidence_name"], body["evidence_write_error"] = _write_evidence(
+            p, "rename_plan", body, EVIDENCE_RENAME_PLAN, stem=sha256[:16])
+        return _j(body)
+    finally:
+        if work is not None:
+            _remove_owned_work(work)
+        _release_slot_lock(lock)
+
+
+def _plan_problem(plan):
+    """(error, field) when `plan` is not a well-formed rename plan, else (None, None). Pure."""
+    if not isinstance(plan, dict):
+        return "PLAN_NOT_AN_OBJECT", None
+    for field, kind in (("schema", int), ("kind", str), ("target_sha256", str), ("label", str), ("base_version", int),
+                        ("items", list), ("plan_sha256", str)):
+        if not isinstance(plan.get(field), kind) or isinstance(plan.get(field), bool):
+            return "PLAN_FIELD_MISSING_OR_WRONG_TYPE", field
+    if plan["schema"] != _PLAN_SCHEMA or plan["kind"] != "rename":
+        return "PLAN_SCHEMA_UNSUPPORTED", "schema"
+    if not re.fullmatch(r"[0-9a-f]{64}", plan["target_sha256"]) or not _valid_label(plan["label"]) or plan["base_version"] < 0:
+        return "PLAN_FIELD_INVALID", "target_sha256/label/base_version"
+    if "base_db_sha256" not in plan or not (plan["base_db_sha256"] is None or isinstance(plan["base_db_sha256"], str)):
+        return "PLAN_FIELD_MISSING_OR_WRONG_TYPE", "base_db_sha256"
+    if not 1 <= len(plan["items"]) <= _RENAME_MAX_ITEMS:
+        return "PLAN_ITEMS_OUT_OF_RANGE", "items"
+    for item in plan["items"]:
+        if not (isinstance(item, dict) and set(item) == {"index", "address", "address_kind", "new_name", "expect_name"}
+                and isinstance(item["index"], int) and isinstance(item["address"], str)
+                and item["address_kind"] == "va" and isinstance(item["expect_name"], str)
+                and isinstance(item["new_name"], str) and _NEW_NAME.fullmatch(item["new_name"])):
+            return "PLAN_ITEM_MALFORMED", "items"
+    return None, None
+
+
+def ida_annotations_apply(path, plan=None, allow_partial=False, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                          cancellation_token=None):
+    """APPLY a plan from `ida_rename_plan`: write its renames into a new, immutable annotation version of
+    the scope it names. It cannot be called without a plan, and the plan must be unaltered (its digest is
+    recomputed), made for this input (hash), and still current (its base version and database hash must be
+    the published ones, and every item's `expect` name must be what the database holds now).
+
+    `plan` is the plan object (or its JSON text). `allow_partial` must be exactly True or False. The
+    default is atomic: the first item that fails stops everything, nothing is promoted (`ABORTED_ATOMIC`).
+    `allow_partial=True` applies the items whose preconditions hold and reports the rest (`PARTIAL_FAILURE`,
+    or `ALL_FAILED` and no new version).
+
+    Order of events: the audit journal gets `batch_prepared` (synced to disk, before anything is promoted);
+    the candidate is promoted to an immutable version file; a NEW engine process then opens a copy of that
+    stored version and reads the names and the annotation marker back (a read in the writing session proves
+    nothing); only when that matches is the one manifest pointer published; then `batch_committed` is
+    journalled. If promotion fails the candidate stays in its recovery directory; if the read-back does not
+    match, the version file stays unpublished and the answer says `VERIFICATION_FAILED`. Nothing is ever
+    published unverified. A journal that cannot be written blocks the write (before the prepared record) or
+    is reported as `commit_record_pending` (after publication). The next operation on the scope finishes or
+    closes whatever a crash left open.
+
+    Concurrent writers are blocked, not merged: see `concurrency_policy` in the answer. The pristine cache
+    database is only read; annotated versions live in their own root and are never evicted.
+
+    Status vocabulary: OK, PARTIAL_FAILURE, ALL_FAILED, ABORTED_ATOMIC, PRECONDITION_FAILED, VERIFICATION_FAILED,
+    ANNOTATED_PROMOTION_BLOCKED, JOURNAL_UNWRITABLE, TOOL_MISSING, PATH_REFUSED, NOT_FOUND, TIMEOUT, CANCELLED,
+    ANALYSIS_LIMITED, RESULT_PARSE_FAILED, INVALID_PLAN. Refusals say `fixable`.
+    """
+    tool = "ida_annotations_apply"
+    if isinstance(plan, str):
+        try:
+            plan = json.loads(plan)
+        except ValueError:
+            return _refuse(tool, "INVALID_PLAN", "PLAN_NOT_JSON", fixable=True, field="plan",
+                           fix="`plan` is the object `ida_rename_plan` returned under `plan`, or its JSON text.")
+    if plan is None:
+        return _refuse(tool, "INVALID_PLAN", "PLAN_REQUIRED", fixable=True, field="plan",
+                       fix="There is no apply without a plan. Call ida_rename_plan, then pass its `plan` here, with "
+                           "the `plan_sha256` it returned inside the plan object as `plan_sha256`.")
+    if isinstance(plan, dict) and "items" not in plan and isinstance(plan.get("plan"), dict):
+        plan = {**plan["plan"], "plan_sha256": plan.get("plan_sha256")}      # the whole plan answer is also accepted
+    error, field = _plan_problem(plan)
+    if error:
+        return _refuse(tool, "INVALID_PLAN", error, fixable=True, field=field,
+                       accepted="the `plan` object of ida_rename_plan with its `plan_sha256` added",
+                       fix="Pass the plan exactly as returned (add the answer's `plan_sha256` as the key "
+                           "`plan_sha256` of the plan, or pass the whole answer).")
+    body_without_digest = {k: v for k, v in plan.items() if k != "plan_sha256"}
+    if _sha256_text(_canonical(body_without_digest)) != plan["plan_sha256"]:
+        return _refuse(tool, "INVALID_PLAN", "PLAN_HASH_MISMATCH", fixable=True, field="plan_sha256",
+                       fix="The plan's content does not match its digest: it was altered or mixed up. Plan again; "
+                           "the digest is not a signature, only a guard against accidents.")
+    if allow_partial is not True and allow_partial is not False:
+        return _refuse(tool, "ANALYSIS_LIMITED", "INVALID_ALLOW_PARTIAL", fixable=True, field="allow_partial",
+                       given=repr(allow_partial)[:80], accepted=[True, False],
+                       fix="`allow_partial` must be exactly True or False; it is never inferred from a string or a number.")
+    p, fail = _checked_path(path, tool, echo_path=False)
+    if fail:
+        return fail
+    if p.suffix.lower() in _DATABASE_SUFFIXES:
+        return _refuse(tool, "ANALYSIS_LIMITED", "DATABASE_INPUT_NOT_SUPPORTED", fixable=True,
+                       fix="Pass the original binary (the plan names its hash).")
+    exe = _ida_binary()
+    if not exe:
+        return _tool_missing(tool)
+    if not (_ANNOTATE_WORKER_SOURCE.is_file() and _WORKER_SOURCE.is_file()):
+        return _refuse(tool, "ANALYSIS_LIMITED", "IDA_WORKER_MISSING", fixable=False,
+                       fix="A packaged IDAPython worker is absent from this install (a packaging defect, not an IDA problem).")
+    total = _clamp(timeout_seconds, _MIN_TIMEOUT_SECONDS, _MAX_CREATE_TIMEOUT_SECONDS, _DEFAULT_TIMEOUT_SECONDS)
+    try:
+        sha256, md5 = _sha256_md5(p)
+    except OSError as exc:
+        return _j({"ok": False, "tool": tool, "status": "READ_FAILED", "error": "IDA_INPUT_UNREADABLE",
+                   "environment_error": {"type": type(exc).__name__, "errno": exc.errno,
+                                         "strerror": _redact(exc.strerror or type(exc).__name__)},
+                   "detail": "The input file could not be read; nothing was written."})
+    if sha256 != plan["target_sha256"]:
+        return _refuse(tool, "INVALID_PLAN", "PLAN_TARGET_MISMATCH", fixable=True, field="plan.target_sha256",
+                       target_sha256=sha256, plan_target_sha256=plan["target_sha256"],
+                       fix="The plan was made for different input content. Plan again for this file.")
+    label = plan["label"]
+    invocation = {"operation": "annotations_apply", "label": label, "plan_sha256": plan["plan_sha256"],
+                  "item_count": len(plan["items"]), "allow_partial": allow_partial, "timeout_seconds": total}
+    overlap = _overlap_refusal(tool)
+    if overlap:
+        return overlap
+    lock, busy = _lock_annotated(tool, sha256, cancellation_token)
+    if busy:
+        return busy
+    try:
+        return _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, invocation, cancellation_token)
+    except OSError as exc:
+        return _j(_EnvironmentFailure("IDA_ANNOTATED_IO_ERROR", exc).body(tool, target_sha256=sha256, invocation=invocation))
+    finally:
+        _release_slot_lock(lock)
+
+
+def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, invocation, cancellation_token):
+    """The body of `ida_annotations_apply`, under the per-hash lock. Returns the finished JSON."""
+    unverified, recovered = _recover_pending(sha256)
+    refusal = _opening_checks(tool, sha256, label, unverified)
+    if refusal:
+        return refusal
+    state, problem = _annotated_state(sha256, label)
+    if problem:
+        return _refuse(tool, "ANALYSIS_LIMITED", problem["error"], fixable=False, reason=problem["reason"],
+                       target_sha256=sha256, label=label,
+                       fix="The published state of this scope cannot be confirmed; it is neither repaired nor served.")
+    if state["version"] != plan["base_version"] or state["db_sha256"] != plan["base_db_sha256"]:
+        return _j({"ok": False, "tool": tool, "status": "PRECONDITION_FAILED", "error": "STALE_BASE_VERSION",
+                   "target_sha256": sha256, "label": label, "plan_base_version": plan["base_version"],
+                   "published_version": state["version"], "fixable": True, "concurrency_policy": _CONCURRENCY_POLICY,
+                   "fix": "Another write changed this scope after the plan was made. Nothing was written. Plan again "
+                          "against the current version.", "written": False})
+    deadline = time.monotonic() + total
+    label_dir = state["label_dir"]
+    write_id = uuid.uuid4().hex[:12]
+    # Never reuse a number: not one a directory holds, and not one the journal ever prepared (a purged
+    # version's number stays taken, so a record's version always means one write).
+    journalled = [r["version"] for r in _journal_records(sha256)[0] if r.get("event") == "batch_prepared"
+                  and r.get("label") == label and isinstance(r.get("version"), int)]
+    version = max([state["version"]] + journalled + [int(m.group(1)) for d in (label_dir / "versions").glob("v*")
+                                                      if (m := _VERSION_DIR.fullmatch(d.name))]) + 1
+    rdir = label_dir / "recovery" / write_id
+    verify_dir = label_dir / f"scratch-{uuid.uuid4().hex[:8]}"
+    journal = {"prepared": None, "committed": None}
+    marker = {"schema": 1, "label": label, "version": version, "write_id": write_id,
+              "plan_sha256": plan["plan_sha256"], "target_sha256": sha256}
+    result = {"ok": False, "tool": tool, "target_sha256": sha256, "label": label, "invocation": invocation,
+              "write_id": write_id, "concurrency_policy": _CONCURRENCY_POLICY, "written": False}
+    if recovered:
+        result["recovery_actions"] = recovered
+
+    def remaining():
+        return int(deadline - time.monotonic())
+
+    try:
+        # 1. the candidate, in its own recovery directory, from the published version (or the pristine analysis)
+        try:
+            rdir.mkdir(parents=True)
+            if state["version"] > 0:
+                _copy_into_budget(state["db"], rdir / _DB_NAME, tool, sha256, cancellation_token)
+            else:
+                staging = rdir / "pristine.copy"
+                _copy_pristine(exe, p, sha256, md5, staging, total, cancellation_token)
+                _copy_into_budget(staging, rdir / _DB_NAME, tool, sha256, cancellation_token)
+                staging.unlink()
+            left = remaining()
+            if left < 1:
+                _remove_owned_work(rdir)
+                return _j({**result, "status": "TIMEOUT", "error": "IDA_TIMEOUT_BUDGET_EXHAUSTED"})
+            # 2. the write session (an ordinary session of the candidate; not temporary)
+            job = {"operation": "rename_apply", "write_mode": "write", "allow_partial": allow_partial, "marker": marker,
+                   "items": [{"address": i["address"], "address_kind": "va", "new_name": i["new_name"],
+                              "expect_name": i["expect_name"]} for i in plan["items"]]}
+            data, signals, provenance = _annotated_session(
+                exe, rdir, job, tool=tool, sha256=sha256, md5=md5, invocation=invocation, temporary=False,
+                seconds=min(left, _MAX_ANNOTATE_TIMEOUT_SECONDS), cancellation_token=cancellation_token)
+        except _StageFailure as failure:
+            return _j({**failure.body, "written": False, "candidate_retained": rdir.exists(),
+                       "concurrency_policy": _CONCURRENCY_POLICY})
+        if data.get("ok") is False:
+            reasons = {"ABORTED_ATOMIC": "ABORTED_ATOMIC", "ALL_FAILED": "ALL_FAILED"}
+            status = reasons.get(data.get("error"), "ANALYSIS_LIMITED")
+            _remove_owned_work(rdir)              # nothing was promoted and the candidate holds no change
+            return _j({**result, "status": status, "error": data.get("error", "UNKNOWN_ERROR"),
+                       "applied": data.get("applied", []), "failed": data.get("failed", []),
+                       "save_returned": data.get("save_returned"), "marker_stored": data.get("marker_stored"),
+                       "fixable": status in ("ABORTED_ATOMIC", "ALL_FAILED"),
+                       "fix": "Nothing was promoted and the published version is unchanged. Plan again (or pass "
+                              "allow_partial=True to apply the items whose preconditions hold).", "provenance": provenance})
+        candidate_db = rdir / _DB_NAME
+        sync_error = _fsync_path(candidate_db)
+        candidate_sha, hash_error = _file_sha256(candidate_db)
+        if sync_error or hash_error or candidate_sha is None:
+            return _j({**result, "status": "ANALYSIS_LIMITED", "error": "CANDIDATE_NOT_SYNCABLE",
+                       "candidate_retained": True, "fixable": "retry_later",
+                       "fix": "The candidate could not be synced to disk or read back; it is kept in its recovery "
+                              "directory and nothing was promoted.", "environment_error": sync_error or hash_error})
+        candidate_bytes = candidate_db.stat().st_size
+        total_now = _annotated_total_bytes()
+        if total_now is None or total_now > _annotated_budget_bytes():
+            return _j({**result, "status": "ANALYSIS_LIMITED", "candidate_retained": True, "fixable": False,
+                       "error": "ANNOTATED_BUDGET_UNVERIFIABLE" if total_now is None else "ANNOTATED_BUDGET_EXHAUSTED",
+                       "fix": "The candidate grew past the annotated byte budget (or the bytes could not be measured). "
+                              "It is kept in recovery and nothing was promoted; an operator decides about the budget."})
+        applied = data.get("applied", [])
+        # 3. write-ahead: batch_prepared, synced, BEFORE the promotion
+        journal["prepared"] = {
+            "event": "batch_prepared", "operation": "rename", "write_id": write_id, "label": label, "version": version,
+            "prior_version": state["version"], "prior_db_sha256": state["db_sha256"], "candidate_db_sha256": candidate_sha,
+            "candidate_bytes": candidate_bytes, "candidate_location": f"recovery/{write_id}/{_DB_NAME}",
+            "plan_sha256": plan["plan_sha256"], "item_count": len(applied),
+            "items": [{"index": a["index"], "address": a["address"], "old_name": a["old_name"], "new_name": a["new_name"]}
+                      for a in applied],
+        }
+        written, why = _journal_append(sha256, journal["prepared"])
+        if not written:
+            return _j({**result, "status": "JOURNAL_UNWRITABLE", "error": "PREPARED_RECORD_NOT_WRITTEN",
+                       "journal_error": why, "candidate_retained": True, "fixable": "retry_later",
+                       "fix": "The audit journal could not be written, so nothing was promoted. The candidate is "
+                              "kept in its recovery directory. Fix the journal's location or permissions and retry."})
+        # 4. promotion into an immutable version file (a new path: nothing is overwritten)
+        version_dir = label_dir / "versions" / f"v{version:06d}"
+        try:
+            version_dir.mkdir(parents=True, exist_ok=False)
+        except OSError as exc:
+            promote_error = type(exc).__name__
+        else:
+            promote_error = _replace_file(candidate_db, version_dir / _DB_NAME)
+        if promote_error:
+            if version_dir.is_dir() and not any(version_dir.iterdir()):
+                version_dir.rmdir()
+            _journal_append(sha256, {"event": "batch_aborted", "write_id": write_id, "label": label,
+                                     "reason": "promotion_failed", "error": promote_error, "retained": "recovery"})
+            return _j({**result, "status": "ANNOTATED_PROMOTION_BLOCKED", "error": "PROMOTION_FAILED",
+                       "environment_error": promote_error, "candidate_retained": True, "candidate_sha256": candidate_sha,
+                       "fixable": "retry_later",
+                       "fix": "Another handle held the file (a retry of up to 10 s was made) or the file system refused "
+                              "the move. The candidate is intact in its recovery directory; nothing was published."})
+        # 5. verification in a NEW engine process, over a copy of the promoted file
+        promoted = version_dir / _DB_NAME
+        promoted_sha, _ = _file_sha256(promoted)
+        verify = {"separate_process": True, "names_matched": 0, "names_expected": len(applied),
+                  "marker_matched": False, "write_session_pid": data.get("engine_pid")}
+
+        def abort(reason, **extra):
+            ok, _why = _journal_append(sha256, {"event": "batch_aborted", "write_id": write_id, "label": label,
+                                                "reason": reason, "retained": "versions"})
+            return _j({**result, "status": "VERIFICATION_FAILED" if reason == "verification_failed" else "ANALYSIS_LIMITED",
+                       "error": reason.upper(), "version_retained_unpublished": f"v{version:06d}", "verification": verify,
+                       "abort_record_written": ok, "fixable": False,
+                       "fix": "The stored version was not published. It is kept, unreferenced, as evidence; the "
+                              "published version is unchanged. Plan again.", **extra})
+
+        if promoted_sha != candidate_sha:
+            return abort("promoted_file_differs_from_candidate")
+        left = remaining()
+        if left < 1:
+            return abort("timeout_before_verification")
+        verify_dir.mkdir(parents=True)
+        shutil.copyfile(promoted, verify_dir / _DB_NAME)
+        try:
+            checked, _signals, _prov = _annotated_session(
+                exe, verify_dir, {"operation": "rename_verify", "write_mode": "verify",
+                                  "items": [{"address": a["address"], "address_kind": "va"} for a in applied]},
+                tool=tool, sha256=sha256, md5=md5, invocation=invocation, temporary=True,
+                seconds=min(left, _MAX_ANNOTATE_TIMEOUT_SECONDS), cancellation_token=cancellation_token)
+        except _StageFailure as failure:
+            return abort("verification_session_failed", verification_failure=failure.body.get("error"))
+        verify["verify_session_pid"] = checked.get("engine_pid")
+        verify["harness_pid"] = os.getpid()
+        got = {row["address"]: row["actual_name"] for row in checked.get("verified_items") or []}
+        verify["names_matched"] = sum(1 for a in applied if got.get(a["address"]) == a["new_name"])
+        stored = checked.get("annotation_marker")
+        verify["marker_matched"] = isinstance(stored, dict) and all(stored.get(k) == marker[k] for k in marker)
+        verify["marker_version"] = stored.get("version") if isinstance(stored, dict) else None
+        if checked.get("ok") is not True or verify["names_matched"] != len(applied) or not verify["marker_matched"] \
+                or verify["verify_session_pid"] in (None, verify["write_session_pid"], verify["harness_pid"]):
+            return abort("verification_failed")
+        # 6. publish the single pointer
+        manifest = {"schema": 1, "sha256": sha256, "label": label, "version": version, "write_id": write_id,
+                    "db_sha256": candidate_sha, "db_bytes": candidate_bytes, "plan_sha256": plan["plan_sha256"],
+                    "previous_version": state["version"], "published": _utc_now(), "profile": _ANALYSIS_PROFILE}
+        manifest_error = _manifest_write(label_dir, manifest)
+        if manifest_error:
+            return abort("manifest_unwritable", environment_error=manifest_error)
+        # 7. commit record; failing to write it does not undo the (verified, published) write
+        journal["committed"] = {"event": "batch_committed", "write_id": write_id, "label": label, "version": version,
+                                "db_sha256": candidate_sha, "plan_sha256": plan["plan_sha256"],
+                                "items": journal["prepared"]["items"]}
+        committed, commit_why = _journal_append(sha256, journal["committed"])
+        _remove_owned_work(rdir)
+        failed = data.get("failed", [])
+        status = "PARTIAL_FAILURE" if failed else "OK"
+        body = {**result, "ok": True, "status": status, "written": True, "version": version,
+                "db_sha256": candidate_sha, "db_bytes": candidate_bytes, "prior_version": state["version"],
+                "applied": applied, "failed": failed, "applied_count": len(applied), "failed_count": len(failed),
+                "items_listed_complete": True, "atomic": not allow_partial,
+                "save_returned": data.get("save_returned"), "verification": verify,
+                "provenance": provenance, "journal": {"prepared": True, "committed": committed},
+                "annotated_view": {"state": "verified", "version": version},
+                "note": ("A new immutable annotation version was published after a separate engine process read its "
+                         "names and marker back from the stored file. The pristine cache database was not changed."
+                         + ("" if not failed else " Some items were not applied (allow_partial=True); see `failed`."))}
+        if not committed:
+            body["commit_record_pending"] = True
+            body["journal"]["commit_error"] = commit_why
+            body["note"] += (" The commit record could not be written; the version IS published (the manifest "
+                             "points at it) and the next operation on this scope records it from the files.")
+        body["internal_evidence_name"], body["evidence_write_error"] = _write_evidence(
+            p, "annotations_apply", body, EVIDENCE_ANNOTATE_APPLY, stem=sha256[:16])
+        return _j(body)
+    finally:
+        _remove_owned_work(verify_dir)
+
+
+# --------------------------------------------------------------------------
+# ida_annotations_purge: the only way annotated data is ever deleted
+# --------------------------------------------------------------------------
+#
+# Mirror of the cache separation: this operation reaches ONLY the annotated root. It never references
+# the cache root, a cache slot, the evidence directories or a pristine database (a test reads its source
+# and pins that), writes no evidence file (the journal is its trace) and deletes only artifacts that are
+# NAMED in the call and that the call's confirmation token was issued for.
+
+_PURGE_MAX_TARGETS = 50
+_PURGE_INVENTORY_LIMIT = 100
+_PURGE_TARGET = re.compile(r"(?:version|published):[1-9][0-9]{0,5}|candidate:[0-9a-f]{12}|scratch:[0-9a-f]{8}|unverified-state")
+_PURGE_ACCEPTED = ["version:<N> (an unpublished or older version)", "published:<N> (the published version; removes the pointer first)",
+                   "candidate:<12 hex> (a kept candidate under recovery/)", "scratch:<8 hex> (a leftover work directory)",
+                   "unverified-state (clears an unverified scope; says so)"]
+
+
+def _tree_bytes(path):
+    """Bytes under `path`, or None when any entry cannot be measured (never a partial count)."""
+    total, problems = 0, []
+    if os.path.isfile(path):
+        try:
+            return os.stat(path).st_size
+        except OSError:
+            return None
+    for directory, _dirs, files in os.walk(path, onerror=problems.append):
+        for name in files:
+            try:
+                total += os.stat(os.path.join(directory, name)).st_size
+            except OSError:
+                return None
+    return None if problems else total
+
+
+def _purge_remove(path, label_dir):
+    """Delete one NAMED artifact of one scope: exactly `versions/vNNNNNN`, `recovery/<id>` or `scratch-<id>`
+    directly under that scope's directory, which itself must sit two levels under the annotated root.
+    Anything else is refused. The second recursive delete of the annotated section, with its own guard."""
+    try:
+        target = Path(os.path.realpath(path))
+        scope = Path(os.path.realpath(label_dir))
+        root = Path(os.path.realpath(_annotated_root()))
+    except (OSError, ValueError):
+        return False
+    shaped = (scope.parent.parent == root and re.fullmatch(r"[0-9a-f]{64}", scope.parent.name) is not None)
+    named = ((target.parent == scope / "versions" and _VERSION_DIR.fullmatch(target.name) is not None)
+             or (target.parent == scope / "recovery" and re.fullmatch(r"[0-9a-f]{12}", target.name) is not None)
+             or (target.parent == scope and re.fullmatch(r"scratch-[0-9a-f]{8}", target.name) is not None))
+    if not (shaped and named):
+        return False
+    shutil.rmtree(target, ignore_errors=True)
+    return not target.exists()
+
+
+def _purge_inventory(sha256, label, state, problem):
+    """What this scope holds, measured: (inventory, fingerprints keyed by target name). None for a value
+    that could not be measured is reported as such, never as zero."""
+    label_dir = _label_dir(sha256, label)
+    published = state["version"] if state else None
+    entries, prints = [], {}
+    versions = label_dir / "versions"
+    for d in sorted(versions.glob("v*")) if versions.is_dir() else []:
+        match = _VERSION_DIR.fullmatch(d.name)
+        if not (d.is_dir() and match):
+            continue
+        number = int(match.group(1))
+        digest, _err = _file_sha256(d / _DB_NAME)
+        size = _tree_bytes(d)
+        kind = "published" if number == published else "version"
+        entries.append({"target": f"{kind}:{number}", "kind": kind, "bytes": size,
+                        "state": "published" if kind == "published" else (
+                            "older version" if published and number < published else "unpublished (never verified or aborted)")})
+        prints[f"{kind}:{number}"] = [digest, size]
+    recovery = label_dir / "recovery"
+    for d in sorted(recovery.glob("*")) if recovery.is_dir() else []:
+        if d.is_dir() and re.fullmatch(r"[0-9a-f]{12}", d.name):
+            digest, _err = _file_sha256(d / _DB_NAME)
+            size = _tree_bytes(d)
+            entries.append({"target": f"candidate:{d.name}", "kind": "candidate", "bytes": size,
+                            "state": "kept candidate (never promoted)"})
+            prints[f"candidate:{d.name}"] = [digest, size]
+    for d in sorted(label_dir.glob("scratch-*")) if label_dir.is_dir() else []:
+        if d.is_dir() and re.fullmatch(r"scratch-[0-9a-f]{8}", d.name):
+            size = _tree_bytes(d)
+            entries.append({"target": f"scratch:{d.name[8:]}", "kind": "scratch", "bytes": size, "state": "leftover work directory"})
+            prints[f"scratch:{d.name[8:]}"] = [None, size]
+    if problem:
+        manifest_digest, _err = _file_sha256(label_dir / "manifest.json")
+        entries.append({"target": "unverified-state", "kind": "unverified-state", "bytes": 0,
+                        "state": "scope is unverified: " + str(problem["reason"])})
+        prints["unverified-state"] = [str(problem["reason"]), manifest_digest]
+    return entries, prints
+
+
+def _purge_confirmation(sha256, label, names, prints, published):
+    return _sha256_text(_canonical({"purge": 1, "target_sha256": sha256, "label": label, "targets": sorted(names),
+                                    "published_version": published, "fingerprints": {n: prints.get(n) for n in sorted(names)}}))
+
+
+def ida_annotations_purge(path, label=None, targets=None, confirm_token=None, cancellation_token=None):
+    """Report, and on explicit confirmation delete, NAMED annotated artifacts of one scope (`path`'s input
+    hash plus `label`). Nothing is deleted by default; the call without `confirm_token` is the dry run and
+    its answer is the report (`status: REPORT_ONLY`).
+
+    `targets` is a list of exact names, never a pattern: `version:<N>`, `published:<N>`, `candidate:<12 hex>`,
+    `scratch:<8 hex>` and `unverified-state`. A wildcard or `all` is refused. The report lists everything
+    the scope holds (`inventory`, cut at 100 entries and saying so), measures what the named targets
+    would free, and returns a `confirm_token` bound to this input hash, this label, exactly these targets
+    and their measured state (file digests and sizes, the published version). Pass the same targets and the
+    token back to delete. If anything changed in between, the answer is `STALE_CONFIRMATION` and nothing is
+    deleted. A published version is deleted only by naming it as `published:<N>`; its pointer is removed
+    first. `version:<N>` refuses the published one.
+
+    `unverified-state` clears a scope whose recorded state could not be confirmed (a pointer that does not
+    match its file, an interrupted write that cannot be reconciled): it removes the pointer, closes the open
+    write records with an abort record, and says `unverified_cleared: true` with the reason it cleared. The
+    versions stay (name them to delete them). A damaged or unreadable JOURNAL is not clearable here.
+
+    Only the annotated root is touched: never the cache, a pristine database or the evidence directories.
+    Every deletion is journalled (`purge_prepared`, synced, before the first delete; `purge_committed` after).
+    Statuses: REPORT_ONLY, OK, PARTIAL_FAILURE, STALE_CONFIRMATION, JOURNAL_UNWRITABLE, ANALYSIS_LIMITED
+    (named error, `fixable`), PATH_REFUSED, NOT_FOUND, READ_FAILED.
+    """
+    tool = "ida_annotations_purge"
+    if not _valid_label(label):
+        return _label_refusal(tool, label)
+    names = []
+    if targets is not None:
+        if not isinstance(targets, list) or len(targets) > _PURGE_MAX_TARGETS or not all(isinstance(t, str) for t in targets):
+            return _refuse(tool, "ANALYSIS_LIMITED", "TARGETS_INVALID", fixable=True, field="targets",
+                           accepted=_PURGE_ACCEPTED, fix=f"`targets` is a list of at most {_PURGE_MAX_TARGETS} exact names, or omitted for the report.")
+        for entry in targets:
+            if entry.strip().lower() in ("all", "*") or any(c in entry for c in "*?[]"):
+                return _refuse(tool, "ANALYSIS_LIMITED", "WILDCARD_REFUSED", fixable=True, field="targets", given=entry[:40],
+                               accepted=_PURGE_ACCEPTED,
+                               fix="There is no 'delete everything' form. Run the report and name each thing to delete.")
+            if not _PURGE_TARGET.fullmatch(entry):
+                return _refuse(tool, "ANALYSIS_LIMITED", "TARGET_NAME_INVALID", fixable=True, field="targets", given=entry[:40],
+                               accepted=_PURGE_ACCEPTED, fix="Use the exact `target` names the report lists.")
+            if entry in names:
+                return _refuse(tool, "ANALYSIS_LIMITED", "DUPLICATE_TARGET", fixable=True, field="targets", given=entry,
+                               fix="Name each target once.")
+            names.append(entry)
+    if confirm_token is not None and (not isinstance(confirm_token, str) or not names):
+        return _refuse(tool, "ANALYSIS_LIMITED", "CONFIRMATION_NEEDS_TARGETS", fixable=True, field="confirm_token",
+                       accepted="the `confirm_token` string of a report, with the same `targets`",
+                       fix="A confirmation is bound to the targets it was issued for: pass the same `targets` list with it.")
+    p, fail = _checked_path(path, tool, echo_path=False)
+    if fail:
+        return fail
+    try:
+        sha256 = _sha256_md5(p)[0]
+    except OSError as exc:
+        return _j({"ok": False, "tool": tool, "status": "READ_FAILED", "error": "IDA_INPUT_UNREADABLE",
+                   "environment_error": {"type": type(exc).__name__, "errno": exc.errno, "strerror": _redact(exc.strerror or type(exc).__name__)},
+                   "detail": "The input file could not be read; nothing was deleted."})
+    overlap = _overlap_refusal(tool)
+    if overlap:
+        return overlap
+    lock, busy = _lock_annotated(tool, sha256, cancellation_token)
+    if busy:
+        return busy
+    try:
+        return _purge_locked(tool, sha256, label, names, confirm_token)
+    except OSError as exc:
+        return _j(_EnvironmentFailure("IDA_ANNOTATED_IO_ERROR", exc).body(tool, target_sha256=sha256))
+    finally:
+        _release_slot_lock(lock)
+
+
+def _purge_locked(tool, sha256, label, names, confirm_token):
+    unverified, _actions = _recover_pending(sha256)
+    if "*" in unverified:
+        return _refuse(tool, "ANALYSIS_LIMITED", "JOURNAL_NOT_CLEARABLE", fixable=False, reason=unverified["*"], target_sha256=sha256,
+                       fix="The audit journal itself is damaged or unreadable. Purge does not clear that: an operator must "
+                           "inspect the annotated root. Nothing was deleted.")
+    state, problem = _annotated_state(sha256, label)
+    if state is None and label in unverified and problem is None:
+        problem = {"error": _ANNOTATED_STATE_UNVERIFIED, "reason": unverified[label]}
+    if state is None and problem is None:
+        problem = {"error": _ANNOTATED_STATE_UNVERIFIED, "reason": "UNKNOWN"}
+    if state is not None and label in unverified:
+        state, problem = None, {"error": _ANNOTATED_STATE_UNVERIFIED, "reason": unverified[label]}
+    label_dir = _label_dir(sha256, label)
+    published = state["version"] if state else None
+    if state is None and _manifest_read(label_dir)[0]:
+        published = None
+    entries, prints = _purge_inventory(sha256, label, state, problem)
+    if any(e["bytes"] is None for e in entries):
+        return _refuse(tool, "ANALYSIS_LIMITED", "SIZES_UNVERIFIABLE", fixable=False, target_sha256=sha256,
+                       fix="An entry under this scope could not be measured, so no honest report or token can be made. Nothing was deleted.")
+    by_name = {e["target"]: e for e in entries}
+    for name in names:
+        if name.startswith("version:") and f"published:{name.split(':')[1]}" in by_name:
+            return _refuse(tool, "ANALYSIS_LIMITED", "PUBLISHED_VERSION_PROTECTED", fixable=True, field="targets", given=name,
+                           fix="That version is the published one. To delete it, name it `published:<N>`; its pointer is removed first.")
+        if name not in by_name and confirm_token is not None:
+            # a confirmed target that is no longer there: the scope changed since the report
+            return _j({"ok": False, "tool": tool, "status": "STALE_CONFIRMATION", "error": "STALE_CONFIRMATION", "deleted": False,
+                       "fixable": True, "target_sha256": sha256, "label": label, "missing_target": name,
+                       "inventory": entries[:_PURGE_INVENTORY_LIMIT], "inventory_cut": len(entries) > _PURGE_INVENTORY_LIMIT,
+                       "fix": "A named target is no longer in the scope, so the confirmation is stale. Nothing was deleted. "
+                              "Run the report again and confirm with its new `confirm_token`."})
+        if name not in by_name:
+            return _refuse(tool, "ANALYSIS_LIMITED", "TARGET_NOT_FOUND", fixable=True, field="targets", given=name,
+                           accepted=sorted(by_name)[:_PURGE_INVENTORY_LIMIT],
+                           fix="Name only what the report lists for this scope; the scope may have changed since.")
+    if problem and any(n.startswith("published:") for n in names):
+        return _refuse(tool, "ANALYSIS_LIMITED", "PUBLISHED_NAME_NOT_AVAILABLE", fixable=True,
+                       fix="The scope is unverified, so no version is known to be the published one. Clear the state with "
+                           "`unverified-state` first, then name versions with `version:<N>`.")
+    selected = [by_name[n] for n in names]
+    freed = sum(e["bytes"] for e in selected)
+    token = _purge_confirmation(sha256, label, names, prints, published) if names else None
+    shown = entries[:_PURGE_INVENTORY_LIMIT]
+    held, budget = _annotated_total_bytes(), _annotated_budget_bytes()
+    report = {"target_sha256": sha256, "label": label, "published_version": published,
+              "inventory": shown, "inventory_total": len(entries), "inventory_cut": len(entries) > len(shown),
+              "annotated_bytes_held": held, "annotated_budget_bytes": budget,
+              "would_delete": [{"target": e["target"], "bytes": e["bytes"], "state": e["state"]} for e in selected],
+              "would_free_bytes": freed, "scope_unverified": bool(problem),
+              "unverified_reason": problem["reason"] if problem else None}
+    if report["inventory_cut"]:
+        report["inventory_note"] = f"the inventory is cut at {_PURGE_INVENTORY_LIMIT} of {len(entries)} entries"
+    if confirm_token is None:
+        return _j({"ok": True, "tool": tool, "status": "REPORT_ONLY", "deleted": False, **report, "confirm_token": token,
+                   "note": ("Nothing was deleted. " + ("To delete exactly the targets named in `would_delete`, call again with "
+                            "the same `targets` and this `confirm_token`." if names else "Name targets from `inventory` to get a "
+                            "confirmation token for them."))})
+    if confirm_token != token:
+        return _j({"ok": False, "tool": tool, "status": "STALE_CONFIRMATION", "error": "STALE_CONFIRMATION", "deleted": False,
+                   "fixable": True, **report, "confirm_token": token,
+                   "fix": "The confirmation does not match the scope as it is now (a different token, other targets, or a change "
+                          "since the report). Nothing was deleted. Read this report and confirm with the new `confirm_token`."})
+    cleared = "unverified-state" in names
+    if cleared and str(problem["reason"]).startswith("JOURNAL_UNREADABLE"):
+        return _refuse(tool, "ANALYSIS_LIMITED", "JOURNAL_NOT_CLEARABLE", fixable=False, reason=problem["reason"])
+    ok, why = _journal_append(sha256, {"event": "purge_prepared", "label": label, "targets": names, "bytes": freed,
+                                       "published_version": published, "unverified_reason": problem["reason"] if cleared else None})
+    if not ok:
+        return _j({"ok": False, "tool": tool, "status": "JOURNAL_UNWRITABLE", "error": "PURGE_RECORD_NOT_WRITTEN", "deleted": False,
+                   "journal_error": why, "fixable": "retry_later",
+                   "fix": "The audit journal could not be written, so nothing was deleted. Fix its location or permissions and retry."})
+    results = []
+    for name in names:
+        entry = by_name[name]
+        if name == "unverified-state":
+            manifest = label_dir / "manifest.json"
+            digest = _file_sha256(manifest)[0]
+            done = True
+            try:
+                manifest.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                done = False
+            records = _journal_records(sha256)[0]
+            closed = {r.get("write_id") for r in records if r.get("event") in ("batch_committed", "batch_aborted")}
+            for r in records:
+                if r.get("event") == "batch_prepared" and r.get("label") == label and r.get("write_id") not in closed:
+                    done = _journal_append(sha256, {"event": "batch_aborted", "write_id": r["write_id"], "label": label,
+                                                    "reason": "cleared_by_purge", "retained": "none"})[0] and done
+            results.append({"target": name, "deleted": done, "removed_manifest_sha256": digest})
+            continue
+        path = label_dir / ("versions/v%06d" % int(name.split(":")[1]) if name.split(":")[0] in ("version", "published")
+                            else "recovery/" + name.split(":")[1] if name.startswith("candidate:") else "scratch-" + name.split(":")[1])
+        if name.startswith("published:"):
+            try:
+                (label_dir / "manifest.json").unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                results.append({"target": name, "deleted": False, "error": "POINTER_NOT_REMOVED"})
+                continue
+        results.append({"target": name, "deleted": _purge_remove(path, label_dir), "bytes": entry["bytes"]})
+    state_after, problem_after = _annotated_state(sha256, label)
+    deleted_all = all(r["deleted"] for r in results)
+    committed, commit_why = _journal_append(sha256, {"event": "purge_committed", "label": label, "results": results,
+                                                     "state_clean_after": problem_after is None})
+    body = {"ok": deleted_all, "tool": tool, "status": "OK" if deleted_all else "PARTIAL_FAILURE", "deleted": any(r["deleted"] for r in results),
+            "results": results, "freed_bytes": sum(r.get("bytes", 0) for r in results if r["deleted"]),
+            "target_sha256": sha256, "label": label, "journal": {"prepared": True, "committed": committed},
+            "published_version_after": state_after["version"] if state_after else None,
+            "scope_unverified_after": problem_after is not None}
+    if cleared:
+        body["unverified_cleared"] = deleted_all and problem_after is None
+        body["unverified_reason_was"] = problem["reason"]
+        body["note"] = ("The unverified state was cleared by this call: the pointer was removed (its digest is in the results and the "
+                        "journal), open write records were closed as `cleared_by_purge`, and the scope now has no published version. "
+                        "The version files that remain are unreferenced; name them to delete them.")
+        if problem_after is not None:
+            body["note"] = "The unverified state could NOT be cleared: " + str(problem_after["reason"])
+    if not committed:
+        body["commit_record_pending"] = True
+        body["journal"]["commit_error"] = commit_why
+    if not deleted_all:
+        body["fix"] = "Some targets were not deleted (a handle may hold them). Run the report again and retry what remains."
+    return _j(body)
+
+
+# --------------------------------------------------------------------------
 # ida_status
 # --------------------------------------------------------------------------
 
@@ -1943,7 +3287,8 @@ def ida_status():
             "network_lookup_detected": signals["network_lookup_detected"],
             "cache": _cache_summary(),
             "operations": ["ida_query", "ida_microcode_cfg", "ida_type_member_offset", "ida_patch_plan",
-                           "ida_annotations", "ida_status"],
+                           "ida_annotations", "ida_rename_plan", "ida_annotations_apply", "ida_annotations_purge",
+                           "ida_status"],
             "query_operations": list(_ALLOWED_OPERATIONS),
             "note": (
                 "OK means idat launched headless and exited cleanly on an empty database; it does not "

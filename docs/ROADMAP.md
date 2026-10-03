@@ -86,10 +86,12 @@ hidden feature.
   needs a licensed IDA Pro 9.x, so CI cannot exercise it: the default tier tests the
   wrapper against a stand-in `idat`, and one `heavy` class runs the real thing locally.
   Also shipped: `ida_type_member_offset`, `ida_patch_plan` (a plan, checked by hashing the
-  cached database before and after) and `ida_annotations` (a read of the annotation log).
+  cached database before and after), `ida_annotations` (a read of the annotation log) and the
+  persistent rename pair `ida_rename_plan` / `ida_annotations_apply` (own annotated root, audit
+  journal, read-back in a separate engine process).
   **Still open:** `ida_disasm_listing` (read-only, next
-  round), the write operations (`ida_rename`, `ida_set_comments`, which persist into the
-  database and so need an audit log), a Ghidra
+  round), the comment write (`ida_set_comments`, which will follow the rename pair's plan/apply
+  shape), a Ghidra
   wrapper (the more approachable half, since `analyzeHeadless` is scriptable and free to
   install), and normalising answers across engines.
 - **Function-boundary recovery from exception-directory unwind data**, with
