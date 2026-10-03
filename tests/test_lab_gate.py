@@ -49,6 +49,19 @@ def _command():
     return ["sleep", "120"]
 
 
+def _confirmed_dead(pid):
+    """True when `pid` is gone (or only a reaped zombie). A pid that vanishes between the existence
+    probe and the status query is the very state wanted, so psutil.NoSuchProcess counts as proof of
+    death. AccessDenied and every other error are not proof of anything and propagate."""
+    import psutil
+    if not psutil.pid_exists(pid):
+        return True
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return True
+
+
 @pytest.fixture()
 def child():
     """A process THIS test started: console, no window, always killed and confirmed dead."""
@@ -63,8 +76,7 @@ def child():
         proc.kill()
         proc.wait(timeout=10)
         assert proc.poll() is not None
-        import psutil
-        assert not psutil.pid_exists(proc.pid) or psutil.Process(proc.pid).status() == psutil.STATUS_ZOMBIE
+        assert _confirmed_dead(proc.pid)
 
 
 @pytest.fixture()
@@ -76,6 +88,24 @@ def image_sha(child):
 def lab_open():
     with mock.patch.dict(os.environ, OPEN):
         yield
+
+
+class TestConfirmedDead:
+    """The teardown's death proof must treat a vanished pid as dead and nothing else as a pass."""
+
+    def test_pid_vanishing_between_probe_and_query_is_death(self):
+        import psutil
+        with mock.patch.object(psutil, "pid_exists", return_value=True),                 mock.patch.object(psutil, "Process", side_effect=psutil.NoSuchProcess(4242)):
+            assert _confirmed_dead(4242) is True
+
+    def test_a_live_process_is_not_dead(self, child):
+        assert _confirmed_dead(child.pid) is False
+
+    def test_access_denied_is_not_proof_of_death(self):
+        import psutil
+        with mock.patch.object(psutil, "pid_exists", return_value=True),                 mock.patch.object(psutil, "Process", side_effect=psutil.AccessDenied(4242)):
+            with pytest.raises(psutil.AccessDenied):
+                _confirmed_dead(4242)
 
 
 class TestRefusals:
@@ -144,7 +174,7 @@ class TestRefusals:
             deadline = time.time() + 10
             while time.time() < deadline and any(psutil.pid_exists(p) for p in victims):
                 time.sleep(0.1)
-            assert not any(psutil.pid_exists(p) and psutil.Process(p).status() != psutil.STATUS_ZOMBIE for p in victims)
+            assert all(_confirmed_dead(p) for p in victims)
 
     def test_a_missing_or_nonexistent_process_is_refused(self, lab_open):
         assert _gate(None, authorization=_auth(1), sample_sha256="0" * 64)["status"] == "PID_REQUIRED"
