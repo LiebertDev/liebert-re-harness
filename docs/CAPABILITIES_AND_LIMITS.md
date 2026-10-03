@@ -143,7 +143,24 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
   checked, so no claim is made that unflattening works. The session that builds the
   microcode never runs longer than 300 s (its own ceiling); the worker's full result goes to
   `dataset/evidence/ida_microcode_cfg/`.
-- Not here: renaming, comments, patch planning, type-member offsets, disassembly listing, and any
+- `ida_type_member_offset`: the byte offset (and bit offset, size and type text) of one direct member of a
+  named struct or union, read from the type information the cached database holds, in the same temporary
+  session. Both `_FOO` and `FOO` are tried. Three negatives are kept apart (no such type, not a struct or
+  union, no such member; the last lists the members the type does have, cut at 100 and saying so), and
+  each is an answer about the loaded type information, not about the program. A found offset is that
+  definition's layout, not proof the program was built against it. Own 300 s session ceiling.
+- `ida_patch_plan`: a PLAN for `force_branch` or `nop_out` at an address (`va`, `rva` or `file_offset`), in the
+  same operation names, address form and answer shape as `rizin_patch_plan`; x86 and x86-64 only; the input
+  file is never written. It is not a pure read: IDA's patch API is called in an in-memory copy of the database
+  inside the temporary session and undone. The cached database file is hashed before and after and both
+  hashes are in the answer; a difference is `PATCH_PLAN_CACHE_VIOLATION` (slot deleted, no plan returned).
+  Own 300 s session ceiling. Whether the patched program behaves as intended is not checked.
+- `ida_annotations`: reads the per-hash annotation log next to the cache slots. A plain file read: no IDA is
+  started or needed. A list cut at `max_results` or `max_chars` says so and counts what was left out;
+  unreadable lines are counted; a log with no readable line is an error, not an empty list. No log means this
+  package recorded no annotation for that input, not that the database has no names (nothing here writes
+  annotations yet). These three answers carry the input's hash, not its name or path.
+- Not here: renaming, comments, disassembly listing, and any
   Ghidra wrapper.
 
 ### External-engine wrappers actually present
