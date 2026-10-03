@@ -120,6 +120,15 @@ MAX_FILE_BYTES = 8_000_000
 MAX_READ_LINES = 500
 MAX_SEARCH_RESULTS = 250
 MAX_FIND_RESULTS = 400
+MAX_READ_FILES = 10
+
+
+def _limit_marker(returned, limit, total=None):
+    """The visible end-of-list line for a plain-text result that was cut at a
+    cap: that it was cut, how many items came back, the cap itself and the true
+    total when it is known. A partial list must never read as a complete one."""
+    seen = "total=unknown (more exist)" if total is None else f"total={total}"
+    return f"[limit:{limit}; truncated=true; returned={returned}; {seen}]"
 
 def _looks_like_windows_absolute_path(raw: str) -> bool:
     """Pure string check for Windows absolute-path syntax: a drive letter
@@ -256,8 +265,9 @@ def find_files(pattern="*", path="."):
         if skipped(p) or not p.is_file():
             continue
         if fnmatch.fnmatch(p.name.lower(), pat) or fnmatch.fnmatch(relative(p).lower(), pat):
+            if len(out)>=MAX_FIND_RESULTS:
+                return "\n".join(out)+"\n"+_limit_marker(len(out), MAX_FIND_RESULTS)
             out.append(relative(p))
-            if len(out)>=MAX_FIND_RESULTS: break
     return "\n".join(out) if out else "File not found."
 
 def read_file(path, start_line=1, end_line=None):
@@ -278,7 +288,10 @@ def read_file(path, start_line=1, end_line=None):
 
 def read_files(paths):
     if not isinstance(paths,list): return "paths must be a list."
-    return "\n\n".join(read_file(str(p),1,250) for p in paths[:10])
+    body = "\n\n".join(read_file(str(p),1,250) for p in paths[:MAX_READ_FILES])
+    if len(paths) > MAX_READ_FILES:
+        body += "\n\n" + _limit_marker(MAX_READ_FILES, MAX_READ_FILES, len(paths)) + " the remaining paths were not read"
+    return body
 
 def search_text(query,path=".",file_pattern="*",case_sensitive=False):
     target=safe_path(path)

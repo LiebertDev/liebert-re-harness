@@ -21,6 +21,7 @@ import shutil
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 import pytest
 from liebert_re.evidence.claim_index import ClaimError, ClaimIndex, claim_index
@@ -510,6 +511,52 @@ class RealCaseValidationTests(unittest.TestCase):
             self.assertEqual(prov3["refutes"][0]["evidence_uid"], uid_km_kill_verified)
             prov4 = claims.claim_provenance(claim4["claim_uid"])
             self.assertEqual(prov4["supports"][0]["evidence_uid"], uid_km_kill_verified)
+
+
+class JsonlRecordTests(unittest.TestCase):
+    """A JSONL evidence file is read line by line: one bad line costs that line, not the file."""
+
+    def _row(self, body, name="events_aaaaaa_lockevents.jsonl"):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / name
+            path.write_bytes(body)
+            return EvidenceIndex(root=root, db_path=root / "x.sqlite")._build_row(path, name, path.stat())
+
+    def test_multi_line_jsonl_is_ok_and_fields_are_extracted(self):
+        body = (b'{"reason": "stale", "reclaimed_by_pid": 41, "reclaimed_at": "2026-01-01T00:00:00Z"}\n'
+                b'\n'
+                b'{"reason": "dead_owner", "reclaimed_by_pid": 42, "reclaimed_at": "2026-01-02T00:00:00Z"}\n')
+        row = self._row(body)
+        self.assertEqual(row["status"], "json_ok")
+        self.assertIsNone(row["parse_error"])
+        for expected in ("lines_ok=2/2", "events=stale,dead_owner", "pids=41,42", "time=2026-01-01T00:00:00Z..2026-01-02T00:00:00Z"):
+            self.assertIn(expected, row["summary"])
+
+    def test_a_bad_line_is_named_and_the_good_lines_are_kept(self):
+        row = self._row(b'{"event": "a"}\nnot json\n{"event": "b"}\n{broken\n')
+        self.assertEqual(row["status"], "jsonl_partial")
+        self.assertIn("line 2", row["parse_error"])
+        self.assertIn("2 bad line(s)", row["parse_error"])
+        self.assertIn("2 of 4 read", row["parse_error"])
+        self.assertIn("lines_ok=2/4", row["summary"])
+        self.assertIn("bad_lines=2,4", row["summary"])
+        self.assertIn("events=a,b", row["summary"])
+
+    def test_a_file_with_no_parsable_line_is_malformed(self):
+        row = self._row(b"garbage\nmore garbage\n")
+        self.assertEqual(row["status"], "json_malformed")
+        self.assertIn("line 1", row["parse_error"])
+
+    def test_a_cut_read_drops_the_partial_last_line_without_calling_it_corrupt(self):
+        import liebert_re.evidence.index as index_module
+        line = b'{"event": "x"}\n'
+        body = line * 4 + b'{"event": "cut-off-in-the-mid'
+        with mock.patch.object(index_module, "MAX_CONTENT_BYTES", len(line) * 4 + 5):
+            row = self._row(body)
+        self.assertEqual(row["status"], "json_ok")
+        self.assertIn("partial_last_line_dropped", row["summary"])
+        self.assertTrue(row["parse_error"].startswith("TRUNCATED"))
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import liebert_re.workspace as tools_workspace
 from liebert_re.tools.generic_static_probe import generic_static_probe, normalize_tool_result
@@ -82,6 +83,53 @@ class NormalizeToolResultTests(unittest.TestCase):
         out = normalize_tool_result("plain text result, not json", tool="x", target="y")
         self.assertEqual(out["summary"], "plain text result, not json")
         self.assertFalse(out["truncated"])
+
+
+class ProbeEvidenceBindingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=tools_workspace.WORKSPACE)
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.evidence_root = self.root / "evidence"
+        (self.evidence_root / "generic_static_probe").mkdir(parents=True)
+        self.sample = self.root / "notes.txt"
+        self.sample.write_text("hello world\n", encoding="utf-8")
+
+    def _probe(self):
+        import liebert_re.evidence.index as index_module
+        import liebert_re.tools.generic_static_probe as probe
+        with mock.patch.object(probe, "EVIDENCE", self.evidence_root / "generic_static_probe"), \
+                mock.patch.object(index_module, "EVIDENCE_ROOT_DEFAULT", self.evidence_root), \
+                mock.patch.object(probe, "_evidence_index_record_write", return_value={"ok": True}) as hook:
+            return json.loads(probe.generic_static_probe(str(self.sample))), hook
+
+    def test_the_result_carries_the_evidence_identity_of_the_file_it_wrote(self):
+        from liebert_re.evidence.index import _evidence_uid
+        result, hook = self._probe()
+        self.assertRegex(result["evidence_id"], r"^EVX-[0-9a-f]{20}$")
+        written = self.evidence_root / "generic_static_probe" / result["evidence_file"]
+        self.assertEqual(result["evidence_id"], _evidence_uid("generic_static_probe/" + result["evidence_file"]))
+        self.assertEqual(json.loads(written.read_text(encoding="utf-8"))["evidence_id"], result["evidence_id"])
+        hook.assert_called_once()
+
+    def test_an_unwritable_ledger_leaves_the_id_empty_and_says_why(self):
+        import liebert_re.tools.generic_static_probe as probe
+        blocker = self.root / "blocked"
+        blocker.write_text("a file where a folder is needed", encoding="utf-8")
+        with mock.patch.object(probe, "EVIDENCE", blocker / "sub"), \
+                mock.patch("liebert_re.evidence.index.EVIDENCE_ROOT_DEFAULT", self.root):
+            result = json.loads(probe.generic_static_probe(str(self.sample)))
+        self.assertIsNone(result["evidence_id"])
+        self.assertTrue(result["evidence_error"].startswith("EVIDENCE_NOT_WRITTEN"))
+        self.assertNotIn("evidence_file", result)
+
+    def test_a_path_outside_the_index_root_never_gets_an_invented_id(self):
+        import liebert_re.tools.generic_static_probe as probe
+        with mock.patch.object(probe, "EVIDENCE", self.root / "elsewhere"), \
+                mock.patch("liebert_re.evidence.index.EVIDENCE_ROOT_DEFAULT", self.evidence_root):
+            result = json.loads(probe.generic_static_probe(str(self.sample)))
+        self.assertIsNone(result["evidence_id"])
+        self.assertTrue(result["evidence_error"].startswith("EVIDENCE_PATH_OUTSIDE_INDEX_ROOT"))
 
 
 if __name__ == "__main__":

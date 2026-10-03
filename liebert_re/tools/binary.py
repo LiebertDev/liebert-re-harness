@@ -1,6 +1,6 @@
 import hashlib, json, math, os, re
 from liebert_re.bounded_subprocess import run_bounded_process
-from liebert_re.workspace import safe_path, relative, skipped
+from liebert_re.workspace import safe_path, relative, skipped, _limit_marker
 
 try:
     from liebert_re.evidence.index import record_write as _evidence_index_record_write
@@ -42,8 +42,9 @@ def find_binaries(path=".",max_results=300):
     for p in root.rglob("*"):
         if skipped(p) or not p.is_file():continue
         if p.suffix.lower() in BINARY_EXTS:
+            if len(out)>=max_results:
+                return "\n".join(out)+"\n"+_limit_marker(len(out),max_results)
             out.append(f"{relative(p)} ({p.stat().st_size} bytes)")
-            if len(out)>=max_results:break
     return "\n".join(out) if out else "No binary found."
 
 def hash_file(path):
@@ -81,11 +82,12 @@ def binary_strings(path,min_length=4,contains=None,max_results=300):
     for m in ar.finditer(data):vals.append((m.start(),"ascii",m.group().decode("ascii",errors="replace")))
     for m in ur.finditer(data):vals.append((m.start(),"utf16",m.group().decode("utf-16le",errors="replace")))
     vals.sort()
-    out=[]
+    out=[]; matched=0
     for off,k,s in vals:
         if contains and contains.lower() not in s.lower():continue
-        out.append(f"0x{off:X} [{k}] {s}")
-        if len(out)>=max_results:break
+        matched+=1
+        if len(out)<max_results:out.append(f"0x{off:X} [{k}] {s}")
+    if matched>len(out):out.append(_limit_marker(len(out),max_results,matched))
     return "\n".join(out) if out else "No strings found."
 
 def pe_sections(path):
@@ -157,8 +159,8 @@ def pe_imports(path,filter_text=None,max_results=500):
             name=x.name.decode(errors="replace") if x.name else f"ordinal:{x.ordinal}"
             line=f"{dn}!{name} @IAT {hex(x.address)}"
             if flt and flt not in line.lower():continue
+            if len(out)>=max_results:return "\n".join(out)+"\n"+_limit_marker(len(out),max_results)+tail
             out.append(line)
-            if len(out)>=max_results:return "\n".join(out)+f"\n[limit:{max_results}]"+tail
     return "\n".join(out)+tail if out else "No matches."+tail
 
 def pe_exports(path,max_results=500):
@@ -169,9 +171,11 @@ def pe_exports(path,max_results=500):
         if problem:return f"{EXPORT_DIRECTORY_UNREADABLE}: {problem}. This is NOT the same as a binary with no exports."
         return "No export table."
     out=[]
-    for s in ex.symbols[:max_results]:
+    all_symbols=list(ex.symbols)
+    for s in all_symbols[:max_results]:
         n=s.name.decode(errors="replace") if s.name else f"ordinal:{s.ordinal}"
         out.append(f"{n} RVA={hex(s.address)} ordinal={s.ordinal}")
+    if len(all_symbols)>max_results:out.append(_limit_marker(len(out),max_results,len(all_symbols)))
     if problem:out.append(f"[{EXPORT_DIRECTORY_PARTIAL}: {problem}]")
     return "\n".join(out)
 
@@ -183,9 +187,11 @@ def dotnet_metadata(path,max_types=300):
     dn=dnfile.dnPE(str(p)); out=[]
     try:
         td=dn.net.mdtables.TypeDef
-        for row in list(td.rows)[:max_types]:
+        all_rows=list(td.rows)
+        for row in all_rows[:max_types]:
             ns=str(row.TypeNamespace or ""); name=str(row.TypeName or "")
             out.append(f"{ns}.{name}".strip("."))
+        if len(all_rows)>max_types:out.append(_limit_marker(len(out),max_types,len(all_rows)))
     except Exception as e:return f".NET metadata incomplete or failed: {e}"
     return "\n".join(out) if out else ".NET assembly parsed, but TypeDef table is empty."
 
@@ -299,8 +305,8 @@ def search_binary_bytes(path,pattern,max_results=100):
     out=[]; n=len(pat)
     for i in range(max(0,len(data)-n+1)):
         if all(v is None or data[i+j]==v for j,v in enumerate(pat)):
+            if len(out)>=max_results:return "\n".join(out)+"\n"+_limit_marker(len(out),max_results)
             out.append(f"file_offset=0x{i:X}")
-            if len(out)>=max_results:break
     return "\n".join(out) if out else "No matches."
 
 class _ResourceMalformed(Exception):

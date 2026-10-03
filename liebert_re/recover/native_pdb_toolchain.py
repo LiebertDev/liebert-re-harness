@@ -224,6 +224,8 @@ def validate_owned_native_pdb(exe_path: str | Path | None = None, pdb_path: str 
             "records_parsed": publics.get("records_parsed"),
             "status": publics.get("status"),
             "names": names[:40],
+            "name_count": len(names),
+            "names_truncated": len(names) > 40,
             "wanted_found": found_wanted,
             "unsupported_records": publics.get("unsupported_records") or 0,
         },

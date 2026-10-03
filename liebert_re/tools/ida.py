@@ -166,7 +166,7 @@ _LOCK_STALE_SECONDS = _MAX_CREATE_TIMEOUT_SECONDS + 120
 # no legitimate call holds a slot for twice the stale age, so beyond this the
 # pid is taken to have been reused or the owner to be hung.
 _LOCK_OWNER_ALIVE_CEILING_SECONDS = 2 * _LOCK_STALE_SECONDS
-_SLOT_NAME = re.compile(r"^[0-9a-f]{64}\.[A-Za-z0-9]+$")
+_SLOT_NAME = re.compile(r"^[0-9a-f]{64}(?:\.[A-Za-z0-9]+)+$")
 
 # The eight levels microcode passes through (MMAT_ZERO is "not built yet", not a level).
 _MICROCODE_MATURITIES = (
@@ -349,8 +349,34 @@ def _cache_budget_bytes():
         return _CACHE_BUDGET_DEFAULT
 
 
-def _slot_dir(sha256):
-    return _cache_root() / f"{sha256}.{_ANALYSIS_PROFILE}"
+_ENGINE_FILES = ("ida.dll", "ida64.dll", "libida.so", "libida64.so", "libida.dylib", "libida64.dylib")
+
+
+def _engine_tag(exe):
+    """A short, stable label of the analysis engine that would build a database:
+    a hash of the name, size and modification time of the resolved idat binary
+    and of the IDA kernel library beside it. IDA is not asked for its version
+    (that costs a launch), so an update or reinstall changes the tag and a
+    database built by the old engine is not reused. A binary that cannot be
+    inspected gives the fixed tag `unversioned`, never an exception."""
+    parts = []
+    try:
+        if exe:
+            folder = Path(exe).parent
+            for candidate in (Path(exe), *(folder / name for name in _ENGINE_FILES)):
+                if candidate.is_file():
+                    info = candidate.stat()
+                    parts.append(f"{candidate.name}:{info.st_size}:{info.st_mtime_ns}")
+    except OSError:
+        parts = []
+    if not parts:
+        return "unversioned"
+    return "e" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:10]
+
+
+def _slot_dir(sha256, exe=None):
+    """Cache key: sha256(input) + analysis profile + engine tag."""
+    return _cache_root() / f"{sha256}.{_ANALYSIS_PROFILE}.{_engine_tag(exe or _ida_binary())}"
 
 
 def _lock_path(slot):
@@ -588,7 +614,7 @@ def _touch_meta(slot, sha256, *, created=False):
     except (OSError, ValueError):
         pass
     now = time.time()
-    record.update({"sha256": sha256, "profile": _ANALYSIS_PROFILE, "last_used": now})
+    record.update({"sha256": sha256, "profile": _ANALYSIS_PROFILE, "engine": slot.name.rsplit(".", 1)[-1], "last_used": now})
     if created or "created" not in record:
         record["created"] = now
     try:
@@ -652,7 +678,7 @@ def _cache_summary():
                 slots += 1
                 total += _dir_bytes(child)
     return {"root": _display_cache_root(), "slot_count": slots, "total_bytes": total,
-            "budget_bytes": _cache_budget_bytes(), "key": f"sha256(input file) + profile {_ANALYSIS_PROFILE}"}
+            "budget_bytes": _cache_budget_bytes(), "key": f"sha256(input file) + profile {_ANALYSIS_PROFILE} + engine tag (size/mtime of idat and the IDA kernel library)"}
 
 
 def _display_cache_root():
@@ -1065,7 +1091,7 @@ def _locked_call(tool, exe, p, invocation, max_chars, cancellation_token, profil
                                   "strerror": _redact(exc.strerror or type(exc).__name__)},
             "detail": "The input file could not be read; no claim is made about its content.",
         })
-    slot = _slot_dir(sha256)
+    slot = _slot_dir(sha256, exe)
     try:
         lock = _acquire_slot_lock(slot, cancellation_token)
     except OSError as exc:

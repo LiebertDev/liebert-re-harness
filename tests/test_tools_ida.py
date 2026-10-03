@@ -438,7 +438,7 @@ class CacheTests(IdaCase):
     def test_slot_is_named_by_the_inputs_sha256(self):
         self.q()
         (slot,) = self.slots()
-        self.assertEqual(slot.name, f"{self.sha}.{ti._ANALYSIS_PROFILE}")
+        self.assertEqual(slot.name, ti._slot_dir(self.sha).name)
         self.assertEqual(sorted(p.name for p in slot.iterdir()), ["db.i64", "meta.json"])
 
     def test_first_call_creates_later_calls_hit(self):
@@ -516,7 +516,7 @@ class CacheTests(IdaCase):
         self.assertEqual(data["cache_evicted_slots"], [old.name])
         self.assertEqual(data["cache_budget_bytes"], 3000)
         self.assertEqual(len(self.slots()), 1)
-        self.assertEqual(self.slots()[0].name, f"{self.sha}.{ti._ANALYSIS_PROFILE}")
+        self.assertEqual(self.slots()[0].name, ti._slot_dir(self.sha).name)
 
     def test_the_slot_in_use_is_never_evicted_even_over_budget(self):
         with mock.patch.dict(os.environ, {"LIEBERT_IDA_CACHE_BYTES": "1"}):
@@ -573,6 +573,42 @@ class CacheTests(IdaCase):
             with mock.patch.dict(os.environ, {"LIEBERT_IDA_CACHE_BYTES": raw}):
                 self.assertEqual(ti._cache_budget_bytes(), expected, raw)
         self.assertEqual(ti._CACHE_BUDGET_DEFAULT, 5 * 1024 ** 3)
+
+
+class EngineKeyTests(IdaCase):
+    """The cache key carries the analysis engine: an updated idat must not reuse an old database."""
+
+    def _engine(self, size):
+        exe = self.root / "ida_home" / "idat.exe"
+        exe.parent.mkdir(exist_ok=True)
+        exe.write_bytes(b"\0" * size)
+        return exe
+
+    def test_tag_changes_when_the_engine_binary_changes_and_is_stable_otherwise(self):
+        exe = self._engine(100)
+        first = ti._engine_tag(str(exe))
+        self.assertEqual(first, ti._engine_tag(str(exe)))
+        self.assertRegex(first, r"^e[0-9a-f]{10}$")
+        exe = self._engine(101)
+        without_kernel = ti._engine_tag(str(exe))
+        self.assertNotEqual(first, without_kernel)
+        (exe.parent / "ida.dll").write_bytes(b"k")
+        self.assertNotEqual(without_kernel, ti._engine_tag(str(exe)))
+
+    @pytest.mark.contract
+    def test_an_unreadable_engine_gives_a_fixed_tag_not_an_exception(self):
+        self.assertEqual(ti._engine_tag(None), "unversioned")
+        self.assertEqual(ti._engine_tag(str(self.root / "no" / "idat.exe")), "unversioned")
+
+    def test_a_new_engine_builds_a_new_slot_instead_of_reusing_the_old_database(self):
+        with mock.patch.object(ti, "_ida_binary", return_value=str(self._engine(100))):
+            self.assertEqual(self.q()["database_cache"], "CREATED")
+            self.assertEqual(self.q()["database_cache"], "HIT")
+        with mock.patch.object(ti, "_ida_binary", return_value=str(self._engine(200))):
+            self.assertEqual(self.q()["database_cache"], "CREATED")
+        names = [p.name for p in self.slots()]
+        self.assertEqual(len(names), 2)
+        self.assertTrue(all(n.startswith(f"{self.sha}.{ti._ANALYSIS_PROFILE}.e") for n in names))
 
 
 class SlotLockTests(IdaCase):
