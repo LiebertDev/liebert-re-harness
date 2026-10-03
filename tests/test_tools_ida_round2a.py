@@ -126,12 +126,14 @@ class Round2aCase(unittest.TestCase):
         self.sample.write_bytes(b"MZ" + bytes(range(64)))
         self.sha, self.md5 = ti._sha256_md5(self.sample)
         self.cache = self.root / "cache"
+        self.annotated = self.root / "annotated"      # the journal lives in the annotated root, not in the cache
         self.ev_type, self.ev_patch, self.ev_ann = (self.root / n for n in ("ev_type", "ev_patch", "ev_ann"))
         self.fake = Round2aFakeIdat(self.sha, self.md5, "ok")
         stack = ExitStack()
         self.addCleanup(stack.close)
         for target in (
             mock.patch.object(ti, "CACHE_ROOT", self.cache),
+            mock.patch.object(ti, "ANNOTATED_ROOT", self.annotated),
             mock.patch.object(ti, "EVIDENCE_TYPE_MEMBER", self.ev_type),
             mock.patch.object(ti, "EVIDENCE_PATCH_PLAN", self.ev_patch),
             mock.patch.object(ti, "EVIDENCE_ANNOTATIONS", self.ev_ann),
@@ -150,8 +152,8 @@ class Round2aCase(unittest.TestCase):
         return [c for c in self.fake.calls if c["job"]["mode"] == "reopen"]
 
     def write_log(self, lines, raw=None):
-        self.cache.mkdir(parents=True, exist_ok=True)
-        log = self.cache / f"{self.sha}{ti._ANNOTATION_LOG_SUFFIX}"
+        self.annotated.mkdir(parents=True, exist_ok=True)
+        log = self.annotated / f"{self.sha}{ti._ANNOTATION_LOG_SUFFIX}"
         log.write_bytes(raw if raw is not None else ("\n".join(json.dumps(x) if not isinstance(x, str) else x
                                                               for x in lines) + "\n").encode("utf-8"))
         return log
@@ -184,7 +186,7 @@ class AnnotationReaderTests(Round2aCase):
         data = self.a()
         self.assertEqual((data["ok"], data["status"], data["found"], data["total_entries"], data["entries"]),
                          (True, "OK", False, 0, []))
-        self.assertIn("does not exist until one does", data["note"])
+        self.assertIn("does not exist until one has been applied", data["note"])
         self.assertIn("IDA's own names", data["note"])
         self.assertFalse(self.cache.exists())   # a read creates nothing
 
@@ -299,7 +301,7 @@ class AnnotationReaderTests(Round2aCase):
 
     @pytest.mark.contract
     def test_a_log_that_cannot_be_read_is_an_environment_status_not_an_empty_list(self):
-        (self.cache / f"{self.sha}{ti._ANNOTATION_LOG_SUFFIX}").mkdir(parents=True)   # opening a directory fails
+        (self.annotated / f"{self.sha}{ti._ANNOTATION_LOG_SUFFIX}").mkdir(parents=True)   # opening a directory fails
         data = self.a()
         self.assertEqual((data["ok"], data["status"], data["error"]), (False, "READ_FAILED", "ANNOTATION_LOG_UNREADABLE_OS"))
         self.assertIn("errno", data["environment_error"])
@@ -1008,6 +1010,7 @@ class IdaRound2aRealInstallTests(unittest.TestCase):
         self.cache = self.root / f"c{hashlib.sha256(self.id().encode()).hexdigest()[:6]}"
         self.cache.mkdir(parents=True)
         stack.enter_context(mock.patch.object(ti, "CACHE_ROOT", self.cache / "db"))
+        stack.enter_context(mock.patch.object(ti, "ANNOTATED_ROOT", self.cache / "annotated"))
         for name in ("EVIDENCE", "EVIDENCE_TYPE_MEMBER", "EVIDENCE_PATCH_PLAN", "EVIDENCE_ANNOTATIONS"):
             stack.enter_context(mock.patch.object(ti, name, self.cache / "ev"))
         stack.enter_context(mock.patch.object(ti, "_evidence_index_record_write", return_value={}))
@@ -1081,7 +1084,8 @@ class IdaRound2aRealInstallTests(unittest.TestCase):
         self.prime()
         before = self.database_digest()
         sha = ti._sha256_md5(self.pe)[0]
-        log = ti._cache_root() / f"{sha}{ti._ANNOTATION_LOG_SUFFIX}"
+        log = ti._journal_path(sha)
+        log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text(json.dumps({"operation": "rename", "ok": True}) + "\n" + "{torn", encoding="utf-8")
         with mock.patch.object(ti, "run_bounded_process", side_effect=AssertionError("idat must not be started")):
             data = json.loads(ti.ida_annotations(str(self.pe)))

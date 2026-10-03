@@ -158,9 +158,18 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
 - `ida_annotations`: reads the per-hash annotation log next to the cache slots. A plain file read: no IDA is
   started or needed. A list cut at `max_results` or `max_chars` says so and counts what was left out;
   unreadable lines are counted; a log with no readable line is an error, not an empty list. No log means this
-  package recorded no annotation for that input, not that the database has no names (nothing here writes
-  annotations yet). These three answers carry the input's hash, not its name or path.
-- Not here: renaming, comments, disassembly listing, and any
+  package recorded no annotation for that input, not that the database has no names. These three answers
+  carry the input's hash, not its name or path.
+- `ida_rename_plan` + `ida_annotations_apply`: renames that persist, as two operations (a plan, then an apply
+  that cannot be called without it) over a named scope label. The plan reads the scope's current names and
+  carries a digest, a base version and a per-item expectation; a stale plan is refused, never merged. An apply
+  writes into a scratch copy, journals `batch_prepared` (synced) before promoting the candidate to an immutable
+  version file, has a NEW engine process read the names and an in-database marker back, and only then publishes
+  one manifest pointer and journals `batch_committed`. Annotated data lives in its own root
+  (`dataset/ida_annotated/`, never inside the cache, never evicted; byte ceiling `LIEBERT_IDA_ANNOTATED_BYTES`,
+  default 2 GiB) with its own locks. A candidate whose promotion failed is kept. Atomic is the default;
+  `allow_partial=True` is an explicit choice. Comments are not written yet; there is no purge operation yet.
+- Not here: comments, disassembly listing, and any
   Ghidra wrapper.
 
 ### External-engine wrappers actually present

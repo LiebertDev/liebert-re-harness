@@ -1,0 +1,350 @@
+"""IDAPython worker for ``liebert_re.tools.ida`` (the annotation write path: ``ida_rename_plan``
+and ``ida_annotations_apply``).
+
+Runs INSIDE idat's own interpreter, never in the harness venv: only the standard library and IDA's
+``ida_*`` / ``idc`` modules are importable here. This file must not import anything from
+``liebert_re``. The wrapper copies it into a private work directory as ``liebert_ida_job.py``
+(BOM-free) and launches it on a COPY of a database, never on the cached pristine database and never
+on a published annotation version:
+
+    idat -A -Opdb:off -Lida.log -Sliebert_ida_job.py db.i64
+
+The job comes from the JSON file named in ``LIEBERT_IDA_JOB``. Three operations, three modes:
+
+* ``rename_plan``   mode ``plan``    (temporary session): read each address's current name.
+* ``rename_verify`` mode ``verify``  (temporary session, a NEW process after the write): read the
+                                     names and the annotation marker back from the stored database.
+* ``rename_apply``  mode ``write``   (an ordinary session on a scratch copy): set the names, store the
+                                     annotation marker, save, and report what every call returned.
+
+This is the only worker file that changes a database. Every call that does is a method of
+``_ScratchWriter`` and nowhere else (a test pins that); ``_ScratchWriter`` refuses to exist in a
+session that was marked temporary (its changes would be discarded and the report would lie), and
+the read modes refuse to run in a session that was NOT marked temporary (a read must not rewrite a
+database on exit).
+
+The annotation marker is a small record stored INSIDE the database (a netnode blob): schema, label,
+version and write id. It is what lets a later read say which annotation version it is looking at,
+independently of any file name or manifest.
+"""
+import json
+import os
+import sys
+import traceback
+
+import ida_auto
+import ida_loader
+import ida_nalt
+import ida_netnode
+import ida_pro
+import idaapi
+import idc
+
+JOB_ENV = "LIEBERT_IDA_JOB"
+OPERATIONS = ("rename_plan", "rename_verify", "rename_apply")
+MODES = {"rename_plan": "plan", "rename_verify": "verify", "rename_apply": "write"}
+MARKER_NODE = "$ liebert.annotation"
+MARKER_SCHEMA = 1
+ADDRESS_KINDS = ("va", "rva", "file_offset")
+_MAX_ITEMS = 200
+_NAME_MAX = 255
+
+
+class _WorkerError(Exception):
+    """A named, expected failure: becomes ``ok: false`` with ``error`` set."""
+
+    def __init__(self, error, detail=None, **extra):
+        super().__init__(error)
+        self.error = error
+        self.detail = detail
+        self.extra = extra
+
+
+def _job():
+    path = os.environ.get(JOB_ENV, "").strip()
+    if not path:
+        return None, "MISSING_JOB_ENV"
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            job = json.load(handle)
+    except Exception as exc:  # noqa: BLE001
+        return None, "JOB_UNREADABLE: %s: %s" % (type(exc).__name__, exc)
+    if not isinstance(job, dict) or not job.get("output"):
+        return None, "JOB_MALFORMED"
+    return job, None
+
+
+def _safe(callable_, default=None):
+    try:
+        return callable_()
+    except Exception:  # noqa: BLE001 - one unavailable field never fails the whole answer
+        return default
+
+
+def _hexdigest(value):
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    return str(value) if value else None
+
+
+def _is_temporary():
+    """Whether this session was marked temporary. None when this build cannot say."""
+    try:
+        return bool(ida_loader.is_database_flag(ida_loader.DBFL_TEMP))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _mark_temporary():
+    try:
+        ida_loader.set_database_flag(ida_loader.DBFL_TEMP)
+    except Exception:  # noqa: BLE001
+        raise _WorkerError(
+            "DATABASE_CHANGES_NOT_DISCARDABLE",
+            "Could not mark the session database temporary (DBFL_TEMP); nothing was read.",
+        ) from None
+
+
+def _address_form(ea):
+    if ea is None or ea == idc.BADADDR:
+        return {"resolved": False, "error": "BADADDR"}
+    offset = idaapi.get_fileregion_offset(ea)
+    base = ida_nalt.get_imagebase()
+    return {
+        "file_offset": hex(offset) if offset is not None and offset >= 0 else None,
+        "rva": hex(ea - base), "va": hex(ea), "image_base": hex(base),
+        "section": idc.get_segm_name(ea) or "",
+    }
+
+
+def _resolve_ea(address, address_kind):
+    kind = str(address_kind or "va").strip().lower()
+    if kind not in ADDRESS_KINDS:
+        raise _WorkerError("INVALID_ADDRESS_KIND", given=str(address_kind)[:40], accepted=list(ADDRESS_KINDS))
+    try:
+        value = int(str(address), 0)
+    except (TypeError, ValueError):
+        raise _WorkerError("INVALID_ADDRESS", given=str(address)[:80]) from None
+    if kind == "va":
+        ea = value
+    elif kind == "rva":
+        ea = ida_nalt.get_imagebase() + value
+    else:
+        ea = idaapi.get_fileregion_ea(value)
+    if ea is None or ea == idc.BADADDR or not idc.get_segm_name(ea):
+        raise _WorkerError("ADDRESS_OUTSIDE_SECTION", given=str(address)[:80], address_kind=kind)
+    return ea
+
+
+def _read_marker():
+    """The annotation marker stored in this database, or None when it has none."""
+    node = ida_netnode.netnode(MARKER_NODE, 0, False)
+    if node == ida_netnode.BADNODE:
+        return None
+    blob = node.getblob(0, "B")
+    if not blob:
+        return None
+    try:
+        record = json.loads(bytes(blob).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return {"unreadable": True}
+    return record if isinstance(record, dict) else {"unreadable": True}
+
+
+class _ScratchWriter:
+    """The only place in this file that changes the database.
+
+    Construction refuses a session marked temporary: an apply whose changes IDA would discard on exit
+    is not an apply. The calls below are the write API; nothing else in this file reaches it."""
+
+    def __init__(self):
+        if _is_temporary() is not False:
+            raise _WorkerError(
+                "APPLY_SESSION_IS_TEMPORARY",
+                "The write session must be an ordinary session of a scratch copy; this one is temporary or "
+                "its flag could not be read, so nothing was written.",
+            )
+
+    def rename(self, ea, new_name):
+        """(ok, name read back at once). IDA's own return value is the first word, the read-back the second."""
+        done = bool(idc.set_name(ea, new_name, idc.SN_NOWARN))
+        return done, idc.get_name(ea)
+
+    def store_marker(self, marker):
+        node = ida_netnode.netnode(MARKER_NODE, 0, True)
+        return bool(node.setblob(json.dumps(marker, sort_keys=True).encode("utf-8"), 0, "B"))
+
+    def save(self):
+        """The return value of the save call, checked by the caller. The database's own path is passed:
+        measured on IDA 9.4, an empty path makes the call return False although the changes are written
+        when the session ends, which is exactly the kind of return that must not be taken on faith."""
+        return bool(ida_loader.save_database(ida_loader.get_path(ida_loader.PATH_TYPE_IDB), 0))
+
+
+def _check_name(name):
+    if not isinstance(name, str) or not name or len(name) > _NAME_MAX:
+        raise _WorkerError("INVALID_NAME", given=repr(name)[:80])
+
+
+def _items(job):
+    items = job.get("items")
+    if not isinstance(items, list) or not items or len(items) > _MAX_ITEMS:
+        raise _WorkerError("INVALID_ITEMS", "`items` is a non-empty list of at most %d entries." % _MAX_ITEMS)
+    return items
+
+
+def _op_rename_plan(result, job):
+    _mark_temporary()
+    result["database_changes_discarded"] = True
+    ida_auto.auto_wait()
+    rows = []
+    for index, item in enumerate(_items(job)):
+        try:
+            ea = _resolve_ea(item.get("address"), item.get("address_kind"))
+            _check_name(item.get("new_name"))
+        except _WorkerError as exc:
+            raise _WorkerError("PLAN_ITEM_REFUSED", item_index=index, item_error=exc.error, **exc.extra) from None
+        head = idc.get_item_head(ea)
+        if head != ea:
+            raise _WorkerError("PLAN_ITEM_REFUSED", item_index=index, item_error="ADDRESS_NOT_AN_ITEM_START",
+                               given=hex(ea), item_start=hex(head))
+        current = idc.get_name(ea) or ""
+        if current == item.get("new_name"):
+            raise _WorkerError("PLAN_ITEM_REFUSED", item_index=index, item_error="NAME_UNCHANGED", current_name=current)
+        rows.append({"index": index, "address": _address_form(ea), "old_name": current,
+                     "new_name": item["new_name"]})
+    result["plan_items"] = rows
+    result["annotation_marker"] = _read_marker()
+
+
+def _op_rename_verify(result, job):
+    _mark_temporary()
+    result["database_changes_discarded"] = True
+    ida_auto.auto_wait()
+    rows = []
+    for index, item in enumerate(_items(job)):
+        ea = _resolve_ea(item.get("address"), item.get("address_kind"))
+        rows.append({"index": index, "address": hex(ea), "actual_name": idc.get_name(ea) or ""})
+    result["verified_items"] = rows
+    result["annotation_marker"] = _read_marker()
+
+
+def _op_rename_apply(result, job):
+    writer = _ScratchWriter()
+    result["database_changes_discarded"] = False
+    ida_auto.auto_wait()
+    allow_partial = job.get("allow_partial") is True
+    marker = job.get("marker")
+    if not isinstance(marker, dict):
+        raise _WorkerError("INVALID_MARKER")
+    resolved = []
+    failed = []
+    for index, item in enumerate(_items(job)):
+        try:
+            ea = _resolve_ea(item.get("address"), item.get("address_kind"))
+            _check_name(item.get("new_name"))
+        except _WorkerError as exc:
+            failed.append({"index": index, "error": exc.error})
+            continue
+        current = idc.get_name(ea) or ""
+        if current != item.get("expect_name"):
+            failed.append({"index": index, "error": "PRECONDITION_FAILED", "expected": item.get("expect_name"),
+                           "actual": current})
+            continue
+        resolved.append((index, ea, item["new_name"], current))
+    result["atomic"] = not allow_partial
+    if failed and not allow_partial:
+        result.update({"ok": False, "error": "ABORTED_ATOMIC", "applied": [], "failed": failed,
+                       "saved": False, "detail": "A precondition failed before anything was written."})
+        return
+    applied = []
+    for index, ea, new_name, old in resolved:
+        done, read_back = writer.rename(ea, new_name)
+        if done and read_back == new_name:
+            applied.append({"index": index, "address": hex(ea), "old_name": old, "new_name": new_name})
+        else:
+            failed.append({"index": index, "error": "RENAME_REJECTED_BY_ENGINE", "set_returned": done,
+                           "read_back_matches": read_back == new_name})
+            if not allow_partial:
+                result.update({"ok": False, "error": "ABORTED_ATOMIC", "applied": [], "failed": failed,
+                               "saved": False, "detail": "The engine refused a rename; nothing was saved."})
+                return
+    result["applied"] = sorted(applied, key=lambda row: row["index"])
+    result["failed"] = sorted(failed, key=lambda row: row["index"])
+    if not applied:
+        result.update({"ok": False, "error": "ALL_FAILED", "saved": False})
+        return
+    marked = writer.store_marker(marker)
+    saved = writer.save()
+    result["marker_stored"] = marked
+    result["save_returned"] = saved
+    result["saved"] = bool(marked and saved)
+    if not result["saved"]:
+        result.update({"ok": False, "error": "SAVE_NOT_CONFIRMED"})
+
+
+_DISPATCH = {"rename_plan": _op_rename_plan, "rename_verify": _op_rename_verify, "rename_apply": _op_rename_apply}
+
+
+def _run(job):
+    operation = str(job.get("operation") or "")
+    result = {"ok": True, "tool": "ida_annotations", "operation": operation}
+    try:
+        if operation not in _DISPATCH:
+            result.update({"ok": False, "error": "UNKNOWN_OPERATION", "allowed": list(OPERATIONS)})
+        elif job.get("write_mode") != MODES[operation]:
+            result.update({"ok": False, "error": "OPERATION_MODE_MISMATCH", "expected_mode": MODES[operation]})
+        else:
+            _DISPATCH[operation](result, job)
+    except _WorkerError as exc:
+        discarded = result.get("database_changes_discarded")
+        result = {"ok": False, "tool": "ida_annotations", "operation": operation, "error": exc.error}
+        if exc.detail:
+            result["detail"] = exc.detail
+        result.update(exc.extra)
+        if discarded is not None:
+            result["database_changes_discarded"] = discarded
+    except Exception:  # noqa: BLE001
+        discarded = result.get("database_changes_discarded")
+        result = {"ok": False, "tool": "ida_annotations", "operation": operation,
+                  "error": "IDAPYTHON_SCRIPT_EXCEPTION", "traceback": traceback.format_exc()}
+        if discarded is not None:
+            result["database_changes_discarded"] = discarded
+    result["engine_pid"] = os.getpid()   # lets the wrapper show that the read-back ran in another process
+    result["engine_input_sha256"] = _hexdigest(_safe(ida_nalt.retrieve_input_file_sha256))
+    result["engine_input_md5"] = _hexdigest(_safe(ida_nalt.retrieve_input_file_md5))
+    return result
+
+
+def _write_result(path, result):
+    result["script_completed"] = True  # last key: a truncated file cannot carry it
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(result, handle, ensure_ascii=False, indent=2)
+    os.replace(temporary, path)
+
+
+def main():
+    job, problem = _job()
+    if job is None:
+        sys.stderr.write("liebert_ida_job: %s\n" % problem)
+        return 2
+    try:
+        _write_result(job["output"], _run(job))
+        return 0
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return 3
+
+
+def _entry():
+    """Run the job, then ALWAYS leave through ``qexit`` so idat never waits for input."""
+    code = 4
+    try:
+        code = main()
+    finally:
+        ida_pro.qexit(code)
+
+
+if __name__ == "__main__":
+    _entry()

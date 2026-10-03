@@ -151,6 +151,8 @@ jobs:
           assert microcode_worker.is_file(), "the IDAPython microcode worker is missing from the wheel"
           patch_plan_worker = _res.files("liebert_re.tools").joinpath("ida_scripts/patch_plan.idapy")
           assert patch_plan_worker.is_file(), "the IDAPython patch-plan worker is missing from the wheel"
+          annotate_worker = _res.files("liebert_re.tools").joinpath("ida_scripts/annotate_write.idapy")
+          assert annotate_worker.is_file(), "the IDAPython annotation write worker is missing from the wheel"
           for m in mods:
               try:
                   mod = importlib.import_module(m)

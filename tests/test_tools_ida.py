@@ -2026,7 +2026,8 @@ class RoutingTests(unittest.TestCase):
 
     def test_tools_that_are_not_implemented_yet_are_still_not_claimed(self):
         published = tool_families.published_tools("native")
-        # ida_patch_plan, ida_type_member_offset and ida_annotations are implemented and left this list.
+        # ida_patch_plan, ida_type_member_offset and ida_annotations are implemented and left this list; so did
+        # the rename pair (ida_rename became ida_rename_plan + ida_annotations_apply, two names, not a flag).
         for name in ("ida_rename", "ida_set_comments", "ida_disasm_listing"):
             self.assertNotIn(name, published, name)
 
