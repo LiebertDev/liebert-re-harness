@@ -57,7 +57,7 @@ JOB_ENV = "LIEBERT_IDA_JOB"
 
 _OPERATIONS = (
     "summary", "list_functions", "segments", "function_at_address",
-    "decompile_function", "xrefs_to", "imports_exports", "strings",
+    "decompile_function", "xrefs_to", "imports_exports", "strings", "type_member_offset",
 )
 
 # Defense-in-depth ceilings for the two walks whose size is controlled by the
@@ -386,6 +386,83 @@ def _op_strings(result, query, max_results, offset):
         result.update(budget.as_limited())
 
 
+# The member names offered when a type exists but the requested member does not.
+_MEMBER_NAME_LIST_LIMIT = 100
+
+
+def _op_type_member_offset(result, query, max_results, offset):
+    """Byte offset of one DIRECT member of a named struct or union, read from the
+    type information of the loaded database (its own types plus the type libraries
+    it loaded). `query` is a JSON object {"struct_name": ..., "member_name": ...}.
+    The name as given and its leading-underscore counterpart are both tried
+    (`_FOO` / `FOO`): Windows headers declare `_FOO` and typedef `FOO`.
+
+    Three negatives are kept apart, and none of them is a statement about the
+    program, only about what the loaded type information knows: no such type
+    (TYPE_NOT_FOUND), a type that is not a struct or union (TYPE_NOT_STRUCT_OR_UNION),
+    and a struct or union without that member (MEMBER_NOT_FOUND, which then lists
+    the members it does have, cut at a stated limit). Members of nested or
+    anonymous types are not searched. The `ida_typeinf` import is local: only this
+    operation needs it."""
+    import ida_typeinf
+
+    try:
+        request = json.loads(query)
+        struct_name = str(request["struct_name"])
+        member_name = str(request["member_name"])
+    except Exception:  # noqa: BLE001
+        result["ok"] = False
+        result["error"] = "INVALID_TYPE_MEMBER_REQUEST"
+        result["detail"] = "The job's query must be a JSON object with struct_name and member_name."
+        return
+    candidates = [struct_name, struct_name[1:] if struct_name.startswith("_") else "_" + struct_name]
+    til = ida_typeinf.get_idati()
+    not_struct = []
+    for name in candidates:
+        tif = ida_typeinf.tinfo_t()
+        if not tif.get_named_type(til, name, ida_typeinf.BTF_TYPEDEF, True):
+            continue
+        if not tif.is_udt():
+            not_struct.append(name)
+            continue
+        udm = ida_typeinf.udm_t()
+        udm.name = member_name
+        index = tif.find_udm(udm, ida_typeinf.STRMEM_NAME)
+        member_count = tif.get_udt_nmembers()
+        if index is None or index < 0:
+            listed = []
+            for i in range(min(member_count, _MEMBER_NAME_LIST_LIMIT)):
+                listed.append(_safe(lambda: tif.get_udm(i)[1].name))
+            result["ok"] = False
+            result["error"] = "MEMBER_NOT_FOUND"
+            result["resolved_type_name"] = name
+            result["is_union"] = bool(tif.is_union())
+            result["member_count"] = member_count
+            result["member_names"] = listed
+            result["member_names_truncated"] = member_count > len(listed)
+            return
+        found_index, member = tif.get_udm(index)
+        bits = member.offset
+        result["resolved_type_name"] = name
+        result["tried_type_names"] = candidates
+        result["is_union"] = bool(tif.is_union())
+        result["member_name"] = member_name
+        result["member_index"] = found_index
+        result["offset_bits"] = bits
+        result["offset_bytes"] = bits // 8
+        result["byte_aligned"] = bits % 8 == 0
+        result["member_size_bits"] = member.size
+        result["member_size_bytes"] = (member.size // 8) if member.size and member.size % 8 == 0 else None
+        result["member_type"] = _safe(lambda: str(member.type))
+        result["is_bitfield"] = bool(_safe(member.is_bitfield, False))
+        result["struct_size_bytes"] = _safe(tif.get_size)
+        result["member_count"] = member_count
+        return
+    result["ok"] = False
+    result["error"] = "TYPE_NOT_STRUCT_OR_UNION" if not_struct else "TYPE_NOT_FOUND"
+    result["tried_type_names"] = candidates
+
+
 _DISPATCH = {
     "summary": _op_summary,
     "list_functions": _op_list_functions,
@@ -395,6 +472,7 @@ _DISPATCH = {
     "xrefs_to": _op_xrefs_to,
     "imports_exports": _op_imports_exports,
     "strings": _op_strings,
+    "type_member_offset": _op_type_member_offset,
 }
 
 

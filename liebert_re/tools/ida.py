@@ -82,11 +82,24 @@ driven against a private configuration directory (its `options.json` is the
 user's own file); see `microcode_cfg.idapy`. The pass targets instruction-level obfuscation and
 control-flow flattening patterns. It does not handle virtualised (VM-based) code: that logic lives in bytecode data, which microcode rules cannot rewrite.
 
-Scope of this module: `ida_query` and `ida_microcode_cfg` (read-only) and
-`ida_status`. Writing operations (rename, comments, patch planning) are not here.
+**Type members, patch plans, annotation log.** Three more top-level operations, none of which
+persists anything. `ida_type_member_offset` reads one member's offset from the database's type
+information (a third operation of `query_program.idapy`'s session, kept off `ida_query`'s menu).
+`ida_patch_plan` is NOT a pure read: its worker (`ida_scripts/patch_plan.idapy`) calls IDA's patch
+API in an in-memory copy of the database inside the same discard guarantee, so the wrapper hashes
+the cached database file before and after and answers `PATCH_PLAN_CACHE_VIOLATION` (slot dropped, no
+plan) if the two differ. `ida_annotations` is a file-system read of the per-hash write log next to
+the cache slots and never starts IDA. These three keep the target's name and path out of their
+answers and out of their evidence file names (the input hash names them), and each of the first two
+has its own reopen-session ceiling constant.
+
+Scope of this module: `ida_query`, `ida_microcode_cfg`, `ida_type_member_offset`, `ida_patch_plan`
+and `ida_annotations` (none of them writes the input or persists anything) and `ida_status`. The
+operations that persist annotations (rename, comments) are not here.
 """
 from __future__ import annotations
 
+import collections
 import getpass
 import hashlib
 import json
@@ -112,12 +125,18 @@ EVIDENCE = APP_DIR / "dataset" / "evidence" / "ida_query"
 EVIDENCE.mkdir(parents=True, exist_ok=True)
 EVIDENCE_MICROCODE = APP_DIR / "dataset" / "evidence" / "ida_microcode_cfg"
 EVIDENCE_MICROCODE.mkdir(parents=True, exist_ok=True)
+# The three operations below write their evidence directory on first use (`_write_evidence` creates it),
+# so importing this module leaves nothing on disk. Tests patch these names.
+EVIDENCE_TYPE_MEMBER = APP_DIR / "dataset" / "evidence" / "ida_type_member_offset"
+EVIDENCE_PATCH_PLAN = APP_DIR / "dataset" / "evidence" / "ida_patch_plan"
+EVIDENCE_ANNOTATIONS = APP_DIR / "dataset" / "evidence" / "ida_annotations"
 # Created lazily, on first use: a status call on a machine without IDA must
 # not leave an empty directory behind. Tests patch this name.
 CACHE_ROOT = APP_DIR / "dataset" / "ida_cache"
 
 _WORKER_SOURCE = Path(__file__).resolve().parent / "ida_scripts" / "query_program.idapy"
 _MICROCODE_WORKER_SOURCE = Path(__file__).resolve().parent / "ida_scripts" / "microcode_cfg.idapy"
+_PATCH_PLAN_WORKER_SOURCE = Path(__file__).resolve().parent / "ida_scripts" / "patch_plan.idapy"
 _JOB_ENV = "LIEBERT_IDA_JOB"
 _JOB_SCRIPT = "liebert_ida_job.py"
 _LOG_NAME = "ida.log"
@@ -149,6 +168,13 @@ _STATUS_TIMEOUT_SECONDS = 60
 # single function), so it is the same size as a question; the first analysis
 # keeps the larger create ceiling. Exceeding it is TIMEOUT, never "no microcode".
 _MAX_MICROCODE_TIMEOUT_SECONDS = 300
+# The reopen-session ceilings of the type-member lookup and the patch plan. Each is its own constant,
+# like the microcode one: these are these operations' numbers, not shared infrastructure. Both are one
+# temporary reopen session that reads a type or plans one patch (the patch plan also hashes the cached
+# database twice), so they are the same size as a question; the first analysis keeps the create ceiling.
+# Exceeding one is TIMEOUT, never "no such member" or "no plan".
+_MAX_TYPE_MEMBER_TIMEOUT_SECONDS = 300
+_MAX_PATCH_PLAN_TIMEOUT_SECONDS = 300
 # idat's own stdout/stderr is a few KB; the result travels in a file.
 _MAX_OUTPUT_CHARS = 1024 * 1024
 _MIN_RESPONSE_CHARS = 2000
@@ -183,6 +209,29 @@ _D810_PROJECT_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 _D810_STATE_PATH_LIMIT = 150
 # A worker error that names a missing prerequisite rather than a failed analysis.
 _MICROCODE_ERROR_STATUS = {"D810_NOT_INSTALLED": "TOOL_MISSING"}
+
+# A struct, union or member name: a C identifier, with the `::` of a C++ scope allowed in a type name.
+_TYPE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*$")
+_MEMBER_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_TYPE_NAME_MAX = 256
+
+_PATCH_OPERATIONS = ("force_branch", "nop_out")
+_PATCH_ADDRESS_KINDS = ("va", "rva", "file_offset")
+_PATCH_INSTRUCTION_CAP = 64
+# The patch plan's own domain refusals carry their name as the status, the same vocabulary the rizin
+# planner uses, so a caller switching engines reads the same answer.
+_PATCH_PLAN_ERROR_STATUS = {name: name for name in (
+    "NOT_A_CONDITIONAL_BRANCH", "NO_DIRECT_BRANCH_TARGET", "TARGET_TOO_FAR_FOR_ORIGINAL_LENGTH",
+    "NOT_ENOUGH_INSTRUCTIONS_IN_WINDOW", "ASSEMBLY_FAILED", "DISASSEMBLY_FAILED", "INVALID_ADDRESS",
+    "INVALID_ADDRESS_KIND", "ADDRESS_OUTSIDE_SECTION", "ARCHITECTURE_NOT_SUPPORTED")}
+
+# The write log of annotations made through this package (one append-only JSON-lines file per input
+# hash, next to the cache slots). This module only READS it; it never starts IDA for that.
+_ANNOTATION_LOG_SUFFIX = ".writes.jsonl"
+_ANNOTATION_DEFAULT_MAXIMUM = 500
+_ANNOTATION_MAX_ENTRIES = 5000
+# A line longer than this is not read into memory; it is counted as unreadable.
+_ANNOTATION_MAX_LINE_BYTES = 1024 * 1024
 
 _KNOWN_INSTALL_GLOBS = ("IDA Professional 9*", "IDA Pro 9*")
 
@@ -282,13 +331,21 @@ def _tool_missing(tool):
     })
 
 
-def _checked_path(path, tool):
+def _checked_path(path, tool, echo_path=True):
+    """`echo_path=False` is for the operations whose answers never carry the target's name or path."""
     try:
         p = safe_path(path)
     except PermissionError as exc:
         return None, _j({"ok": False, "tool": tool, "status": "PATH_REFUSED", "error": str(exc)})
+    except (OSError, ValueError) as exc:     # a path the operating system cannot even resolve (an embedded NUL, ...)
+        return None, _j({"ok": False, "tool": tool, "status": "PATH_REFUSED", "error": type(exc).__name__})
     if not p.is_file():
-        return None, _j({"ok": False, "tool": tool, "status": "NOT_FOUND", "path": str(path)})
+        body = {"ok": False, "tool": tool, "status": "NOT_FOUND"}
+        if echo_path:
+            body["path"] = str(path)
+        else:
+            body["detail"] = "The input is not a file inside the workspace."
+        return None, _j(body)
     return p, None
 
 
@@ -898,7 +955,7 @@ def _walk_limit_text(walk_limit):
 
 
 def _success_response(tool, p, sha256, md5, operation, data, *, cache_state, signals, invocation,
-                      max_chars, evidence, note=None):
+                      max_chars, evidence, note=None, omit_path=False):
     body = {k: v for k, v in data.items() if k not in _WORKER_BOOKKEEPING}
     limitations = []
     walk_limit = body.get("walk_limit")
@@ -918,6 +975,8 @@ def _success_response(tool, p, sha256, md5, operation, data, *, cache_state, sig
         "signals": signals,
         "pdb_lookup": "disabled",
     }
+    if omit_path:
+        del head["path"]       # the answer is keyed by the hash; the target's name and path stay out of it
     merged = {**head, **body}
     merged["internal_evidence_name"] = evidence[0]
     merged["evidence_write_error"] = evidence[1]
@@ -952,10 +1011,13 @@ def _success_response(tool, p, sha256, md5, operation, data, *, cache_state, sig
     return merged
 
 
-def _write_evidence(p, operation, data, directory=None):
-    out = (directory or EVIDENCE) / f"{p.stem}_{uuid.uuid4().hex[:8]}_{operation}.json"
+def _write_evidence(p, operation, data, directory=None, stem=None):
+    """`stem` replaces the input's file name in the evidence file's name (a caller that keeps the
+    target's name out of its answers passes the start of the input hash)."""
+    out = (directory or EVIDENCE) / f"{stem or p.stem}_{uuid.uuid4().hex[:8]}_{operation}.json"
     error = None
     try:
+        out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         _evidence_index_record_write(out)
     except OSError as exc:
@@ -1216,6 +1278,326 @@ def ida_microcode_cfg(path, function, maturity="MMAT_LVARS", deobfuscate=False,
     return _locked_call(tool, exe, p, invocation, max_chars, cancellation_token, profile)
 
 
+def ida_type_member_offset(path, struct_name=None, member_name=None, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                           max_chars=60000, cancellation_token=None):
+    """The byte offset of one direct member of a named struct or union, read from the type
+    information the cached IDA database holds (its own types plus the type libraries it loaded):
+    a settled fact in place of a remembered or guessed displacement.
+
+    `struct_name` is the type's name as the type information spells it, `_LIST_ENTRY` or
+    `LIST_ENTRY` (both spellings are tried: Windows headers declare `_FOO` and typedef `FOO`); a
+    C identifier, with `::` allowed between scope parts. `member_name` is a direct member's name: a
+    member of a nested or anonymous type is not searched. The answer gives the offset in bits and in
+    bytes (`byte_aligned` says whether the two agree; a bit-field is not byte aligned), the member's
+    size and type text, the type's size and whether it is a union.
+
+    **A negative is an answer about the type information, not about the program.** A type that is not
+    in the loaded information (`TYPE_NOT_FOUND`), a name that is not a struct or union
+    (`TYPE_NOT_STRUCT_OR_UNION`) and a type without that member (`MEMBER_NOT_FOUND`, which lists the
+    members it does have, cut at a stated limit) are three different refusals, each `ANALYSIS_LIMITED`.
+    A found offset is the loaded type library's layout; it is not proof that the analysed program was
+    built against that definition (version, packing and compiler can differ).
+
+    Runs in the same temporary reopen session as a question: nothing it does is saved, the first
+    analysis of a file, the slot lock, the four-signal verdict and the statuses are `ida_query`'s.
+    `timeout_seconds` is one budget for the whole call, clamped to 5..600; the session that reads
+    the type never runs longer than 300 s (`_MAX_TYPE_MEMBER_TIMEOUT_SECONDS`). The answer carries no
+    path or file name of the input, only its hash. The worker's full result is saved under
+    `dataset/evidence/ida_type_member_offset/`. The offset is not an address, so the shared address
+    form does not apply.
+    """
+    tool = "ida_type_member_offset"
+    for field, value, pattern, example in (
+            ("struct_name", struct_name, _TYPE_NAME, "_LIST_ENTRY"), ("member_name", member_name, _MEMBER_NAME, "Blink")):
+        if not isinstance(value, str) or len(value) > _TYPE_NAME_MAX or not pattern.match(value):
+            return _j({
+                "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": field.upper() + "_REQUIRED",
+                "field": field, "given": repr(value)[:80],
+                "detail": (
+                    f"`{field}` is required: a non-empty string of at most {_TYPE_NAME_MAX} characters that is a "
+                    f"C identifier (letters, digits and '_', not starting with a digit"
+                    + ("; '::' may join scope parts" if field == "struct_name" else "")
+                    + f"), for example `{example}`."
+                ),
+            })
+    p, fail = _checked_path(path, tool, echo_path=False)
+    if fail:
+        return fail
+    if p.suffix.lower() in _DATABASE_SUFFIXES:
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "DATABASE_INPUT_NOT_SUPPORTED",
+                   "detail": "An existing IDA database is not accepted as input; pass the original binary (see ida_query)."})
+    exe = _ida_binary()
+    if not exe:
+        return _tool_missing(tool)
+    if not _WORKER_SOURCE.is_file():
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "IDA_WORKER_MISSING",
+                   "detail": "The packaged IDAPython worker is absent from this install (a packaging defect, not an IDA problem)."})
+    timeout_seconds = _clamp(timeout_seconds, _MIN_TIMEOUT_SECONDS, _MAX_CREATE_TIMEOUT_SECONDS, _DEFAULT_TIMEOUT_SECONDS)
+    max_chars = _clamp(max_chars, _MIN_RESPONSE_CHARS, _MAX_RESPONSE_CHARS, 60000)
+    invocation = {"operation": "type_member_offset", "struct_name": struct_name, "member_name": member_name,
+                  "max_results": 1, "offset": 0, "timeout_seconds": timeout_seconds}
+
+    def incomplete(data):
+        """A found member must carry its offset as integers; anything else is not an answer."""
+        numbers = (data.get("offset_bits"), data.get("offset_bytes"), data.get("member_size_bits"))
+        return None if all(isinstance(n, int) and not isinstance(n, bool) for n in numbers) else "TYPE_MEMBER_RESULT_INCOMPLETE"
+
+    profile = {
+        "tool": tool, "reopen_ceiling": _MAX_TYPE_MEMBER_TIMEOUT_SECONDS,
+        "job_fields": {"query": json.dumps({"struct_name": struct_name, "member_name": member_name})},
+        "evidence_dir": EVIDENCE_TYPE_MEMBER, "evidence_on_refusal": True, "omit_path": True, "strip_fields": ("items", "count"),
+        "validate": incomplete,
+        "refusal_note": (
+            "A type or member that is absent is a statement about the type information loaded in this "
+            "database (its own types and the type libraries it loaded), not about the program."
+        ),
+        "note": (
+            "The offset comes from the type information of the cached database (its own types plus the "
+            "type libraries it loaded), read in a temporary session: nothing was saved. It is that "
+            "definition's layout, not proof that the analysed program was built against it. Only direct "
+            "members are searched."
+        ),
+    }
+    return _locked_call(tool, exe, p, invocation, max_chars, cancellation_token, profile)
+
+
+def ida_patch_plan(path, address=None, operation=None, address_kind="va", instruction_count=1,
+                   timeout_seconds=_DEFAULT_TIMEOUT_SECONDS, max_chars=60000, cancellation_token=None):
+    """PLAN, never apply, a byte-level patch at `address` of a PE: the bytes an explicit apply step
+    would write and how IDA reads them. The input file is never written. Same operations, address
+    forms and answer shape as `rizin_patch_plan`, so a caller can switch engines.
+
+    `operation` is `force_branch` (the conditional jump at `address` becomes an unconditional jump to
+    the same target, padded with NOPs to the same length, so every later address stays put) or
+    `nop_out` (`instruction_count` instructions, 1..64, become NOPs of exactly their combined length).
+    `address_kind` is `va` (default), `rva` or `file_offset`. x86 and x86-64 only.
+
+    **This is not a pure read.** The plan calls IDA's patch API in an in-memory copy of the database,
+    and undoes it before the session ends, inside the same temporary session as a question (nothing
+    is saved). It therefore carries a cache-violation status: the cached database file is hashed
+    before and after the session, the two hashes are in the answer (`signals.database_integrity`), and
+    if they differ the answer is `PATCH_PLAN_CACHE_VIOLATION`, the slot is deleted and no plan is
+    returned. `plan_only` is always true and `applied_to_file` always false.
+
+    Status vocabulary: OK, TOOL_MISSING, PATH_REFUSED, NOT_FOUND, UNKNOWN_OPERATION, INVALID_ADDRESS,
+    INVALID_ADDRESS_KIND, ADDRESS_OUTSIDE_SECTION, ARCHITECTURE_NOT_SUPPORTED, NOT_A_CONDITIONAL_BRANCH,
+    NO_DIRECT_BRANCH_TARGET, TARGET_TOO_FAR_FOR_ORIGINAL_LENGTH, NOT_ENOUGH_INSTRUCTIONS_IN_WINDOW,
+    ASSEMBLY_FAILED, DISASSEMBLY_FAILED, PATCH_PLAN_CACHE_VIOLATION, TIMEOUT, CANCELLED, ANALYSIS_LIMITED,
+    RESULT_PARSE_FAILED. `timeout_seconds` is one budget for the whole call, clamped to 5..600; the
+    session that plans never runs longer than 300 s (`_MAX_PATCH_PLAN_TIMEOUT_SECONDS`). The answer
+    carries no path or file name of the input, only its hash; the worker's full result is saved under
+    `dataset/evidence/ida_patch_plan/`.
+    """
+    tool = "ida_patch_plan"
+    if not isinstance(operation, str) or operation.strip().lower() not in _PATCH_OPERATIONS:
+        return _j({"ok": False, "tool": tool, "status": "UNKNOWN_OPERATION", "error": "UNKNOWN_OPERATION",
+                   "operation": repr(operation)[:80], "allowed": list(_PATCH_OPERATIONS),
+                   "detail": "`operation` is required and is one of the names in `allowed`."})
+    patch_operation = operation.strip().lower()
+    kind = address_kind.strip().lower() if isinstance(address_kind, str) else None
+    if kind not in _PATCH_ADDRESS_KINDS:
+        return _j({"ok": False, "tool": tool, "status": "INVALID_ADDRESS_KIND", "error": "INVALID_ADDRESS_KIND",
+                   "given": repr(address_kind)[:80], "accepted": list(_PATCH_ADDRESS_KINDS)})
+    try:
+        if isinstance(address, bool) or not isinstance(address, (int, str)):
+            raise ValueError
+        value = address if isinstance(address, int) else int(address.strip(), 0)
+        if not 0 <= value < 1 << 64:
+            raise ValueError
+    except ValueError:
+        return _j({"ok": False, "tool": tool, "status": "INVALID_ADDRESS", "error": "INVALID_ADDRESS",
+                   "given": repr(address)[:80], "address_kind": kind,
+                   "detail": "`address` is required: a non-negative integer, or a string such as \"0x140001002\" "
+                             "or \"4198402\", read as an address of the kind named by `address_kind`."})
+    if isinstance(instruction_count, bool) or not isinstance(instruction_count, int):
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "INVALID_INSTRUCTION_COUNT",
+                   "given": repr(instruction_count)[:80],
+                   "detail": f"`instruction_count` is an integer from 1 to {_PATCH_INSTRUCTION_CAP}; only `nop_out` uses it."})
+    count = max(1, min(instruction_count, _PATCH_INSTRUCTION_CAP))
+    p, fail = _checked_path(path, tool, echo_path=False)
+    if fail:
+        return fail
+    if p.suffix.lower() in _DATABASE_SUFFIXES:
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "DATABASE_INPUT_NOT_SUPPORTED",
+                   "detail": "An existing IDA database is not accepted as input; pass the original binary (see ida_query)."})
+    exe = _ida_binary()
+    if not exe:
+        return _tool_missing(tool)
+    if not (_PATCH_PLAN_WORKER_SOURCE.is_file() and _WORKER_SOURCE.is_file()):
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "IDA_WORKER_MISSING",
+                   "detail": "A packaged IDAPython worker is absent from this install (a packaging defect, not an IDA problem)."})
+    timeout_seconds = _clamp(timeout_seconds, _MIN_TIMEOUT_SECONDS, _MAX_CREATE_TIMEOUT_SECONDS, _DEFAULT_TIMEOUT_SECONDS)
+    max_chars = _clamp(max_chars, _MIN_RESPONSE_CHARS, _MAX_RESPONSE_CHARS, 60000)
+    invocation = {"operation": "patch_plan", "patch_operation": patch_operation, "address": hex(value),
+                  "address_kind": kind, "instruction_count": count if patch_operation == "nop_out" else None,
+                  "max_results": 1, "offset": 0, "timeout_seconds": timeout_seconds}
+
+    def incomplete(data):
+        """A plan must say it is only a plan and carry matching, non-empty hex byte strings."""
+        original, patched = data.get("original_bytes"), data.get("patched_bytes")
+        hexes = all(isinstance(b, str) and b and len(b) % 2 == 0 and re.fullmatch(r"[0-9a-f]+", b) for b in (original, patched))
+        sound = (data.get("plan_only") is True and data.get("applied_to_file") is False and hexes
+                 and len(original) == len(patched) and isinstance(data.get("address"), dict))
+        return None if sound else "PATCH_PLAN_RESULT_INCOMPLETE"
+
+    profile = {
+        "tool": tool, "worker": _PATCH_PLAN_WORKER_SOURCE, "reopen_ceiling": _MAX_PATCH_PLAN_TIMEOUT_SECONDS,
+        "job_fields": {"address": hex(value), "address_kind": kind, "patch_operation": patch_operation,
+                       "instruction_count": count},
+        "evidence_dir": EVIDENCE_PATCH_PLAN, "evidence_on_refusal": True, "omit_path": True, "strip_fields": ("items", "count"),
+        "error_status": _PATCH_PLAN_ERROR_STATUS, "validate": incomplete,
+        "verify_database_unchanged": True, "cache_violation_error": "PATCH_PLAN_CACHE_VIOLATION",
+        "note": (
+            "A PLAN: the bytes a separate apply step would write and IDA's reading of them. Nothing was "
+            "written to the input file. IDA's patch API was called in an in-memory copy of the cached "
+            "database inside a temporary session; the database file's hash before and after is in "
+            "`signals.database_integrity`. The disassembly of the patched bytes is IDA's reading, and "
+            "whether the patched program behaves as intended is not checked."
+        ),
+    }
+    return _locked_call(tool, exe, p, invocation, max_chars, cancellation_token, profile)
+
+
+def ida_annotations(path, max_results=_ANNOTATION_DEFAULT_MAXIMUM, max_chars=60000):
+    """Read the log of annotations (renames and comments) this package has recorded for `path`'s
+    content, keyed by the input file's SHA-256. A plain file read: no analysis engine is started, IDA
+    does not need to be installed, and no database is opened.
+
+    The newest `max_results` entries (1..5000) are returned in the order they were written. When
+    there are more, the answer is `PARTIAL`, says `truncated: true` and how many older entries were
+    left out (`omitted_older_entries`); the same when `max_chars` forces entries out (the oldest go
+    first). Lines of the log that are not readable JSON objects are counted in `unreadable_lines`
+    and are never silently dropped; a log with no readable line at all is `ANALYSIS_LIMITED`
+    (`ANNOTATION_LOG_UNREADABLE`), not an empty list.
+
+    `found: false` (no log for this hash) means this package recorded no annotation for this input.
+    It does NOT mean the database has no names or comments of its own: IDA's analysis and any loaded
+    symbols are not logged here. This package has no operation that writes annotations yet, so no
+    log exists until one does. The answer carries the input's hash, not its name or path, and every
+    string from the log passes the same scrubbing as IDA's output (home paths, account name).
+
+    Status vocabulary: OK, PARTIAL, PATH_REFUSED, NOT_FOUND, READ_FAILED, ANALYSIS_LIMITED.
+    """
+    tool = "ida_annotations"
+    if isinstance(max_results, bool) or not isinstance(max_results, int):
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "INVALID_MAX_RESULTS",
+                   "given": repr(max_results)[:80],
+                   "detail": f"`max_results` is an integer from 1 to {_ANNOTATION_MAX_ENTRIES} "
+                             f"(default {_ANNOTATION_DEFAULT_MAXIMUM}); a value outside the range is clamped."})
+    limit = _clamp(max_results, 1, _ANNOTATION_MAX_ENTRIES, _ANNOTATION_DEFAULT_MAXIMUM)
+    max_chars = _clamp(max_chars, _MIN_RESPONSE_CHARS, _MAX_RESPONSE_CHARS, 60000)
+    p, fail = _checked_path(path, tool, echo_path=False)
+    if fail:
+        return fail
+    if p.suffix.lower() in _DATABASE_SUFFIXES:
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "DATABASE_INPUT_NOT_SUPPORTED",
+                   "detail": "An existing IDA database is not accepted as input; pass the original binary (see ida_query)."})
+    try:
+        sha256 = _sha256_md5(p)[0]
+    except OSError as exc:
+        return _j({"ok": False, "tool": tool, "status": "READ_FAILED", "error": "IDA_INPUT_UNREADABLE",
+                   "environment_error": {"type": type(exc).__name__, "errno": exc.errno,
+                                         "strerror": _redact(exc.strerror or type(exc).__name__)},
+                   "detail": "The input file could not be read; no claim is made about its annotations."})
+    log = _cache_root() / f"{sha256}{_ANNOTATION_LOG_SUFFIX}"
+    kept = collections.deque(maxlen=limit)
+    total = unreadable = oversized = 0
+    present = True
+    try:
+        with open(log, "rb") as handle:
+            while True:
+                line = handle.readline(_ANNOTATION_MAX_LINE_BYTES + 1)
+                if not line:
+                    break
+                if len(line) > _ANNOTATION_MAX_LINE_BYTES and not line.endswith(b"\n"):
+                    while True:           # an oversized line is skipped to its end without being held
+                        rest = handle.readline(_ANNOTATION_MAX_LINE_BYTES)
+                        if not rest or rest.endswith(b"\n"):
+                            break
+                    unreadable += 1
+                    oversized += 1
+                    continue
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line.decode("utf-8"))
+                except (ValueError, RecursionError):   # ValueError covers UnicodeDecodeError and json's decode error
+                    unreadable += 1
+                    continue
+                if not isinstance(record, dict):
+                    unreadable += 1
+                    continue
+                total += 1
+                kept.append(record)
+    except FileNotFoundError:
+        present = False
+    except OSError as exc:
+        return _j({"ok": False, "tool": tool, "status": "READ_FAILED", "error": "ANNOTATION_LOG_UNREADABLE_OS",
+                   "target_sha256": sha256,
+                   "environment_error": {"type": type(exc).__name__, "errno": exc.errno,
+                                         "strerror": _redact(exc.strerror or type(exc).__name__)},
+                   "detail": "The annotation log exists but could not be read; no claim is made about its content."})
+    if present and total == 0 and unreadable:
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "ANNOTATION_LOG_UNREADABLE",
+                   "target_sha256": sha256, "unreadable_lines": unreadable,
+                   "detail": "The annotation log exists but not one line of it is a readable JSON object. This is "
+                             "not 'no annotations'; the log needs inspection."})
+
+    def scrub(value):
+        """Strings from the log go through the same redaction as IDA's output."""
+        if isinstance(value, str):
+            return _redact(value)
+        if isinstance(value, list):
+            return [scrub(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): scrub(v) for k, v in value.items()}
+        return value
+
+    entries = [scrub(r) for r in kept]
+    body = {
+        "ok": True, "tool": tool, "status": "OK", "target_sha256": sha256,
+        "engine_started": False, "found": present, "log_name": log.name if present else None,
+        "invocation": {"max_results": limit, "max_chars": max_chars},
+        "total_entries": total, "returned_entries": len(entries), "omitted_older_entries": total - len(entries),
+        "unreadable_lines": unreadable, "entries": entries,
+        "note": (
+            "Annotations this package recorded for this input content; IDA's own names, comments and any "
+            "loaded symbols are not in this log. "
+            + ("" if present else "No log exists for this input hash: this package has recorded no annotation for it. "
+               "It has no operation that writes annotations yet, so a log does not exist until one does.")
+        ),
+    }
+    evidence = _write_evidence(p, "annotations", body, EVIDENCE_ANNOTATIONS, stem=sha256[:16])
+    body["internal_evidence_name"], body["evidence_write_error"] = evidence
+    limitations = []
+    if body["omitted_older_entries"]:
+        limitations.append(f"the newest {len(entries)} of {total} entries are listed (max_results={limit}); "
+                           f"{total - len(entries)} older entries were left out")
+    if unreadable:
+        limitations.append(f"{unreadable} line(s) of the log are not readable JSON objects and are not listed"
+                           + (f" ({oversized} longer than {_ANNOTATION_MAX_LINE_BYTES} bytes)" if oversized else ""))
+    if limitations:
+        body["status"], body["limitations"], body["truncated"] = "PARTIAL", limitations, bool(body["omitted_older_entries"])
+    cut = False
+    while len(_j(body)) > max_chars and body["entries"]:
+        drop = max(1, len(body["entries"]) // 10)
+        del body["entries"][:drop]       # the oldest go first
+        cut = True
+        body["returned_entries"] = len(body["entries"])
+        body["omitted_older_entries"] = total - len(body["entries"])
+    if cut:
+        body["status"], body["truncated"] = "PARTIAL", True
+        limitations = [x for x in limitations if not x.startswith("the newest ")]
+        limitations.insert(0, f"response-size ceiling reached: the newest {len(body['entries'])} of {total} entries "
+                              f"are listed (max_chars={max_chars}); the evidence file holds every entry that was read")
+        body["limitations"] = limitations
+        while len(_j(body)) > max_chars and body["entries"]:     # the limitation text counts against the bound too
+            del body["entries"][0]
+            body["returned_entries"] = len(body["entries"])
+            body["omitted_older_entries"] = total - len(body["entries"])
+    return _j(body)
+
+
 class _StageFailure(Exception):
     """One idat launch did not produce a usable answer; carries the response."""
 
@@ -1248,7 +1630,17 @@ def _run_stage(exe, p, sha256, md5, slot, *, mode, operation, invocation, timeou
     state_dir = None
     if not creating:
         job.update(profile.get("job_fields") or {})
+    # An operation that mutates the session's in-memory database on purpose (the patch plan) is held to
+    # a measurement, not to the flag alone: the cached database file is hashed before and after.
+    verify = not creating and bool(profile.get("verify_database_unchanged"))
+    db_before = None
     try:
+        if verify:
+            try:
+                db_before = _sha256_md5(slot / _DB_NAME)[0]
+            except OSError as exc:
+                raise _StageFailure(_EnvironmentFailure("IDA_DATABASE_UNREADABLE", exc).body(
+                    tool, invocation=invocation, target_sha256=sha256)) from exc
         if not creating and profile.get("isolated_state_dir"):
             # d810's private configuration directory (see microcode_cfg.idapy): a short path next to
             # the slots, or under the OS temp directory when the cache root is too deep; removed below.
@@ -1283,10 +1675,35 @@ def _run_stage(exe, p, sha256, md5, slot, *, mode, operation, invocation, timeou
                     "discarded, so the next call starts over. Do not read a timeout as 'nothing found'."
                 )
             raise _StageFailure(body)
+        integrity = None
+        if verify:
+            violation = profile.get("cache_violation_error", "CACHE_VIOLATION")
+            try:
+                db_after = _sha256_md5(slot / _DB_NAME)[0]
+            except OSError:
+                db_after = None
+            integrity = {"database_sha256_before": db_before, "database_sha256_after": db_after,
+                         "unchanged": db_after == db_before}
+            if db_after != db_before:
+                # The guarantee that this session leaves the cached database as it found it did not hold.
+                # The slot is dropped (it is rebuilt from the input on the next call), and the answer is
+                # withheld even if the worker reported a plan.
+                _evict_slot(slot)
+                raise _StageFailure({
+                    "ok": False, "tool": tool, "status": violation, "error": violation,
+                    "invocation": invocation, "target_sha256": sha256, "database_integrity": integrity,
+                    "detail": (
+                        "The cached database file differed after the session (or could not be read again), "
+                        "although the session was marked temporary. The cache slot was deleted and no plan is "
+                        "returned; the next call analyses the input again."
+                    ),
+                })
         data, error, signals = _verdict(
             cp, work, (work / _DB_NAME) if creating else (slot / _DB_NAME), expect_database=creating,
             expect_operation=operation, require_discard=not creating,
         )
+        if integrity is not None:
+            signals["database_integrity"] = integrity
         if error:
             # A reopen whose result is missing, or is not a trustworthy answer
             # (wrong operation, no discard guarantee), may have left the
@@ -1394,6 +1811,16 @@ def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation
                 "invocation": invocation, "provenance": provenance,
                 "traceback": _redact(data.get("traceback", ""), work=slot, target=p) or None,
             }
+            if profile.get("omit_path"):
+                del refusal["path"]
+            if "database_integrity" in signals:
+                refusal["database_integrity"] = signals["database_integrity"]
+            if profile.get("evidence_on_refusal"):
+                # The worker's raw refusal is evidence too (it is how a negative can be told from a failure).
+                refusal["internal_evidence_name"], refusal["evidence_write_error"] = _write_evidence(
+                    p, operation, data, profile.get("evidence_dir"), stem=sha256[:16])
+            if profile.get("refusal_note"):
+                refusal["note"] = profile["refusal_note"]
             if isinstance(refusal.get("detail"), str):
                 refusal["detail"] = _redact(refusal["detail"], work=slot, target=p)   # an exception text can carry a path
             return refusal
@@ -1401,16 +1828,24 @@ def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation
         if mislabelled:
             # The answer does not say what it is (raw or d810-processed) the way the call asked for it.
             # Returning it would present transformed microcode as raw, or the reverse.
-            return {
+            unlabelled = {
                 "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": mislabelled,
                 "path": relative(p), "target_sha256": sha256, "database_cache": cache_state,
                 "invocation": invocation, "provenance": provenance,
-                "detail": "The worker's result did not carry the label this call requires; no microcode is returned.",
+                "detail": "The worker's result did not carry the label this call requires; no result is returned.",
             }
-        evidence = _write_evidence(p, operation, data, profile.get("evidence_dir"))
+            if profile.get("omit_path"):
+                del unlabelled["path"]
+            return unlabelled
+        evidence = _write_evidence(p, operation, data, profile.get("evidence_dir"),
+                                   stem=sha256[:16] if profile.get("omit_path") else None)
+        # Fields the worker's shared envelope adds that mean nothing for this operation (an `items` list
+        # that is always empty would read as "found nothing") are left out of the answer, not of the evidence.
+        data = {k: v for k, v in data.items() if k not in profile.get("strip_fields", ())}
         return _success_response(
             tool, p, sha256, md5, operation, data, cache_state=cache_state, signals=signals,
             invocation=invocation, max_chars=max_chars, evidence=evidence, note=profile.get("note"),
+            omit_path=bool(profile.get("omit_path")),
         )
     except _StageFailure as failure:
         return failure.body
@@ -1481,7 +1916,8 @@ def ida_status():
             "pdb_lookup": "disabled (-Opdb:off on every launch)",
             "network_lookup_detected": signals["network_lookup_detected"],
             "cache": _cache_summary(),
-            "operations": ["ida_query", "ida_microcode_cfg", "ida_status"],
+            "operations": ["ida_query", "ida_microcode_cfg", "ida_type_member_offset", "ida_patch_plan",
+                           "ida_annotations", "ida_status"],
             "query_operations": list(_ALLOWED_OPERATIONS),
             "note": (
                 "OK means idat launched headless and exited cleanly on an empty database; it does not "

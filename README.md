@@ -136,8 +136,8 @@ import is the exact failure this project is organised against:
   script that needed it (the mutated-crackme-5 serial solver) is not
   distributed in this public package; it is documentation-only.
 - **A Ghidra wrapper, and normalisation of answers across engines.** Not here. An IDA
-  wrapper *is* here, read-only (`ida_query`, `ida_microcode_cfg`, `ida_status`); IDA's write operations
-  (rename, comments, patch planning), type-member offsets and the
+  wrapper *is* here, read-only (`ida_query`, `ida_microcode_cfg`, `ida_type_member_offset`, `ida_patch_plan` (a plan only), `ida_annotations`, `ida_status`); IDA's write operations
+  (rename, comments) and the
   disassembly-listing operation are not. `docs/INSTALL.md` is the authority on which
   engines this package can actually drive.
 - **Function-boundary recovery from exception-directory unwind data**, prologue

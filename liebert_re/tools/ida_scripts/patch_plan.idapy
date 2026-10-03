@@ -1,0 +1,389 @@
+"""IDAPython worker for ``liebert_re.tools.ida`` (``ida_patch_plan``).
+
+Runs INSIDE idat's own interpreter, never in the harness venv: only the
+standard library and IDA's ``ida_*`` / ``idaapi`` / ``idautils`` / ``idc``
+modules are importable here. This file must not import anything from
+``liebert_re``. The wrapper copies it into a private work directory as
+``liebert_ida_job.py`` (BOM-free) and launches it in a REOPEN session of the
+cached database, exactly like ``query_program.idapy``:
+
+    idat -A -Opdb:off -Lida.log -Sliebert_ida_job.py db.i64
+
+The job comes from the JSON file named in ``LIEBERT_IDA_JOB``:
+
+    {"output": "<abs path>", "operation": "patch_plan", "mode": "reopen",
+     "address": "0x140001002", "address_kind": "va",
+     "patch_operation": "force_branch" | "nop_out", "instruction_count": 1}
+
+What it does: PLANS a patch. It computes the bytes a separate, explicit
+apply step would write, and shows how IDA would read them. It never writes the
+input file (this process never opens it for writing) and it never changes the
+cached database.
+
+This is the one worker whose planning step really calls IDA's patch API. It
+does that INSIDE an in-memory copy of the database that IDA discards on exit:
+
+* every patch call in this file is a method of ``_TempSession`` and nowhere
+  else (a test pins that), and ``_TempSession`` marks the database temporary
+  (``DBFL_TEMP``) before any other call, refusing to exist when it cannot;
+* the patch is undone before the session ends (bytes and instruction
+  boundaries), so a later step of the same session does not see it;
+* the wrapper hashes the cached database file before and after the session and
+  reports ``PATCH_PLAN_CACHE_VIOLATION`` (and drops the slot) if the two
+  differ. That check is the proof; the flag above is the mechanism.
+
+Every address in the answer is the shared five-field form (file offset, RVA,
+VA, image base, section), built from IDA's own loader state.
+"""
+import json
+import os
+import sys
+import traceback
+
+import ida_auto
+import ida_bytes
+import ida_idp
+import ida_ida
+import ida_loader
+import ida_name
+import ida_nalt
+import ida_pro
+import idaapi
+import idautils
+import idc
+
+JOB_ENV = "LIEBERT_IDA_JOB"
+OPERATION = "patch_plan"
+PATCH_OPERATIONS = ("force_branch", "nop_out")
+ADDRESS_KINDS = ("va", "rva", "file_offset")
+_MAX_INSTRUCTIONS = 64
+# Conditional-jump mnemonics eligible for force_branch. jmp and call are excluded (already
+# unconditional or not a branch to force), the same convention the rizin planner follows, so the
+# two engines refuse the same inputs with the same NOT_A_CONDITIONAL_BRANCH.
+_CONDITIONAL_JCC_MNEMONICS = {
+    "jz", "jnz", "je", "jne", "ja", "jae", "jb", "jbe", "jg", "jge", "jl",
+    "jle", "jo", "jno", "js", "jns", "jp", "jpe", "jnp", "jpo",
+    "jcxz", "jecxz", "jrcxz", "loop", "loope", "loopne", "loopz", "loopnz",
+}
+_X86_NOP = b"\x90"
+
+
+class _WorkerError(Exception):
+    """A named, expected failure: becomes ``ok: false`` with ``error`` set."""
+
+    def __init__(self, error, detail=None, **extra):
+        super().__init__(error)
+        self.error = error
+        self.detail = detail
+        self.extra = extra
+
+
+def _job():
+    path = os.environ.get(JOB_ENV, "").strip()
+    if not path:
+        return None, "MISSING_JOB_ENV"
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            job = json.load(handle)
+    except Exception as exc:  # noqa: BLE001
+        return None, "JOB_UNREADABLE: %s: %s" % (type(exc).__name__, exc)
+    if not isinstance(job, dict) or not job.get("output"):
+        return None, "JOB_MALFORMED"
+    return job, None
+
+
+def _safe(callable_, default=None):
+    try:
+        return callable_()
+    except Exception:  # noqa: BLE001 - one unavailable field never fails the plan
+        return default
+
+
+def _hexdigest(value):
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    return str(value) if value else None
+
+
+def _address_form(ea):
+    """The five-field address shape (file offset, RVA, VA, image base,
+    section), built from IDA's own loader state: the same shape the other
+    worker and the rizin planner return."""
+    if ea is None or ea == idc.BADADDR:
+        return {"resolved": False, "error": "BADADDR"}
+    file_offset = idaapi.get_fileregion_offset(ea)
+    if file_offset is None or file_offset < 0:
+        return {"resolved": False, "error": "NO_FILE_OFFSET", "va": hex(ea)}
+    image_base = ida_nalt.get_imagebase()
+    return {
+        "file_offset": hex(file_offset),
+        "rva": hex(ea - image_base),
+        "va": hex(ea),
+        "image_base": hex(image_base),
+        "section": idc.get_segm_name(ea) or "",
+    }
+
+
+def _resolve_ea(address, address_kind):
+    """One address (va, rva or file offset) to an ``ea`` inside a loaded segment."""
+    kind = str(address_kind or "va").strip().lower()
+    if kind not in ADDRESS_KINDS:
+        raise _WorkerError("INVALID_ADDRESS_KIND", given=str(address_kind), accepted=list(ADDRESS_KINDS))
+    try:
+        value = int(str(address), 0)
+    except (TypeError, ValueError):
+        raise _WorkerError("INVALID_ADDRESS", given=str(address)[:80]) from None
+    if kind == "va":
+        ea = value
+    elif kind == "rva":
+        ea = ida_nalt.get_imagebase() + value
+    else:
+        ea = idaapi.get_fileregion_ea(value)
+    if ea is None or ea == idc.BADADDR or not idc.get_segm_name(ea):
+        raise _WorkerError("ADDRESS_OUTSIDE_SECTION", given=str(address)[:80], address_kind=kind)
+    return ea
+
+
+class _TempSession:
+    """The only place in this file that changes the database.
+
+    Construction marks the database temporary (IDA then does not write this
+    session's changes back on exit) before anything else is done, and refuses to
+    exist if that cannot be set up: no patch call can happen without it. The
+    patch and its undo are methods here so that a reader, and a test, can see
+    that no other code path reaches IDA's patch API."""
+
+    def __init__(self):
+        try:
+            ida_loader.set_database_flag(ida_loader.DBFL_TEMP)
+        except Exception:  # noqa: BLE001
+            raise _WorkerError(
+                "DATABASE_CHANGES_NOT_DISCARDABLE",
+                "Could not mark the session database temporary (DBFL_TEMP); no patch was tried.",
+            ) from None
+
+    def ensure_code(self, ea):
+        """Make IDA decode an instruction at ``ea`` if it has not already. True only when the item
+        there is code afterwards: data bytes are never counted as instructions."""
+        if not idc.is_code(idc.get_full_flags(ea)):
+            idc.create_insn(ea)
+        return bool(idc.is_code(idc.get_full_flags(ea)))
+
+    def round_trip(self, ea, patched, original):
+        """Write ``patched`` over the instruction(s) at ``ea`` in the in-memory
+        database, let IDA re-read the region, capture one disassembly line per
+        resulting instruction, then put the original bytes and instruction
+        boundaries back."""
+        ida_bytes.patch_bytes(ea, patched)
+        idc.del_items(ea, idc.DELIT_SIMPLE, len(patched))
+        ida_auto.auto_wait()
+        lines = []
+        cur = ea
+        end = ea + len(patched)
+        while cur < end:
+            if not idc.create_insn(cur):
+                lines.append("??")
+                cur += 1
+                continue
+            lines.append((idc.generate_disasm_line(cur, 0) or "").strip())
+            cur += max(1, idc.get_item_size(cur))
+        ida_bytes.patch_bytes(ea, original)
+        idc.del_items(ea, idc.DELIT_SIMPLE, len(original))
+        idc.create_insn(ea)
+        ida_auto.auto_wait()
+        return lines
+
+
+def _mnemonic_operands(ea):
+    mnem = idc.print_insn_mnem(ea) or ""
+    ops = []
+    for n in range(3):
+        op = idc.print_operand(ea, n)
+        if not op:
+            break
+        ops.append(op)
+    return mnem, ", ".join(ops)
+
+
+def _branch_target(ea):
+    """First explicit code reference FROM ``ea`` that is not ordinary
+    fall-through flow, so jmp, call and jcc need no mnemonic table."""
+    for ref in idautils.CodeRefsFrom(ea, 0):
+        return ref
+    return None
+
+
+def _plan_force_branch(session, ea):
+    decoded = session.ensure_code(ea)
+    size = idc.get_item_size(ea)
+    if not decoded or not size:
+        raise _WorkerError("DISASSEMBLY_FAILED", "IDA could not decode an instruction at this address.")
+    mnem, _operands = _mnemonic_operands(ea)
+    original = idc.get_bytes(ea, size) or b""
+    before = (idc.generate_disasm_line(ea, 0) or mnem).strip()
+    if mnem.lower() not in _CONDITIONAL_JCC_MNEMONICS:
+        raise _WorkerError("NOT_A_CONDITIONAL_BRANCH", instruction=before)
+    target = _branch_target(ea)
+    if target is None or target == idc.BADADDR:
+        raise _WorkerError("NO_DIRECT_BRANCH_TARGET", instruction=before)
+    # IDA's assembler rejects a raw hex literal as a jump target; it needs the symbol IDA already
+    # has for that address (an auto-generated loc_ or sub_ label for anything it disassembled).
+    target_name = ida_name.get_name(target)
+    if not target_name:
+        raise _WorkerError("ASSEMBLY_FAILED", "NO_SYMBOL_FOR_BRANCH_TARGET", target=hex(target))
+    cs = idc.get_sreg(ea, "CS") or 0
+    try:
+        encoded = ida_idp.AssembleLine(ea, cs, ea, True, "jmp " + target_name)
+    except Exception as exc:  # noqa: BLE001
+        raise _WorkerError("ASSEMBLY_FAILED", "%s: %s" % (type(exc).__name__, exc)) from None
+    if not encoded:
+        raise _WorkerError("ASSEMBLY_FAILED", instruction="jmp " + target_name)
+    jump = bytes(encoded) if isinstance(encoded, (bytes, bytearray)) else bytes(encoded, "latin-1")
+    if len(jump) > size:
+        raise _WorkerError("TARGET_TOO_FAR_FOR_ORIGINAL_LENGTH", original_length=size,
+                           unconditional_jump_length=len(jump))
+    padding = size - len(jump)
+    patched = jump + _X86_NOP * padding
+    after = session.round_trip(ea, patched, original)
+    warnings = []
+    if len(after) != 1:
+        warnings.append(
+            "instruction boundaries inside the patched region changed: 1 instruction (%d byte(s)) became "
+            "%d instructions (%d-byte jmp + %d NOP byte(s)); the total region length is unchanged, so every "
+            "address after this region is unaffected." % (size, len(after), len(jump), padding)
+        )
+    return {
+        "address": _address_form(ea),
+        "original_length": size, "patched_length": len(patched),
+        "original_bytes": original.hex(), "patched_bytes": patched.hex(),
+        "branch_target": _address_form(target),
+        "disasm_before": [before], "disasm_after": after, "warnings": warnings,
+    }
+
+
+def _plan_nop_out(session, ea, instruction_count):
+    cur = ea
+    sizes = []
+    for _ in range(instruction_count):
+        decoded = session.ensure_code(cur)
+        size = idc.get_item_size(cur)
+        if not decoded or not size:
+            break
+        sizes.append(size)
+        cur += size
+    if len(sizes) < instruction_count:
+        raise _WorkerError("NOT_ENOUGH_INSTRUCTIONS_IN_WINDOW", requested=instruction_count, decoded=len(sizes))
+    total = sum(sizes)
+    original = idc.get_bytes(ea, total) or b""
+    before = []
+    cur = ea
+    for size in sizes:
+        before.append((idc.generate_disasm_line(cur, 0) or "").strip())
+        cur += size
+    patched = _X86_NOP * total
+    after = session.round_trip(ea, patched, original)
+    warnings = []
+    if len(after) != len(sizes):
+        warnings.append(
+            "instruction boundaries inside the patched region changed: %d instruction(s) became %d NOP "
+            "instruction(s); the total region length (%d byte(s)) is unchanged, so every address after "
+            "this region is unaffected." % (len(sizes), len(after), total)
+        )
+    return {
+        "address": _address_form(ea), "instruction_count": instruction_count,
+        "original_length": total, "patched_length": len(patched),
+        "original_bytes": original.hex(), "patched_bytes": patched.hex(),
+        "disasm_before": before, "disasm_after": after, "warnings": warnings,
+    }
+
+
+def _op_patch_plan(result, job):
+    patch_operation = str(job.get("patch_operation") or "")
+    if patch_operation not in PATCH_OPERATIONS:
+        raise _WorkerError("UNKNOWN_PATCH_OPERATION", given=patch_operation, accepted=list(PATCH_OPERATIONS))
+    count = max(1, min(int(job.get("instruction_count") or 1), _MAX_INSTRUCTIONS))
+    # Before anything that could touch the database, auto_wait included.
+    session = _TempSession()
+    result["database_changes_discarded"] = True
+    # The processor check comes before any planning: the NOP byte and the mnemonic table are x86's.
+    processor = _safe(ida_ida.inf_get_procname)
+    if processor != "metapc":
+        raise _WorkerError("ARCHITECTURE_NOT_SUPPORTED", "Patch planning here knows x86 and x86-64 only.",
+                           processor=processor)
+    ida_auto.auto_wait()
+    ea = _resolve_ea(job.get("address"), job.get("address_kind"))
+    result["patch_operation"] = patch_operation
+    result["plan_only"] = True
+    result["applied_to_file"] = False
+    if patch_operation == "force_branch":
+        plan = _plan_force_branch(session, ea)
+    else:
+        plan = _plan_nop_out(session, ea, count)
+    result.update(plan)
+
+
+def _run(job):
+    operation = str(job.get("operation") or "")
+    result = {"ok": True, "tool": "ida_patch_plan", "operation": operation}
+    try:
+        if operation != OPERATION:
+            result["ok"] = False
+            result["error"] = "UNKNOWN_OPERATION"
+        elif job.get("mode") != "reopen":
+            # A create session is the one place a database is saved; a plan must never run there.
+            result["ok"] = False
+            result["error"] = "PATCH_PLAN_REQUIRES_REOPEN_SESSION"
+        else:
+            _op_patch_plan(result, job)
+    except _WorkerError as exc:
+        discarded = result.get("database_changes_discarded")
+        result = {"ok": False, "tool": "ida_patch_plan", "operation": operation, "error": exc.error}
+        if exc.detail:
+            result["detail"] = exc.detail
+        result.update(exc.extra)
+        if discarded is not None:
+            result["database_changes_discarded"] = discarded
+    except Exception:  # noqa: BLE001
+        discarded = result.get("database_changes_discarded")
+        result = {"ok": False, "tool": "ida_patch_plan", "operation": operation,
+                  "error": "IDAPYTHON_SCRIPT_EXCEPTION", "traceback": traceback.format_exc()}
+        if discarded is not None:
+            result["database_changes_discarded"] = discarded
+    result["engine_input_sha256"] = _hexdigest(_safe(ida_nalt.retrieve_input_file_sha256))
+    result["engine_input_md5"] = _hexdigest(_safe(ida_nalt.retrieve_input_file_md5))
+    return result
+
+
+def _write_result(path, result):
+    result["script_completed"] = True  # last key: a truncated file cannot carry it
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(result, handle, ensure_ascii=False, indent=2)
+    os.replace(temporary, path)
+
+
+def main():
+    job, problem = _job()
+    if job is None:
+        sys.stderr.write("liebert_ida_job: %s\n" % problem)
+        return 2
+    try:
+        result = _run(job)
+        _write_result(job["output"], result)
+        return 0
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return 3
+
+
+def _entry():
+    """Run the job, then ALWAYS leave through ``qexit`` so idat never waits for input."""
+    code = 4
+    try:
+        code = main()
+    finally:
+        ida_pro.qexit(code)
+
+
+if __name__ == "__main__":
+    _entry()
