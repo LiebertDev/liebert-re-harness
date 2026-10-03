@@ -1,0 +1,581 @@
+"""IDAPython worker for ``liebert_re.tools.ida`` (``ida_microcode_cfg``).
+
+Runs INSIDE idat's own interpreter, never in the harness venv: only the
+standard library, IDA's ``ida_*`` / ``idaapi`` / ``idc`` modules and, when the
+caller asks for the optional deobfuscation pass, the third-party ``d810``
+package are importable here. This file must not import anything from
+``liebert_re``. The wrapper copies it into a private work directory as
+``liebert_ida_job.py`` (BOM-free) and launches it, in a REOPEN session of the
+cached database, exactly like ``query_program.idapy``:
+
+    idat -A -Opdb:off -Lida.log -Sliebert_ida_job.py db.i64
+
+The job comes from the JSON file named in ``LIEBERT_IDA_JOB``:
+
+    {"output": "<abs path>", "operation": "microcode_cfg", "query": "<function>",
+     "max_results": 2000, "offset": 0, "mode": "reopen", "maturity": "MMAT_LVARS",
+     "deobfuscate": false, "d810_project": "default_instruction_only",
+     "d810_state_dir": "<abs path inside the work directory>"}
+
+What it returns: the microcode of ONE function at ONE maturity level as a
+control-flow graph (blocks, their predecessors and successors, their
+instructions), every address in the shared five-field address form.
+
+Raw is the default. The d810 pass targets instruction-level obfuscation and
+control-flow flattening patterns; it does not handle virtualised (VM-based) code.
+``deobfuscate: true`` runs the same generation with the
+d810 microcode optimizer installed and reports which of its rules fired, how
+the output differs from the raw microcode of the same function generated in the
+same session, and which d810 project was loaded. When d810 is missing or cannot
+be started the result is an error and NO microcode: it never falls back to raw
+microcode under a deobfuscation request.
+
+d810 configuration. Loading and starting d810 write its ``options.json`` (a
+``last_project_index`` and the project list). The user's own copy must not be
+touched, so for the duration of the pass d810's user-directory constant is
+pointed at a private directory inside the work directory (deleted by the
+wrapper). The user's ``options.json`` is hashed before and after; if it changed
+anyway its original bytes are written back and the result says so.
+
+Read-only: nothing in this file renames, comments, patches or retypes
+anything, and the session database is marked temporary (DBFL_TEMP) before any
+other call, so nothing this session does is saved.
+"""
+import hashlib
+import json
+import os
+import pathlib
+import sys
+import traceback
+
+import ida_auto
+import ida_funcs
+import ida_hexrays
+import ida_lines
+import ida_loader
+import ida_nalt
+import ida_pro
+import idaapi
+import idc
+
+JOB_ENV = "LIEBERT_IDA_JOB"
+OPERATION = "microcode_cfg"
+
+# The eight maturity levels microcode passes through, in order. MMAT_ZERO is the
+# "not built yet" marker, not a level one can ask for.
+MATURITY_NAMES = (
+    "MMAT_GENERATED", "MMAT_PREOPTIMIZED", "MMAT_LOCOPT", "MMAT_CALLS",
+    "MMAT_GLBOPT1", "MMAT_GLBOPT2", "MMAT_GLBOPT3", "MMAT_LVARS",
+)
+_DEFAULT_MAX_INSTRUCTIONS = 2000
+_MAX_INSTRUCTIONS = 5000
+_BLOCK_TYPE_NAMES = {0: "BLT_NONE", 1: "BLT_STOP", 2: "BLT_0WAY", 3: "BLT_1WAY", 4: "BLT_2WAY",
+                     5: "BLT_NWAY", 6: "BLT_XTRN"}
+
+
+class _WorkerError(Exception):
+    """A named, expected failure: becomes ``ok: false`` with ``error`` set."""
+
+    def __init__(self, error, detail=None, **extra):
+        super().__init__(error)
+        self.error = error
+        self.detail = detail
+        self.extra = extra
+
+
+def _job():
+    path = os.environ.get(JOB_ENV, "").strip()
+    if not path:
+        return None, "MISSING_JOB_ENV"
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            job = json.load(handle)
+    except Exception as exc:  # noqa: BLE001
+        return None, "JOB_UNREADABLE: %s: %s" % (type(exc).__name__, exc)
+    if not isinstance(job, dict) or not job.get("output"):
+        return None, "JOB_MALFORMED"
+    return job, None
+
+
+def _safe(callable_, default=None):
+    try:
+        return callable_()
+    except Exception:  # noqa: BLE001 - one unavailable field never fails the query
+        return default
+
+
+def _hex(value):
+    return hex(value) if isinstance(value, int) else None
+
+
+def _hexdigest(value):
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    return str(value) if value else None
+
+
+def _address_form(ea):
+    """The five-field address shape (file offset, RVA, VA, image base,
+    section), built from IDA's own loader state. The same shape as
+    ``query_program.idapy`` and the rizin wrapper return. Microcode created
+    by an optimizer can carry no address at all; that is a marked, unresolved
+    form, never a made-up one."""
+    if ea is None or ea == idc.BADADDR:
+        return {"resolved": False, "error": "BADADDR"}
+    file_offset = idaapi.get_fileregion_offset(ea)
+    if file_offset is None or file_offset < 0:
+        return {"resolved": False, "error": "NO_FILE_OFFSET", "va": hex(ea)}
+    image_base = ida_nalt.get_imagebase()
+    return {
+        "file_offset": hex(file_offset),
+        "rva": hex(ea - image_base),
+        "va": hex(ea),
+        "image_base": hex(image_base),
+        "section": idc.get_segm_name(ea) or "",
+    }
+
+
+def _parse_address(text):
+    try:
+        return int(str(text), 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_function(query):
+    """A symbol name, or a raw address inside a loaded segment, resolved to the
+    start of its containing function. None when it is neither."""
+    if not query:
+        return None
+    ea = idc.get_name_ea_simple(query)
+    if ea == idc.BADADDR:
+        value = _parse_address(query)
+        if value is None or value == idc.BADADDR or not idc.get_segm_name(value):
+            return None
+        ea = value
+    func = ida_funcs.get_func(ea)
+    return func.start_ea if func else None
+
+
+def _discard_session_changes():
+    """Mark the session's database temporary so IDA does not write this
+    session's changes back on exit (see ``query_program.idapy`` for the
+    measurements behind this). False when this IDA build does not offer the
+    flag; the operation then does not run."""
+    try:
+        ida_loader.set_database_flag(ida_loader.DBFL_TEMP)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _stamp_input_identity(result):
+    result["engine_input_sha256"] = _hexdigest(_safe(ida_nalt.retrieve_input_file_sha256))
+    result["engine_input_md5"] = _hexdigest(_safe(ida_nalt.retrieve_input_file_md5))
+
+
+# --------------------------------------------------------------------------
+# microcode generation and serialisation
+# --------------------------------------------------------------------------
+
+def _opcode_names():
+    names = {}
+    for name in dir(ida_hexrays):
+        if name.startswith("m_"):
+            value = getattr(ida_hexrays, name, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                names.setdefault(value, name[2:])
+    return names
+
+
+def _maturity_value(name):
+    return getattr(ida_hexrays, name)
+
+
+def _maturity_name(value):
+    for name in MATURITY_NAMES:
+        if getattr(ida_hexrays, name, None) == value:
+            return name
+    return "MMAT_%s" % value if value is not None else None
+
+
+def _generate(func_ea, maturity):
+    """One microcode generation for the whole function at `maturity`, through
+    the ``decomp_ranges_t(func_ea)`` form (the older ``mba_ranges_t``
+    overloads are deprecated in 9.4). Raises _WorkerError with the decompiler's
+    own message when Hex-Rays refuses."""
+    failure = ida_hexrays.hexrays_failure_t()
+    ranges = ida_hexrays.decomp_ranges_t(func_ea)
+    flags = ida_hexrays.DECOMP_NO_WAIT | ida_hexrays.DECOMP_NO_CACHE
+    mba = ida_hexrays.gen_microcode(ranges, failure, None, flags, maturity)
+    if mba is None:
+        raise _WorkerError("MICROCODE_GENERATION_FAILED", _safe(lambda: str(failure.str)) or None,
+                           hexrays_error_code=_safe(lambda: int(failure.code)))
+    return mba
+
+
+def _walk(mba):
+    """Yield (block, [instructions]) for every block of `mba`."""
+    for index in range(mba.qty):
+        block = mba.get_mblock(index)
+        insns = []
+        insn = block.head
+        while insn:
+            insns.append(insn)
+            insn = insn.next
+        yield block, insns
+
+
+def _insn_text(insn):
+    return ida_lines.tag_remove(insn.dstr())
+
+
+def _listing_digest(mba):
+    """sha256 over the whole listing (every block, every instruction), so two
+    microcode listings can be compared for equality even when the response
+    only carries a bounded part of them."""
+    digest = hashlib.sha256()
+    for block, insns in _walk(mba):
+        digest.update(("B%s:%s:%s:%s\n" % (block.serial, block.type, hex(block.start), hex(block.end))).encode())
+        for insn in insns:
+            digest.update(("%s:%s\n" % (hex(insn.ea), _insn_text(insn))).encode("utf-8", "replace"))
+    return digest.hexdigest()
+
+
+def _counts(mba):
+    blocks = instructions = 0
+    for _block, insns in _walk(mba):
+        blocks += 1
+        instructions += len(insns)
+    return blocks, instructions
+
+
+def _serialise(mba, max_instructions):
+    """The graph. Blocks always carry their edges; instructions are listed
+    until `max_instructions` have been returned, and the cut is reported, never
+    silent."""
+    names = _opcode_names()
+    blocks, returned, total = [], 0, 0
+    for block, insns in _walk(mba):
+        listed = []
+        for position, insn in enumerate(insns):
+            total += 1
+            if returned >= max_instructions:
+                continue
+            returned += 1
+            listed.append({
+                "index": position,
+                "address": _address_form(insn.ea),
+                "opcode": names.get(insn.opcode, "opcode_%s" % insn.opcode),
+                "text": _insn_text(insn),
+            })
+        blocks.append({
+            "serial": block.serial,
+            "type": _BLOCK_TYPE_NAMES.get(block.type, "BLT_%s" % block.type),
+            "start": _address_form(block.start),
+            "end": _address_form(block.end),
+            "predecessors": [block.pred(i) for i in range(block.npred())],
+            "successors": [block.succ(i) for i in range(block.nsucc())],
+            "instruction_count": len(insns),
+            "instructions": listed,
+        })
+    return blocks, total, returned
+
+
+# --------------------------------------------------------------------------
+# the optional d810 pass
+# --------------------------------------------------------------------------
+
+def _file_sha256(path):
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest(), None
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        return None, "%s" % type(exc).__name__
+
+
+def _import_d810():
+    try:
+        import d810
+        import d810.core.config as d810_config
+        from d810._vendor.ida_reloader import Scanner
+        import d810.manager as d810_manager
+    except Exception as exc:  # noqa: BLE001 - any import failure means "not usable here"
+        raise _WorkerError(
+            "D810_NOT_INSTALLED",
+            "The d810 package could not be imported inside IDA's Python (%s). The deobfuscation pass "
+            "was requested and was NOT run; no microcode is returned in its place." % type(exc).__name__,
+            import_error=type(exc).__name__,
+        ) from exc
+    return d810, d810_config, Scanner, d810_manager
+
+
+def _import_every_d810_module(d810, scanner):
+    """Import every d810 module except its GUI package, through d810's own
+    ``Scanner``. A scan of the whole package also imports ``d810.ui``, whose
+    Qt classes do not exist headless: the loader catches the AttributeError and
+    prints a traceback into IDA's log, which the wrapper (rightly) reads as a
+    failed run. Rules and optimizers do not live under ``ui``."""
+    import pkgutil
+    for base in list(d810.__path__):
+        for info in pkgutil.iter_modules([base]):
+            if info.name == "ui":
+                continue
+            if info.ispkg:
+                scanner.scan([os.path.join(base, info.name)], "d810.%s." % info.name, skip_packages=False)
+                __import__("d810.%s" % info.name)
+            else:
+                __import__("d810.%s" % info.name)
+
+
+def _rules_fired(stats):
+    fired = []
+    for name, count in dict(stats.instruction_rule_usage).items():
+        fired.append({"name": str(name), "kind": "instruction_rule", "fired": int(count)})
+    for name, uses in dict(stats.cfg_rule_usages).items():
+        uses = list(uses)
+        fired.append({"name": str(name), "kind": "block_rule", "uses": len(uses),
+                      "patches": int(sum(uses))})
+    fired.sort(key=lambda item: (item["kind"], item["name"]))
+    optimizers = {str(k): int(v) for k, v in sorted(dict(stats.instruction_optimizer_usage).items())}
+    return fired, optimizers
+
+
+def _project_info(state, requested):
+    project = state.current_project
+    return {
+        "requested": requested,
+        "loaded": project.path.name,
+        "description": getattr(project, "description", None),
+        "instruction_rules_known": len(state.known_ins_rules),
+        "instruction_rules_active": len(state.current_ins_rules),
+        "block_rules_known": len(state.known_blk_rules),
+        "block_rules_active": len(state.current_blk_rules),
+    }
+
+
+def _run_with_d810(job, func_ea, maturity):
+    """Raw microcode and d810-processed microcode of the same function, from
+    the same session. Returns (raw_mba_summary, d810_mba, deobfuscation_info).
+    Raises _WorkerError, and in that case leaves d810 stopped and the user's
+    configuration as it found it."""
+    d810, d810_config, scanner, d810_manager = _import_d810()
+    requested = str(job.get("d810_project") or "")
+    state_dir = job.get("d810_state_dir")
+    if not state_dir:
+        raise _WorkerError("D810_STATE_DIR_MISSING", "The wrapper did not supply an isolated state directory; "
+                           "refusing to let d810 write into the user's configuration.")
+    real_dir = pathlib.Path(d810_config.DEFAULT_IDA_USER_DIR)
+    real_options = real_dir / "cfg" / "d810" / "options.json"
+    before_hash, _ = _file_sha256(real_options)
+    try:
+        before_bytes = real_options.read_bytes() if before_hash else None
+    except OSError:
+        before_bytes = None
+    isolation = {"mode": "isolated_state_directory", "user_options_sha256_before": before_hash}
+    state, started = None, False
+    try:
+        pathlib.Path(state_dir).mkdir(parents=True, exist_ok=True)
+        d810_config.DEFAULT_IDA_USER_DIR = pathlib.Path(state_dir)
+        # Every d810 module must be imported before start_d810(): the chain
+        # optimizer's module is not among the ones a bare import pulls in, and
+        # start_d810() then fails with KeyError('chainoptimizer') in the registry.
+        _import_every_d810_module(d810, scanner)
+        state = d810_manager.D810State()
+        if getattr(state.manager, "_started", None) is True:
+            state.stop_d810()
+            isolation["d810_was_running_before"] = True
+        raw_mba = _generate(func_ea, maturity)
+        raw_blocks, raw_instructions = _counts(raw_mba)
+        raw_summary = {"blocks": raw_blocks, "instructions": raw_instructions,
+                       "microcode_sha256": _listing_digest(raw_mba)}
+        try:
+            state.load(gui=False)
+        except Exception as exc:  # noqa: BLE001
+            raise _WorkerError("D810_LOAD_FAILED", "%s: %s" % (type(exc).__name__, exc)) from exc
+        if not state.is_loaded():
+            raise _WorkerError("D810_LOAD_FAILED", "d810 reported no usable project configuration after load().")
+        names = state.project_manager.project_names()
+        candidates = [requested, requested + ".json"]
+        match = next((c for c in candidates if c in names), None)
+        if match is None:
+            raise _WorkerError("D810_PROJECT_NOT_FOUND", "No d810 project named %r." % requested,
+                               available_projects=sorted(names))
+        state.load_project(state.project_manager.index(match))
+        project = _project_info(state, requested)
+        try:
+            state.start_d810()
+        except Exception as exc:  # noqa: BLE001
+            raise _WorkerError("D810_START_FAILED", "%s: %s" % (type(exc).__name__, exc), project=project) from exc
+        started_flag = getattr(state.manager, "_started", None)
+        if started_flag is not True:
+            # start_d810() logs and returns when Hex-Rays or a rule set is unusable; it does not raise.
+            raise _WorkerError(
+                "D810_NOT_STARTED",
+                "d810 loaded the project but its optimizer did not start (started=%r). The deobfuscation "
+                "pass did NOT run; no microcode is returned in its place." % (started_flag,),
+                project=project)
+        started = True
+        state.manager.stats.reset()
+        mba = _generate(func_ea, maturity)
+        blocks, instructions = _counts(mba)
+        digest = _listing_digest(mba)
+        fired, optimizers = _rules_fired(state.manager.stats)
+        info = {
+            "requested": True, "pass": "d810", "d810_version": getattr(d810, "__version__", None),
+            "project": project,
+            "raw_baseline": raw_summary,
+            "output": {"blocks": blocks, "instructions": instructions, "microcode_sha256": digest},
+            "transformed": digest != raw_summary["microcode_sha256"],
+            "rules_fired": fired, "optimizers_fired": optimizers,
+            "rules_fired_count": len(fired),
+            "counters_note": (
+                "rules_fired and optimizers_fired are d810's own counters (instruction-rule matches, "
+                "block-rule patch counts), not an independent observation. They do not cover every rule: "
+                "measured on a control-flow-flattened function, the block count fell while no block rule "
+                "was counted. `transformed` compares the two listings and is the authority on whether the "
+                "output changed; the counters say what d810 reports, not everything that acted."),
+        }
+        return mba, info, isolation
+    finally:
+        try:
+            if state is not None and started:
+                state.stop_d810()
+            if state is not None:
+                state.unload(gui=False)
+        except Exception:  # noqa: BLE001 - the session ends right after this; the result is what matters
+            pass
+        d810_config.DEFAULT_IDA_USER_DIR = real_dir
+        after_hash, _ = _file_sha256(real_options)
+        isolation["user_options_sha256_after"] = after_hash
+        changed = after_hash != before_hash
+        isolation["user_options_unchanged"] = not changed
+        if changed:
+            restored = False
+            try:
+                if before_bytes is not None:
+                    real_options.write_bytes(before_bytes)
+                    restored = _file_sha256(real_options)[0] == before_hash
+            except OSError:
+                restored = False
+            isolation["user_options_restored"] = restored
+
+
+def _op_microcode_cfg(result, job):
+    ea = _resolve_function(str(job.get("query") or ""))
+    if ea is None:
+        raise _WorkerError("FUNCTION_NOT_FOUND")
+    if not ida_hexrays.init_hexrays_plugin():
+        raise _WorkerError("HEXRAYS_NOT_AVAILABLE")
+    maturity_name = str(job.get("maturity") or "")
+    if maturity_name not in MATURITY_NAMES:
+        raise _WorkerError("UNKNOWN_MATURITY", allowed=list(MATURITY_NAMES))
+    maturity = _maturity_value(maturity_name)
+    cap = max(1, min(int(job.get("max_results") or _DEFAULT_MAX_INSTRUCTIONS), _MAX_INSTRUCTIONS))
+    result["function"] = {"name": idc.get_name(ea), "address": _address_form(ea)}
+
+    isolation = None
+    if job.get("deobfuscate") is True:
+        mba, deobfuscation, isolation = _run_with_d810(job, ea, maturity)
+        deobfuscation["config_isolation"] = isolation
+        result["microcode_kind"] = "d810_pass"
+    else:
+        mba = _generate(ea, maturity)
+        deobfuscation = {"requested": False, "pass": None}
+        result["microcode_kind"] = "raw"
+    blocks, total, returned = _serialise(mba, cap)
+    if not blocks or total == 0:
+        raise _WorkerError("MICROCODE_EMPTY", "Hex-Rays returned a microcode array with no instructions; "
+                           "that is not evidence that the function is empty.")
+    reached = _safe(lambda: int(mba.maturity))
+    result["maturity"] = {"requested": maturity_name, "reached": _maturity_name(reached),
+                          "reached_as_requested": reached == maturity}
+    result["block_count"] = len(blocks)
+    result["instruction_count"] = total
+    result["instructions_returned"] = returned
+    result["instructions_truncated"] = returned < total
+    result["microcode_sha256"] = _listing_digest(mba)
+    result["deobfuscation"] = deobfuscation
+    result["items"] = blocks
+
+
+def _run(job):
+    operation = str(job.get("operation") or "")
+    result = {"ok": True, "tool": "ida_microcode_cfg", "operation": operation, "items": []}
+    try:
+        if operation != OPERATION:
+            result["ok"] = False
+            result["error"] = "UNKNOWN_OPERATION"
+        else:
+            discard_ok = True
+            if job.get("mode") == "reopen":
+                discard_ok = _discard_session_changes()
+                result["database_changes_discarded"] = discard_ok
+            if not discard_ok:
+                result["ok"] = False
+                result["error"] = "DATABASE_CHANGES_NOT_DISCARDABLE"
+                result["detail"] = ("Could not mark the session database temporary "
+                                    "(DBFL_TEMP); the operation was not run.")
+            elif job.get("mode") != "reopen":
+                # Microcode is only ever asked of a reopened (temporary) session; a create session
+                # is the one place a database is saved, and it must not carry a decompiler-side change.
+                result["ok"] = False
+                result["error"] = "MICROCODE_REQUIRES_REOPEN_SESSION"
+            else:
+                ida_auto.auto_wait()
+                _op_microcode_cfg(result, job)
+    except _WorkerError as exc:
+        discarded = result.get("database_changes_discarded")
+        result = {"ok": False, "tool": "ida_microcode_cfg", "operation": operation, "items": [],
+                  "error": exc.error}
+        if exc.detail:
+            result["detail"] = exc.detail
+        result.update(exc.extra)
+        if discarded is not None:
+            result["database_changes_discarded"] = discarded
+    except Exception:  # noqa: BLE001
+        discarded = result.get("database_changes_discarded")
+        result = {"ok": False, "tool": "ida_microcode_cfg", "operation": operation, "items": [],
+                  "error": "IDAPYTHON_SCRIPT_EXCEPTION", "traceback": traceback.format_exc()}
+        if discarded is not None:
+            result["database_changes_discarded"] = discarded
+    _stamp_input_identity(result)
+    return result
+
+
+def _write_result(path, result):
+    result["script_completed"] = True  # last key: a truncated file cannot carry it
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(result, handle, ensure_ascii=False, indent=2)
+    os.replace(temporary, path)
+
+
+def main():
+    job, problem = _job()
+    if job is None:
+        sys.stderr.write("liebert_ida_job: %s\n" % problem)
+        return 2
+    try:
+        result = _run(job)
+        _write_result(job["output"], result)
+        return 0
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return 3
+
+
+def _entry():
+    """Run the job, then ALWAYS leave through ``qexit`` so idat never waits
+    for input."""
+    code = 4
+    try:
+        code = main()
+    finally:
+        ida_pro.qexit(code)
+
+
+if __name__ == "__main__":
+    _entry()

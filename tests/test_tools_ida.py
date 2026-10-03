@@ -2026,7 +2026,7 @@ class RoutingTests(unittest.TestCase):
 
     def test_tools_that_are_not_implemented_yet_are_still_not_claimed(self):
         published = tool_families.published_tools("native")
-        for name in ("ida_rename", "ida_set_comments", "ida_patch_plan", "ida_microcode_cfg",
+        for name in ("ida_rename", "ida_set_comments", "ida_patch_plan",
                      "ida_disasm_listing", "ida_type_member_offset", "ida_annotations"):
             self.assertNotIn(name, published, name)
 

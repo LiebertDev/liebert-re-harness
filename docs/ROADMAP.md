@@ -87,7 +87,7 @@ hidden feature.
   wrapper against a stand-in `idat`, and one `heavy` class runs the real thing locally.
   **Still open:** `ida_disasm_listing` and `ida_type_member_offset` (read-only, next
   round), the write operations (`ida_rename`, `ida_set_comments`, which persist into the
-  database and so need an audit log, and `ida_patch_plan`), microcode export, a Ghidra
+  database and so need an audit log, and `ida_patch_plan`), a Ghidra
   wrapper (the more approachable half, since `analyzeHeadless` is scriptable and free to
   install), and normalising answers across engines.
 - **Function-boundary recovery from exception-directory unwind data**, with

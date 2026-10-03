@@ -68,8 +68,22 @@ paths. Anything from the log that leaves this module (failure tails) goes
 through `_redact`: the licence line is replaced, home-directory paths become
 `<HOME>`, and the scratch and input paths become `<WORK>` / `<INPUT>`.
 
-Scope of this module: `ida_query` (read-only) and `ida_status`. Writing
-operations (rename, comments, patch planning) and microcode are not here.
+**Microcode (`ida_microcode_cfg`).** One function's microcode as a control-flow
+graph at one of the eight maturity levels, read in the same temporary reopen
+session as a question (`ida_scripts/microcode_cfg.idapy`, a second worker, so
+`query_program.idapy` stays free of the decompiler's microcode API and of any
+third-party import). Raw microcode is the default. `deobfuscate=True` is an
+opt-in pass of the third-party d810 plugin over the same generation: the answer
+then says it is a d810 pass, which project was loaded, which rules fired, and
+whether the output differs from the raw microcode of the same function built in
+the same session. If d810 is missing or does not start, the answer is a status
+with no microcode, never raw microcode under a deobfuscation request. d810 is
+driven against a private configuration directory (its `options.json` is the
+user's own file); see `microcode_cfg.idapy`. The pass targets instruction-level obfuscation and
+control-flow flattening patterns. It does not handle virtualised (VM-based) code: that logic lives in bytecode data, which microcode rules cannot rewrite.
+
+Scope of this module: `ida_query` and `ida_microcode_cfg` (read-only) and
+`ida_status`. Writing operations (rename, comments, patch planning) are not here.
 """
 from __future__ import annotations
 
@@ -79,6 +93,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -95,11 +110,14 @@ except Exception:  # pragma: no cover - an indexing dependency must never block 
 from liebert_re.workspace import PROJECT_ROOT as APP_DIR
 EVIDENCE = APP_DIR / "dataset" / "evidence" / "ida_query"
 EVIDENCE.mkdir(parents=True, exist_ok=True)
+EVIDENCE_MICROCODE = APP_DIR / "dataset" / "evidence" / "ida_microcode_cfg"
+EVIDENCE_MICROCODE.mkdir(parents=True, exist_ok=True)
 # Created lazily, on first use: a status call on a machine without IDA must
 # not leave an empty directory behind. Tests patch this name.
 CACHE_ROOT = APP_DIR / "dataset" / "ida_cache"
 
 _WORKER_SOURCE = Path(__file__).resolve().parent / "ida_scripts" / "query_program.idapy"
+_MICROCODE_WORKER_SOURCE = Path(__file__).resolve().parent / "ida_scripts" / "microcode_cfg.idapy"
 _JOB_ENV = "LIEBERT_IDA_JOB"
 _JOB_SCRIPT = "liebert_ida_job.py"
 _LOG_NAME = "ida.log"
@@ -125,6 +143,12 @@ _MIN_TIMEOUT_SECONDS = 5
 _MAX_QUERY_TIMEOUT_SECONDS = 300
 _MAX_CREATE_TIMEOUT_SECONDS = 600
 _STATUS_TIMEOUT_SECONDS = 60
+# The microcode session's own ceiling, separate from the question ceiling above
+# on purpose: it is this operation's constant, not shared infrastructure. It is
+# one reopen session (one or, with the d810 pass, two microcode generations of a
+# single function), so it is the same size as a question; the first analysis
+# keeps the larger create ceiling. Exceeding it is TIMEOUT, never "no microcode".
+_MAX_MICROCODE_TIMEOUT_SECONDS = 300
 # idat's own stdout/stderr is a few KB; the result travels in a file.
 _MAX_OUTPUT_CHARS = 1024 * 1024
 _MIN_RESPONSE_CHARS = 2000
@@ -143,6 +167,22 @@ _LOCK_STALE_SECONDS = _MAX_CREATE_TIMEOUT_SECONDS + 120
 # pid is taken to have been reused or the owner to be hung.
 _LOCK_OWNER_ALIVE_CEILING_SECONDS = 2 * _LOCK_STALE_SECONDS
 _SLOT_NAME = re.compile(r"^[0-9a-f]{64}\.[A-Za-z0-9]+$")
+
+# The eight levels microcode passes through (MMAT_ZERO is "not built yet", not a level).
+_MICROCODE_MATURITIES = (
+    "MMAT_GENERATED", "MMAT_PREOPTIMIZED", "MMAT_LOCOPT", "MMAT_CALLS",
+    "MMAT_GLBOPT1", "MMAT_GLBOPT2", "MMAT_GLBOPT3", "MMAT_LVARS",
+)
+_MICROCODE_DEFAULT_MAXIMUM = 2000
+_MICROCODE_INSTRUCTION_CAP = 5000
+_MICROCODE_DEFAULT_D810_PROJECT = "default_instruction_only"
+_D810_PROJECT_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+# d810 writes log files about 70 characters deeper than the state directory it is
+# given; past Windows' 260-character path limit its logging setup fails to
+# configure. A state directory path longer than this is not used.
+_D810_STATE_PATH_LIMIT = 150
+# A worker error that names a missing prerequisite rather than a failed analysis.
+_MICROCODE_ERROR_STATUS = {"D810_NOT_INSTALLED": "TOOL_MISSING"}
 
 _KNOWN_INSTALL_GLOBS = ("IDA Professional 9*", "IDA Pro 9*")
 
@@ -654,12 +694,14 @@ class _EnvironmentFailure(Exception):
         return body
 
 
-def _write_worker(work):
+def _write_worker(work, worker_source=None):
     """Copy the worker into the work directory, BOM-free. IDAPython refuses a
     script that starts with a UTF-8 BOM (`invalid non-printable character
-    U+FEFF`), so the bytes are normalised here instead of trusting the file."""
+    U+FEFF`), so the bytes are normalised here instead of trusting the file.
+    `worker_source` is the microcode worker for that operation; the default is
+    the query worker."""
     try:
-        source = _WORKER_SOURCE.read_bytes()
+        source = (worker_source or _WORKER_SOURCE).read_bytes()
     except OSError as exc:
         raise _EnvironmentFailure("IDA_WORKER_UNREADABLE", exc) from exc
     if source.startswith(b"\xef\xbb\xbf"):
@@ -673,11 +715,12 @@ def _job_environment(job_path):
     return env
 
 
-def _launch(exe, work, job, *, mode, target, timeout_seconds, cancellation_token, empty_database=False):
+def _launch(exe, work, job, *, mode, target, timeout_seconds, cancellation_token, empty_database=False,
+            worker_source=None):
     """Run idat once in `work`. `mode` is "create" (analyse `target` into
     work/db.i64) or "reopen" (open `target`, an existing database).
     Returns (process_result, command)."""
-    _write_worker(work)
+    _write_worker(work, worker_source)
     job_path = work / "job.json"
     try:
         job_path.write_text(json.dumps(job), encoding="utf-8")
@@ -855,12 +898,17 @@ def _walk_limit_text(walk_limit):
 
 
 def _success_response(tool, p, sha256, md5, operation, data, *, cache_state, signals, invocation,
-                      max_chars, evidence):
+                      max_chars, evidence, note=None):
     body = {k: v for k, v in data.items() if k not in _WORKER_BOOKKEEPING}
     limitations = []
     walk_limit = body.get("walk_limit")
     if walk_limit:
         limitations.append(_walk_limit_text(walk_limit))
+    if body.get("instructions_truncated"):
+        limitations.append(
+            f"the microcode listing was cut at {body.get('instructions_returned')} of "
+            f"{body.get('instruction_count')} instructions (max_results); block edges are complete"
+        )
     head = {
         "ok": True, "tool": tool, "status": "OK",
         "path": relative(p), "target_sha256": sha256,
@@ -877,7 +925,7 @@ def _success_response(tool, p, sha256, md5, operation, data, *, cache_state, sig
         "The worker's full unmodified JSON result was saved; this response is the same data, "
         "trimmed only if it exceeded max_chars."
     )
-    merged["note"] = (
+    merged["note"] = note or (
         "Results come from IDA's analysis of the file as loaded, with symbol-server lookups "
         "disabled; names that exist only in a PDB are absent. Auto-analysis can miss or "
         "mis-split code in obfuscated or packed targets, so an absent function or xref is not "
@@ -904,8 +952,8 @@ def _success_response(tool, p, sha256, md5, operation, data, *, cache_state, sig
     return merged
 
 
-def _write_evidence(p, operation, data):
-    out = EVIDENCE / f"{p.stem}_{uuid.uuid4().hex[:8]}_{operation}.json"
+def _write_evidence(p, operation, data, directory=None):
+    out = (directory or EVIDENCE) / f"{p.stem}_{uuid.uuid4().hex[:8]}_{operation}.json"
     error = None
     try:
         out.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -998,6 +1046,15 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
     invocation = {"operation": operation, "query": query, "max_results": max_results, "offset": offset,
                   "timeout_seconds": timeout_seconds}
 
+    return _locked_call(tool, exe, p, invocation, max_chars, cancellation_token)
+
+
+def _locked_call(tool, exe, p, invocation, max_chars, cancellation_token, profile=None):
+    """The part every question shares: hash the input, take its slot lock, run
+    the staged session(s) under it, enforce the cache budget on success. Returns
+    the finished JSON string. `profile` (None for `ida_query`) carries what a
+    different operation changes: its worker, the extra job fields, the ceiling
+    of its reopen session, its evidence directory and its note."""
     try:
         sha256, md5 = _sha256_md5(p)
     except OSError as exc:
@@ -1021,7 +1078,7 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
             "detail": "Another process is analysing this exact file; retry when it finishes.",
         })
     try:
-        outcome = _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation_token)
+        outcome = _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation_token, profile)
         if isinstance(outcome, dict) and outcome.get("ok") is True:
             outcome_evict = _enforce_cache_budget(slot)
             if outcome_evict[0]:
@@ -1036,6 +1093,129 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
         _release_slot_lock(lock)
 
 
+def ida_microcode_cfg(path, function, maturity="MMAT_LVARS", deobfuscate=False,
+                      d810_project=_MICROCODE_DEFAULT_D810_PROJECT, max_results=_MICROCODE_DEFAULT_MAXIMUM,
+                      timeout_seconds=_DEFAULT_TIMEOUT_SECONDS, max_chars=60000, cancellation_token=None):
+    """Read one function's microcode from IDA as a control-flow graph: blocks,
+    their predecessors and successors, their instructions, every address in the
+    shared five-field address form (file offset, RVA, VA, image base, section).
+
+    `function` is a symbol name or a virtual address inside the function.
+    `maturity` is one of the eight levels `MMAT_GENERATED`, `MMAT_PREOPTIMIZED`,
+    `MMAT_LOCOPT`, `MMAT_CALLS`, `MMAT_GLBOPT1`, `MMAT_GLBOPT2`, `MMAT_GLBOPT3`,
+    `MMAT_LVARS` (default; the `MMAT_` prefix may be left off). The answer says
+    which level was actually reached. `max_results` bounds the instructions
+    LISTED (1..5000); block edges are always complete, and a cut is reported as
+    PARTIAL with the totals.
+
+    **Raw is the default.** `deobfuscate` must be exactly `True` or `False` (a
+    truthy string is refused, not guessed at). With `False` no third-party code
+    runs and the answer is `microcode_kind: "raw"`, Hex-Rays' own output.
+
+    With `deobfuscate=True` the third-party d810 plugin's optimizer is installed
+    for the generation and the answer is `microcode_kind: "d810_pass"`. It says,
+    under `deobfuscation`: which d810 project was loaded (`project.loaded`, with
+    its active rule counts; `d810_project` picks it, default
+    `default_instruction_only`, a different project is a different rule set),
+    which rules and optimizers fired and how often (`rules_fired`,
+    `optimizers_fired`), the raw microcode of the same function from the same
+    session (`raw_baseline`) and whether the output differs from it
+    (`transformed`). A rule firing is not proof that the function was
+    obfuscated, and a project whose rules did not fire is not proof that it
+    wasn't. d810 missing is `TOOL_MISSING`; d810 present but not startable (no
+    such project, did not load, optimizer not started) is `ANALYSIS_LIMITED`.
+    In neither case does this return raw microcode in place of what was asked.
+    The pass is not a devirtualiser: it targets instruction-level obfuscation (MBA, opaque predicates,
+    constant folding) and control-flow flattening patterns, and does not handle virtualised (VM-based)
+    code. Whether its rules fire on a given function is a measurement; that the rewritten control flow
+    is correct is not checked here.
+    d810's own `options.json` writes go to a private directory; the user's copy
+    is hashed before and after and the result reports it (`config_isolation`).
+
+    The first analysis of a file, the discard guarantee (the session is
+    temporary, nothing it does is saved), the slot lock, the four-signal
+    verdict and the status vocabulary are `ida_query`'s. `timeout_seconds` is
+    one budget for the whole call, clamped to 5..600; the session that builds
+    the microcode never runs longer than 300 s (`_MAX_MICROCODE_TIMEOUT_SECONDS`).
+    The worker's full result is saved under `dataset/evidence/ida_microcode_cfg/`.
+    """
+    tool = "ida_microcode_cfg"
+    exe = _ida_binary()
+    if not exe:
+        return _tool_missing(tool)
+    p, fail = _checked_path(path, tool)
+    if fail:
+        return fail
+    if p.suffix.lower() in _DATABASE_SUFFIXES:
+        return _j({
+            "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "DATABASE_INPUT_NOT_SUPPORTED",
+            "path": relative(p),
+            "detail": "An existing IDA database is not accepted as input; pass the original binary (see ida_query).",
+        })
+    if not isinstance(function, str) or not function.strip() or len(function) > 512:
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "FUNCTION_REQUIRED",
+                   "detail": "`function` is a symbol name or a virtual address, a non-empty string of at most 512 characters."})
+    level = str(maturity).strip().upper() if isinstance(maturity, str) else ""
+    if level and not level.startswith("MMAT_"):
+        level = "MMAT_" + level
+    if level not in _MICROCODE_MATURITIES:
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "UNKNOWN_MATURITY",
+                   "given": str(maturity), "accepted": list(_MICROCODE_MATURITIES)})
+    if deobfuscate is not True and deobfuscate is not False:
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "INVALID_DEOBFUSCATE_ARGUMENT",
+                   "given": repr(deobfuscate)[:80],
+                   "detail": "`deobfuscate` must be exactly True or False. It is never inferred from a string or a number."})
+    if not isinstance(d810_project, str) or not _D810_PROJECT_NAME.match(d810_project):
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "INVALID_D810_PROJECT",
+                   "given": repr(d810_project)[:80],
+                   "detail": "A d810 project is named by its configuration file name (letters, digits, '_', '.', '-')."})
+    if not (_MICROCODE_WORKER_SOURCE.is_file() and _WORKER_SOURCE.is_file()):
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "IDA_WORKER_MISSING",
+                   "detail": "A packaged IDAPython worker is absent from this install (a packaging defect, not an IDA problem)."})
+    timeout_seconds = _clamp(timeout_seconds, _MIN_TIMEOUT_SECONDS, _MAX_CREATE_TIMEOUT_SECONDS, _DEFAULT_TIMEOUT_SECONDS)
+    max_results = _clamp(max_results, 1, _MICROCODE_INSTRUCTION_CAP, _MICROCODE_DEFAULT_MAXIMUM)
+    max_chars = _clamp(max_chars, _MIN_RESPONSE_CHARS, _MAX_RESPONSE_CHARS, 60000)
+    function = function.strip()
+    invocation = {"operation": "microcode_cfg", "function": function, "maturity": level,
+                  "deobfuscate": deobfuscate, "d810_project": d810_project if deobfuscate else None,
+                  "max_results": max_results, "offset": 0, "timeout_seconds": timeout_seconds}
+
+    def label_problem(data):
+        """The result must say what it is, in the terms this call asked for."""
+        kind, info = data.get("microcode_kind"), data.get("deobfuscation")
+        info = info if isinstance(info, dict) else {}
+        if not isinstance(data.get("items"), list) or not data["items"] or not data.get("instruction_count"):
+            return "MICROCODE_EMPTY"
+        if deobfuscate:
+            project = info.get("project") if isinstance(info.get("project"), dict) else {}
+            labelled = (kind == "d810_pass" and info.get("requested") is True and info.get("pass") == "d810"
+                        and isinstance(info.get("rules_fired"), list) and isinstance(info.get("transformed"), bool)
+                        and bool(project.get("loaded")) and isinstance(info.get("config_isolation"), dict))
+            return None if labelled else "DEOBFUSCATION_RESULT_UNLABELLED"
+        return None if kind == "raw" and info.get("requested") is False else "MICROCODE_KIND_MISMATCH"
+
+    note = (
+        "Microcode of one function from IDA, generated in a temporary session of the cached database "
+        "(nothing was saved). "
+        + ("This is a d810 pass: the microcode was produced WITH d810's optimizer installed, so it is "
+           "transformed output, not Hex-Rays' own. `deobfuscation` names the project that was loaded, the "
+           "rules that fired and whether the output differs from the raw microcode of the same function. "
+           "Which rules fired is a measurement of the rules on this function, not a verdict that it was "
+           "obfuscated or that the result is correct. The pass does not handle virtualised (VM-based) code."
+           if deobfuscate else
+           "This is raw microcode: no third-party pass ran. Hex-Rays can fail or time out on obfuscated "
+           "functions, so an absent block or a missing function is not proof of absence.")
+    )
+    profile = {
+        "tool": tool, "worker": _MICROCODE_WORKER_SOURCE, "reopen_ceiling": _MAX_MICROCODE_TIMEOUT_SECONDS,
+        "job_fields": {"query": function, "maturity": level, "deobfuscate": deobfuscate,
+                       "d810_project": d810_project, "max_results": max_results},
+        "isolated_state_dir": deobfuscate, "evidence_dir": EVIDENCE_MICROCODE,
+        "error_status": _MICROCODE_ERROR_STATUS, "validate": label_problem, "note": note,
+    }
+    return _locked_call(tool, exe, p, invocation, max_chars, cancellation_token, profile)
+
+
 class _StageFailure(Exception):
     """One idat launch did not produce a usable answer; carries the response."""
 
@@ -1044,7 +1224,8 @@ class _StageFailure(Exception):
         self.body = body
 
 
-def _run_stage(exe, p, sha256, md5, slot, *, mode, operation, invocation, timeout_seconds, cancellation_token):
+def _run_stage(exe, p, sha256, md5, slot, *, mode, operation, invocation, timeout_seconds, cancellation_token,
+               profile=None):
     """One idat launch in its own scratch directory and its four-signal
     verdict. `mode` "create" analyses `p` into a new database and, only if
     every signal agrees, promotes it into `slot`; "reopen" queries the cached
@@ -1054,18 +1235,34 @@ def _run_stage(exe, p, sha256, md5, slot, *, mode, operation, invocation, timeou
     The scratch directory is always deleted, so a failed first analysis
     leaves neither a database nor the unpacked .id0/.id1/.id2/.nam/.til
     components IDA scatters while it works."""
-    tool = "ida_query"
+    profile = profile or {}
+    tool = profile.get("tool", "ida_query")
+    # The first analysis is always the query worker's `summary`; only the reopen
+    # session runs the operation's own worker, with its own job fields and ceiling.
     creating = mode == "create"
+    reopen_ceiling = profile.get("reopen_ceiling", _MAX_QUERY_TIMEOUT_SECONDS)
     work = slot / f"work-{uuid.uuid4().hex[:8]}"
     work.mkdir()
-    job = {"output": str(work / _RESULT_NAME), "operation": operation, "query": invocation["query"],
+    job = {"output": str(work / _RESULT_NAME), "operation": operation, "query": invocation.get("query", ""),
            "max_results": invocation["max_results"], "offset": invocation["offset"], "mode": mode}
+    state_dir = None
+    if not creating:
+        job.update(profile.get("job_fields") or {})
     try:
-        timeout_seconds = min(timeout_seconds, _MAX_CREATE_TIMEOUT_SECONDS if creating else _MAX_QUERY_TIMEOUT_SECONDS)
+        if not creating and profile.get("isolated_state_dir"):
+            # d810's private configuration directory (see microcode_cfg.idapy): a short path next to
+            # the slots, or under the OS temp directory when the cache root is too deep; removed below.
+            state_dir = _cache_root() / f"d810-{uuid.uuid4().hex[:8]}"
+            if len(str(state_dir)) > _D810_STATE_PATH_LIMIT:
+                state_dir = Path(tempfile.gettempdir()) / f"liebert-d810-{uuid.uuid4().hex[:8]}"
+            state_dir.mkdir(parents=True)
+            job["d810_state_dir"] = str(state_dir)
+        timeout_seconds = min(timeout_seconds, _MAX_CREATE_TIMEOUT_SECONDS if creating else reopen_ceiling)
         try:
             cp, _command = _launch(
                 exe, work, job, mode=mode, target=p if creating else slot / _DB_NAME,
                 timeout_seconds=timeout_seconds, cancellation_token=cancellation_token,
+                worker_source=None if creating else profile.get("worker"),
             )
         except _EnvironmentFailure as failure:
             # Nothing was launched, so the database was not touched: the slot stays.
@@ -1080,7 +1277,7 @@ def _run_stage(exe, p, sha256, md5, slot, *, mode, operation, invocation, timeou
             if cp.timed_out:
                 body["timeout_seconds"] = timeout_seconds
                 body["timed_out_stage"] = "analysis" if creating else "query"
-                body["stage_ceiling_seconds"] = _MAX_CREATE_TIMEOUT_SECONDS if creating else _MAX_QUERY_TIMEOUT_SECONDS
+                body["stage_ceiling_seconds"] = _MAX_CREATE_TIMEOUT_SECONDS if creating else reopen_ceiling
                 body["detail"] = (
                     "The first analysis of a large file can exceed the timeout; an incomplete analysis is "
                     "discarded, so the next call starts over. Do not read a timeout as 'nothing found'."
@@ -1100,6 +1297,8 @@ def _run_stage(exe, p, sha256, md5, slot, *, mode, operation, invocation, timeou
             extra = {"invocation": invocation, "target_sha256": sha256}
             if isinstance(data, dict) and data.get("error"):
                 extra["worker_error"] = data.get("error")
+                if data.get("detail"):
+                    extra["worker_detail"] = _redact(str(data["detail"]), work=work, target=p)[:2000]
             raise _StageFailure(_failure_response(
                 tool, "RESULT_PARSE_FAILED" if error == "RESULT_PARSE_FAILED" else "ANALYSIS_LIMITED", error,
                 operation=operation, signals=signals, cp=cp, work=work, target=p, extra=extra,
@@ -1120,10 +1319,14 @@ def _run_stage(exe, p, sha256, md5, slot, *, mode, operation, invocation, timeou
         return data, signals, provenance
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        if state_dir is not None:
+            shutil.rmtree(state_dir, ignore_errors=True)
 
 
-def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation_token):
-    tool = "ida_query"
+def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation_token, profile=None):
+    profile = profile or {}
+    tool = profile.get("tool", "ida_query")
+    reopen_ceiling = profile.get("reopen_ceiling", _MAX_QUERY_TIMEOUT_SECONDS)
     operation = invocation["operation"]
     total = invocation["timeout_seconds"]
     deadline = time.monotonic() + total
@@ -1155,7 +1358,7 @@ def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation
             # operation is answered from the reopen session below.
             data, signals, provenance = _run_stage(
                 exe, p, sha256, md5, slot, mode="create", operation="summary", invocation=invocation,
-                timeout_seconds=total, cancellation_token=cancellation_token,
+                timeout_seconds=total, cancellation_token=cancellation_token, profile=profile,
             )
         if operation != "summary" or cache_state == "HIT":
             left = remaining()
@@ -1168,7 +1371,7 @@ def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation
                     "ok": False, "tool": tool, "status": "TIMEOUT", "invocation": invocation,
                     "target_sha256": sha256, "error": "IDA_TIMEOUT_BUDGET_EXHAUSTED",
                     "timeout_seconds": total, "timed_out_stage": "query",
-                    "stage_ceiling_seconds": _MAX_QUERY_TIMEOUT_SECONDS,
+                    "stage_ceiling_seconds": reopen_ceiling,
                     "database_cache": cache_state,
                     "detail": (
                         "The first analysis used the whole timeout_seconds budget, so the question was not "
@@ -1178,22 +1381,36 @@ def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation
                 })
             data, signals, provenance = _run_stage(
                 exe, p, sha256, md5, slot, mode="reopen", operation=operation, invocation=invocation,
-                timeout_seconds=left, cancellation_token=cancellation_token,
+                timeout_seconds=left, cancellation_token=cancellation_token, profile=profile,
             )
         if data.get("ok") is False:
             # The worker ran and answered "no" (unknown symbol, decompiler refused). The database is fine.
-            return {
-                "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED",
+            refusal = {
+                "ok": False, "tool": tool,
+                "status": (profile.get("error_status") or {}).get(data.get("error"), "ANALYSIS_LIMITED"),
                 "error": data.get("error", "UNKNOWN_ERROR"),
                 **{k: v for k, v in data.items() if k not in _WORKER_BOOKKEEPING and k not in ("error", "items", "traceback")},
                 "path": relative(p), "target_sha256": sha256, "database_cache": cache_state,
                 "invocation": invocation, "provenance": provenance,
                 "traceback": _redact(data.get("traceback", ""), work=slot, target=p) or None,
             }
-        evidence = _write_evidence(p, operation, data)
+            if isinstance(refusal.get("detail"), str):
+                refusal["detail"] = _redact(refusal["detail"], work=slot, target=p)   # an exception text can carry a path
+            return refusal
+        mislabelled = profile["validate"](data) if profile.get("validate") else None
+        if mislabelled:
+            # The answer does not say what it is (raw or d810-processed) the way the call asked for it.
+            # Returning it would present transformed microcode as raw, or the reverse.
+            return {
+                "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": mislabelled,
+                "path": relative(p), "target_sha256": sha256, "database_cache": cache_state,
+                "invocation": invocation, "provenance": provenance,
+                "detail": "The worker's result did not carry the label this call requires; no microcode is returned.",
+            }
+        evidence = _write_evidence(p, operation, data, profile.get("evidence_dir"))
         return _success_response(
             tool, p, sha256, md5, operation, data, cache_state=cache_state, signals=signals,
-            invocation=invocation, max_chars=max_chars, evidence=evidence,
+            invocation=invocation, max_chars=max_chars, evidence=evidence, note=profile.get("note"),
         )
     except _StageFailure as failure:
         return failure.body
@@ -1264,7 +1481,7 @@ def ida_status():
             "pdb_lookup": "disabled (-Opdb:off on every launch)",
             "network_lookup_detected": signals["network_lookup_detected"],
             "cache": _cache_summary(),
-            "operations": ["ida_query", "ida_status"],
+            "operations": ["ida_query", "ida_microcode_cfg", "ida_status"],
             "query_operations": list(_ALLOWED_OPERATIONS),
             "note": (
                 "OK means idat launched headless and exited cleanly on an empty database; it does not "

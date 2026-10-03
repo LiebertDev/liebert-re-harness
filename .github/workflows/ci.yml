@@ -147,6 +147,8 @@ jobs:
           import importlib.resources as _res
           worker = _res.files("liebert_re.tools").joinpath("ida_scripts/query_program.idapy")
           assert worker.is_file(), "the IDAPython worker is missing from the wheel"
+          microcode_worker = _res.files("liebert_re.tools").joinpath("ida_scripts/microcode_cfg.idapy")
+          assert microcode_worker.is_file(), "the IDAPython microcode worker is missing from the wheel"
           for m in mods:
               try:
                   mod = importlib.import_module(m)

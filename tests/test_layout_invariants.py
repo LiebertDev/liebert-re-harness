@@ -105,7 +105,20 @@ def test_published_tool_name_set_is_unchanged():
     # CLI joined three top-level names on purpose: the handlers _labgate and _labregister and the
     # shared argument helper _gate_args, reached as `labgate` and `labregister`; pe_sieve_scan
     # now takes the gate's authorization arguments through the same helper.
+    #
+    # Updated again: liebert_re/tools/ida.py gained microcode (ida_microcode_cfg, already a
+    # FAMILIES["native"] name with no implementation here), a read of one function's microcode as a
+    # control-flow graph, raw by default, with an opt-in d810 deobfuscation pass that labels its own
+    # output. Three top-level names joined the pin and the digest was recomputed from the source, not
+    # edited by hand: the public ida_microcode_cfg; the private _locked_call in ida.py, which is the
+    # hash-the-input / take-the-slot-lock / run-the-sessions / enforce-the-budget tail that ida_query had
+    # inline and that both now share (a top-level def, not nested, because two public functions call it);
+    # and the handler _ida_microcode in liebert_re/cli.py, reached as `idamicrocode`. Everything else the
+    # change needs rides in the existing call chain as a plain `profile` dict (no new defs), and the
+    # validation and label check specific to the microcode call are nested inside ida_microcode_cfg. The
+    # second IDAPython worker, ida_scripts/microcode_cfg.idapy, is a data file like the first and adds
+    # no names here.
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "a6ad6f3b06ef77e395f2271e6d46deee5fb55b5452dc30b6e2dbcabc9e5d77a5"
+    assert digest == "b3157f223e624b97dd576c11bf81fd5741c4f9c1394cdb86d8b82c62b2387965"

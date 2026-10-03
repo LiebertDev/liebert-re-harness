@@ -107,7 +107,7 @@ naming it — it does not silently degrade or guess.
 | **JADX** | Decompiling one named class from a DEX, APK-derived DEX or JVM `.class` / `.jar` (`liebert_re/tools/dex.py`, `liebert_re/tools/jvm.py`); structural listing works without it and the decompile operation returns `JADX_TOOL_MISSING` | `JADX_EXE`, else `jadx` on `PATH`, else a `teacher-tools/jadx/bin/jadx.bat` under the user's home directory |
 | **Il2CppDumper** | Unity IL2CPP type and method name to address mapping (`liebert_re/tools/il2cpp.py`); every operation returns `IL2CPPDUMPER_TOOL_MISSING` without it | `IL2CPPDUMPER_EXE`, else a `teacher-tools/il2cppdumper/Il2CppDumper.exe` under the user's home directory |
 | **UPX** | Static UPX unpacking with `upx -d` on a copy of the input (`liebert_re/tools/upx.py`); returns `TOOL_MISSING` without it | `UPX_HOME`, else `upx` on `PATH`, else a `teacher-tools/upx/upx.exe` under the user's home directory |
-| **IDA Pro 9.x** (licensed, with the Hex-Rays decompiler for `decompile_function`) | Read-only headless queries through `idat -A`: summary, function list, segments, function-at-address, pseudocode, cross-references, imports/exports, strings (`liebert_re/tools/ida.py`); returns `TOOL_MISSING` without it. Not wrapped: renaming, comments, patch planning, microcode | `IDAT_EXE` (file or folder), else `IDA_HOME`, else `idat` on `PATH`, else the installer's default `IDA Professional 9*` / `IDA Pro 9*` folder under Program Files. Cache size cap: `LIEBERT_IDA_CACHE_BYTES` (default 5 GiB) |
+| **IDA Pro 9.x** (licensed, with the Hex-Rays decompiler for `decompile_function`) | Read-only headless queries through `idat -A`: summary, function list, segments, function-at-address, pseudocode, cross-references, imports/exports, strings, and one function's microcode as a graph (`ida_microcode_cfg`; raw by default, with an opt-in d810 pass that needs the third-party d810 package in IDA's Python and says so in the answer) (`liebert_re/tools/ida.py`); returns `TOOL_MISSING` without it. Not wrapped: renaming, comments, patch planning | `IDAT_EXE` (file or folder), else `IDA_HOME`, else `idat` on `PATH`, else the installer's default `IDA Professional 9*` / `IDA Pro 9*` folder under Program Files. Cache size cap: `LIEBERT_IDA_CACHE_BYTES` (default 5 GiB) |
 | **Ghidra** | Decompilation, cross-references, callers and callees | A wrapper for this lives in the upstream tree; this package does not ship it |
 
 Set an environment variable to the tool's install directory, for example:
@@ -186,7 +186,7 @@ whether the decompiler initialises.
 - **Your files are not modified.** The input is only read; the cache holds IDA's own database.
 - **What is returned is scrubbed.** Anything from IDA's log that reaches a result (failure tails) has the
   licence line, home-directory paths, and the input and scratch paths replaced.
-- Not shipped: renaming, comments, patch planning, microcode. Only IDA 9.x is supported (IDA 9 has a
+- Not shipped: renaming, comments, patch planning. Only IDA 9.x is supported (IDA 9 has a
   single `idat`; there is no `idat64`).
 
 ## The heavy test tier

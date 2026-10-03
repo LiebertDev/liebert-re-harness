@@ -149,7 +149,7 @@ distinction is usually where tool inventories lie.
 
 | Engine | Integration |
 |---|---|
-| IDA (Professional) | **Real, read-only subset in this package** — `idat -A` batch in a bounded subprocess, database cache keyed by the input file's SHA-256 and size-capped; write operations and microcode are in the private tree only |
+| IDA (Professional) | **Real, read-only subset in this package** — `idat -A` batch in a bounded subprocess, database cache keyed by the input file's SHA-256 and size-capped; write operations are in the private tree only; microcode reading is here |
 | Ghidra | **Real** — `analyzeHeadless`, session-scoped project |
 | rizin / radare2 | **Real** (rizin wrapper only in this package; no radare2 driver) — bounded subprocess wrapper |
 | Capstone, Unicorn | **Real** — in-process imports (Unicorn only for the VEX self-check in `recover/vex.py`; no range emulation ships) |

@@ -104,7 +104,7 @@ Module paths are relative to `liebert_re/`.
 
 ### Decompilation and cross-references (needs a licensed IDA)
 
-- `tools/ida.py`: `ida_query` (read-only) and `ida_status`, driving IDA Pro 9.x headless
+- `tools/ida.py`: `ida_query` (read-only), `ida_microcode_cfg` (below) and `ida_status`, driving IDA Pro 9.x headless
   (`idat -A`) in a bounded subprocess. Operations: `summary`, `list_functions`, `segments`,
   `function_at_address`, `decompile_function` (Hex-Rays pseudocode), `xrefs_to` (any symbol or
   address, including import slots; calls are flagged, jumps are not calls), `imports_exports`,
@@ -119,8 +119,25 @@ Module paths are relative to `liebert_re/`.
   content), the session that answers a question never runs longer than 300 s. A timed-out analysis
   is discarded, not half-cached, and is reported as `TIMEOUT`, never as "nothing found". A listing
   cut short by a walk ceiling or by `max_chars` is `PARTIAL` and names the ceiling and its value.
-- Not here: renaming, comments, patch planning, microcode, type-member offsets, disassembly listing,
-  and any Ghidra wrapper.
+- `ida_microcode_cfg` (CLI `idamicrocode`): one function's microcode as a control-flow graph (blocks,
+  predecessors, successors, instructions; every address in the shared five-field address form) at any
+  of the eight maturity levels, read in the same temporary session as a question. **Raw by default.**
+  `deobfuscate=True` (CLI `--deobfuscate`) installs the third-party d810 optimizer for the generation
+  and the answer then says so: `microcode_kind: d810_pass`, the d810 project that was loaded, the
+  rules and optimizers that fired (d810's own counters, which do not cover every rule), the raw
+  microcode of the same function from the same session, and whether the output differs from it. d810
+  missing is `TOOL_MISSING`; present but not startable is `ANALYSIS_LIMITED`; in neither case is raw
+  microcode returned in place of what was asked. d810's `options.json` writes go to a private
+  directory and the user's copy is hashed before and after. Scope: the pass targets instruction-level
+  obfuscation (MBA, opaque predicates, constant folding) and control-flow flattening patterns. It does
+  not handle virtualised (VM-based) code: that logic lives in bytecode data, which microcode rules
+  cannot rewrite. Rule firing and a changed listing were observed on the plugin's own sample binary
+  (including with its flattening projects); whether a rewritten control flow is correct was not
+  checked, so no claim is made that unflattening works. The session that builds the
+  microcode never runs longer than 300 s (its own ceiling); the worker's full result goes to
+  `dataset/evidence/ida_microcode_cfg/`.
+- Not here: renaming, comments, patch planning, type-member offsets, disassembly listing, and any
+  Ghidra wrapper.
 
 ### External-engine wrappers actually present
 
@@ -200,7 +217,10 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
 ### Other classes of target not reached
 
 - Virtualised or bytecode-interpreter protections, control-flow flattening,
-  encrypted-at-rest sections: no devirtualisation, deflattening or static path.
+  encrypted-at-rest sections: no devirtualisation, deflattening or static path. (The optional d810
+  pass of `ida_microcode_cfg` runs a third-party microcode optimizer aimed at instruction-level
+  obfuscation and flattening patterns; it is not a deflattener this project vouches for and does not
+  touch virtualised code.)
 - Whole-program dataflow, taint and symbolic execution: absent.
 - Imports resolved at runtime by the target itself: not recovered.
 - Dalvik method bytecode, Android resource tables, signature verification

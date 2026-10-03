@@ -70,6 +70,9 @@ _TEXT_SHAPES = {
 # file imports each tool lazily; tests/test_tools_ida.py pins the two lists equal.
 _IDA_OPERATIONS = ("summary", "list_functions", "segments", "function_at_address",
                    "decompile_function", "xrefs_to", "imports_exports", "strings")
+# The microcode maturity levels ida_microcode_cfg accepts (same lazy-import reason; pinned by the same test file).
+_IDA_MATURITIES = ("MMAT_GENERATED", "MMAT_PREOPTIMIZED", "MMAT_LOCOPT", "MMAT_CALLS",
+                   "MMAT_GLBOPT1", "MMAT_GLBOPT2", "MMAT_GLBOPT3", "MMAT_LVARS")
 
 
 def _envelope(command, payload, workspace=None):
@@ -252,6 +255,13 @@ def _ida(a):
     return _load("liebert_re.tools.ida", "ida_query")(
         a.path, operation=a.operation, query=a.query, max_results=a.max_results,
         offset=a.offset, timeout_seconds=a.timeout, max_chars=a.max_chars,
+    )
+
+
+def _ida_microcode(a):
+    return _load("liebert_re.tools.ida", "ida_microcode_cfg")(
+        a.path, a.function, maturity=a.maturity, deobfuscate=a.deobfuscate, d810_project=a.d810_project,
+        max_results=a.max_results, timeout_seconds=a.timeout, max_chars=a.max_chars,
     )
 
 
@@ -450,6 +460,14 @@ def _build_parser():
     sp.add_argument("--offset", type=int, default=0, help="page offset for the listing operations")
     sp.add_argument("--max-chars", type=int, default=60000, help="bound on the JSON response")
     sp.add_argument("--timeout", type=int, default=180, help="seconds for the whole call, clamped to 5-600; the first analysis of a file may use all of it, the session that answers is capped at 300")
+    sp = add("idamicrocode", _ida_microcode, "read one function's microcode from headless IDA as a control-flow graph (raw by default; --deobfuscate runs the optional d810 pass and says so)")
+    sp.add_argument("--function", required=True, metavar="TEXT", help="a symbol name or a virtual address inside the function")
+    sp.add_argument("--maturity", default="MMAT_LVARS", choices=_IDA_MATURITIES, help="microcode maturity level (default: MMAT_LVARS)")
+    sp.add_argument("--deobfuscate", action="store_true", help="install the third-party d810 optimizer for the generation; the answer is labelled a d810 pass, lists the rules that fired and says whether the output differs from the raw microcode. Off by default")
+    sp.add_argument("--d810-project", default="default_instruction_only", metavar="NAME", help="d810 project (rule set) to load with --deobfuscate")
+    sp.add_argument("--max-results", type=int, default=2000, help="instructions listed, 1-5000 (block edges are always complete)")
+    sp.add_argument("--max-chars", type=int, default=60000, help="bound on the JSON response")
+    sp.add_argument("--timeout", type=int, default=180, help="seconds for the whole call, clamped to 5-600; the session that builds the microcode is capped at 300")
     add("idastatus", _ida_status, "report whether IDA is reachable, from where, its version and whether the decompiler initialises (runs idat once)", path=False)
     add("unpack", _unpack, "statically unpack a UPX-packed PE (output goes to the evidence cache)").add_argument("--timeout", type=int, default=60)
     add("scan", _scan, "scan with YARA-X rules").add_argument("--rules", required=True, help="rules file")
