@@ -4,7 +4,7 @@ decompilation for a single named class. Does not disassemble Dalvik method
 bytecode itself -- that depth comes only through JADX's own decompiled
 Java source, mirroring dotnet_inspect's structural-metadata/ILSpy-decompile split."""
 from __future__ import annotations
-import json,os,shutil,struct,tempfile
+import json,os,re,shutil,struct,tempfile
 from pathlib import Path
 from liebert_re.bounded_subprocess import run_bounded_process
 from liebert_re.workspace import safe_path,relative
@@ -121,3 +121,72 @@ def dex_decompiler(path,operation='summary',class_name='',max_items=300,max_char
             text=hit.read_text(encoding='utf-8',errors='replace')
         return _j({**base,'class':class_name,'content':text[:max_chars],'truncated':len(text)>max_chars})
     return _j({**base,'ok':False,'error':'UNSUPPORTED_DEX_OPERATION'})
+
+
+def dex_status():
+    """Whether JADX (the decompiler behind `decompile_class`) is reachable, where from,
+    whether it actually runs, and its version -- the capability probe to run before
+    reporting DEX/APK decompilation as unavailable.
+
+    Runs `jadx --version` once (starts a JVM, opens no input; seconds). Statuses: `OK`,
+    `TOOL_MISSING` (`detail` names JADX_EXE and the other places it looked), `TIMEOUT`, and
+    `ANALYSIS_LIMITED` (a launcher resolved but did not print a version, which on this tool
+    usually means no usable Java runtime: JADX is a Java program, so a launcher can exist
+    and still not work). `resolved_by` is JADX_EXE, PATH or bundled_fallback (the per-user
+    tools folder). `operations_without_the_tool` are answered by pure-Python parsing and
+    keep working when JADX is missing; only `decompile_class` needs it.
+    """
+    tool = "dex_status"
+    try:
+        exe = _jadx()
+        if not exe:
+            return _j({
+                "ok": False, "tool": tool, "status": "TOOL_MISSING", "resolved": False,
+                "required_capability": "JADX launcher (jadx / jadx.bat) and a Java runtime",
+                "detail": (
+                    "jadx was not found. Set JADX_EXE to its full path (or to a name on PATH), or put "
+                    "its bin folder on PATH; the last place this module looks is "
+                    f"{Path.home() / 'teacher-tools' / 'jadx' / 'bin' / 'jadx.bat'}. JADX also needs Java "
+                    "on PATH or JAVA_HOME. decompile_class cannot run until then."
+                ),
+                "env_set": {"JADX_EXE": bool(os.getenv("JADX_EXE", "").strip())},
+                "operations_without_the_tool": ["summary", "headers", "classes", "strings"],
+            })
+
+        def _same(a, b):
+            return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
+
+        explicit = os.getenv("JADX_EXE", "").strip()
+        resolved_by = "bundled_fallback"
+        if explicit and shutil.which(explicit) and _same(exe, shutil.which(explicit)):
+            resolved_by = "JADX_EXE"
+        else:
+            on_path = shutil.which("jadx")
+            if on_path and _same(exe, on_path):
+                resolved_by = "PATH"
+        cp = run_bounded_process([exe, "--version"], timeout_seconds=30, max_output_chars=8192)
+        if cp.timed_out or cp.cancelled:
+            return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "binary": exe,
+                       "resolved_by": resolved_by, "runnable": False, "error": "JADX_VERSION_TIMEOUT"})
+        text = ((cp.stdout or "") + chr(10) + (cp.stderr or "")).strip()
+        match = re.search(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?\S*", text)
+        if cp.returncode not in (0, None) or not match:
+            return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "binary": exe,
+                       "resolved_by": resolved_by, "runnable": False, "error": "JADX_VERSION_UNREADABLE",
+                       "exit_code": cp.returncode, "output_tail": text[-500:],
+                       "detail": "The launcher resolved but did not print a version when run. Check that a Java runtime is installed and on PATH or JAVA_HOME."})
+        return _j({
+            "ok": True, "tool": tool, "status": "OK",
+            "binary": exe, "resolved_by": resolved_by, "runnable": True,
+            "version": match.group(0),
+            "operations": ["dex_decompiler", "dex_status"],
+            "operations_without_the_tool": ["summary", "headers", "classes", "strings"],
+            "note": (
+                "OK means the launcher started a JVM and printed its version; no input file was opened. "
+                "decompile_class decompiles the whole input before it reads one class, so it can take "
+                "minutes on a large file."
+            ),
+        })
+    except Exception as exc:  # noqa: BLE001 - the contract is a JSON string, never an exception
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "JADX_STATUS_UNEXPECTED_ERROR",
+                   "detail": f"{type(exc).__name__}: {exc}"})

@@ -118,7 +118,19 @@ def test_published_tool_name_set_is_unchanged():
     # validation and label check specific to the microcode call are nested inside ida_microcode_cfg. The
     # second IDAPython worker, ida_scripts/microcode_cfg.idapy, is a data file like the first and adds
     # no names here.
+    # Updated again: status probes for the tools that had none, so a driver can ask "is this tool
+    # resolvable and does it run" instead of guessing. The public functions added on purpose are
+    # yara_x_status and upx_status (registered in tool_families.FAMILIES["native"]), il2cpp_status
+    # (["game-engine"]), dex_status (["android"]), jvm_status (["jvm"]) and frida_status (["dynamic"],
+    # defined in liebert_re/dynamic/lab_gate.py, because the frida client module is guest-only and
+    # the CLI source may not mention frida). The CLI reaches the first five as `yarastatus`,
+    # `upxstatus`, `il2cppstatus`, `dexstatus` and `jvmstatus` through the handlers _yara_x_status,
+    # _upx_status, _il2cpp_status, _dex_status and _jvm_status in liebert_re/cli.py; frida_status
+    # has no CLI command on purpose. Eleven top-level names joined the pin (6 public + 5 handlers),
+    # 644 -> 655, and the digest was recomputed from the source, not edited by hand. The resolver
+    # logic for "where was it found" lives nested inside each status function, so no private
+    # helper joined the set. No module was added: the CI module count stays 70.
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "b3157f223e624b97dd576c11bf81fd5741c4f9c1394cdb86d8b82c62b2387965"
+    assert digest == "0bcd457fdaf602a6d679d486a16b1dc6985722603b2df3923c8abab5b3217e58"

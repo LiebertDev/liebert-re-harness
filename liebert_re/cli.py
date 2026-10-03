@@ -235,6 +235,26 @@ def _sieve_status(a):
     return _load("liebert_re.tools.pe_sieve", "pe_sieve_status")()
 
 
+def _yara_x_status(a):
+    return _load("liebert_re.tools.yara_x", "yara_x_status")()
+
+
+def _upx_status(a):
+    return _load("liebert_re.tools.upx", "upx_status")()
+
+
+def _il2cpp_status(a):
+    return _load("liebert_re.tools.il2cpp", "il2cpp_status")()
+
+
+def _dex_status(a):
+    return _load("liebert_re.tools.dex", "dex_status")()
+
+
+def _jvm_status(a):
+    return _load("liebert_re.tools.jvm", "jvm_status")()
+
+
 def _flirt_inventory(a):
     return _load("liebert_re.tools.rizin", "rizin_flirt_inventory")(timeout_seconds=a.timeout)
 
@@ -439,6 +459,11 @@ def _build_parser():
     add("sievestatus", _sieve_status, "report whether pe-sieve is reachable, from where, which scanner bitness and its version", path=False)
     add("rzbinstatus", _rzbin_status, "report whether rz-bin is reachable, from where, and its version", path=False)
     add("diestatus", _die_status, "report whether Detect It Easy is reachable, from where, and its version", path=False)
+    add("yarastatus", _yara_x_status, "report whether YARA-X is reachable, from where, and its version", path=False)
+    add("upxstatus", _upx_status, "report whether UPX is reachable, from where, and its version", path=False)
+    add("il2cppstatus", _il2cpp_status, "report whether Il2CppDumper is reachable, from where, and its version", path=False)
+    add("dexstatus", _dex_status, "report whether JADX (used by the DEX decompiler) is reachable, from where, and its version", path=False)
+    add("jvmstatus", _jvm_status, "report whether JADX (used by the JVM decompiler) is reachable, from where, and its version", path=False)
     # capa's default backend takes MINUTES (measured 3m48s for a 1.2 MB PE), so the
     # default timeout is minutes too; --functions is how to bound a run instead.
     sp = add("capa", _capa, "identify capabilities, ATT&CK techniques and MBC behaviours (capa)")

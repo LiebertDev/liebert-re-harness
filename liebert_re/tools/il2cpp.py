@@ -89,3 +89,90 @@ def il2cpp_mapper(binary_path, metadata_path, operation="summary", query="", max
                 "truncated": len(hits) > max_results,
             })
         return _j({**base, "ok": False, "error": "UNSUPPORTED_IL2CPP_OPERATION"})
+
+
+def il2cpp_status():
+    """Whether Il2CppDumper is reachable, where from, whether it actually runs, and
+    its version -- the capability probe to run before reporting IL2CPP mapping as
+    unavailable.
+
+    Runs `Il2CppDumper --help` once (prints its usage line and exits; no binary or
+    metadata file is opened). The tool has no version switch, so `version` is read
+    from the exe's own version resource (Windows API, runs nothing) and
+    `version_source` says so; it is null when the resource is unreadable. Statuses:
+    `OK`, `TOOL_MISSING`, `TIMEOUT`, `ANALYSIS_LIMITED`. `resolved_by` is
+    IL2CPPDUMPER_EXE (a file path, or a name on PATH) or bundled_fallback.
+    """
+    tool = "il2cpp_status"
+    try:
+        exe = _il2cppdumper()
+        if not exe:
+            return _j({
+                "ok": False, "tool": tool, "status": "TOOL_MISSING", "resolved": False,
+                "required_capability": "Il2CppDumper console build (Il2CppDumper.exe)",
+                "detail": (
+                    "Il2CppDumper.exe was not found. Set IL2CPPDUMPER_EXE to its full path, or "
+                    "install it at "
+                    f"{Path.home() / 'teacher-tools' / 'il2cppdumper' / 'Il2CppDumper.exe'}. "
+                    "il2cpp_mapper cannot run until then."
+                ),
+                "env_set": {"IL2CPPDUMPER_EXE": bool(os.getenv("IL2CPPDUMPER_EXE", "").strip())},
+            })
+
+        def _same(a, b):
+            return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
+
+        explicit = os.getenv("IL2CPPDUMPER_EXE", "").strip()
+        resolved_by = "bundled_fallback"
+        if explicit and any(_same(exe, c) for c in (explicit, shutil.which(explicit) or explicit)):
+            resolved_by = "IL2CPPDUMPER_EXE"
+        cp = run_bounded_process([exe, "--help"], timeout_seconds=15, max_output_chars=4096)
+        if cp.timed_out or cp.cancelled:
+            return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "binary": exe,
+                       "resolved_by": resolved_by, "runnable": False, "error": "IL2CPPDUMPER_HELP_TIMEOUT"})
+        text = ((cp.stdout or "") + "\n" + (cp.stderr or "")).strip()
+        if cp.returncode not in (0, None) or "il2cppdumper" not in text.lower():
+            return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "binary": exe,
+                       "resolved_by": resolved_by, "runnable": False, "error": "IL2CPPDUMPER_HELP_UNREADABLE",
+                       "exit_code": cp.returncode, "output_tail": text[-500:],
+                       "detail": "The file resolved but did not print its usage line when run, so it is not known to work."})
+        version = None
+        if os.name == "nt":  # the exe's own version resource, via the OS API: reads it, runs nothing
+            try:
+                import ctypes
+                from ctypes import wintypes
+                api = ctypes.WinDLL("version", use_last_error=True)
+                api.GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+                api.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+                api.GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+                api.GetFileVersionInfoW.restype = wintypes.BOOL
+                api.VerQueryValueW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR,
+                                               ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.UINT)]
+                api.VerQueryValueW.restype = wintypes.BOOL
+                size = api.GetFileVersionInfoSizeW(exe, None)
+                if size:
+                    buf = ctypes.create_string_buffer(size)
+                    if api.GetFileVersionInfoW(exe, 0, size, buf):
+                        ptr, length = ctypes.c_void_p(), wintypes.UINT()
+                        if api.VerQueryValueW(buf, r"\VarFileInfo\Translation", ctypes.byref(ptr), ctypes.byref(length)) and length.value >= 4:
+                            lang, page = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ushort * 2)).contents
+                            if api.VerQueryValueW(buf, rf"\StringFileInfo\{lang:04x}{page:04x}\ProductVersion",
+                                                  ctypes.byref(ptr), ctypes.byref(length)) and length.value:
+                                version = ctypes.wstring_at(ptr.value, length.value).rstrip(chr(0)).strip() or None
+            except Exception:  # noqa: BLE001 - a missing version is reported as null, never an error
+                version = None
+        return _j({
+            "ok": True, "tool": tool, "status": "OK",
+            "binary": exe, "resolved_by": resolved_by, "runnable": True,
+            "version": version, "version_source": "exe_version_resource" if version else "unavailable",
+            "usage": text.splitlines()[0].strip() if text else None,
+            "operations": ["il2cpp_mapper", "il2cpp_status"],
+            "note": (
+                "OK means Il2CppDumper started and printed its usage line; it was not run on any file. "
+                "il2cpp_mapper needs a GameAssembly/executable plus its global-metadata.dat and can take "
+                "minutes on a real pair."
+            ),
+        })
+    except Exception as exc:  # noqa: BLE001 - the contract is a JSON string, never an exception
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "IL2CPPDUMPER_STATUS_UNEXPECTED_ERROR",
+                   "detail": f"{type(exc).__name__}: {exc}"})

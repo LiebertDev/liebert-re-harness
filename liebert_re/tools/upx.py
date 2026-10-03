@@ -103,3 +103,64 @@ def upx_unpack(path, timeout_seconds=60, cancellation_token=None):
         })
     except Exception as exc:  # noqa: BLE001
         return _j({"ok": False, "tool": "upx_unpack", "status": "UPX_UNPACK_FAILED", "error": str(exc)})
+
+
+def upx_status():
+    """Whether upx.exe is reachable, where from, whether it actually runs, and its
+    version -- the capability probe to run before reporting UPX as unavailable.
+
+    Runs `upx --version` once (touches no file). Statuses: `OK`, `TOOL_MISSING`
+    (`detail` names UPX_HOME and the other places it looked), `TIMEOUT`, and
+    `ANALYSIS_LIMITED` (resolved but did not run or printed no version).
+    `resolved_by` is UPX_HOME, PATH or bundled_fallback (the per-user tools folder).
+    Only decompression (`upx_unpack`) is wrapped; this adds no compression.
+    """
+    tool = "upx_status"
+    try:
+        exe = _upx_binary()
+        if not exe:
+            return _j({
+                "ok": False, "tool": tool, "status": "TOOL_MISSING", "resolved": False,
+                "required_capability": "UPX CLI (upx.exe)",
+                "detail": (
+                    "upx.exe was not found. Set UPX_HOME to its full path (or its folder), or put "
+                    "it on PATH; the last place this module looks is "
+                    f"{Path.home() / 'teacher-tools' / 'upx' / 'upx.exe'}. upx_unpack cannot run until then."
+                ),
+                "env_set": {"UPX_HOME": bool(os.getenv("UPX_HOME", "").strip())},
+            })
+
+        def _same(a, b):
+            return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
+
+        explicit = os.getenv("UPX_HOME", "").strip()
+        resolved_by = "bundled_fallback"
+        if explicit and any(_same(exe, c) for c in (explicit, Path(explicit) / "upx.exe")):
+            resolved_by = "UPX_HOME"
+        else:
+            on_path = shutil.which("upx")
+            if on_path and _same(exe, on_path):
+                resolved_by = "PATH"
+        cp = run_bounded_process([exe, "--version"], timeout_seconds=10, max_output_chars=4096)
+        if cp.timed_out or cp.cancelled:
+            return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "binary": exe,
+                       "resolved_by": resolved_by, "runnable": False, "error": "UPX_VERSION_TIMEOUT"})
+        lines = ((cp.stdout or "") + "\n" + (cp.stderr or "")).strip().splitlines()
+        if cp.returncode not in (0, None) or not lines or not lines[0].strip():
+            return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "binary": exe,
+                       "resolved_by": resolved_by, "runnable": False, "error": "UPX_VERSION_UNREADABLE",
+                       "exit_code": cp.returncode, "output_tail": ((cp.stdout or "") + (cp.stderr or ""))[-500:],
+                       "detail": "The file resolved but did not print a version when run, so it is not known to work."})
+        return _j({
+            "ok": True, "tool": tool, "status": "OK",
+            "binary": exe, "resolved_by": resolved_by, "runnable": True,
+            "version": lines[0].strip(),
+            "operations": ["upx_unpack", "upx_status"],
+            "note": (
+                "OK means upx.exe started and printed its version. Only `upx -d` on a disposable copy "
+                "is wrapped (upx_unpack); compression is not offered."
+            ),
+        })
+    except Exception as exc:  # noqa: BLE001 - the contract is a JSON string, never an exception
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "UPX_STATUS_UNEXPECTED_ERROR",
+                   "detail": f"{type(exc).__name__}: {exc}"})

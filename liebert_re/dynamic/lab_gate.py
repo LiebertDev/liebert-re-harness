@@ -483,3 +483,108 @@ def dynamic_lab_register_owned_process(pid=None):
     except Exception as exc:  # noqa: BLE001
         return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "REGISTER_UNEXPECTED_ERROR",
                    "detail": f"{type(exc).__name__}: {exc}"})
+
+
+def frida_status():
+    """What frida this HOST has, and whether the harness's own client can use it.
+
+    The two are different questions and this answers both separately. The harness's
+    frida client (liebert_re.dynamic.frida_trace_client) is written to run ONLY inside
+    the isolated guest, as a standalone exe that carries its own frida; nothing on the
+    host imports frida. So a frida install on this machine is NOT what the harness
+    drives: `host_frida_used_by_harness` is always false, and `harness_client` says
+    where the client runs. A host install is reported because it exists, not because
+    any harness operation uses it.
+
+    Looks without touching a target: `importlib.util.find_spec` (does NOT import frida;
+    the host never does), `importlib.metadata` for the version, and `frida --version`
+    once on PATH (starts no process and attaches to nothing). The library answer
+    belongs to THE INTERPRETER RUNNING THIS CALL: another Python on the same machine
+    can differ, so `interpreter` is reported. The guest is not probed.
+
+    Statuses: `OK` (a host library or CLI was found and, for the CLI, ran), `TOOL_MISSING`
+    (neither; this does not block guest tracing, `detail` says so), `TIMEOUT`,
+    `ANALYSIS_LIMITED` (a frida CLI resolved but did not run and no library was found).
+    """
+    tool = "frida_status"
+    try:
+        import importlib.metadata
+        import importlib.util
+        import shutil
+        import sys
+
+        from liebert_re.bounded_subprocess import run_bounded_process
+
+        interpreter = {"executable": sys.executable,
+                       "version": ".".join(str(n) for n in sys.version_info[:3])}
+        library = {"found": False, "version": None, "location": None, "resolved_by": None}
+        try:
+            spec = importlib.util.find_spec("frida")
+        except (ImportError, ValueError):
+            spec = None
+        if spec is not None:
+            library["found"] = True
+            library["location"] = spec.origin
+            library["resolved_by"] = "this interpreter's sys.path"
+            try:
+                library["version"] = importlib.metadata.version("frida")
+            except importlib.metadata.PackageNotFoundError:
+                library["version"] = None
+
+        cli = {"found": False, "runnable": False, "version": None, "binary": None, "resolved_by": None}
+        exe = shutil.which("frida") or shutil.which("frida.exe")
+        timed_out = False
+        if exe:
+            cli.update(found=True, binary=exe, resolved_by="PATH")
+            cp = run_bounded_process([exe, "--version"], timeout_seconds=20, max_output_chars=4096)
+            if cp.timed_out or cp.cancelled:
+                timed_out = True
+            else:
+                lines = ((cp.stdout or "") + chr(10) + (cp.stderr or "")).strip().splitlines()
+                if cp.returncode in (0, None) and lines and lines[0].strip():
+                    cli.update(runnable=True, version=lines[0].strip())
+
+        harness_client = {
+            "module": "liebert_re.dynamic.frida_trace_client",
+            "runs_where": "isolated guest only (a standalone exe that carries its own frida)",
+            "uses_host_frida": False,
+            "guest_probed": False,
+        }
+        common = {
+            "tool": tool,
+            "interpreter": interpreter,
+            "host_frida": {"python_library": library, "cli": cli},
+            "host_frida_used_by_harness": False,
+            "harness_client": harness_client,
+        }
+        if timed_out and not library["found"]:
+            return _j({**common, "ok": False, "status": "TIMEOUT", "error": "FRIDA_VERSION_TIMEOUT"})
+        if not library["found"] and not cli["runnable"]:
+            if cli["found"]:
+                return _j({**common, "ok": False, "status": "ANALYSIS_LIMITED",
+                           "error": "FRIDA_CLI_VERSION_UNREADABLE",
+                           "detail": "A frida CLI is on PATH but did not print a version, and no frida "
+                                     "library is importable by this interpreter."})
+            return _j({**common, "ok": False, "status": "TOOL_MISSING", "resolved": False,
+                       "required_capability": "frida (host-side; optional)",
+                       "detail": (
+                           "No frida library for this interpreter and no frida CLI on PATH. This does NOT "
+                           "block the harness: its client runs in the isolated guest with its own frida, "
+                           "and host frida is not used. Install the `frida` Python package for THIS "
+                           "interpreter (and `frida-tools` for the CLI) only for host-side work outside "
+                           "the harness. The guest side is not probed here."
+                       )})
+        return _j({
+            **common, "ok": True, "status": "OK",
+            "version": library["version"] or cli["version"],
+            "note": (
+                "OK means a host frida exists and (for the CLI) ran; it does NOT mean the harness can "
+                "trace anything. The harness's frida client is guest-only and does not use this "
+                "install (host_frida_used_by_harness is false), and instrumenting a process is refused "
+                "by the dynamic-lab gate with ISOLATION_REQUIRED outside a verified guest. Whether the "
+                "guest client is present and working is a separate question this call does not answer."
+            ),
+        })
+    except Exception as exc:  # noqa: BLE001 - the contract is a JSON string, never an exception
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "FRIDA_STATUS_UNEXPECTED_ERROR",
+                   "detail": f"{type(exc).__name__}: {exc}"})

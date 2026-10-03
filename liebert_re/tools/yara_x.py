@@ -408,3 +408,70 @@ def yara_x_scan(
         "evidence_access": "Full unmodified `yr scan -o json` output saved; `content` is a bounded, content_offset-pageable JSON excerpt of the normalized findings list.",
         "note": "YARA-X is a deterministic rule-condition matcher, not a probabilistic classifier: every finding here is a real compiled-rule match yr.exe itself evaluated, never a fabricated confidence score.",
     })
+
+
+def yara_x_status():
+    """Whether yr.exe is reachable, where from, whether it actually runs, and its
+    version -- the capability probe to run before reporting YARA-X as unavailable.
+
+    Runs `yr --version` once (scans nothing, takes no rules). Statuses: `OK` (found,
+    ran, version read), `TOOL_MISSING` (nothing resolved; `detail` says which
+    environment variable to set and where it also looked), `TIMEOUT`, and
+    `ANALYSIS_LIMITED` (a file resolved but did not run, or printed no version:
+    "present" is not "working"). `resolved_by` is YARA_X_EXE, YARA_X_HOME, PATH or
+    known_install. `rulesets` lists the named rule packs and whether each is installed.
+    """
+    tool = "yara_x_status"
+    try:
+        exe = _yara_x_binary()
+        if not exe:
+            return _j({
+                "ok": False, "tool": tool, "status": "TOOL_MISSING", "resolved": False,
+                "required_capability": "YARA-X console build (yr.exe)",
+                "detail": (
+                    "yr.exe was not found. Set YARA_X_EXE to its full path (or its folder), or "
+                    "YARA_X_HOME to its install folder, or put it on PATH. The known-install "
+                    f"fallback this module checks is {_KNOWN_INSTALL}. yara_x_scan cannot run until then."
+                ),
+                "env_set": {n: bool(os.getenv(n, "").strip()) for n in ("YARA_X_EXE", "YARA_X_HOME")},
+            })
+
+        def _same(a, b):
+            return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
+
+        resolved_by = "known_install"
+        for name in ("YARA_X_EXE", "YARA_X_HOME"):
+            value = os.getenv(name, "").strip()
+            if value and any(_same(exe, c) for c in (value, Path(value) / "yr.exe")):
+                resolved_by = name
+                break
+        else:
+            on_path = shutil.which("yr") or shutil.which("yr.exe")
+            if on_path and _same(exe, on_path):
+                resolved_by = "PATH"
+        cp = run_bounded_process([exe, "--version"], timeout_seconds=_MIN_TIMEOUT_SECONDS,
+                                 max_output_chars=4096)
+        if cp.timed_out or cp.cancelled:
+            return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "binary": exe,
+                       "resolved_by": resolved_by, "runnable": False, "error": "YARA_X_VERSION_TIMEOUT"})
+        lines = ((cp.stdout or "") + "\n" + (cp.stderr or "")).strip().splitlines()
+        if cp.returncode not in (0, None) or not lines or not lines[0].strip():
+            return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "binary": exe,
+                       "resolved_by": resolved_by, "runnable": False, "error": "YARA_X_VERSION_UNREADABLE",
+                       "exit_code": cp.returncode, "output_tail": ((cp.stdout or "") + (cp.stderr or ""))[-500:],
+                       "detail": "The file resolved but did not print a version when run, so it is not known to work."})
+        return _j({
+            "ok": True, "tool": tool, "status": "OK",
+            "binary": exe, "resolved_by": resolved_by, "runnable": True,
+            "version": lines[0].strip(),
+            "rulesets": known_rulesets(),
+            "operations": ["yara_x_scan", "yara_x_status"],
+            "note": (
+                "OK means yr.exe started and printed its version; it says nothing about any rule "
+                "source. A named ruleset is usable only if its `installed` is true; rules_path and "
+                "rules_text are always caller-supplied."
+            ),
+        })
+    except Exception as exc:  # noqa: BLE001 - the contract is a JSON string, never an exception
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "YARA_X_STATUS_UNEXPECTED_ERROR",
+                   "detail": f"{type(exc).__name__}: {exc}"})

@@ -38,16 +38,16 @@ FAMILIES = {
     "identity": {"file_identity", "generic_static_probe", "route_file", "capability_lookup", "capability_registry_v2", "capability_gap_report", "framework_detect", "specialist_gap_report", "tool_missing", "research_plan", "tool_provision_acquire", "tool_provision_status", "opencode_ask", "opencode_status"},
     "source": {"source_inspect", "semantic_security_analyze", "deep_source_analyze", "attack_surface_map", "project_inspect", "cross_file_graph", "research_graph"},
     "binary": {"binary_summary", "binary_strings", "search_binary_bytes", "hash_file"},
-    "native": {"native_inspect", "native_function_inventory", "native_xref_analyze", "binary_version_diff", "binary_security_analyze", "capa_analyze", "floss_analyze", "patch_preflight", "known_plaintext_scan", "pe_sections", "pe_imports", "pe_exports", "disassemble_pe", "ghidra_query", "ida_query", "ida_microcode_cfg", "ida_type_member_offset", "ida_rename", "ida_set_comments", "ida_annotations", "decompile_coverage_check", "runtime_resolved_api_recover", "resolve_incoming_parameter_source", "stack_string_recover", "upx_unpack", "cfg_deobfuscate", "vb6_inspect", "delphi_inspect", "cpp_rtti_inspect", "vb6_pcode", "analyze_obfuscation", "authenticode_signature", "plist_inspect", "analyze_tls_directory", "binary_patch", "dataflow_recover", "detection_reason_map", "decompiler_status", "die_identify", "die_entropy", "die_file_info", "die_format_check", "die_hashes", "die_structures", "die_struct_raw", "die_database_info", "die_status", "capa_status", "find_import_references", "find_code_references", "setopt_call_arguments", "find_function_by_body_shape", "functional_verification_evaluate", "ghidra_decompile", "ida_disasm_listing", "ida_patch_plan", "ida_status", "pe_resources", "rizin_disasm_listing", "rizin_functions", "rizin_patch_apply", "rizin_patch_plan", "rizin_status", "rz_bin_imports", "rz_bin_sections", "rz_bin_headers", "rz_bin_relocations", "rz_bin_status", "rizin_flirt_match", "rizin_flirt_match_file", "rizin_flirt_inventory", "yara_x_scan", "binary_summary", "binary_strings"},
+    "native": {"native_inspect", "native_function_inventory", "native_xref_analyze", "binary_version_diff", "binary_security_analyze", "capa_analyze", "floss_analyze", "patch_preflight", "known_plaintext_scan", "pe_sections", "pe_imports", "pe_exports", "disassemble_pe", "ghidra_query", "ida_query", "ida_microcode_cfg", "ida_type_member_offset", "ida_rename", "ida_set_comments", "ida_annotations", "decompile_coverage_check", "runtime_resolved_api_recover", "resolve_incoming_parameter_source", "stack_string_recover", "upx_unpack", "cfg_deobfuscate", "vb6_inspect", "delphi_inspect", "cpp_rtti_inspect", "vb6_pcode", "analyze_obfuscation", "authenticode_signature", "plist_inspect", "analyze_tls_directory", "binary_patch", "dataflow_recover", "detection_reason_map", "decompiler_status", "die_identify", "die_entropy", "die_file_info", "die_format_check", "die_hashes", "die_structures", "die_struct_raw", "die_database_info", "die_status", "capa_status", "find_import_references", "find_code_references", "setopt_call_arguments", "find_function_by_body_shape", "functional_verification_evaluate", "ghidra_decompile", "ida_disasm_listing", "ida_patch_plan", "ida_status", "pe_resources", "rizin_disasm_listing", "rizin_functions", "rizin_patch_apply", "rizin_patch_plan", "rizin_status", "rz_bin_imports", "rz_bin_sections", "rz_bin_headers", "rz_bin_relocations", "rz_bin_status", "rizin_flirt_match", "rizin_flirt_match_file", "rizin_flirt_inventory", "yara_x_scan", "yara_x_status", "upx_status", "binary_summary", "binary_strings"},
     "windows-kernel": {"kernel_triage", "kernel_debug_analyze", "kernel_security_analyze", "semantic_security_analyze", "native_inspect", "ghidra_query", "ioctl_control_code_decode", "ioctl_code_recovery", "tool_missing", "kernel_callback_registrations", "detection_reason_map", "driver_major_function_scan", "iat_call_argument_recover", "passive_object_namespace_probe", "rip_relative_iat_scan"},
     "dotnet": {"dotnet_inspect", "dotnet_security_analyze", "dotnet_relationship_analyze", "dotnet_metadata", "decompile_dotnet", "decompiler_status", "dotnet_deobfuscate", "dotnet_il_inspect", "dotnet_metadata_inspect"},
     "archive": {"archive_inspect", "rar_7z"},
-    "android": {"archive_inspect", "framework_detect", "dex_decompiler", "android_resource_analyzer", "tool_missing"},
-    "game-engine": {"framework_detect", "archive_inspect", "native_inspect", "dotnet_inspect", "godot_asset_analyzer", "unity_asset_analyzer", "unreal_asset_analyzer", "dart_aot_recovery", "il2cpp_mapper", "tool_missing"},
+    "android": {"archive_inspect", "framework_detect", "dex_decompiler", "dex_status", "android_resource_analyzer", "tool_missing"},
+    "game-engine": {"framework_detect", "archive_inspect", "native_inspect", "dotnet_inspect", "godot_asset_analyzer", "unity_asset_analyzer", "unreal_asset_analyzer", "dart_aot_recovery", "il2cpp_mapper", "il2cpp_status", "tool_missing"},
     "network": {"har_inspect", "pcap_analyzer", "tool_missing"},
     "database": {"sqlite_inspect", "structured_inspect"},
     "structured": {"structured_inspect", "log_inspect", "log_triage_inspect"},
-    "jvm": {"java_class_inspect", "archive_inspect", "jvm_decompiler", "tool_missing"},
+    "jvm": {"java_class_inspect", "archive_inspect", "jvm_decompiler", "jvm_status", "tool_missing"},
     "webassembly": {"wasm_inspect", "tool_missing"},
     "correlation": {"attack_surface_map", "research_graph", "cross_binary_relationship_analyze", "counter_evidence_verify", "finding_report_generate", "attack_resistance_report", "attack_resistance_assess", "coverage_report", "exploit_validation_plan", "exploit_validation_result_verify", "claim_verify", "decompiler_fabrication_audit", "decompiler_trust_audit", "deep_security_verify", "evidence_graph_inspect", "evidence_ledger_v2", "red_finding_validate", "functional_verification_evaluate"},
     "debug": {"minidump_structural_analyze", "minidump_analyzer", "msf_pdb_inspect", "pdb_symbols", "crash_symbolize", "tool_missing", "windbg_dump_analyze", "windbg_run_commands", "windbg_symbol_status"},
@@ -65,7 +65,7 @@ FAMILIES = {
     # no such tool is
     # ever auto-invoked by file routing -- they only ever reach the model via
     # this keyword/state-driven family, never via artifact classification.
-    "dynamic": {"pe_sieve_scan", "pe_sieve_status", "dynamic_owned_process_scan", "dynamic_owned_process_diff_scan", "isolated_dynamic_validate", "tool_missing",
+    "dynamic": {"pe_sieve_scan", "pe_sieve_status", "frida_status", "dynamic_owned_process_scan", "dynamic_owned_process_diff_scan", "isolated_dynamic_validate", "tool_missing",
                 "api_catalog", "apimonitor_status", "differential_execution_validate", "dynamic_lab_gate", "dynamic_lab_register_owned_process",
                 "environment_contamination_check", "guest_analyze_static", "guest_checkpoint_create",
                 "guest_checkpoint_delete", "guest_checkpoint_list", "guest_checkpoint_restore",
@@ -226,6 +226,7 @@ NATIVE_NOT_FILE_ROUTABLE = tuple(sorted({
     "rz_bin_status",  # backend health, zero args
     "rizin_flirt_inventory",  # lists the sigdb, zero args
     "capa_status",  # backend health + which backends capa accepts, zero args
+    "yara_x_status", "upx_status",  # backend health, zero args
 }))
 NATIVE_PATH_ONLY_TOOLS = tuple(sorted(_NATIVE_PATH_ONLY_TOOL_NAMES))
 NATIVE_COORDINATE_TOOLS = tuple(sorted(
