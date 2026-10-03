@@ -297,6 +297,20 @@ def api_catalog(module_filter=None, category=None, max_files=_MAX_CATALOG_FILES)
     })
 
 
+_WORKING_OPERATIONS = ["apimonitor_status", "api_catalog"]
+
+
+def _working_operations_note():
+    return {
+        "working_operations": list(_WORKING_OPERATIONS),
+        "working_operations_note": (
+            "The tool is not useless: apimonitor_status (install and version check) and "
+            "api_catalog (which APIs/modules the install can hook, read from its own XML "
+            "definitions) both work and run nothing."
+        ),
+    }
+
+
 def parse_trace(*_args, **_kwargs):
     """Always refuses. API Monitor v2's .apmx64/.apmx32 trace-file format is
     proprietary and undocumented by rohitab.com; this install ships no
@@ -319,6 +333,21 @@ def parse_trace(*_args, **_kwargs):
             "for once a real sample is available. This function does not fabricate a binary-format "
             "parser without verified ground truth."
         ),
+        "reason": (
+            "The native trace format (.apmx64/.apmx32) is binary, proprietary and undocumented, "
+            "and no verifiable sample or schema was found on this machine."
+        ),
+        "restriction": "FIXABLE",
+        "permanent": False,
+        "retry_same_call": False,
+        "unlocks_when": (
+            "Either a trace exported as text from the tool's own export function, or a format "
+            "definition, is supplied. Formats that could be considered once a real sample "
+            "exists: XML or CSV from the GUI's File > Export. None of them is supported today; "
+            "this list is not a claim of support."
+        ),
+        "accepted_formats_today": [],
+        **_working_operations_note(),
         "execution_performed": False,
     })
 
@@ -349,5 +378,17 @@ def live_trace(*_args, **_kwargs):
             "Monitor is added later, it must reuse the same isolated_context_confirmed + operator-env "
             "double-gate those two modules use."
         ),
+        "reason": (
+            "API Monitor offers no command-line or automation surface to start a capture, and "
+            "live instrumentation of a process sits behind the dynamic-lab isolation gate."
+        ),
+        "restriction": "PERMANENT",
+        "permanent": True,
+        "retry_same_call": False,
+        "unlocks_when": (
+            "Nothing in this tool unlocks it; retrying with other arguments will not help. "
+            "Use the scriptable alternatives named in remediation, behind the isolation gate."
+        ),
+        **_working_operations_note(),
         "execution_performed": False,
     })

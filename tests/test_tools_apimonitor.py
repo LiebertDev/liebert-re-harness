@@ -119,6 +119,35 @@ class ApiMonitorUnsupportedOperationTests(unittest.TestCase):
         self.assertFalse(data["execution_performed"])
         mocked_run.assert_not_called()
 
+    @pytest.mark.contract
+    def test_parse_trace_refusal_is_fixable_and_teaches(self):
+        data = json.loads(am.parse_trace())
+        self.assertEqual(data["status"], "NOT_SUPPORTED")
+        self.assertEqual(data["restriction"], "FIXABLE")
+        self.assertFalse(data["permanent"])
+        self.assertFalse(data["retry_same_call"])
+        self.assertIn("binary", data["reason"])
+        self.assertIn("export", data["unlocks_when"])
+        self.assertEqual(data["accepted_formats_today"], [])
+        self.assertEqual(data["working_operations"], ["apimonitor_status", "api_catalog"])
+
+    @pytest.mark.contract
+    def test_live_trace_refusal_is_permanent_and_teaches(self):
+        data = json.loads(am.live_trace())
+        self.assertEqual(data["status"], "NOT_SUPPORTED")
+        self.assertEqual(data["restriction"], "PERMANENT")
+        self.assertTrue(data["permanent"])
+        self.assertFalse(data["retry_same_call"])
+        self.assertIn("isolation gate", data["reason"])
+        self.assertIn("retrying", data["unlocks_when"])
+        self.assertEqual(data["working_operations"], ["apimonitor_status", "api_catalog"])
+
+    @pytest.mark.contract
+    def test_the_two_refusals_differ_on_permanence(self):
+        a = json.loads(am.parse_trace())
+        b = json.loads(am.live_trace())
+        self.assertNotEqual(a["restriction"], b["restriction"])
+
 
 class ApiCatalogParsingTests(unittest.TestCase):
     """Real parse of API Monitor's own XML definition schema against a
