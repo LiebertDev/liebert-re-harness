@@ -791,6 +791,18 @@ class BudgetTests(AnnotateCase):
         with mock.patch.object(ti.os, "stat", side_effect=OSError("denied")):
             self.assertIsNone(ti._annotated_total_bytes())
 
+    def test_a_root_that_exists_but_cannot_be_looked_at_is_unknown_not_zero(self):
+        # os.path.isdir() answers False on any OSError, so this used to read 0 (POSIX isdir goes
+        # through os.stat); the mocked stat makes that visible on every platform.
+        self.annotated.mkdir(parents=True)
+        (self.annotated / "f").write_bytes(b"x" * 10)
+        with mock.patch.object(ti.os, "stat", side_effect=PermissionError("denied")),                 mock.patch.object(ti.os.path, "isdir", side_effect=lambda p: False):
+            self.assertIsNone(ti._annotated_total_bytes())
+
+    def test_an_absent_root_is_zero(self):
+        self.assertFalse(self.annotated.exists())
+        self.assertEqual(ti._annotated_total_bytes(), 0)
+
     def test_the_budget_counts_what_is_held_and_has_its_own_default(self):
         self.assertEqual(ti._ANNOTATED_BUDGET_DEFAULT, 2 * 1024 ** 3)
         self.write()
@@ -1509,6 +1521,7 @@ class AnnotateRealInstallTests(unittest.TestCase):
         stored = ti._version_file(ti._label_dir(self.sha, "first-pass"), 1)
         before = {p.relative_to(self.annotated).as_posix(): ti._file_sha256(p)[0] for p in self.annotated.rglob("*")
                   if p.is_file() and not p.name.endswith(".lock")}
+        self.assertTrue(list(self.cache.glob("*.p0v1.*/db.i64")), "precondition: a pristine slot exists before the eviction")
         with mock.patch.dict(os.environ, {"LIEBERT_IDA_CACHE_BYTES": "1"}), mock.patch.object(ti, "_EVICT_SKIP_RECENT_SECONDS", 0):
             ti._enforce_cache_budget(None)                      # the cache evicts every slot it may
         self.assertEqual(list(self.cache.glob("*.p0v1.*")), [], "the pristine slot WAS evicted")

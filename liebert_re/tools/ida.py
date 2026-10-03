@@ -1980,8 +1980,17 @@ def _annotated_total_bytes():
     """Bytes under the annotated root, or None when that cannot be measured (an unreadable entry is
     not skipped: a budget decision over a partial count would be a guess)."""
     root = _annotated_root()
-    if not os.path.isdir(root):
+    # os.path.isdir() folds every OSError into False, so an existing root that cannot be stat'ed
+    # (permissions, I/O error) would read as "no root, zero bytes". Only a root that is really
+    # absent is zero; any other failure to look at it is "cannot be measured".
+    try:
+        os.stat(root)
+    except FileNotFoundError:
         return 0
+    except OSError:
+        return None
+    if not os.path.isdir(root):
+        return None
     total = 0
     problems = []
     for directory, _dirs, files in os.walk(root, onerror=problems.append):
