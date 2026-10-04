@@ -168,14 +168,28 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
   one manifest pointer and journals `batch_committed`. Annotated data lives in its own root
   (`dataset/ida_annotated/`, never inside the cache, never evicted; byte ceiling `LIEBERT_IDA_ANNOTATED_BYTES`,
   default 2 GiB) with its own locks. A candidate whose promotion failed is kept. Atomic is the default;
-  `allow_partial=True` is an explicit choice. Comments are not written yet.
+  `allow_partial=True` is an explicit choice.
+- Comments use the same two steps: `ida_set_comments_plan` plans, `ida_annotations_apply` applies. Accepted
+  comment kinds are `regular` and `repeatable` only; a decompiler comment is not supported and is refused with
+  `UNSUPPORTED_COMMENT_KIND`. Limits:
+  (a) Comment text is free operator text. The journal and the evidence file carry only its sha256 and length,
+  never the text. The work files in the recovery directory do carry the full text and are removed when the
+  apply returns; if removal fails, `signals.text_scrub_failures` reports it.
+  (b) Verification after promotion runs in a separate process. If it fails, the version stays promoted but
+  unpublished in the manifest. This `unverified` state is by design, not a defect; it is cleared as a purge
+  target (`unverified-state`), and purge is currently the only way out of it.
+  (c) The `regular`/`repeatable` mapping has been tested only against a stand-in for IDA; no test has run it
+  against a real IDA. This is a limit, not a verified fact.
+- Evidence directory naming: the comment plan's evidence is written to `dataset/evidence/ida_rename_plan/`
+  (the constant is reused, so the directory name is misleading for comments). The file name ends in
+  `_comment_plan.json` and its content carries `plan.kind="comments"`; read that, not the directory name.
 - `ida_annotations_purge`: the only deletion of annotated data. Called without a confirmation it deletes nothing
   and reports what the scope holds and what the named targets would free; the report carries a token bound to
   the input hash, label, the exact targets and their measured state, and a changed scope is
   `STALE_CONFIRMATION`. Targets are exact names (versions, kept candidates, leftover work directories, and
   `unverified-state`, which clears an unverified scope and says it did); there is no wildcard and no "all".
   It reaches only the annotated root and journals every deletion.
-- Not here: comments, disassembly listing, and any
+- Not here: disassembly listing, decompiler comments, and any
   Ghidra wrapper.
 
 ### External-engine wrappers actually present
@@ -239,7 +253,8 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
 - `report/tool_families.py` names a `windows-kernel` family of 15 tools. Only the
   generic `tool_missing` sentinel is defined in this package; the other 14 are
   names of upstream tools that are not here. The family routes and then has
-  nothing to dispatch.
+  nothing to dispatch. The other names are a roadmap, not capability: this package cannot analyse a kernel
+  driver.
 - No module parses a driver's dispatch table, callback registrations, device or
   control-code definitions, or any other kernel-specific structure. A
   kernel-mode PE is handled as an ordinary PE: headers, imports, strings,
