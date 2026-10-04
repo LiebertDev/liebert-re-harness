@@ -438,8 +438,15 @@ def _run(job):
             result["database_changes_discarded"] = discarded
     except Exception:  # noqa: BLE001
         discarded = result.get("database_changes_discarded")
+        trace = traceback.format_exc()
+        # the engine may quote a comment in its message and result.json lands on disk: take every
+        # comment text of the job out of the trace, longest first, leaving only its length
+        texts = sorted({str(i["comment"]) for i in (job.get("items") or []) if isinstance(i, dict) and i.get("comment")},
+                       key=len, reverse=True)
+        for text in texts:
+            trace = trace.replace(text, "<comment:%d chars>" % len(text))
         result = {"ok": False, "tool": "ida_annotations", "operation": operation,
-                  "error": "IDAPYTHON_SCRIPT_EXCEPTION", "traceback": traceback.format_exc()}
+                  "error": "IDAPYTHON_SCRIPT_EXCEPTION", "traceback": trace}
         if discarded is not None:
             result["database_changes_discarded"] = discarded
     result["engine_pid"] = os.getpid()   # lets the wrapper show that the read-back ran in another process

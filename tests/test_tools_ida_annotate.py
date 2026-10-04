@@ -1789,6 +1789,24 @@ class WorkerLogicTests(unittest.TestCase):
         self.assertEqual(self.run_op("comment_apply", "verify", [self.comment_item()], marker={})["error"],
                          "OPERATION_MODE_MISMATCH")
 
+    @pytest.mark.contract
+    def test_a_worker_exception_message_never_puts_the_comment_text_in_result_json(self):
+        quoted_text = "quoted-comment-text-0451"
+        idc = self.ida["idc"]
+        idc.get_cmt.side_effect = lambda ea, rpt: None
+        idc.set_cmt.side_effect = RuntimeError("engine refused: " + quoted_text)   # worst case: the message quotes the text
+        out = Path(process_scratch("an_worker_exc")) / "out.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(shutil.rmtree, out.parent, ignore_errors=True)
+        job = out.parent / "job.json"
+        job.write_text(json.dumps({"output": str(out), "operation": "comment_apply", "write_mode": "write", "marker": {},
+                                   "items": [dict(self.comment_item(comment=quoted_text), expect_comment=None)]}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {self.w.JOB_ENV: str(job)}):
+            self.assertEqual(self.w.main(), 0)
+        on_disk = out.read_text(encoding="utf-8")
+        self.assertEqual(json.loads(on_disk)["error"], "IDAPYTHON_SCRIPT_EXCEPTION")
+        self.assertNotIn(quoted_text, on_disk)
+
     def test_the_result_carries_the_engine_pid_and_the_completion_marker_last(self):
         out = Path(process_scratch("an_worker")) / "out.json"
         out.parent.mkdir(parents=True, exist_ok=True)
