@@ -155,7 +155,15 @@ def test_published_tool_name_set_is_unchanged():
     # _purge_remove, _recover_pending, _refuse, _remove_owned_work, _replace_file, _roots_apart,
     # _sha256_text, _tree_bytes, _utc_now, _valid_label, _version_file. The new annotate_write.idapy
     # is a data file, not a module: the CI module count stays 70.
+    #
+    # IDA comment plan slice: 706 -> 707, one top-level name added, none removed:
+    # ida_set_comments_plan (public, liebert_re/tools/ida.py; plan only, nothing persists, apply is a
+    # later slice). In tool_families.FAMILIES["native"] the never-implemented name ida_set_comments was
+    # replaced by ida_set_comments_plan (a manifest string, not a def, so it does not change the count
+    # by itself). The new nested helper `digest` is not top-level. Worker annotate_write.idapy gained
+    # a comment_plan operation (data file): the CI module count stays 70. Digest recomputed from the
+    # source with sha256(repr(sorted(tool_families._locally_defined_tool_names())).encode()).
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "bf6a72f8973ddb1bcbb94b766c8a448f88587d67db8e7aa4ae1682926be27bec"
+    assert digest == "440a45bbf40ac3977c9ec280f2c46ddf36f5b1257a926c6e6942bcdf10c7259f"

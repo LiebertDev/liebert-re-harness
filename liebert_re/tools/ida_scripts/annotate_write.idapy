@@ -9,9 +9,11 @@ on a published annotation version:
 
     idat -A -Opdb:off -Lida.log -Sliebert_ida_job.py db.i64
 
-The job comes from the JSON file named in ``LIEBERT_IDA_JOB``. Three operations, three modes:
+The job comes from the JSON file named in ``LIEBERT_IDA_JOB``. Four operations, three modes:
 
 * ``rename_plan``   mode ``plan``    (temporary session): read each address's current name.
+* ``comment_plan``  mode ``plan``    (temporary session): read each address's current comment of the
+                                     requested kind (``null`` when there is none). Read-only.
 * ``rename_verify`` mode ``verify``  (temporary session, a NEW process after the write): read the
                                      names and the annotation marker back from the stored database.
 * ``rename_apply``  mode ``write``   (an ordinary session on a scratch copy): set the names, store the
@@ -41,13 +43,15 @@ import idaapi
 import idc
 
 JOB_ENV = "LIEBERT_IDA_JOB"
-OPERATIONS = ("rename_plan", "rename_verify", "rename_apply")
-MODES = {"rename_plan": "plan", "rename_verify": "verify", "rename_apply": "write"}
+OPERATIONS = ("rename_plan", "rename_verify", "rename_apply", "comment_plan")
+MODES = {"rename_plan": "plan", "rename_verify": "verify", "rename_apply": "write", "comment_plan": "plan"}
 MARKER_NODE = "$ liebert.annotation"
 MARKER_SCHEMA = 1
 ADDRESS_KINDS = ("va", "rva", "file_offset")
 _MAX_ITEMS = 200
 _NAME_MAX = 255
+COMMENT_KINDS = ("regular", "repeatable")
+_COMMENT_MAX = 1024
 
 
 class _WorkerError(Exception):
@@ -217,6 +221,38 @@ def _op_rename_plan(result, job):
     result["annotation_marker"] = _read_marker()
 
 
+def _op_comment_plan(result, job):
+    """Read-only: the existing comment of each item (``expect_comment``). No write call is made here and
+    the comment text of the job is never echoed into the result."""
+    _mark_temporary()
+    result["database_changes_discarded"] = True
+    ida_auto.auto_wait()
+    rows = []
+    for index, item in enumerate(_items(job)):
+        try:
+            ea = _resolve_ea(item.get("address"), item.get("address_kind"))
+        except _WorkerError as exc:
+            raise _WorkerError("PLAN_ITEM_REFUSED", item_index=index, item_error=exc.error, **exc.extra) from None
+        kind = item.get("comment_kind")
+        if kind not in COMMENT_KINDS:
+            raise _WorkerError("PLAN_ITEM_REFUSED", item_index=index, item_error="UNSUPPORTED_COMMENT_KIND",
+                               accepted=list(COMMENT_KINDS))
+        text = item.get("comment")
+        if not isinstance(text, str) or not text.strip() or len(text) > _COMMENT_MAX:
+            raise _WorkerError("PLAN_ITEM_REFUSED", item_index=index, item_error="INVALID_COMMENT")
+        head = idc.get_item_head(ea)
+        if head != ea:
+            raise _WorkerError("PLAN_ITEM_REFUSED", item_index=index, item_error="ADDRESS_NOT_AN_ITEM_START",
+                               given=hex(ea), item_start=hex(head))
+        current = idc.get_cmt(ea, 1 if kind == "repeatable" else 0)
+        current = current if isinstance(current, str) and current else None      # absent is None, never ""
+        if current == text:
+            raise _WorkerError("PLAN_ITEM_REFUSED", item_index=index, item_error="COMMENT_UNCHANGED")
+        rows.append({"index": index, "address": _address_form(ea), "comment_kind": kind, "expect_comment": current})
+    result["plan_items"] = rows
+    result["annotation_marker"] = _read_marker()
+
+
 def _op_rename_verify(result, job):
     _mark_temporary()
     result["database_changes_discarded"] = True
@@ -283,7 +319,7 @@ def _op_rename_apply(result, job):
         result.update({"ok": False, "error": "SAVE_NOT_CONFIRMED"})
 
 
-_DISPATCH = {"rename_plan": _op_rename_plan, "rename_verify": _op_rename_verify, "rename_apply": _op_rename_apply}
+_DISPATCH = {"rename_plan": _op_rename_plan, "comment_plan": _op_comment_plan, "rename_verify": _op_rename_verify, "rename_apply": _op_rename_apply}
 
 
 def _run(job):

@@ -72,6 +72,7 @@ class AnnotateFakeIdat:
         self.timeout_on = None
         self.pid = 4000
         self.pristine = {START: "start"}
+        self.comments = {}      # (address, comment_kind) -> text the database holds
 
     def state(self, db):
         try:
@@ -97,7 +98,7 @@ class AnnotateFakeIdat:
             db.write_bytes(b"IDA-DB" * 100)
             body = _result("summary", self.sha256, self.md5, **SUMMARY)
         else:
-            body = self.rename(job, db) if operation.startswith("rename_") else _result(
+            body = self.rename(job, db) if operation.startswith("rename_") or operation == "comment_plan" else _result(
                 operation, self.sha256, self.md5, **SUMMARY)
             body.setdefault("engine_input_sha256", self.sha256)
             body.setdefault("engine_input_md5", self.md5)
@@ -112,7 +113,15 @@ class AnnotateFakeIdat:
         state = self.state(db) or {"names": {}, "marker": None}
         names = state["names"]
         items = job["items"]
-        if job["operation"] == "rename_plan":
+        if job["operation"] == "comment_plan":
+            body["database_changes_discarded"] = True
+            body["plan_items"] = [{"index": i, "address": {"va": it["address"], "rva": "0x1000", "file_offset": "0x200",
+                                                           "image_base": "0x140000000", "section": ".text"},
+                                   "comment_kind": it["comment_kind"],
+                                   "expect_comment": self.comments.get((it["address"], it["comment_kind"]))}
+                                  for i, it in enumerate(items)]
+            body["annotation_marker"] = state["marker"]
+        elif job["operation"] == "rename_plan":
             body["database_changes_discarded"] = True
             body["plan_items"] = [{"index": i, "address": {"va": it["address"], "rva": "0x1000", "file_offset": "0x200",
                                                            "image_base": "0x140000000", "section": ".text"},
@@ -950,6 +959,202 @@ class CacheSeparationTests(AnnotateCase):
 
 
 # ---------------------------------------------------------------------------
+# the comment plan: ida_set_comments_plan (plan only; apply is a later slice)
+# ---------------------------------------------------------------------------
+SECRET_TEXT = "ZZ_comment_text_must_not_reach_a_log"
+
+
+class CommentPlanTests(AnnotateCase):
+    def cplan(self, comments=None, label="first-pass", **kwargs):
+        comments = comments if comments is not None else [
+            {"address": START, "comment": SECRET_TEXT, "comment_kind": "regular"}]
+        return json.loads(ti.ida_set_comments_plan(str(self.sample), label, comments, **kwargs))
+
+    @pytest.mark.contract
+    def test_the_answer_has_exactly_the_keys_of_the_rename_plan(self):
+        out = self.cplan()
+        rename = self.plan()
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(set(out), set(rename))
+        self.assertEqual(set(out["plan"]), set(rename["plan"]))
+        self.assertEqual((out["plan"]["kind"], out["plan"]["schema"], out["plan"]["base_version"]), ("comments", 1, 0))
+        self.assertEqual(out["plan"]["items"], [{"index": 0, "address": START, "address_kind": "va",
+                                                 "comment": SECRET_TEXT, "comment_kind": "regular",
+                                                 "expect_comment": None}])
+        self.assertIs(out["items_listed_complete"], True)
+
+    @pytest.mark.contract
+    def test_signature_mirrors_the_rename_plan(self):
+        import inspect
+        mine = inspect.signature(ti.ida_set_comments_plan).parameters
+        theirs = inspect.signature(ti.ida_rename_plan).parameters
+        self.assertEqual(list(mine), ["path", "label", "comments", "timeout_seconds", "cancellation_token"])
+        for name in ("label", "timeout_seconds", "cancellation_token"):
+            self.assertEqual(mine[name].default, theirs[name].default)
+        self.assertIn("ida_set_comments_plan", tool_families.published_tools("native"))
+        self.assertNotIn("ida_set_comments", tool_families.published_tools("native"))
+
+    @pytest.mark.contract
+    def test_a_bad_item_names_the_item_and_what_is_accepted(self):
+        cases = [
+            ([], "COMMENTS_REQUIRED"),
+            (["nope"], "COMMENT_ITEM_NOT_AN_OBJECT"),
+            ([{"address": START, "comment": "x", "comment_kind": "regular", "new_name": "n"}], "COMMENT_ITEM_UNKNOWN_FIELD"),
+            ([{"comment": "x", "comment_kind": "regular"}], "COMMENT_ITEM_ADDRESS_INVALID"),
+            ([{"address": True, "comment": "x", "comment_kind": "regular"}], "COMMENT_ITEM_ADDRESS_INVALID"),
+            ([{"address": "zz", "comment": "x", "comment_kind": "regular"}], "COMMENT_ITEM_ADDRESS_INVALID"),
+            ([{"address": START, "comment": 5, "comment_kind": "regular"}], "COMMENT_ITEM_COMMENT_INVALID"),
+            ([{"address": START, "comment": "a\x00b", "comment_kind": "regular"}], "COMMENT_ITEM_COMMENT_INVALID"),
+            ([{"address": START, "comment": "x", "comment_kind": "regular", "address_kind": "ea"}], "INVALID_ADDRESS_KIND"),
+        ]
+        for comments, error in cases:
+            with self.subTest(error=error, comments=str(comments)[:40]):
+                out = self.cplan(comments)
+                self.assertEqual((out["ok"], out["error"], out["fixable"]), (False, error, True))
+                self.assertIn("accepted", out)
+        none = json.loads(ti.ida_set_comments_plan(str(self.sample), "first-pass", None))
+        self.assertEqual((none["error"], none["fixable"]), ("COMMENTS_REQUIRED", True))
+        self.assertEqual(self.fake.calls, [], "a refusal before the engine starts no session")
+
+    @pytest.mark.contract
+    def test_the_label_rule_is_the_rename_plans(self):
+        for label in (None, "", "has space", "x" * 49):
+            with self.subTest(label=label):
+                out = self.cplan(label=label)
+                self.assertEqual((out["ok"], out["error"], out["fixable"], out["field"]), (False, "LABEL_REQUIRED", True, "label"))
+        self.assertEqual(self.fake.calls, [])
+
+    @pytest.mark.contract
+    def test_the_item_ceiling_is_refused_not_cut(self):
+        many = [{"address": hex(0x140001000 + i), "comment": "c", "comment_kind": "regular"} for i in range(201)]
+        out = self.cplan(many)
+        self.assertEqual((out["ok"], out["error"], out["fixable"]), (False, "COMMENTS_REQUIRED", True))
+        ok = self.cplan(many[:200])
+        self.assertEqual((ok["ok"], ok["item_count"], len(ok["plan"]["items"])), (True, 200, 200))
+
+    @pytest.mark.contract
+    def test_an_empty_or_too_long_comment_is_refused(self):
+        for text, error in (("", "COMMENT_ITEM_COMMENT_EMPTY"), ("   \n", "COMMENT_ITEM_COMMENT_EMPTY"),
+                            ("x" * (ti._COMMENT_MAX_CHARS + 1), "COMMENT_ITEM_COMMENT_TOO_LONG")):
+            with self.subTest(error=error, length=len(text)):
+                out = self.cplan([{"address": START, "comment": text, "comment_kind": "regular"}])
+                self.assertEqual((out["ok"], out["error"], out["item_index"]), (False, error, 0))
+                self.assertNotIn("xxxxxxxx", json.dumps(out), "a refusal never echoes the text")
+        edge = self.cplan([{"address": START, "comment": "x" * ti._COMMENT_MAX_CHARS, "comment_kind": "regular"}])
+        self.assertTrue(edge["ok"], edge)
+
+    @pytest.mark.contract
+    def test_a_duplicate_address_is_refused(self):
+        two = [{"address": START, "comment": "a", "comment_kind": "regular"},
+               {"address": 0x140001000, "comment": "b", "comment_kind": "repeatable"}]
+        out = self.cplan(two)
+        self.assertEqual((out["ok"], out["error"], out["item_index"]), (False, "DUPLICATE_ADDRESS", 1))
+
+    @pytest.mark.contract
+    def test_only_regular_and_repeatable_are_accepted_and_nothing_is_defaulted(self):
+        for kind in ("decompiler", "pseudocode", "anterior", "", None, 1, "Regular"):
+            with self.subTest(kind=kind):
+                out = self.cplan([{"address": START, "comment": "x", "comment_kind": kind}])
+                self.assertEqual((out["ok"], out["error"], out["fixable"], out["accepted"]),
+                                 (False, "UNSUPPORTED_COMMENT_KIND", True, ["regular", "repeatable"]))
+        missing = self.cplan([{"address": START, "comment": "x"}])
+        self.assertEqual(missing["error"], "UNSUPPORTED_COMMENT_KIND", "the kind is required, never defaulted")
+        self.assertEqual(self.fake.calls, [], "an unsupported kind never reaches the engine")
+        for kind in ("regular", "repeatable"):
+            self.assertTrue(self.cplan([{"address": START, "comment": "x", "comment_kind": kind}])["ok"])
+
+    @pytest.mark.contract
+    def test_text_that_redaction_would_change_is_refused_not_altered(self):
+        out = self.cplan([{"address": START, "comment": "see C:\\Users\\someone\\file", "comment_kind": "regular"}])
+        self.assertEqual((out["ok"], out["error"], out["fixable"]), (False, "COMMENT_TEXT_NEEDS_REDACTION", True))
+        self.assertNotIn("someone", json.dumps(out))
+
+    @pytest.mark.contract
+    def test_the_plan_digest_is_stable_and_binds_the_comment(self):
+        a = self.cplan()
+        b = self.cplan()
+        self.assertEqual(a["plan_sha256"], b["plan_sha256"])
+        self.assertEqual(a["plan_sha256"], ti._sha256_text(ti._canonical(a["plan"])))
+        changed = self.cplan([{"address": START, "comment": SECRET_TEXT + "!", "comment_kind": "regular"}])
+        self.assertNotEqual(a["plan_sha256"], changed["plan_sha256"])
+        other_kind = self.cplan([{"address": START, "comment": SECRET_TEXT, "comment_kind": "repeatable"}])
+        self.assertNotEqual(a["plan_sha256"], other_kind["plan_sha256"])
+        self.assertNotEqual(a["plan_sha256"], self.plan()["plan_sha256"])
+
+    @pytest.mark.contract
+    def test_the_existing_comment_of_that_kind_is_read_as_the_expectation(self):
+        self.fake.comments[(START, "regular")] = "old note"
+        regular = self.cplan([{"address": START, "comment": "new note", "comment_kind": "regular"}])
+        repeatable = self.cplan([{"address": START, "comment": "new note", "comment_kind": "repeatable"}])
+        self.assertEqual(regular["plan"]["items"][0]["expect_comment"], "old note")
+        self.assertIsNone(repeatable["plan"]["items"][0]["expect_comment"], "absent stays None, not an empty string")
+        job = self.fake.calls[-1]["job"]
+        self.assertEqual((job["operation"], job["mode"], job["write_mode"]), ("comment_plan", "reopen", "plan"))
+
+    @pytest.mark.contract
+    def test_the_plan_reads_the_published_version_like_the_rename_plan(self):
+        self.write()
+        again = self.cplan()
+        self.assertEqual(again["plan"]["base_version"], 1)
+        self.assertEqual(again["annotated_view"]["read_from"], "published annotation version")
+        self.assertEqual(again["plan"]["base_db_sha256"], self.manifest()["db_sha256"])
+
+    @pytest.mark.contract
+    def test_comment_text_is_not_written_to_any_log_only_hash_and_length(self):
+        out = self.cplan()
+        self.assertTrue(out["ok"], out)
+        text_hash = ti._sha256_text(SECRET_TEXT)
+        detail = out["items_detail"][0]
+        self.assertEqual((detail["comment_sha256"], detail["comment_length"]), (text_hash, len(SECRET_TEXT)))
+        self.assertNotIn(SECRET_TEXT, json.dumps(out["items_detail"]))
+        evidence = list(self.ev.glob("*_comment_plan.json"))
+        self.assertEqual(len(evidence), 1)
+        raw = evidence[0].read_text(encoding="utf-8")
+        self.assertNotIn(SECRET_TEXT, raw)
+        self.assertIn(text_hash, raw)
+        self.assertIn(str(len(SECRET_TEXT)), raw)
+        self.assertEqual(out["internal_evidence_name"], evidence[0].name)
+        # the audit journal is not touched by a plan, and no log-like file under any root holds the text
+        self.assertEqual(ti._journal_records(self.sha)[0], [])
+        for root in (self.annotated, self.ev, self.cache):
+            if not Path(root).exists():
+                continue
+            for f in Path(root).rglob("*"):
+                if f.is_file() and f.suffix in (".json", ".jsonl", ".log"):
+                    self.assertNotIn(SECRET_TEXT, f.read_text(encoding="utf-8", errors="ignore"), f.name)
+
+    @pytest.mark.contract
+    def test_nothing_is_published_by_a_plan(self):
+        before = self.snapshot() if self.annotated.exists() else {}
+        self.assertTrue(self.cplan()["ok"])
+        self.assertEqual(self.snapshot() if self.annotated.exists() else {}, before)
+
+    @pytest.mark.contract
+    def test_the_comment_plan_is_not_accepted_by_apply_yet(self):
+        plan = self.cplan()
+        out = self.apply(self.sealed(plan))
+        self.assertEqual((out["ok"], out["status"], out["error"]), (False, "INVALID_PLAN", "PLAN_SCHEMA_UNSUPPORTED"))
+
+    @pytest.mark.contract
+    def test_plan_problem_checks_each_kind_with_its_own_field_set(self):
+        plan = self.cplan()["plan"]
+        sealed = dict(plan, plan_sha256="0" * 64)
+        self.assertEqual(ti._plan_problem(sealed, ("rename", "comments")), (None, None))
+        self.assertEqual(ti._plan_problem(sealed)[0], "PLAN_SCHEMA_UNSUPPORTED")
+        for mutate in (lambda i: i.pop("expect_comment"), lambda i: i.update(new_name="x"),
+                       lambda i: i.update(comment_kind="decompiler"), lambda i: i.update(comment=""),
+                       lambda i: i.update(expect_comment=5)):
+            broken = json.loads(json.dumps(sealed))
+            mutate(broken["items"][0])
+            self.assertEqual(ti._plan_problem(broken, ("rename", "comments")), ("PLAN_ITEM_MALFORMED", "items"))
+        rename = dict(self.plan()["plan"], plan_sha256="0" * 64)
+        self.assertEqual(ti._plan_problem(rename), (None, None))
+        self.assertEqual(ti._plan_problem(rename, ("rename", "comments")), (None, None))
+        rename["items"][0]["comment"] = "x"
+        self.assertEqual(ti._plan_problem(rename)[0], "PLAN_ITEM_MALFORMED")
+
+
+# ---------------------------------------------------------------------------
 # the write worker as a file
 # ---------------------------------------------------------------------------
 def _load_worker():
@@ -1120,6 +1325,43 @@ class WorkerLogicTests(unittest.TestCase):
         self.ida["idc"].get_item_head.side_effect = lambda ea: ea - 1
         result = self.run_op("rename_plan", "plan", [self.item(new="y")])
         self.assertEqual(result["item_error"], "ADDRESS_NOT_AN_ITEM_START")
+
+    def comment_item(self, address="0x140001000", comment="note", kind="regular"):
+        return {"address": address, "address_kind": "va", "comment_kind": kind, "comment": comment}
+
+    def test_comment_plan_reads_the_existing_comment_of_the_kind_and_never_writes(self):
+        idc = self.ida["idc"]
+        idc.get_cmt.side_effect = lambda ea, rpt: {(0x140001000, 0): "old", (0x140001004, 1): ""}.get((ea, rpt))
+        self.ida["ida_loader"].set_database_flag.reset_mock()
+        result = self.run_op("comment_plan", "plan", [self.comment_item(), self.comment_item("0x140001004", "n", "repeatable"),
+                                                      self.comment_item("0x140001008", "n", "regular")])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual([(r["comment_kind"], r["expect_comment"]) for r in result["plan_items"]],
+                         [("regular", "old"), ("repeatable", None), ("regular", None)])
+        self.assertIs(result["database_changes_discarded"], True)
+        self.ida["ida_loader"].set_database_flag.assert_called_once_with(4)
+        idc.set_cmt.assert_not_called()
+        idc.set_name.assert_not_called()
+        self.ida["ida_loader"].save_database.assert_not_called()
+        self.assertNotIn("note", json.dumps(result), "the job's comment text is not echoed")
+
+    def test_comment_plan_refuses_by_item_and_says_which(self):
+        self.ida["idc"].get_cmt.side_effect = lambda ea, rpt: "same"
+        cases = [(self.comment_item(comment="same"), "COMMENT_UNCHANGED"), (self.comment_item(address="zz"), "INVALID_ADDRESS"),
+                 (self.comment_item(kind="decompiler"), "UNSUPPORTED_COMMENT_KIND"), (self.comment_item(comment=""), "INVALID_COMMENT")]
+        for item, error in cases:
+            with self.subTest(error):
+                result = self.run_op("comment_plan", "plan", [item])
+                self.assertEqual((result["ok"], result["error"], result["item_error"], result["item_index"]),
+                                 (False, "PLAN_ITEM_REFUSED", error, 0))
+                self.assertNotIn("same", json.dumps(result))
+        self.assertEqual(self.run_op("comment_plan", "write", [self.comment_item()])["error"], "OPERATION_MODE_MISMATCH")
+
+    def test_comment_plan_in_a_session_that_cannot_be_marked_temporary_reads_nothing(self):
+        self.ida["ida_loader"].set_database_flag.side_effect = RuntimeError("no flag")
+        result = self.run_op("comment_plan", "plan", [self.comment_item()])
+        self.assertEqual((result["ok"], result["error"]), (False, "DATABASE_CHANGES_NOT_DISCARDABLE"))
+        self.ida["idc"].get_cmt.assert_not_called()
 
     def test_the_result_carries_the_engine_pid_and_the_completion_marker_last(self):
         out = Path(process_scratch("an_worker")) / "out.json"

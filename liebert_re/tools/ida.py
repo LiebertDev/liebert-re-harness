@@ -109,7 +109,8 @@ contains write calls.
 
 Scope of this module: `ida_query`, `ida_microcode_cfg`, `ida_type_member_offset`, `ida_patch_plan`
 and `ida_annotations` (none of them writes the input or persists anything), `ida_rename_plan` and
-`ida_annotations_apply` (the one persistent write path; comments are not here yet), `ida_annotations_purge`
+`ida_annotations_apply` (the one persistent write path; comments have a plan, `ida_set_comments_plan`, and
+no apply yet), `ida_annotations_purge`
 (the only deletion of annotated data: named targets, report first, a confirmation bound to what it reports) and `ida_status`.
 """
 from __future__ import annotations
@@ -208,6 +209,12 @@ _PROMOTE_RETRY_SECONDS = 10
 _LABEL = re.compile(r"[A-Za-z0-9._-]{1,48}")
 _NEW_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,254}")
 _RENAME_MAX_ITEMS = 200
+# Comment plans: only the two plain disassembly comment kinds. Decompiler (pseudocode) comments are NOT
+# supported and are refused by name, never mapped to one of these. The length ceiling is a chosen bound
+# for a reviewable plan, not a measured IDA limit.
+_COMMENT_KINDS = ("regular", "repeatable")
+_COMMENT_MAX_CHARS = 1024
+_PLAN_KINDS = ("rename", "comments")
 _PLAN_SCHEMA = 1
 _VERSION_DIR = re.compile(r"v(\d{6})")
 # idat's own stdout/stderr is a few KB; the result travels in a file.
@@ -2610,15 +2617,220 @@ def ida_rename_plan(path, label=None, renames=None, timeout_seconds=_DEFAULT_TIM
         _release_slot_lock(lock)
 
 
-def _plan_problem(plan):
-    """(error, field) when `plan` is not a well-formed rename plan, else (None, None). Pure."""
+def ida_set_comments_plan(path, label=None, comments=None, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                          cancellation_token=None):
+    """PLAN comments on items in the analysis database of `path`; nothing is written. Mirrors
+    `ida_rename_plan`: the plan is read from the annotation scope `label` as it is now, so each item carries
+    the comment it expects to find (`expect_comment`, `null` when the address has none).
+
+    `label` is required and explicit (1 to 48 characters of letters, digits, '.', '_', '-'). `comments` is
+    a list of 1 to 200 objects: `address` (an integer or a string such as "0x140001000"), `comment` (text,
+    1 to 1024 characters, no NUL), `comment_kind` (REQUIRED, never defaulted: `regular` or `repeatable`;
+    decompiler comments are not supported and are refused as UNSUPPORTED_COMMENT_KIND), and optionally
+    `address_kind` (`va` default, `rva` or `file_offset`). The address must be the start of an item, and the
+    comment must differ from the current one of that kind. Comment text that `_redact` would change (a home
+    path, the account name, a licence line) is refused, not silently altered.
+
+    The answer has the keys of `ida_rename_plan`. The plan carries the comment text (apply needs it); the
+    evidence file written beside the answer carries only its SHA-256 and length. Nothing in this operation
+    writes the audit journal. Apply is not available for this plan kind yet.
+
+    Status vocabulary: OK, TOOL_MISSING, PATH_REFUSED, NOT_FOUND, TIMEOUT, CANCELLED, ANALYSIS_LIMITED
+    (every refusal names the field, what is accepted, and `fixable`), RESULT_PARSE_FAILED.
+    """
+    tool = "ida_set_comments_plan"
+    if not _valid_label(label):
+        return _label_refusal(tool, label)
+    if not isinstance(comments, list) or not 1 <= len(comments) <= _RENAME_MAX_ITEMS:
+        return _refuse(tool, "ANALYSIS_LIMITED", "COMMENTS_REQUIRED", fixable=True, field="comments",
+                       given=f"{type(comments).__name__}" + (f" of {len(comments)}" if isinstance(comments, list) else ""),
+                       accepted=f"a list of 1 to {_RENAME_MAX_ITEMS} objects with address, comment and comment_kind",
+                       fix="Pass the comments as a list of objects; a longer list is refused rather than cut, so split it.")
+    allowed_fields = {"address", "comment", "comment_kind", "address_kind"}
+    items, seen_addresses = [], set()
+    for index, entry in enumerate(comments):
+        problem, value = None, None
+        if not isinstance(entry, dict):
+            problem = ("COMMENT_ITEM_NOT_AN_OBJECT", None)
+        elif set(entry) - allowed_fields:
+            problem = ("COMMENT_ITEM_UNKNOWN_FIELD", sorted(set(entry) - allowed_fields)[:5])
+        elif isinstance(entry.get("address"), bool) or not isinstance(entry.get("address"), (int, str)) \
+                or (isinstance(entry.get("address"), int) and not 0 <= entry["address"] < 1 << 64):
+            problem = ("COMMENT_ITEM_ADDRESS_INVALID", None)
+        elif entry.get("comment_kind") not in _COMMENT_KINDS:
+            problem = ("UNSUPPORTED_COMMENT_KIND", list(_COMMENT_KINDS))
+        elif not isinstance(entry.get("comment"), str) or "\x00" in entry["comment"]:
+            problem = ("COMMENT_ITEM_COMMENT_INVALID", None)
+        elif not entry["comment"].strip():
+            problem = ("COMMENT_ITEM_COMMENT_EMPTY", None)
+        elif len(entry["comment"]) > _COMMENT_MAX_CHARS:
+            problem = ("COMMENT_ITEM_COMMENT_TOO_LONG", f"at most {_COMMENT_MAX_CHARS} characters")
+        elif _redact(entry["comment"]) != entry["comment"]:
+            problem = ("COMMENT_TEXT_NEEDS_REDACTION", "text without a home path, account name or licence line")
+        elif entry.get("address_kind", "va") not in _PATCH_ADDRESS_KINDS:
+            problem = ("INVALID_ADDRESS_KIND", list(_PATCH_ADDRESS_KINDS))
+        if problem is None:
+            try:
+                value = entry["address"] if isinstance(entry["address"], int) else int(entry["address"].strip(), 0)
+                if not 0 <= value < 1 << 64:
+                    raise ValueError
+            except ValueError:
+                problem = ("COMMENT_ITEM_ADDRESS_INVALID", None)
+        if problem is None:
+            key = (entry.get("address_kind", "va"), value)
+            if key in seen_addresses:
+                problem = ("DUPLICATE_ADDRESS", None)
+            seen_addresses.add(key)
+        if problem:
+            # A refusal never echoes the comment text.
+            return _refuse(tool, "ANALYSIS_LIMITED", problem[0], fixable=True, field="comments", item_index=index,
+                           accepted=problem[1] if problem[1] else {
+                               "address": "an integer or a string like \"0x140001000\"",
+                               "comment": f"text, 1 to {_COMMENT_MAX_CHARS} characters",
+                               "comment_kind": list(_COMMENT_KINDS), "address_kind": list(_PATCH_ADDRESS_KINDS)},
+                           fix=("Correct that item and plan again; nothing was read. Decompiler comments are not supported."
+                                if problem[0] == "UNSUPPORTED_COMMENT_KIND" else
+                                "Correct that item and plan again; nothing was read."))
+        items.append({"address": hex(value), "address_kind": entry.get("address_kind", "va"),
+                      "comment_kind": entry["comment_kind"], "comment": entry["comment"]})
+    p, fail = _checked_path(path, tool, echo_path=False)
+    if fail:
+        return fail
+    if p.suffix.lower() in _DATABASE_SUFFIXES:
+        return _refuse(tool, "ANALYSIS_LIMITED", "DATABASE_INPUT_NOT_SUPPORTED", fixable=True,
+                       fix="Pass the original binary: the cache and the annotation versions key on that file's hash.")
+    exe = _ida_binary()
+    if not exe:
+        return _tool_missing(tool)
+    if not (_ANNOTATE_WORKER_SOURCE.is_file() and _WORKER_SOURCE.is_file()):
+        return _refuse(tool, "ANALYSIS_LIMITED", "IDA_WORKER_MISSING", fixable=False,
+                       fix="A packaged IDAPython worker is absent from this install (a packaging defect, not an IDA problem).")
+    total = _clamp(timeout_seconds, _MIN_TIMEOUT_SECONDS, _MAX_CREATE_TIMEOUT_SECONDS, _DEFAULT_TIMEOUT_SECONDS)
+    try:
+        sha256, md5 = _sha256_md5(p)
+    except OSError as exc:
+        return _j({"ok": False, "tool": tool, "status": "READ_FAILED", "error": "IDA_INPUT_UNREADABLE",
+                   "environment_error": {"type": type(exc).__name__, "errno": exc.errno,
+                                         "strerror": _redact(exc.strerror or type(exc).__name__)},
+                   "detail": "The input file could not be read; no plan was made."})
+    invocation = {"operation": "comment_plan", "label": label, "item_count": len(items), "timeout_seconds": total}
+    overlap = _overlap_refusal(tool)
+    if overlap:
+        return overlap
+    lock, busy = _lock_annotated(tool, sha256, cancellation_token)
+    if busy:
+        return busy
+    work = None
+    try:
+        unverified, _actions = _recover_pending(sha256)
+        refusal = _opening_checks(tool, sha256, label, unverified)
+        if refusal:
+            return refusal
+        state, problem = _annotated_state(sha256, label)
+        if problem:
+            return _refuse(tool, "ANALYSIS_LIMITED", problem["error"], fixable=False, reason=problem["reason"],
+                           target_sha256=sha256, label=label,
+                           fix="The published state of this scope cannot be confirmed; it is neither repaired nor "
+                               "served. An operator must inspect the annotated root.")
+        deadline = time.monotonic() + total
+        work = state["label_dir"] / f"scratch-{uuid.uuid4().hex[:8]}"
+        work.mkdir(parents=True)
+        try:
+            if state["version"] > 0:
+                shutil.copyfile(state["db"], work / _DB_NAME)
+            else:
+                _copy_pristine(exe, p, sha256, md5, work / _DB_NAME, total, cancellation_token)
+            left = int(deadline - time.monotonic())
+            if left < 1:
+                raise _StageFailure({"ok": False, "tool": tool, "status": "TIMEOUT", "invocation": invocation,
+                                     "target_sha256": sha256, "error": "IDA_TIMEOUT_BUDGET_EXHAUSTED"})
+            data, signals, provenance = _annotated_session(
+                exe, work, {"operation": "comment_plan", "write_mode": "plan", "items": items}, tool=tool,
+                sha256=sha256, md5=md5, invocation=invocation, temporary=True,
+                seconds=min(left, _MAX_ANNOTATE_TIMEOUT_SECONDS), cancellation_token=cancellation_token)
+        except OSError as exc:
+            return _j(_EnvironmentFailure("IDA_ANNOTATED_IO_ERROR", exc).body(tool, target_sha256=sha256, invocation=invocation))
+        except _StageFailure as failure:
+            return _j(failure.body)
+        if data.get("ok") is False:
+            # No current comment text is echoed (the rename plan's `current_name` has no counterpart here).
+            refusal = {"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": data.get("error", "UNKNOWN_ERROR"),
+                       **{k: v for k, v in data.items() if k in ("item_index", "item_error", "given", "accepted",
+                                                                  "item_start", "address_kind")},
+                       "target_sha256": sha256, "label": label, "invocation": invocation, "fixable": True,
+                       "fix": "Correct the item named by item_index and plan again. This is about the database as it is "
+                              "now, not about the program."}
+            return _j(refusal)
+        marker = data.get("annotation_marker")
+        if not _marker_matches(marker, sha256, label, state):
+            return _refuse(tool, "ANALYSIS_LIMITED", "ANNOTATION_VERSION_MISMATCH", fixable=False, target_sha256=sha256,
+                           label=label, manifest_version=state["version"],
+                           marker_version=marker.get("version") if isinstance(marker, dict) else None,
+                           fix="The annotation marker stored inside the database does not match the published "
+                               "manifest, so what was read is not the version the manifest names. Nothing is planned "
+                               "from it; an operator must inspect the scope.")
+        rows = data.get("plan_items") or []
+        if len(rows) != len(items) or len({r["address"]["va"] for r in rows}) != len(rows) \
+                or any(r.get("index") != i or r.get("comment_kind") != items[i]["comment_kind"]
+                       or not (r.get("expect_comment") is None or isinstance(r.get("expect_comment"), str))
+                       for i, r in enumerate(rows)):
+            return _refuse(tool, "ANALYSIS_LIMITED", "DUPLICATE_ADDRESS_AFTER_RESOLUTION", fixable=True,
+                           fix="Two items resolve to the same address, or the engine's rows do not match the request. "
+                               "Give each item one address and plan again; nothing is guessed.")
+        if any(r["expect_comment"] is not None and _redact(r["expect_comment"]) != r["expect_comment"] for r in rows):
+            return _refuse(tool, "ANALYSIS_LIMITED", "EXISTING_COMMENT_NEEDS_REDACTION", fixable=False,
+                           target_sha256=sha256, label=label,
+                           fix="An existing comment holds text that must not leave the database (a home path, an account "
+                               "name or a licence line), so it is neither returned nor used as a precondition.")
+        plan = {"schema": _PLAN_SCHEMA, "kind": "comments", "target_sha256": sha256, "label": label,
+                "base_version": state["version"], "base_db_sha256": state["db_sha256"],
+                "items": [{"index": r["index"], "address": r["address"]["va"], "address_kind": "va",
+                           "comment": items[i]["comment"], "comment_kind": r["comment_kind"],
+                           "expect_comment": r["expect_comment"]} for i, r in enumerate(rows)]}
+
+        def digest(text):      # Privacy decision: comment text is never written to a log; hash and length only.
+            return None if text is None else {"sha256": _sha256_text(text), "length": len(text)}
+
+        detail = [{"index": it["index"], "address": rows[it["index"]]["address"], "comment_kind": it["comment_kind"],
+                   "comment_sha256": digest(it["comment"])["sha256"], "comment_length": len(it["comment"]),
+                   "expect_comment": digest(it["expect_comment"])} for it in plan["items"]]
+        body = {
+            "ok": True, "tool": tool, "status": "OK", "target_sha256": sha256, "label": label,
+            "plan": plan, "plan_sha256": _sha256_text(_canonical(plan)), "item_count": len(rows),
+            "items_detail": detail, "items_listed_complete": True,
+            "annotated_view": {"state": "verified", "version": state["version"],
+                               "read_from": "published annotation version" if state["version"] else "pristine analysis",
+                               "marker_checked": True},
+            "concurrency_policy": _CONCURRENCY_POLICY, "provenance": provenance, "signals": signals,
+            "invocation": invocation,
+            "note": ("A PLAN: nothing was written. It binds to the annotation version it read; if another write "
+                     "to this scope lands first, applying it is refused as stale. The comment-plan apply is not "
+                     "available yet."),
+        }
+        evidence = {k: v for k, v in body.items() if k != "plan"}
+        evidence["plan"] = {**plan, "items": [
+            {**{k: v for k, v in it.items() if k not in ("comment", "expect_comment")},
+             "comment": digest(it["comment"]), "expect_comment": digest(it["expect_comment"])} for it in plan["items"]]}
+        body["internal_evidence_name"], body["evidence_write_error"] = _write_evidence(
+            p, "comment_plan", evidence, EVIDENCE_RENAME_PLAN, stem=sha256[:16])
+        return _j(body)
+    finally:
+        if work is not None:
+            _remove_owned_work(work)
+        _release_slot_lock(lock)
+
+
+def _plan_problem(plan, kinds=("rename",)):
+    """(error, field) when `plan` is not a well-formed plan of one of `kinds`, else (None, None). Pure.
+    The default is rename only, because apply writes only renames; a comments plan is checked by naming
+    "comments" in `kinds`. Each kind has its own item field set."""
     if not isinstance(plan, dict):
         return "PLAN_NOT_AN_OBJECT", None
     for field, kind in (("schema", int), ("kind", str), ("target_sha256", str), ("label", str), ("base_version", int),
                         ("items", list), ("plan_sha256", str)):
         if not isinstance(plan.get(field), kind) or isinstance(plan.get(field), bool):
             return "PLAN_FIELD_MISSING_OR_WRONG_TYPE", field
-    if plan["schema"] != _PLAN_SCHEMA or plan["kind"] != "rename":
+    if plan["schema"] != _PLAN_SCHEMA or plan["kind"] not in _PLAN_KINDS or plan["kind"] not in kinds:
         return "PLAN_SCHEMA_UNSUPPORTED", "schema"
     if not re.fullmatch(r"[0-9a-f]{64}", plan["target_sha256"]) or not _valid_label(plan["label"]) or plan["base_version"] < 0:
         return "PLAN_FIELD_INVALID", "target_sha256/label/base_version"
@@ -2627,6 +2839,16 @@ def _plan_problem(plan):
     if not 1 <= len(plan["items"]) <= _RENAME_MAX_ITEMS:
         return "PLAN_ITEMS_OUT_OF_RANGE", "items"
     for item in plan["items"]:
+        if plan["kind"] == "comments":
+            if not (isinstance(item, dict)
+                    and set(item) == {"index", "address", "address_kind", "comment", "comment_kind", "expect_comment"}
+                    and isinstance(item["index"], int) and not isinstance(item["index"], bool)
+                    and isinstance(item["address"], str) and item["address_kind"] == "va"
+                    and item["comment_kind"] in _COMMENT_KINDS
+                    and isinstance(item["comment"], str) and 1 <= len(item["comment"]) <= _COMMENT_MAX_CHARS
+                    and (item["expect_comment"] is None or isinstance(item["expect_comment"], str))):
+                return "PLAN_ITEM_MALFORMED", "items"
+            continue
         if not (isinstance(item, dict) and set(item) == {"index", "address", "address_kind", "new_name", "expect_name"}
                 and isinstance(item["index"], int) and isinstance(item["address"], str)
                 and item["address_kind"] == "va" and isinstance(item["expect_name"], str)
@@ -3296,8 +3518,8 @@ def ida_status():
             "network_lookup_detected": signals["network_lookup_detected"],
             "cache": _cache_summary(),
             "operations": ["ida_query", "ida_microcode_cfg", "ida_type_member_offset", "ida_patch_plan",
-                           "ida_annotations", "ida_rename_plan", "ida_annotations_apply", "ida_annotations_purge",
-                           "ida_status"],
+                           "ida_annotations", "ida_rename_plan", "ida_set_comments_plan", "ida_annotations_apply",
+                           "ida_annotations_purge", "ida_status"],
             "query_operations": list(_ALLOWED_OPERATIONS),
             "note": (
                 "OK means idat launched headless and exited cleanly on an empty database; it does not "
