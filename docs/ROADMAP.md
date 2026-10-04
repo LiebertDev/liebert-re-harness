@@ -89,9 +89,12 @@ hidden feature.
   cached database before and after), `ida_annotations` (a read of the annotation log) and the
   persistent rename pair `ida_rename_plan` / `ida_annotations_apply` (own annotated root, audit
   journal, read-back in a separate engine process).
+  **Round 2, comment write: landed.** `ida_set_comments_plan` plans and `ida_annotations_apply` writes
+  `regular` and `repeatable` comments. **What is left of round 2 is the CLI binding.**
+  `case_purge` integration is not done: the annotated purge does not read case state today, so a case
+  becoming `solved` or `abandoned` does not trigger it.
   **Still open:** `ida_disasm_listing` (read-only, next
-  round), the comment write (`ida_set_comments`, which will follow the rename pair's plan/apply
-  shape), a Ghidra
+  round), a Ghidra
   wrapper (the more approachable half, since `analyzeHeadless` is scriptable and free to
   install), and normalising answers across engines.
 - **Function-boundary recovery from exception-directory unwind data**, with
@@ -130,6 +133,10 @@ hidden feature.
   is suspicious.
 
 ## Hard problems, honestly hard
+
+- **Kernel static analysis is a staged roadmap and is NOT implemented.** The `windows-kernel` family in
+  `liebert_re/report/tool_families.py` names tools that are not in this package (one of 15 is defined, the
+  generic `tool_missing`). Treat those names as planned routing, not as capability. The first slice will be `kernel_triage`; the other 14 names in the `windows-kernel` family are roadmap.
 
 These are real and known gaps, named so nobody rediscovers them by surprise. They
 are explicitly **not** good first contributions — each is a research problem on
