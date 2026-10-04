@@ -9,7 +9,7 @@ on a published annotation version:
 
     idat -A -Opdb:off -Lida.log -Sliebert_ida_job.py db.i64
 
-The job comes from the JSON file named in ``LIEBERT_IDA_JOB``. Four operations, three modes:
+The job comes from the JSON file named in ``LIEBERT_IDA_JOB``. Six operations, three modes:
 
 * ``rename_plan``   mode ``plan``    (temporary session): read each address's current name.
 * ``comment_plan``  mode ``plan``    (temporary session): read each address's current comment of the
@@ -18,6 +18,11 @@ The job comes from the JSON file named in ``LIEBERT_IDA_JOB``. Four operations, 
                                      names and the annotation marker back from the stored database.
 * ``rename_apply``  mode ``write``   (an ordinary session on a scratch copy): set the names, store the
                                      annotation marker, save, and report what every call returned.
+* ``comment_verify`` mode ``verify`` (temporary session, a NEW process after the write): read the
+                                     comments of the requested kinds and the annotation marker back.
+* ``comment_apply`` mode ``write``   (an ordinary session on a scratch copy): like ``rename_apply`` but
+                                     sets regular or repeatable comments. A precondition is the comment
+                                     the plan expected (``null`` for none); no failure row carries text.
 
 This is the only worker file that changes a database. Every call that does is a method of
 ``_ScratchWriter`` and nowhere else (a test pins that); ``_ScratchWriter`` refuses to exist in a
@@ -43,8 +48,9 @@ import idaapi
 import idc
 
 JOB_ENV = "LIEBERT_IDA_JOB"
-OPERATIONS = ("rename_plan", "rename_verify", "rename_apply", "comment_plan")
-MODES = {"rename_plan": "plan", "rename_verify": "verify", "rename_apply": "write", "comment_plan": "plan"}
+OPERATIONS = ("rename_plan", "rename_verify", "rename_apply", "comment_plan", "comment_verify", "comment_apply")
+MODES = {"rename_plan": "plan", "rename_verify": "verify", "rename_apply": "write", "comment_plan": "plan",
+         "comment_verify": "verify", "comment_apply": "write"}
 MARKER_NODE = "$ liebert.annotation"
 MARKER_SCHEMA = 1
 ADDRESS_KINDS = ("va", "rva", "file_offset")
@@ -174,6 +180,13 @@ class _ScratchWriter:
         done = bool(idc.set_name(ea, new_name, idc.SN_NOWARN))
         return done, idc.get_name(ea)
 
+    def set_comment(self, ea, text, kind):
+        """(ok, comment read back at once). `kind` is "regular" or "repeatable"; the engine's own return
+        value is the first word, the read-back of the same kind the second (None when there is none)."""
+        repeatable = 1 if kind == "repeatable" else 0
+        done = bool(idc.set_cmt(ea, text, repeatable))
+        return done, _read_comment(ea, kind)
+
     def store_marker(self, marker):
         node = ida_netnode.netnode(MARKER_NODE, 0, True)
         return bool(node.setblob(json.dumps(marker, sort_keys=True).encode("utf-8"), 0, "B"))
@@ -183,6 +196,12 @@ class _ScratchWriter:
         measured on IDA 9.4, an empty path makes the call return False although the changes are written
         when the session ends, which is exactly the kind of return that must not be taken on faith."""
         return bool(ida_loader.save_database(ida_loader.get_path(ida_loader.PATH_TYPE_IDB), 0))
+
+
+def _read_comment(ea, kind):
+    """The comment of `kind` at `ea`, or None when there is none (absent is never an empty string)."""
+    current = idc.get_cmt(ea, 1 if kind == "repeatable" else 0)
+    return current if isinstance(current, str) and current else None
 
 
 def _check_name(name):
@@ -244,8 +263,7 @@ def _op_comment_plan(result, job):
         if head != ea:
             raise _WorkerError("PLAN_ITEM_REFUSED", item_index=index, item_error="ADDRESS_NOT_AN_ITEM_START",
                                given=hex(ea), item_start=hex(head))
-        current = idc.get_cmt(ea, 1 if kind == "repeatable" else 0)
-        current = current if isinstance(current, str) and current else None      # absent is None, never ""
+        current = _read_comment(ea, kind)
         if current == text:
             raise _WorkerError("PLAN_ITEM_REFUSED", item_index=index, item_error="COMMENT_UNCHANGED")
         rows.append({"index": index, "address": _address_form(ea), "comment_kind": kind, "expect_comment": current})
@@ -319,7 +337,85 @@ def _op_rename_apply(result, job):
         result.update({"ok": False, "error": "SAVE_NOT_CONFIRMED"})
 
 
-_DISPATCH = {"rename_plan": _op_rename_plan, "comment_plan": _op_comment_plan, "rename_verify": _op_rename_verify, "rename_apply": _op_rename_apply}
+def _op_comment_verify(result, job):
+    """Read-only, temporary session: the comment of each requested kind as the stored database holds it."""
+    _mark_temporary()
+    result["database_changes_discarded"] = True
+    ida_auto.auto_wait()
+    rows = []
+    for index, item in enumerate(_items(job)):
+        ea = _resolve_ea(item.get("address"), item.get("address_kind"))
+        kind = item.get("comment_kind")
+        if kind not in COMMENT_KINDS:
+            raise _WorkerError("UNSUPPORTED_COMMENT_KIND", item_index=index, accepted=list(COMMENT_KINDS))
+        rows.append({"index": index, "address": hex(ea), "comment_kind": kind, "actual_comment": _read_comment(ea, kind)})
+    result["verified_items"] = rows
+    result["annotation_marker"] = _read_marker()
+
+
+def _op_comment_apply(result, job):
+    writer = _ScratchWriter()
+    result["database_changes_discarded"] = False
+    ida_auto.auto_wait()
+    allow_partial = job.get("allow_partial") is True
+    marker = job.get("marker")
+    if not isinstance(marker, dict):
+        raise _WorkerError("INVALID_MARKER")
+    resolved = []
+    failed = []
+    for index, item in enumerate(_items(job)):
+        text, kind, expect = item.get("comment"), item.get("comment_kind"), item.get("expect_comment")
+        try:
+            ea = _resolve_ea(item.get("address"), item.get("address_kind"))
+            if kind not in COMMENT_KINDS:
+                raise _WorkerError("UNSUPPORTED_COMMENT_KIND")
+            if not isinstance(text, str) or not text.strip() or len(text) > _COMMENT_MAX:
+                raise _WorkerError("INVALID_COMMENT")
+            if not (expect is None or isinstance(expect, str)):
+                raise _WorkerError("INVALID_EXPECT_COMMENT")
+        except _WorkerError as exc:
+            failed.append({"index": index, "error": exc.error})
+            continue
+        current = _read_comment(ea, kind)
+        if current != expect:      # no text in the row: only whether a comment was expected / is there
+            failed.append({"index": index, "error": "PRECONDITION_FAILED", "expected_present": expect is not None,
+                           "actual_present": current is not None})
+            continue
+        resolved.append((index, ea, text, kind, current))
+    result["atomic"] = not allow_partial
+    if failed and not allow_partial:
+        result.update({"ok": False, "error": "ABORTED_ATOMIC", "applied": [], "failed": failed,
+                       "saved": False, "detail": "A precondition failed before anything was written."})
+        return
+    applied = []
+    for index, ea, text, kind, old in resolved:
+        done, read_back = writer.set_comment(ea, text, kind)
+        if done and read_back == text:
+            applied.append({"index": index, "address": hex(ea), "comment_kind": kind, "old_comment": old,
+                            "new_comment": text})
+        else:
+            failed.append({"index": index, "error": "COMMENT_REJECTED_BY_ENGINE", "set_returned": done,
+                           "read_back_matches": read_back == text})
+            if not allow_partial:
+                result.update({"ok": False, "error": "ABORTED_ATOMIC", "applied": [], "failed": failed,
+                               "saved": False, "detail": "The engine refused a comment; nothing was saved."})
+                return
+    result["applied"] = sorted(applied, key=lambda row: row["index"])
+    result["failed"] = sorted(failed, key=lambda row: row["index"])
+    if not applied:
+        result.update({"ok": False, "error": "ALL_FAILED", "saved": False})
+        return
+    marked = writer.store_marker(marker)
+    saved = writer.save()
+    result["marker_stored"] = marked
+    result["save_returned"] = saved
+    result["saved"] = bool(marked and saved)
+    if not result["saved"]:
+        result.update({"ok": False, "error": "SAVE_NOT_CONFIRMED"})
+
+
+_DISPATCH = {"rename_plan": _op_rename_plan, "comment_plan": _op_comment_plan, "rename_verify": _op_rename_verify,
+             "rename_apply": _op_rename_apply, "comment_verify": _op_comment_verify, "comment_apply": _op_comment_apply}
 
 
 def _run(job):

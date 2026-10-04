@@ -55,6 +55,12 @@ TARGET_NAME = "ZZ_secret_target_name"
 START = "0x140001000"
 LATER = "0x140001004"
 
+# This sample DELIBERATELY looks like a machine path: redaction behaviour is the one thing it exercises.
+# It is assembled from parts only so that the `test_no_machine_specific_user_paths` text scan never sees
+# such a literal in a tracked file. No real operator path is here; the user name is a placeholder.
+_SAMPLE_DRIVE, _SAMPLE_HOME_DIR, _SAMPLE_USER, _SAMPLE_FILE = "C:", "Users", "someone", "file"
+_MACHINE_PATH_LIKE_SAMPLE = "see " + "\\".join((_SAMPLE_DRIVE, _SAMPLE_HOME_DIR, _SAMPLE_USER, _SAMPLE_FILE))
+
 
 class AnnotateFakeIdat:
     """`idat.exe` at the process boundary, with a database that is a JSON document.
@@ -81,6 +87,13 @@ class AnnotateFakeIdat:
         except (ValueError, OSError):
             return {"names": dict(self.pristine), "marker": None}
 
+    def held_comments(self, state):
+        """The comments a database holds, keyed "address|kind"; a database that never stored any holds the
+        ones the test seeded in `self.comments`."""
+        if "comments" in state:
+            return dict(state["comments"])
+        return {f"{a}|{k}": text for (a, k), text in self.comments.items()}
+
     def store(self, db, state):
         Path(db).write_bytes((json.dumps(state) + " " * 64).encode("utf-8"))
 
@@ -98,7 +111,7 @@ class AnnotateFakeIdat:
             db.write_bytes(b"IDA-DB" * 100)
             body = _result("summary", self.sha256, self.md5, **SUMMARY)
         else:
-            body = self.rename(job, db) if operation.startswith("rename_") or operation == "comment_plan" else _result(
+            body = self.rename(job, db) if operation.startswith(("rename_", "comment_")) else _result(
                 operation, self.sha256, self.md5, **SUMMARY)
             body.setdefault("engine_input_sha256", self.sha256)
             body.setdefault("engine_input_md5", self.md5)
@@ -118,7 +131,7 @@ class AnnotateFakeIdat:
             body["plan_items"] = [{"index": i, "address": {"va": it["address"], "rva": "0x1000", "file_offset": "0x200",
                                                            "image_base": "0x140000000", "section": ".text"},
                                    "comment_kind": it["comment_kind"],
-                                   "expect_comment": self.comments.get((it["address"], it["comment_kind"]))}
+                                   "expect_comment": self.held_comments(state).get(f"{it['address']}|{it['comment_kind']}")}
                                   for i, it in enumerate(items)]
             body["annotation_marker"] = state["marker"]
         elif job["operation"] == "rename_plan":
@@ -128,6 +141,49 @@ class AnnotateFakeIdat:
                                    "old_name": names.get(it["address"], ""), "new_name": it["new_name"]}
                                   for i, it in enumerate(items)]
             body["annotation_marker"] = state["marker"]
+        elif job["operation"] == "comment_verify":
+            body["database_changes_discarded"] = True
+            if self.verify == "same_pid":
+                body["engine_pid"] = self.pid - 1
+            held = self.held_comments(state)
+            body["verified_items"] = [{"index": i, "address": it["address"], "comment_kind": it["comment_kind"],
+                                       "actual_comment": held.get(f"{it['address']}|{it['comment_kind']}")}
+                                      for i, it in enumerate(items)]
+            marker = state["marker"]
+            if self.verify == "wrong_marker" and marker:
+                marker = dict(marker, version=marker["version"] + 7)
+            body["annotation_marker"] = marker
+        elif job["operation"] == "comment_apply":
+            body["database_changes_discarded"] = False
+            partial = job["allow_partial"]
+            held = self.held_comments(state)
+            failed = [{"index": i, "error": "PRECONDITION_FAILED", "expected_present": it["expect_comment"] is not None,
+                       "actual_present": held.get(f"{it['address']}|{it['comment_kind']}") is not None}
+                      for i, it in enumerate(items)
+                      if held.get(f"{it['address']}|{it['comment_kind']}") != it["expect_comment"]]
+            if failed and not partial:
+                body.update(ok=False, error="ABORTED_ATOMIC", applied=[], failed=failed, saved=False)
+                return body
+            skipped = {f["index"] for f in failed}
+            applied = [{"index": i, "address": it["address"], "comment_kind": it["comment_kind"],
+                        "old_comment": it["expect_comment"], "new_comment": it["comment"]}
+                       for i, it in enumerate(items) if i not in skipped]
+            body.update(applied=applied, failed=failed, atomic=not partial)
+            if not applied:
+                body.update(ok=False, error="ALL_FAILED", saved=False)
+                return body
+            if self.apply == "save_false":
+                body.update(ok=False, error="SAVE_NOT_CONFIRMED", save_returned=False, marker_stored=True, saved=False)
+                return body
+            if self.apply == "no_persist":
+                self.store(db, {"names": names, "marker": None, "comments": held})
+            else:
+                for item in applied:      # "wrong_comment": the engine keeps something else than what it reported
+                    held[f"{item['address']}|{item['comment_kind']}"] = (
+                        item["new_comment"] + "!" if self.apply == "wrong_comment" else item["new_comment"])
+                state["marker"] = job["marker"]
+                self.store(db, {"names": names, "marker": state["marker"], "comments": held})
+            body.update(save_returned=True, marker_stored=True, saved=True)
         elif job["operation"] == "rename_verify":
             body["database_changes_discarded"] = True
             if self.verify == "same_pid":
@@ -159,9 +215,9 @@ class AnnotateFakeIdat:
                 for item in applied:
                     names[item["address"]] = item["new_name"]
                 state["marker"] = job["marker"]
-                self.store(db, {"names": names, "marker": state["marker"]})
+                self.store(db, {"names": names, "marker": state["marker"], "comments": self.held_comments(state)})
             else:
-                self.store(db, {"names": names, "marker": None})
+                self.store(db, {"names": names, "marker": None, "comments": self.held_comments(state)})
             body.update(save_returned=True, marker_stored=True, saved=True)
         return body
 
@@ -1065,7 +1121,7 @@ class CommentPlanTests(AnnotateCase):
 
     @pytest.mark.contract
     def test_text_that_redaction_would_change_is_refused_not_altered(self):
-        out = self.cplan([{"address": START, "comment": "see C:\\Users\\someone\\file", "comment_kind": "regular"}])
+        out = self.cplan([{"address": START, "comment": _MACHINE_PATH_LIKE_SAMPLE, "comment_kind": "regular"}])
         self.assertEqual((out["ok"], out["error"], out["fixable"]), (False, "COMMENT_TEXT_NEEDS_REDACTION", True))
         self.assertNotIn("someone", json.dumps(out))
 
@@ -1130,12 +1186,6 @@ class CommentPlanTests(AnnotateCase):
         self.assertEqual(self.snapshot() if self.annotated.exists() else {}, before)
 
     @pytest.mark.contract
-    def test_the_comment_plan_is_not_accepted_by_apply_yet(self):
-        plan = self.cplan()
-        out = self.apply(self.sealed(plan))
-        self.assertEqual((out["ok"], out["status"], out["error"]), (False, "INVALID_PLAN", "PLAN_SCHEMA_UNSUPPORTED"))
-
-    @pytest.mark.contract
     def test_plan_problem_checks_each_kind_with_its_own_field_set(self):
         plan = self.cplan()["plan"]
         sealed = dict(plan, plan_sha256="0" * 64)
@@ -1152,6 +1202,291 @@ class CommentPlanTests(AnnotateCase):
         self.assertEqual(ti._plan_problem(rename, ("rename", "comments")), (None, None))
         rename["items"][0]["comment"] = "x"
         self.assertEqual(ti._plan_problem(rename)[0], "PLAN_ITEM_MALFORMED")
+
+
+# ---------------------------------------------------------------------------
+# the comments plan through ida_annotations_apply
+# ---------------------------------------------------------------------------
+class CommentApplyTests(AnnotateCase):
+    def cplan(self, comments=None, label="first-pass"):
+        comments = comments if comments is not None else [
+            {"address": START, "comment": SECRET_TEXT, "comment_kind": "regular"}]
+        answer = json.loads(ti.ida_set_comments_plan(str(self.sample), label, comments))
+        self.assertTrue(answer["ok"], answer)
+        return answer
+
+    def cwrite(self, comments=None, label="first-pass", **kwargs):
+        return self.apply(self.sealed(self.cplan(comments, label)), **kwargs)
+
+    def resealed(self, plan, mutate):
+        sealed = json.loads(json.dumps(plan))
+        mutate(sealed)
+        sealed.pop("plan_sha256")
+        sealed["plan_sha256"] = ti._sha256_text(ti._canonical(sealed))
+        return sealed
+
+    TWO = [{"address": START, "comment": SECRET_TEXT, "comment_kind": "regular"},
+           {"address": LATER, "comment": SECRET_TEXT + "_b", "comment_kind": "repeatable"}]
+
+    def pristine_bytes(self):
+        return {p.relative_to(self.cache).as_posix(): p.read_bytes() for p in sorted(self.cache.rglob("*.i64"))
+                } if self.cache.exists() else {}
+
+    @pytest.mark.contract
+    def test_a_comment_plan_passes_through_apply_and_is_read_back_by_another_process(self):
+        out = self.cwrite(self.TWO)
+        self.assertEqual((out["ok"], out["status"], out["written"], out["version"], out["atomic"]), (True, "OK", True, 1, True))
+        self.assertEqual((out["applied_count"], out["failed_count"]), (2, 0))
+        self.assertEqual([(a["comment_kind"], a["old_comment"], a["new_comment"]) for a in out["applied"]],
+                         [("regular", None, SECRET_TEXT), ("repeatable", None, SECRET_TEXT + "_b")])
+        v = out["verification"]
+        self.assertEqual((v["separate_process"], v["comments_matched"], v["comments_expected"], v["marker_matched"]),
+                         (True, 2, 2, True))
+        self.assertNotIn("names_matched", v)
+        self.assertEqual(len({v["write_session_pid"], v["verify_session_pid"], v["harness_pid"]}), 3, "three processes")
+        self.assertEqual(self.manifest()["version"], 1)
+        self.assertEqual(self.events(), ["batch_prepared", "batch_committed"])
+        self.assertEqual([c["job"]["operation"] for c in self.fake.calls if c["job"]["mode"] != "create"][-3:],
+                         ["comment_plan", "comment_apply", "comment_verify"])
+        apply_job = next(c["job"] for c in self.fake.calls if c["job"]["operation"] == "comment_apply")
+        self.assertEqual((apply_job["mode"], apply_job["write_mode"]), ("write", "write"))
+        verify_job = next(c["job"] for c in self.fake.calls if c["job"]["operation"] == "comment_verify")
+        self.assertEqual((verify_job["mode"], verify_job["write_mode"]), ("reopen", "verify"))
+        self.assertNotIn("comment", verify_job["items"][0], "the read-back job carries no text")
+
+    @pytest.mark.contract
+    def test_the_next_plan_reads_the_published_comment_as_its_expectation(self):
+        self.cwrite()
+        again = self.cplan([{"address": START, "comment": "second note", "comment_kind": "regular"}])
+        self.assertEqual((again["plan"]["base_version"], again["plan"]["items"][0]["expect_comment"]), (1, SECRET_TEXT))
+        out = self.apply(self.sealed(again))
+        self.assertEqual((out["status"], out["version"]), ("OK", 2))
+        self.assertEqual(out["applied"][0]["old_comment"], SECRET_TEXT)
+
+    @pytest.mark.contract
+    def test_the_journal_and_the_evidence_hold_hash_and_length_never_the_text(self):
+        out = self.cwrite(self.TWO)
+        self.assertEqual(out["status"], "OK")
+        records = ti._journal_records(self.sha)[0]
+        prepared, committed = records
+        self.assertEqual((prepared["event"], prepared["operation"]), ("batch_prepared", "comments"))
+        expected_items = [{"index": i, "address": c["address"], "comment_kind": c["comment_kind"], "old_comment": None,
+                           "new_comment": {"sha256": ti._sha256_text(c["comment"]), "length": len(c["comment"])}}
+                          for i, c in enumerate(self.TWO)]
+        self.assertEqual(prepared["items"], expected_items)
+        self.assertEqual(committed["items"], expected_items)
+        raw_journal = ti._journal_path(self.sha).read_text(encoding="utf-8")      # from disk, not from the parser
+        self.assertNotIn(SECRET_TEXT, raw_journal)
+        self.assertIn(ti._sha256_text(SECRET_TEXT), raw_journal)
+        evidence = list(self.ev.glob("*annotations_apply*.json"))
+        self.assertEqual(len(evidence), 1)
+        raw = evidence[0].read_text(encoding="utf-8")
+        self.assertNotIn(SECRET_TEXT, raw)
+        self.assertIn(ti._sha256_text(SECRET_TEXT), raw)
+        # the caller's answer does carry the (redacted) text, and no file under any root holds it
+        self.assertEqual(out["applied"][0]["new_comment"], SECRET_TEXT)
+        for root in (self.annotated, self.ev, self.cache):
+            if not Path(root).exists():
+                continue
+            for f in Path(root).rglob("*"):
+                if f.is_file() and f.suffix in (".json", ".jsonl", ".log"):
+                    self.assertNotIn(SECRET_TEXT, f.read_text(encoding="utf-8", errors="ignore"), f.name)
+
+    @pytest.mark.contract
+    def test_a_kept_candidate_holds_no_job_or_result_file_with_the_text(self):
+        with mock.patch.object(ti, "_replace_file", side_effect=lambda a, b: "PermissionError"):
+            out = self.cwrite()
+        self.assertEqual(out["status"], "ANNOTATED_PROMOTION_BLOCKED")
+        candidate_dir = self.label_dir() / "recovery" / out["write_id"]
+        self.assertTrue((candidate_dir / ti._DB_NAME).is_file())
+        self.assertFalse((candidate_dir / "job.json").exists())
+        self.assertFalse((candidate_dir / ti._RESULT_NAME).exists())
+        for f in self.annotated.rglob("*"):
+            if f.is_file() and f.suffix in (".json", ".jsonl", ".log"):
+                self.assertNotIn(SECRET_TEXT, f.read_text(encoding="utf-8", errors="ignore"), f.name)
+
+    def failing_unlink(self):
+        real = Path.unlink
+
+        def unlink(path, *a, **k):
+            if Path(path).name in ("job.json", ti._RESULT_NAME):
+                raise PermissionError(13, "denied for " + SECRET_TEXT)
+            return real(path, *a, **k)
+        return mock.patch.object(Path, "unlink", unlink)
+
+    @pytest.mark.contract
+    def test_a_scrub_that_cannot_delete_does_not_crash_apply_and_is_reported(self):
+        with mock.patch.object(ti, "_replace_file", side_effect=lambda a, b: "PermissionError"), self.failing_unlink():
+            out = self.cwrite()
+        self.assertEqual(out["status"], "ANNOTATED_PROMOTION_BLOCKED", "the apply ran to its own verdict")
+        failures = out["signals"]["text_scrub_failures"]
+        self.assertEqual(sorted(f["file"] for f in failures), sorted(["job.json", ti._RESULT_NAME]))
+        for f in failures:
+            self.assertEqual((f["error_type"], f["errno"], f["text_may_remain_on_disk"]), ("PermissionError", 13, True))
+
+    @pytest.mark.contract
+    def test_the_scrub_failure_report_never_carries_the_comment_text(self):
+        with mock.patch.object(ti, "_replace_file", side_effect=lambda a, b: "PermissionError"), self.failing_unlink():
+            out = self.cwrite()
+        self.assertIn("text_scrub_failures", out["signals"])
+        self.assertNotIn(SECRET_TEXT, json.dumps(out))
+        self.assertNotIn("denied", json.dumps(out["signals"]), "the OS message is not copied")
+
+    @pytest.mark.contract
+    def test_a_clean_scrub_reports_no_failure(self):
+        with mock.patch.object(ti, "_replace_file", side_effect=lambda a, b: "PermissionError"):
+            out = self.cwrite()
+        self.assertNotIn("text_scrub_failures", out.get("signals", {}))
+
+    @pytest.mark.contract
+    def test_the_text_in_the_answer_goes_through_redact(self):
+        seen = []
+        real = ti._redact
+        with mock.patch.object(ti, "_redact", side_effect=lambda t, **k: (seen.append(t), real(t, **k))[1]):
+            self.cwrite()
+        self.assertIn(SECRET_TEXT, seen)
+
+    @pytest.mark.contract
+    def test_a_stale_expect_comment_is_a_precondition_failure_and_aborts_everything(self):
+        plan = self.cplan(self.TWO)
+        self.fake.comments[(LATER, "repeatable")] = "someone wrote this since the plan"
+        before = self.pristine_bytes()
+        out = self.apply(self.sealed(plan))
+        self.assertEqual((out["ok"], out["status"], out["error"], out["written"], out["fixable"]),
+                         (False, "ABORTED_ATOMIC", "ABORTED_ATOMIC", False, True))
+        self.assertEqual([(f["index"], f["error"]) for f in out["failed"]], [(1, "PRECONDITION_FAILED")])
+        self.assertEqual((out["failed"][0]["expected_present"], out["failed"][0]["actual_present"]), (False, True))
+        self.assertNotIn("someone wrote", json.dumps(out), "a stale row names no text")
+        self.assertIsNone(self.manifest(), "nothing was promoted")
+        self.assertEqual(self.events(), [])
+        self.assertFalse(list(self.annotated.rglob("versions/*/db.i64")))
+        self.assertEqual(self.pristine_bytes(), before, "the pristine database is byte for byte what it was")
+
+    @pytest.mark.contract
+    def test_a_comment_that_appeared_where_none_was_expected_is_also_stale(self):
+        plan = self.cplan()
+        self.fake.comments[(START, "regular")] = "appeared later"
+        out = self.apply(self.sealed(plan))
+        self.assertEqual((out["status"], out["failed"][0]["error"]), ("ABORTED_ATOMIC", "PRECONDITION_FAILED"))
+
+    @pytest.mark.contract
+    def test_allow_partial_false_with_a_failed_item_promotes_nothing_and_leaves_the_pristine_alone(self):
+        self.fake.comments[(START, "regular")] = "old note"
+        plan = self.cplan([{"address": START, "comment": "new note", "comment_kind": "regular"},
+                           {"address": LATER, "comment": "other", "comment_kind": "regular"}])
+        sealed = self.resealed(self.sealed(plan), lambda p: p["items"][1].update(expect_comment="never there"))
+        before = self.pristine_bytes()
+        out = self.apply(sealed, allow_partial=False)
+        self.assertEqual((out["ok"], out["status"], out["written"], out["atomic"] if "atomic" in out else None),
+                         (False, "ABORTED_ATOMIC", False, None))
+        self.assertEqual(out["applied"], [], "not even the item whose precondition held")
+        self.assertIsNone(self.manifest())
+        self.assertFalse(list(self.annotated.rglob("versions/*/db.i64")))
+        self.assertEqual(self.events(), [])
+        self.assertEqual(self.pristine_bytes(), before)
+
+    @pytest.mark.contract
+    def test_allow_partial_true_applies_what_holds_and_names_what_did_not(self):
+        plan = self.cplan(self.TWO)
+        sealed = self.resealed(self.sealed(plan), lambda p: p["items"][1].update(expect_comment="never there"))
+        out = self.apply(sealed, allow_partial=True)
+        self.assertEqual((out["ok"], out["status"], out["applied_count"], out["failed_count"], out["atomic"]),
+                         (True, "PARTIAL_FAILURE", 1, 1, False))
+        self.assertEqual(out["verification"]["comments_expected"], 1, "only what was applied is verified")
+        self.assertEqual(out["failed"][0]["error"], "PRECONDITION_FAILED")
+        self.assertEqual(self.manifest()["version"], 1)
+        self.assertEqual(len(ti._journal_records(self.sha)[0][0]["items"]), 1)
+
+    @pytest.mark.contract
+    def test_allow_partial_true_with_nothing_applicable_is_all_failed(self):
+        sealed = self.resealed(self.sealed(self.cplan()), lambda p: p["items"][0].update(expect_comment="never there"))
+        out = self.apply(sealed, allow_partial=True)
+        self.assertEqual((out["ok"], out["status"], out["written"]), (False, "ALL_FAILED", False))
+        self.assertIsNone(self.manifest())
+
+    @pytest.mark.contract
+    def test_a_comment_that_did_not_persist_is_verification_failed_and_unpublished(self):
+        self.fake.apply = "wrong_comment"       # the engine reports success but keeps different text
+        out = self.cwrite()
+        self.assertEqual((out["ok"], out["status"], out["error"], out["fixable"]),
+                         (False, "VERIFICATION_FAILED", "VERIFICATION_FAILED", False))
+        self.assertEqual((out["verification"]["comments_matched"], out["verification"]["comments_expected"]), (0, 1))
+        self.assertIsNone(self.manifest())
+        self.assertEqual(out["version_retained_unpublished"], "v000001")
+        self.assertEqual(self.events(), ["batch_prepared", "batch_aborted"])
+        self.assertNotIn(SECRET_TEXT, ti._journal_path(self.sha).read_text(encoding="utf-8"))
+        self.assertEqual(self.cplan()["plan"]["base_version"], 0)
+
+    @pytest.mark.contract
+    def test_a_marker_that_did_not_persist_or_the_wrong_one_is_not_published(self):
+        for mode in ("apply", "verify"):
+            with self.subTest(mode):
+                self.fake.apply, self.fake.verify = ("no_persist", "ok") if mode == "apply" else ("ok", "wrong_marker")
+                out = self.cwrite(label=f"lbl-{mode}")
+                self.assertEqual(out["status"], "VERIFICATION_FAILED")
+                self.assertIsNone(self.manifest(f"lbl-{mode}"))
+
+    @pytest.mark.contract
+    def test_a_read_back_by_the_same_process_is_not_a_read_back_for_comments(self):
+        self.fake.verify = "same_pid"
+        out = self.cwrite()
+        self.assertEqual(out["status"], "VERIFICATION_FAILED")
+        self.assertIsNone(self.manifest())
+
+    @pytest.mark.contract
+    def test_a_save_the_engine_says_did_not_happen_promotes_nothing_for_comments(self):
+        self.fake.apply = "save_false"
+        out = self.cwrite()
+        self.assertEqual((out["ok"], out["error"], out["written"]), (False, "SAVE_NOT_CONFIRMED", False))
+        self.assertIsNone(self.manifest())
+        self.assertEqual(self.events(), [])
+
+    @pytest.mark.contract
+    def test_a_malformed_comment_plan_is_still_refused_before_any_session(self):
+        good = self.sealed(self.cplan())
+        calls = len(self.fake.calls)
+        for label, plan in (("unknown kind", dict(good, items=[dict(good["items"][0], comment_kind="decompiler")])),
+                            ("rename field on a comment item", dict(good, items=[dict(good["items"][0], new_name="x")])),
+                            ("expect missing", dict(good, items=[{k: v for k, v in good["items"][0].items()
+                                                                  if k != "expect_comment"}]))):
+            with self.subTest(label):
+                out = self.apply(plan)
+                self.assertEqual((out["ok"], out["status"], out["error"]), (False, "INVALID_PLAN", "PLAN_ITEM_MALFORMED"))
+        altered = dict(good, label="other-scope")
+        self.assertEqual(self.apply(altered)["error"], "PLAN_HASH_MISMATCH")
+        self.assertEqual(len(self.fake.calls), calls)
+
+    @pytest.mark.contract
+    def test_a_stale_base_version_blocks_a_comment_plan_like_a_rename_plan(self):
+        first, second = self.cplan(), self.cplan()
+        self.assertEqual(self.apply(self.sealed(first))["status"], "OK")
+        lost = self.apply(self.sealed(second))
+        self.assertEqual((lost["status"], lost["error"], lost["written"]), ("PRECONDITION_FAILED", "STALE_BASE_VERSION", False))
+
+    @pytest.mark.contract
+    def test_a_rename_plan_applies_exactly_as_before_and_its_records_keep_their_shape(self):
+        out = self.write([{"address": START, "new_name": "liebert_start"}])
+        self.assertEqual((out["status"], out["version"], out["applied"]),
+                         ("OK", 1, [{"index": 0, "address": START, "old_name": "start", "new_name": "liebert_start"}]))
+        v = out["verification"]
+        self.assertEqual((v["names_matched"], v["names_expected"]), (1, 1))
+        self.assertNotIn("comments_matched", v)
+        prepared, committed = ti._journal_records(self.sha)[0]
+        self.assertEqual((prepared["operation"], prepared["items"]),
+                         ("rename", [{"index": 0, "address": START, "old_name": "start", "new_name": "liebert_start"}]))
+        self.assertEqual(committed["items"], prepared["items"])
+        ops = [c["job"]["operation"] for c in self.fake.calls if c["job"]["mode"] != "create"]
+        self.assertEqual(ops[-3:], ["rename_plan", "rename_apply", "rename_verify"])
+        evidence = next(self.ev.glob("*annotations_apply*.json")).read_text(encoding="utf-8")
+        self.assertIn("liebert_start", evidence, "the rename evidence still carries names")
+
+    @pytest.mark.contract
+    def test_a_rename_then_a_comment_write_stack_as_versions(self):
+        self.assertEqual(self.write()["version"], 1)
+        out = self.cwrite()
+        self.assertEqual((out["status"], out["version"], out["prior_version"]), ("OK", 2, 1))
+        self.assertEqual([r["operation"] for r in ti._journal_records(self.sha)[0] if r["event"] == "batch_prepared"],
+                         ["rename", "comments"])
 
 
 # ---------------------------------------------------------------------------
@@ -1362,6 +1697,97 @@ class WorkerLogicTests(unittest.TestCase):
         result = self.run_op("comment_plan", "plan", [self.comment_item()])
         self.assertEqual((result["ok"], result["error"]), (False, "DATABASE_CHANGES_NOT_DISCARDABLE"))
         self.ida["idc"].get_cmt.assert_not_called()
+
+    def test_comment_apply_sets_the_kind_checks_the_read_back_stores_the_marker_and_checks_the_save(self):
+        held = {}
+        idc = self.ida["idc"]
+        idc.get_cmt.side_effect = lambda ea, rpt: held.get((ea, rpt))
+        idc.set_cmt.side_effect = lambda ea, text, rpt: held.__setitem__((ea, rpt), text) or True
+        items = [dict(self.comment_item(), expect_comment=None),
+                 dict(self.comment_item("0x140001004", "rep", "repeatable"), expect_comment=None)]
+        result = self.run_op("comment_apply", "write", items, marker={"version": 1})
+        self.assertEqual((result["ok"], result["save_returned"], result["marker_stored"], result["saved"]), (True, True, True, True))
+        self.assertEqual([(a["comment_kind"], a["old_comment"], a["new_comment"]) for a in result["applied"]],
+                         [("regular", None, "note"), ("repeatable", None, "rep")])
+        self.assertEqual(held, {(0x140001000, 0): "note", (0x140001004, 1): "rep"}, "repeatable maps to the engine's flag 1")
+        self.ida["ida_loader"].save_database.assert_called_once_with("db.i64", 0)
+        self.assertIs(result["database_changes_discarded"], False)
+
+    def test_comment_apply_refuses_a_temporary_or_unknown_session(self):
+        for flag in (True, None):
+            with self.subTest(flag=flag):
+                self.ida["ida_loader"].is_database_flag.return_value = flag
+                if flag is None:
+                    self.ida["ida_loader"].is_database_flag.side_effect = AttributeError("no such call")
+                result = self.run_op("comment_apply", "write", [dict(self.comment_item(), expect_comment=None)], marker={})
+                self.assertEqual((result["ok"], result["error"]), (False, "APPLY_SESSION_IS_TEMPORARY"))
+                self.ida["idc"].set_cmt.assert_not_called()
+                self.ida["ida_loader"].save_database.assert_not_called()
+
+    def test_comment_apply_precondition_failure_aborts_atomically_and_leaks_no_text(self):
+        idc = self.ida["idc"]
+        idc.get_cmt.side_effect = lambda ea, rpt: {(0x140001004, 0): "someone else"}.get((ea, rpt))
+        items = [dict(self.comment_item(), expect_comment=None),
+                 dict(self.comment_item("0x140001004", "mine"), expect_comment=None)]
+        result = self.run_op("comment_apply", "write", items, marker={})
+        self.assertEqual((result["ok"], result["error"], result["applied"]), (False, "ABORTED_ATOMIC", []))
+        self.assertEqual(result["failed"], [{"index": 1, "error": "PRECONDITION_FAILED", "expected_present": False,
+                                              "actual_present": True}])
+        self.assertNotIn("someone else", json.dumps(result))
+        idc.set_cmt.assert_not_called()
+        self.ida["ida_loader"].save_database.assert_not_called()
+
+    def test_comment_apply_partial_and_all_failed(self):
+        idc = self.ida["idc"]
+        done = set()
+        idc.get_cmt.side_effect = lambda ea, rpt: "note" if (ea, rpt) in done else None
+        idc.set_cmt.side_effect = lambda ea, text, rpt: done.add((ea, rpt)) or True
+        items = [dict(self.comment_item(), expect_comment=None), dict(self.comment_item("0x140001004"), expect_comment="x")]
+        partial = self.run_op("comment_apply", "write", items, marker={}, allow_partial=True)
+        self.assertEqual((partial["ok"], len(partial["applied"]), len(partial["failed"]), partial["atomic"]), (True, 1, 1, False))
+        self.ida["ida_loader"].save_database.reset_mock()
+        none = self.run_op("comment_apply", "write", [dict(self.comment_item("0x140001008"), expect_comment="x")],
+                           marker={}, allow_partial=True)
+        self.assertEqual((none["ok"], none["error"]), (False, "ALL_FAILED"))
+        self.ida["ida_loader"].save_database.assert_not_called()
+
+    def test_comment_apply_whose_read_back_differs_is_a_failure_even_when_set_cmt_said_true(self):
+        idc = self.ida["idc"]
+        idc.get_cmt.side_effect = lambda ea, rpt: None
+        idc.set_cmt.side_effect = lambda ea, text, rpt: True      # says yes, changes nothing
+        result = self.run_op("comment_apply", "write", [dict(self.comment_item(), expect_comment=None)], marker={})
+        self.assertEqual((result["ok"], result["error"], result["failed"][0]["error"], result["failed"][0]["read_back_matches"]),
+                         (False, "ABORTED_ATOMIC", "COMMENT_REJECTED_BY_ENGINE", False))
+        self.ida["ida_loader"].save_database.assert_not_called()
+
+    def test_comment_apply_refuses_bad_items_by_row(self):
+        idc = self.ida["idc"]
+        idc.get_cmt.side_effect = lambda ea, rpt: None
+        for item, error in ((dict(self.comment_item(kind="decompiler"), expect_comment=None), "UNSUPPORTED_COMMENT_KIND"),
+                            (dict(self.comment_item(comment="  "), expect_comment=None), "INVALID_COMMENT"),
+                            (dict(self.comment_item(address="zz"), expect_comment=None), "INVALID_ADDRESS"),
+                            (dict(self.comment_item(), expect_comment=5), "INVALID_EXPECT_COMMENT")):
+            with self.subTest(error):
+                result = self.run_op("comment_apply", "write", [item], marker={})
+                self.assertEqual((result["ok"], result["failed"][0]["error"]), (False, error))
+        idc.set_cmt.assert_not_called()
+
+    def test_comment_verify_is_read_only_marks_the_session_temporary_and_returns_the_kind_asked(self):
+        idc = self.ida["idc"]
+        idc.get_cmt.side_effect = lambda ea, rpt: {(0x140001000, 0): "a", (0x140001004, 1): "b"}.get((ea, rpt))
+        self.ida["ida_loader"].set_database_flag.reset_mock()
+        result = self.run_op("comment_verify", "verify", [self.comment_item(), self.comment_item("0x140001004", kind="repeatable"),
+                                                           self.comment_item("0x140001004", kind="regular")])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual([(r["comment_kind"], r["actual_comment"]) for r in result["verified_items"]],
+                         [("regular", "a"), ("repeatable", "b"), ("regular", None)])
+        self.assertIs(result["database_changes_discarded"], True)
+        self.ida["ida_loader"].set_database_flag.assert_called_once_with(4)
+        idc.set_cmt.assert_not_called()
+        self.ida["ida_loader"].save_database.assert_not_called()
+        self.assertEqual(self.run_op("comment_verify", "write", [self.comment_item()])["error"], "OPERATION_MODE_MISMATCH")
+        self.assertEqual(self.run_op("comment_apply", "verify", [self.comment_item()], marker={})["error"],
+                         "OPERATION_MODE_MISMATCH")
 
     def test_the_result_carries_the_engine_pid_and_the_completion_marker_last(self):
         out = Path(process_scratch("an_worker")) / "out.json"

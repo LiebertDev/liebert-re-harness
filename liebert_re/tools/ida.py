@@ -2859,10 +2859,12 @@ def _plan_problem(plan, kinds=("rename",)):
 
 def ida_annotations_apply(path, plan=None, allow_partial=False, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                           cancellation_token=None):
-    """APPLY a plan from `ida_rename_plan`: write its renames into a new, immutable annotation version of
-    the scope it names. It cannot be called without a plan, and the plan must be unaltered (its digest is
+    """APPLY a plan from `ida_rename_plan` (kind "rename") or `ida_set_comments_plan` (kind "comments"):
+    write its renames or comments into a new, immutable annotation version of the scope it names. A
+    comment's text never reaches the audit journal or the evidence file, only its sha256 and length; the
+    answer to the caller carries it (after redaction). It cannot be called without a plan, and the plan must be unaltered (its digest is
     recomputed), made for this input (hash), and still current (its base version and database hash must be
-    the published ones, and every item's `expect` name must be what the database holds now).
+    the published ones, and every item's `expect` name or comment must be what the database holds now).
 
     `plan` is the plan object (or its JSON text). `allow_partial` must be exactly True or False. The
     default is atomic: the first item that fails stops everything, nothing is promoted (`ABORTED_ATOMIC`).
@@ -2899,10 +2901,10 @@ def ida_annotations_apply(path, plan=None, allow_partial=False, timeout_seconds=
                            "the `plan_sha256` it returned inside the plan object as `plan_sha256`.")
     if isinstance(plan, dict) and "items" not in plan and isinstance(plan.get("plan"), dict):
         plan = {**plan["plan"], "plan_sha256": plan.get("plan_sha256")}      # the whole plan answer is also accepted
-    error, field = _plan_problem(plan)
+    error, field = _plan_problem(plan, ("rename", "comments"))
     if error:
         return _refuse(tool, "INVALID_PLAN", error, fixable=True, field=field,
-                       accepted="the `plan` object of ida_rename_plan with its `plan_sha256` added",
+                       accepted="the `plan` object of ida_rename_plan or ida_set_comments_plan with its `plan_sha256` added",
                        fix="Pass the plan exactly as returned (add the answer's `plan_sha256` as the key "
                            "`plan_sha256` of the plan, or pass the whole answer).")
     body_without_digest = {k: v for k, v in plan.items() if k != "plan_sha256"}
@@ -2973,6 +2975,7 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
                    "fix": "Another write changed this scope after the plan was made. Nothing was written. Plan again "
                           "against the current version.", "written": False})
     deadline = time.monotonic() + total
+    comments = plan["kind"] == "comments"
     label_dir = state["label_dir"]
     write_id = uuid.uuid4().hex[:12]
     # Never reuse a number: not one a directory holds, and not one the journal ever prepared (a purged
@@ -2994,6 +2997,24 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
     def remaining():
         return int(deadline - time.monotonic())
 
+    def comment_digest(text):
+        """What a log may hold of a comment: its sha256 and length. None stays None (no comment there)."""
+        return None if text is None else {"sha256": _sha256_text(text), "length": len(text)}
+
+    def scrub_text_files(directory):
+        """Best-effort removal of the job and result files of a work directory (they hold comment text)."""
+        for name in ("job.json", _RESULT_NAME):
+            try:
+                (Path(directory) / name).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                # Reported, never swallowed: the file may still hold comment text. Only the file name and the
+                # error type go into the answer (no text, no path, no OS message).
+                result.setdefault("signals", {}).setdefault("text_scrub_failures", []).append(
+                    {"file": name, "directory": f"recovery/{write_id}", "error_type": type(exc).__name__,
+                     "errno": exc.errno, "text_may_remain_on_disk": True})
+
     try:
         # 1. the candidate, in its own recovery directory, from the published version (or the pristine analysis)
         try:
@@ -3010,12 +3031,23 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
                 _remove_owned_work(rdir)
                 return _j({**result, "status": "TIMEOUT", "error": "IDA_TIMEOUT_BUDGET_EXHAUSTED"})
             # 2. the write session (an ordinary session of the candidate; not temporary)
-            job = {"operation": "rename_apply", "write_mode": "write", "allow_partial": allow_partial, "marker": marker,
-                   "items": [{"address": i["address"], "address_kind": "va", "new_name": i["new_name"],
-                              "expect_name": i["expect_name"]} for i in plan["items"]]}
-            data, signals, provenance = _annotated_session(
-                exe, rdir, job, tool=tool, sha256=sha256, md5=md5, invocation=invocation, temporary=False,
-                seconds=min(left, _MAX_ANNOTATE_TIMEOUT_SECONDS), cancellation_token=cancellation_token)
+            if comments:
+                job = {"operation": "comment_apply", "write_mode": "write", "allow_partial": allow_partial,
+                       "marker": marker,
+                       "items": [{"address": i["address"], "address_kind": "va", "comment": i["comment"],
+                                  "comment_kind": i["comment_kind"], "expect_comment": i["expect_comment"]}
+                                 for i in plan["items"]]}
+            else:
+                job = {"operation": "rename_apply", "write_mode": "write", "allow_partial": allow_partial, "marker": marker,
+                       "items": [{"address": i["address"], "address_kind": "va", "new_name": i["new_name"],
+                                  "expect_name": i["expect_name"]} for i in plan["items"]]}
+            try:
+                data, signals, provenance = _annotated_session(
+                    exe, rdir, job, tool=tool, sha256=sha256, md5=md5, invocation=invocation, temporary=False,
+                    seconds=min(left, _MAX_ANNOTATE_TIMEOUT_SECONDS), cancellation_token=cancellation_token)
+            finally:
+                if comments:      # the job and result files hold comment text; a kept candidate must not
+                    scrub_text_files(rdir)
         except _StageFailure as failure:
             return _j({**failure.body, "written": False, "candidate_retained": rdir.exists(),
                        "concurrency_policy": _CONCURRENCY_POLICY})
@@ -3045,14 +3077,29 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
                        "fix": "The candidate grew past the annotated byte budget (or the bytes could not be measured). "
                               "It is kept in recovery and nothing was promoted; an operator decides about the budget."})
         applied = data.get("applied", [])
+        if comments and not all(isinstance(a, dict) and isinstance(a.get("index"), int) and isinstance(a.get("address"), str)
+                                and a.get("comment_kind") in _COMMENT_KINDS and isinstance(a.get("new_comment"), str)
+                                and (a.get("old_comment") is None or isinstance(a.get("old_comment"), str))
+                                for a in applied):
+            return _j({**result, "status": "ANALYSIS_LIMITED", "error": "WORKER_APPLIED_ROWS_MALFORMED",
+                       "candidate_retained": True, "fixable": False,
+                       "fix": "The engine's report of what it wrote is not in the expected shape, so nothing was "
+                              "promoted. The candidate is kept in its recovery directory."})
         # 3. write-ahead: batch_prepared, synced, BEFORE the promotion
+        if comments:      # Privacy decision: comment text is never journalled; hash and length only.
+            logged = [{"index": a["index"], "address": a["address"], "comment_kind": a["comment_kind"],
+                       "old_comment": comment_digest(a["old_comment"]), "new_comment": comment_digest(a["new_comment"])}
+                      for a in applied]
+        else:
+            logged = [{"index": a["index"], "address": a["address"], "old_name": a["old_name"], "new_name": a["new_name"]}
+                      for a in applied]
         journal["prepared"] = {
-            "event": "batch_prepared", "operation": "rename", "write_id": write_id, "label": label, "version": version,
+            "event": "batch_prepared", "operation": "comments" if comments else "rename", "write_id": write_id,
+            "label": label, "version": version,
             "prior_version": state["version"], "prior_db_sha256": state["db_sha256"], "candidate_db_sha256": candidate_sha,
             "candidate_bytes": candidate_bytes, "candidate_location": f"recovery/{write_id}/{_DB_NAME}",
             "plan_sha256": plan["plan_sha256"], "item_count": len(applied),
-            "items": [{"index": a["index"], "address": a["address"], "old_name": a["old_name"], "new_name": a["new_name"]}
-                      for a in applied],
+            "items": logged,
         }
         written, why = _journal_append(sha256, journal["prepared"])
         if not written:
@@ -3081,8 +3128,9 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
         # 5. verification in a NEW engine process, over a copy of the promoted file
         promoted = version_dir / _DB_NAME
         promoted_sha, _ = _file_sha256(promoted)
-        verify = {"separate_process": True, "names_matched": 0, "names_expected": len(applied),
-                  "marker_matched": False, "write_session_pid": data.get("engine_pid")}
+        verify = {"separate_process": True, "marker_matched": False, "write_session_pid": data.get("engine_pid")}
+        verify.update({"comments_matched": 0, "comments_expected": len(applied)} if comments
+                      else {"names_matched": 0, "names_expected": len(applied)})
 
         def abort(reason, **extra):
             ok, _why = _journal_append(sha256, {"event": "batch_aborted", "write_id": write_id, "label": label,
@@ -3101,21 +3149,33 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
         verify_dir.mkdir(parents=True)
         shutil.copyfile(promoted, verify_dir / _DB_NAME)
         try:
+            verify_job = (
+                {"operation": "comment_verify", "write_mode": "verify",
+                 "items": [{"address": a["address"], "address_kind": "va", "comment_kind": a["comment_kind"]}
+                           for a in applied]} if comments else
+                {"operation": "rename_verify", "write_mode": "verify",
+                 "items": [{"address": a["address"], "address_kind": "va"} for a in applied]})
             checked, _signals, _prov = _annotated_session(
-                exe, verify_dir, {"operation": "rename_verify", "write_mode": "verify",
-                                  "items": [{"address": a["address"], "address_kind": "va"} for a in applied]},
+                exe, verify_dir, verify_job,
                 tool=tool, sha256=sha256, md5=md5, invocation=invocation, temporary=True,
                 seconds=min(left, _MAX_ANNOTATE_TIMEOUT_SECONDS), cancellation_token=cancellation_token)
         except _StageFailure as failure:
             return abort("verification_session_failed", verification_failure=failure.body.get("error"))
         verify["verify_session_pid"] = checked.get("engine_pid")
         verify["harness_pid"] = os.getpid()
-        got = {row["address"]: row["actual_name"] for row in checked.get("verified_items") or []}
-        verify["names_matched"] = sum(1 for a in applied if got.get(a["address"]) == a["new_name"])
+        if comments:
+            got = {(row.get("address"), row.get("comment_kind")): row.get("actual_comment")
+                   for row in checked.get("verified_items") or [] if isinstance(row, dict)}
+            verify["comments_matched"] = sum(1 for a in applied if got.get((a["address"], a["comment_kind"])) == a["new_comment"])
+            matched, expected = verify["comments_matched"], verify["comments_expected"]
+        else:
+            got = {row["address"]: row["actual_name"] for row in checked.get("verified_items") or []}
+            verify["names_matched"] = sum(1 for a in applied if got.get(a["address"]) == a["new_name"])
+            matched, expected = verify["names_matched"], verify["names_expected"]
         stored = checked.get("annotation_marker")
         verify["marker_matched"] = isinstance(stored, dict) and all(stored.get(k) == marker[k] for k in marker)
         verify["marker_version"] = stored.get("version") if isinstance(stored, dict) else None
-        if checked.get("ok") is not True or verify["names_matched"] != len(applied) or not verify["marker_matched"] \
+        if checked.get("ok") is not True or matched != expected or not verify["marker_matched"] \
                 or verify["verify_session_pid"] in (None, verify["write_session_pid"], verify["harness_pid"]):
             return abort("verification_failed")
         # 6. publish the single pointer
@@ -3133,23 +3193,28 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
         _remove_owned_work(rdir)
         failed = data.get("failed", [])
         status = "PARTIAL_FAILURE" if failed else "OK"
+        shown = [{**a, "old_comment": None if a["old_comment"] is None else _redact(a["old_comment"]),
+                  "new_comment": _redact(a["new_comment"])} for a in applied] if comments else applied
         body = {**result, "ok": True, "status": status, "written": True, "version": version,
                 "db_sha256": candidate_sha, "db_bytes": candidate_bytes, "prior_version": state["version"],
-                "applied": applied, "failed": failed, "applied_count": len(applied), "failed_count": len(failed),
+                "applied": shown, "failed": failed, "applied_count": len(applied), "failed_count": len(failed),
                 "items_listed_complete": True, "atomic": not allow_partial,
                 "save_returned": data.get("save_returned"), "verification": verify,
                 "provenance": provenance, "journal": {"prepared": True, "committed": committed},
                 "annotated_view": {"state": "verified", "version": version},
                 "note": ("A new immutable annotation version was published after a separate engine process read its "
-                         "names and marker back from the stored file. The pristine cache database was not changed."
+                         + ("comments" if comments else "names") + " and marker back from the stored file. The pristine cache database was not changed."
                          + ("" if not failed else " Some items were not applied (allow_partial=True); see `failed`."))}
         if not committed:
             body["commit_record_pending"] = True
             body["journal"]["commit_error"] = commit_why
             body["note"] += (" The commit record could not be written; the version IS published (the manifest "
                              "points at it) and the next operation on this scope records it from the files.")
+        evidence = body
+        if comments:      # the evidence file carries hash and length of each comment, never the text
+            evidence = {**body, "applied": journal["prepared"]["items"]}
         body["internal_evidence_name"], body["evidence_write_error"] = _write_evidence(
-            p, "annotations_apply", body, EVIDENCE_ANNOTATE_APPLY, stem=sha256[:16])
+            p, "annotations_apply", evidence, EVIDENCE_ANNOTATE_APPLY, stem=sha256[:16])
         return _j(body)
     finally:
         _remove_owned_work(verify_dir)
