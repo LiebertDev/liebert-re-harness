@@ -167,3 +167,17 @@ def test_published_tool_name_set_is_unchanged():
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
     assert digest == "440a45bbf40ac3977c9ec280f2c46ddf36f5b1257a926c6e6942bcdf10c7259f"
+
+
+def test_the_imported_package_is_this_checkout():
+    # A stale editable install elsewhere on the machine can shadow the checkout
+    # when the working directory is not the repo root; the suite would then
+    # measure the wrong code without failing. Root comes from conftest.
+    import liebert_re
+
+    root = conftest.REPO_ROOT
+    actual = Path(liebert_re.__file__).resolve()
+    assert root in actual.parents, (
+        f"liebert_re was imported from {actual}, expected a path under {root}. "
+        "Another installation is probably shadowing this checkout."
+    )
