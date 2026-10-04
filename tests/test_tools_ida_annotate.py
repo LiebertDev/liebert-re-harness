@@ -2304,5 +2304,140 @@ class AnnotateRealInstallTests(unittest.TestCase):
         self.assertNotEqual(out["db_sha256"], ti._file_sha256(stored)[0])
 
 
+# An idapy that reads comments with IDA's own `ida_bytes.get_cmt` (a different entry point from the
+# worker's `idc.get_cmt`), so a kind mapping wrong in BOTH the writer and the worker's reader cannot hide.
+_INDEPENDENT_READER = """
+import json, os, ida_auto, ida_bytes, ida_pro
+ida_auto.auto_wait()
+rows = {}
+for ea in json.loads(os.environ["LIEBERT_TEST_EAS"]):
+    rows[hex(ea)] = {"regular": ida_bytes.get_cmt(ea, False), "repeatable": ida_bytes.get_cmt(ea, True)}
+with open(os.environ["LIEBERT_TEST_OUT"], "w", encoding="utf-8") as h:
+    json.dump(rows, h)
+ida_pro.qexit(0)
+"""
+REG_TEXT, REP_TEXT = "liebert regular note", "liebert repeatable note"
+
+
+@pytest.mark.heavy
+class CommentApplyRealInstallTests(unittest.TestCase):
+    """Needs a licensed IDA Pro 9.x; skips when idat is not found. Writes `regular` and `repeatable` comments
+    into a real database and reads the kinds back, including through a reader that is not the worker's."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not ti.ida_available():
+            raise unittest.SkipTest("IDA Pro (idat) is not installed")
+        from liebert_re.recover.owned_binary_fixtures import build_owned_pe_with_code
+        from tests.test_tools_ida_round2a import CODE
+        cls.root = process_scratch("ca_real")
+        cls.root.mkdir(parents=True, exist_ok=True)
+        cls.pe = build_owned_pe_with_code(cls.root / "owned.exe", CODE)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.root, ignore_errors=True)
+
+    def setUp(self):
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        self.base = self.root / f"t{hashlib.sha256(self.id().encode()).hexdigest()[:5]}"
+        self.base.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
+        self.cache, self.annotated = self.base / "c", self.base / "a"
+        stack.enter_context(mock.patch.object(ti, "CACHE_ROOT", self.cache))
+        stack.enter_context(mock.patch.object(ti, "ANNOTATED_ROOT", self.annotated))
+        for name in ("EVIDENCE", "EVIDENCE_RENAME_PLAN", "EVIDENCE_ANNOTATE_APPLY", "EVIDENCE_ANNOTATIONS"):
+            stack.enter_context(mock.patch.object(ti, name, self.base / "e"))
+        stack.enter_context(mock.patch.object(ti, "_evidence_index_record_write", return_value={}))
+        self.sha = ti._sha256_md5(self.pe)[0]
+
+    def cplan(self, comments):
+        answer = json.loads(ti.ida_set_comments_plan(str(self.pe), "first-pass", comments))
+        self.assertTrue(answer["ok"], answer)
+        return answer
+
+    def apply(self, answer):
+        return json.loads(ti.ida_annotations_apply(
+            str(self.pe), dict(answer["plan"], plan_sha256=answer["plan_sha256"])))
+
+    def pristine(self):
+        return next(self.cache.glob("*.p0v1.*/db.i64"))
+
+    TWO = [{"address": START, "comment": REG_TEXT, "comment_kind": "regular"},
+           {"address": LATER, "comment": REP_TEXT, "comment_kind": "repeatable"}]
+
+    def worker_read(self, version, items):
+        """The worker's own read operation (`comment_verify`) in a fresh idat process over a copy."""
+        work = self.annotated / self.sha / "scratch-test0001"
+        work.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        shutil.copyfile(ti._version_file(ti._label_dir(self.sha, "first-pass"), version), work / ti._DB_NAME)
+        data, _s, _p = ti._annotated_session(
+            ti._ida_binary(), work, {"operation": "comment_verify", "write_mode": "verify", "items": items}, tool="t",
+            sha256=self.sha, md5=ti._sha256_md5(self.pe)[1], invocation={}, temporary=True, seconds=120,
+            cancellation_token=None)
+        return {(r["address"], r["comment_kind"]): r["actual_comment"] for r in data["verified_items"]}
+
+    def independent_read(self, version, addresses):
+        """`ida_bytes.get_cmt` of both kinds, by a script that is not the annotation worker."""
+        import subprocess
+        work = self.base / "indep"
+        work.mkdir()
+        shutil.copyfile(ti._version_file(ti._label_dir(self.sha, "first-pass"), version), work / ti._DB_NAME)
+        script, out = work / "reader.py", work / "out.json"
+        script.write_text(_INDEPENDENT_READER, encoding="utf-8")
+        env = dict(os.environ, LIEBERT_TEST_EAS=json.dumps(addresses), LIEBERT_TEST_OUT=str(out))
+        subprocess.run([ti._ida_binary(), "-A", "-Opdb:off", f"-S{script}", str(work / ti._DB_NAME)],
+                       cwd=work, env=env, timeout=180, capture_output=True, check=False)
+        self.assertTrue(out.is_file(), "the independent reader produced no result")
+        return json.loads(out.read_text(encoding="utf-8"))
+
+    def test_regular_and_repeatable_land_as_their_own_kind_and_never_swap(self):
+        out = self.apply(self.cplan(self.TWO))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual((out["status"], out["applied_count"], out["version"]), ("OK", 2, 1))
+        self.assertEqual(out["verification"]["comments_matched"], 2)
+        # (1) the worker's own read operation, asked for BOTH kinds at BOTH addresses
+        asked = [{"address": a, "comment_kind": k} for a in (START, LATER) for k in ("regular", "repeatable")]
+        got = self.worker_read(1, asked)
+        s, n = hex(int(START, 16)), hex(int(LATER, 16))
+        self.assertEqual(got, {(s, "regular"): REG_TEXT, (s, "repeatable"): None,
+                               (n, "regular"): None, (n, "repeatable"): REP_TEXT})
+        # (2) IDA's own `ida_bytes.get_cmt`, from a script that shares nothing with the worker
+        indep = self.independent_read(1, [int(START, 16), int(LATER, 16)])
+        self.assertEqual(indep[s], {"regular": REG_TEXT, "repeatable": None})
+        self.assertEqual(indep[n], {"regular": None, "repeatable": REP_TEXT})
+
+    def test_applying_comments_leaves_the_pristine_database_byte_identical(self):
+        plan = self.cplan(self.TWO)
+        before = ti._file_sha256(self.pristine())
+        size_before = self.pristine().stat().st_size
+        out = self.apply(plan)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(ti._file_sha256(self.pristine()), before)
+        self.assertEqual(self.pristine().stat().st_size, size_before)
+        self.assertNotEqual(out["db_sha256"], before[0])
+
+    def test_a_stale_expect_comment_is_refused_by_the_real_engine(self):
+        first = self.apply(self.cplan([{"address": START, "comment": REG_TEXT, "comment_kind": "regular"}]))
+        self.assertTrue(first["ok"], first)
+        # Based on the published version, so the ONLY thing wrong is the expectation: the plan claims the
+        # address has no comment, the real database holds one.
+        again = self.cplan([{"address": START, "comment": "second", "comment_kind": "regular"}])
+        self.assertEqual(again["plan"]["items"][0]["expect_comment"], REG_TEXT)
+        sealed = json.loads(json.dumps(again["plan"]))
+        sealed["items"][0]["expect_comment"] = None
+        sealed.pop("plan_sha256", None)
+        sealed["plan_sha256"] = ti._sha256_text(ti._canonical(sealed))
+        out = json.loads(ti.ida_annotations_apply(str(self.pe), sealed))
+        # the contract (see the fast-tier twin): an item-level PRECONDITION_FAILED aborts the atomic batch
+        self.assertEqual((out["status"], out["written"], [f["error"] for f in out["failed"]]),
+                         ("ABORTED_ATOMIC", False, ["PRECONDITION_FAILED"]))
+        self.assertIsNone(out["failed"][0].get("new_comment"))
+        self.assertEqual(self.worker_read(1, [{"address": START, "comment_kind": "regular"}]),
+                         {(hex(int(START, 16)), "regular"): REG_TEXT}, "the refused write changed nothing")
+
+
 if __name__ == "__main__":
     unittest.main()
