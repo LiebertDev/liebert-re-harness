@@ -289,6 +289,22 @@ def _ida_status(a):
     return _load("liebert_re.tools.ida", "ida_status")()
 
 
+def _kernel_triage(a):
+    return _load("liebert_re.tools.binary", "kernel_triage")(a.path)
+
+
+def _ghidra_status(a):
+    return _load("liebert_re.tools.ghidra", "ghidra_status")()
+
+
+def _ghidra_facts(a):
+    return _load("liebert_re.tools.ghidra", "ghidra_program_facts")(a.path, timeout_seconds=a.timeout)
+
+
+def _ida_annotations(a):
+    return _load("liebert_re.tools.ida", "ida_annotations")(a.path, max_results=a.max_results, max_chars=a.max_chars)
+
+
 def _capabilities(a):
     return {"families": _load("liebert_re.report.tool_families", "published_family_report")()}
 
@@ -494,6 +510,13 @@ def _build_parser():
     sp.add_argument("--max-chars", type=int, default=60000, help="bound on the JSON response")
     sp.add_argument("--timeout", type=int, default=180, help="seconds for the whole call, clamped to 5-600; the session that builds the microcode is capped at 300")
     add("idastatus", _ida_status, "report whether IDA is reachable, from where, its version and whether the decompiler initialises (runs idat once)", path=False)
+    sp = add("idaannotations", _ida_annotations, "read the log of renames and comments this package recorded for a file's content (a plain file read: no IDA is started)")
+    sp.add_argument("--max-results", type=int, default=500, help="newest entries returned, 1-5000")
+    sp.add_argument("--max-chars", type=int, default=60000, help="bound on the JSON response")
+    sp = add("kerneltriage", _kernel_triage, "read-only first look at a PE that might be a Windows kernel driver (driver_likelihood stays UNKNOWN unless the evidence supports more)")
+    add("ghidrastatus", _ghidra_status, "report where Ghidra's analyzeHeadless is, its version and the Java it needs (does not launch Ghidra)", path=False)
+    sp = add("ghidrafacts", _ghidra_facts, "import a file into a throwaway Ghidra project, run default analysis and report read-only facts about the program (the source file is not modified)")
+    sp.add_argument("--timeout", type=int, default=300, help="seconds for the whole headless run")
     add("unpack", _unpack, "statically unpack a UPX-packed PE (output goes to the evidence cache)").add_argument("--timeout", type=int, default=60)
     add("scan", _scan, "scan with YARA-X rules").add_argument("--rules", required=True, help="rules file")
     sp = add("minidump", _minidump, "analyse a Windows minidump")

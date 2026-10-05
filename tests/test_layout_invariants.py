@@ -212,7 +212,11 @@ def test_published_tool_name_set_is_unchanged():
     # liebert_re/dynamic/frida_trace_client.py, none removed: _classify_rpc_init_error (the marker
     # tuple is an assignment, not a def, so it adds nothing). No new module.
     # Digest recomputed from the source.
-    assert digest == "e9ad4a99d4364b058071d36d84face88843f77acbcc5ce0f56b66026f6a7a282"
+    # CLI read-only wiring slice: 742 -> 746, four top-level handlers added in liebert_re/cli.py,
+    # none removed: _kernel_triage, _ghidra_status, _ghidra_facts, _ida_annotations (reached as
+    # `kerneltriage`, `ghidrastatus`, `ghidrafacts`, `idaannotations`). No new module. Digest
+    # recomputed from the source.
+    assert digest == "18cd9216087efb59eed9921724dcc353051d156cf7b5026c354c403855d3d3b3"
 
 
 def test_the_imported_package_is_this_checkout():
