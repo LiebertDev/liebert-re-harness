@@ -23,6 +23,30 @@ def _descriptor_to_java_relpath(name):
     n=(name or '').strip().replace('.','/')
     return n+'.java'
 
+def _name_stays_in_root(rel):
+    """False for a class name that is really a path out of the output root: an absolute or
+    drive-qualified name, or a `..` component. Checked with the workspace's own safe_path before
+    the name is ever joined onto the decompiler's output directory."""
+    if not rel or '..' in rel.split('/'):return False
+    try:safe_path(rel)
+    except PermissionError:return False
+    return True
+
+def _find_decompiled(root,rel):
+    """(file, []) when the decompiled output holds the class at exactly the requested package
+    path (under `sources/` or the output root). Otherwise (None, packages) where packages are the
+    packages of same-named files elsewhere: a same-named class in another package is a different
+    class, so it is reported, never returned. Package names only, no absolute paths."""
+    for c in (root/'sources'/rel,root/rel):
+        if c.is_file():return c,[]
+    found=set()
+    for c in root.rglob(Path(rel).name):
+        if not c.is_file():continue
+        parts=c.relative_to(root).parts[:-1]
+        if parts[:1]==('sources',):parts=parts[1:]
+        found.add('.'.join(parts))
+    return None,sorted(found)
+
 def _list_classes(p,is_jar):
     if is_jar:
         with zipfile.ZipFile(p) as z:
@@ -42,16 +66,18 @@ def jvm_decompiler(path,operation='classes',class_name='',max_items=300,max_char
     if operation=='decompile_class':
         target=class_name or (classes[0] if len(classes)==1 else '')
         if not target:return _j({**base,'ok':False,'error':'CLASS_NAME_REQUIRED'})
+        rel=_descriptor_to_java_relpath(target)
+        if not _name_stays_in_root(rel):return _j({**base,'ok':False,'error':'CLASS_NAME_OUTSIDE_ROOT','requested_class':target,'detail':'The class name must be a package path, not a path that leaves the decompiled output.'})
         exe=_jadx()
         if not exe:return _j({**base,'ok':False,'error':'JADX_TOOL_MISSING'})
         with tempfile.TemporaryDirectory(prefix='jadx_jvm_out_') as tmp:
             cp=run_bounded_process([exe,'-d',tmp,str(p)],timeout_seconds=180,cancellation_token=cancellation_token,max_output_chars=2_000_000)
             if cp.cancelled:return _j({**base,'ok':False,'error':'JADX_CANCELLED_PROCESS_TREE_TERMINATED'})
             if cp.timed_out:return _j({**base,'ok':False,'error':'JADX_TIMEOUT_PROCESS_TREE_TERMINATED'})
-            rel=_descriptor_to_java_relpath(target)
-            candidates=[Path(tmp)/'sources'/rel,*Path(tmp).rglob(Path(rel).name)]
-            hit=next((c for c in candidates if c.exists()),None)
-            if not hit:return _j({**base,'ok':False,'error':'CLASS_NOT_FOUND_IN_DECOMPILED_OUTPUT','jadx_stderr':(cp.stderr or '')[-1500:]})
+            hit,found_pkgs=_find_decompiled(Path(tmp),rel)
+            if not hit:
+                if found_pkgs:return _j({**base,'ok':False,'error':'CLASS_PATH_MISMATCH','requested_class':target,'requested_package':rel.rpartition('/')[0].replace('/','.'),'found_packages':found_pkgs,'detail':'A file with that name exists only under another package; it is a different class and was not returned.'})
+                return _j({**base,'ok':False,'error':'CLASS_NOT_FOUND_IN_DECOMPILED_OUTPUT','jadx_stderr':(cp.stderr or '')[-1500:]})
             text=hit.read_text(encoding='utf-8',errors='replace')
         return _j({**base,'class':target,'content':text[:max_chars],'truncated':len(text)>max_chars})
     return _j({**base,'ok':False,'error':'UNSUPPORTED_JVM_OPERATION'})

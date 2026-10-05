@@ -201,7 +201,11 @@ def test_published_tool_name_set_is_unchanged():
     # on top, 716 + 21 = 737 (measured, not summed); digest recomputed from the merged source.
     # verified-copy slice: 737 -> 738, one private top-level name added in liebert_re/tools/ida.py,
     # none removed: _verified_copy. No new module. Digest recomputed from the source.
-    assert digest == "fa552392bc04781c2ca0237d67fa6d4d52db126ec897a271bd094ae56e037fdd"
+    # decompiled-class identity slice: 738 -> 740, two private top-level names added, none removed,
+    # the same pair in liebert_re/tools/dex.py and liebert_re/tools/jvm.py (the pin is a set, so the
+    # twin definitions count once each): _name_stays_in_root and _find_decompiled. No new module.
+    # Digest recomputed from the source.
+    assert digest == "41f1039b7415b19eb20e2d980d774ef273293806e3bbff0a0c47b10005e2fdec"
 
 
 def test_the_imported_package_is_this_checkout():
