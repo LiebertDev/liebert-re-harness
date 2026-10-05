@@ -106,26 +106,37 @@ ALGORITHMS = {
 }
 
 
+# status values reuse the vocabulary of liebert_re/tools/binary.py
+# (kernel_triage, rip_relative_iat_scan, ...): OK, ANALYSIS_LIMITED (could not
+# look), INVALID_INPUT (the caller asked wrongly). They are ADDED beside the
+# existing ``error`` strings, which are unchanged.
+STATUS_OK = "OK"
+STATUS_NOT_LOOKED = "ANALYSIS_LIMITED"
+STATUS_USAGE = "INVALID_INPUT"
+
+
 def _read_export_names(dll_path):
+    """Returns ``(names, error, directory_present)``. ``names`` is None on error."""
     try:
         import pefile
     except ImportError:
-        return None, "PEFILE_UNAVAILABLE"
+        return None, "PEFILE_UNAVAILABLE", None
     p = Path(str(dll_path))
     if not p.is_file():
-        return None, f"DLL_NOT_FOUND:{p}"
+        return None, f"DLL_NOT_FOUND:{p}", None
     pe = None
     try:
         pe = pefile.PE(str(p), fast_load=True)
         pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
         names = []
-        if hasattr(pe, "DIRECTORY_ENTRY_EXPORT"):
+        present = hasattr(pe, "DIRECTORY_ENTRY_EXPORT")
+        if present:
             for sym in pe.DIRECTORY_ENTRY_EXPORT.symbols:
                 if sym.name:
                     names.append(sym.name.decode(errors="replace"))
-        return names, None
+        return names, None, present
     except Exception as exc:
-        return None, f"{type(exc).__name__}:{exc}"
+        return None, f"{type(exc).__name__}:{exc}", None
     finally:
         if pe is not None:
             pe.close()
@@ -153,11 +164,21 @@ def crack_api_hash(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None,
     algo_set = {k: v for k, v in ALGORITHMS.items() if not algorithms or k in algorithms}
     unknown = [a for a in (algorithms or []) if a not in ALGORITHMS]
     if unknown:
-        return {"ok": False, "error": "UNKNOWN_ALGORITHM", "unknown": unknown, "available": sorted(ALGORITHMS)}
+        return {"ok": False, "status": STATUS_USAGE, "error": "UNKNOWN_ALGORITHM", "unknown": unknown,
+                "available": sorted(ALGORITHMS)}
 
-    names, err = _read_export_names(dll_path)
+    names, err, directory_present = _read_export_names(dll_path)
     if names is None:
-        return {"ok": False, "error": err}
+        return {"ok": False, "status": STATUS_NOT_LOOKED, "error": err}
+    if not names:
+        # Zero names to hash against is not "searched, found nothing": the
+        # question's domain is empty, so nothing was measured. A directory that
+        # is missing and one that is present but holds no names (measured on an
+        # owned PE: pefile parses it with zero symbols) leave the analyst in the
+        # same place, so both get this code; export_directory_present tells them apart.
+        return {"ok": False, "status": STATUS_NOT_LOOKED, "error": "NO_EXPORT_DIRECTORY",
+                "dll_path": str(dll_path), "export_directory_present": directory_present,
+                "message": "The file has no named exports, so no hash was compared; this is not a search that found nothing."}
 
     matches = []
     for name in names:
@@ -175,6 +196,7 @@ def crack_api_hash(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None,
                         })
     return {
         "ok": True,
+        "status": STATUS_OK,
         "dll_path": str(dll_path),
         "export_count_searched": len(names),
         "algorithms_tried": sorted(algo_set),
@@ -218,8 +240,11 @@ def api_hash_recover_tool(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=N
         if isinstance(values, str):
             values = [int(v, 0) for v in values.replace(",", " ").split()]
         result = crack_api_hash(values, dll_path=dll_path, algorithms=algorithms)
+    except (ValueError, TypeError) as exc:
+        # An unparsable hash constant is the caller's input, not a failure to look.
+        result = {"ok": False, "status": STATUS_USAGE, "error": type(exc).__name__, "detail": str(exc)}
     except Exception as exc:
-        result = {"ok": False, "error": type(exc).__name__, "detail": str(exc)}
+        result = {"ok": False, "status": STATUS_NOT_LOOKED, "error": type(exc).__name__, "detail": str(exc)}
     return json.dumps(result, ensure_ascii=False)
 
 
