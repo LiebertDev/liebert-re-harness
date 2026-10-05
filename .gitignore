@@ -111,3 +111,8 @@ cases/**
 /tmp*/
 /rizin_fab_*/
 /pid_*/
+
+# Sub-agent worktree checkouts are runtime state, not repository content. Untracked but
+# unignored, a bulk `git add -A` would stage them. Only this subdirectory is ignored:
+# .claude/agents and .claude/skills are tracked.
+.claude/worktrees/
