@@ -1095,6 +1095,15 @@ _KCR_APIS={
     ("ntoskrnl","IoRegisterFsRegistrationChange"):"filesystem",("ntoskrnl","IoRegisterFsRegistrationChangeMountAware"):"filesystem",
     ("fltmgr","FltRegisterFilter"):"filesystem",
     ("ntoskrnl","PoRegisterPowerSettingCallback"):"power",
+    # Second batch: name existence re-verified from the ntoskrnl.exe export table; the family labels are inference
+    # from the name only, NOT verified. Seven of nine candidates were added; IoRegisterBootDriverCallback and
+    # SeRegisterImageVerificationCallback were left out because the name alone does not settle what they register.
+    ("ntoskrnl","KeRegisterBugCheckCallback"):"bugcheck",("ntoskrnl","KeRegisterBugCheckReasonCallback"):"bugcheck",
+    ("ntoskrnl","KeRegisterNmiCallback"):"nmi",
+    ("ntoskrnl","IoRegisterPlugPlayNotification"):"pnp",
+    ("ntoskrnl","ExRegisterCallback"):"executive",
+    ("ntoskrnl","PoRegisterCoalescingCallback"):"power",
+    ("ntoskrnl","FsRtlRegisterFileSystemFilterCallbacks"):"filesystem",
 }
 KCR_STATEMENT=("A filter over a byte-pattern first pass: a registration is an import-table call the scan saw, not proof the code runs. "
                "Not seeing one means no direct call through the import table was seen, which is not the same as the driver not registering.")

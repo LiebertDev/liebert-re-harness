@@ -94,6 +94,31 @@ class KernelCallbackRegistrationsTests(unittest.TestCase):
         self.assertEqual(r["dll"], "fltmgr")
         self.assertEqual(r["family"], "filesystem")
 
+    def test_second_batch_of_names_is_found_with_its_family(self):
+        # Name existence was re-verified from the ntoskrnl.exe export table; the family labels are inference.
+        expected = {
+            "KeRegisterBugCheckCallback": "bugcheck", "KeRegisterBugCheckReasonCallback": "bugcheck",
+            "KeRegisterNmiCallback": "nmi", "IoRegisterPlugPlayNotification": "pnp",
+            "ExRegisterCallback": "executive", "PoRegisterCoalescingCallback": "power",
+            "FsRtlRegisterFileSystemFilterCallbacks": "filesystem",
+        }
+        names = list(expected)
+        p = build("batch2.sys", {"ntoskrnl.exe": names}, [(0x10 + 8 * i, i) for i in range(len(names))])
+        body = run(p)
+        self.assertEqual(body["outcome"], "FOUND")
+        self.assertEqual({r["api"]: r["family"] for r in body["registrations"]}, expected)
+        for r in body["registrations"]:
+            self.assertEqual(r["dll"], "ntoskrnl")
+            self.assertIs(r["proves_call"], False)
+
+    def test_second_batch_lookalikes_and_wrong_module_are_not_findings(self):
+        names = ["KeRegisterNmiCallbackX", "xExRegisterCallback", "IoRegisterPlugPlayNotificationEx",
+                 "keRegisterBugCheckCallback"]
+        p = build("batch2trap.sys", {"ntoskrnl.exe": names}, [(0x10 + 8 * i, i) for i in range(len(names))])
+        self.assertEqual(run(p)["registrations"], [])
+        q = build("batch2wrong.sys", {"fltmgr.sys": ["KeRegisterNmiCallback"]}, [(0x10, 0)])
+        self.assertEqual(run(q)["registrations"], [])
+
     def test_name_from_the_wrong_module_is_not_a_finding(self):
         p = build("wrongdll.sys", {"ntoskrnl.exe": ["FltRegisterFilter"]}, [(0x10, 0)])
         body = run(p)
