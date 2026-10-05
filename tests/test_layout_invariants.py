@@ -199,7 +199,9 @@ def test_published_tool_name_set_is_unchanged():
     ).hexdigest()
     # Merged tree (engine-log + process-lock): 714 + 2 = 716 names; with the Ghidra slice's 21 names
     # on top, 716 + 21 = 737 (measured, not summed); digest recomputed from the merged source.
-    assert digest == "e89ef6e0e5ea7f91ce897345ed59c7264009550a49564dae757260443fea3f7d"
+    # verified-copy slice: 737 -> 738, one private top-level name added in liebert_re/tools/ida.py,
+    # none removed: _verified_copy. No new module. Digest recomputed from the source.
+    assert digest == "fa552392bc04781c2ca0237d67fa6d4d52db126ec897a271bd094ae56e037fdd"
 
 
 def test_the_imported_package_is_this_checkout():

@@ -2268,6 +2268,40 @@ def _file_sha256(path):
     return digest.hexdigest(), None
 
 
+def _verified_copy(source, destination, tool, sha256, *, expected_sha256=None, io_error="IDA_COPY_FAILED"):
+    """Copy a database for a child process, then prove the copy before anything opens it: flush the
+    file, hash it, and compare with the source's SHA-256 (`expected_sha256` when the caller already
+    holds it, else the source is hashed here). A size match is not accepted as proof: a same-length
+    corruption is caught only by the hash. On any mismatch this raises _StageFailure with
+    COPY_INTEGRITY_FAILED carrying both hashes (never a path); it never retries, because a retry would
+    hide a damaged file. A copy that raises becomes a structured refusal under `io_error`."""
+    expected = expected_sha256
+    if expected is None:
+        expected, why = _file_sha256(source)
+        if expected is None:
+            raise _StageFailure(json.loads(_refuse(
+                tool, "ANALYSIS_LIMITED", "COPY_INTEGRITY_UNVERIFIABLE", fixable=False, target_sha256=sha256,
+                environment_error=why, fix="The source database could not be read to verify the copy; nothing was "
+                                           "launched. Fix the file-system problem.")))
+    try:
+        shutil.copyfile(source, destination)
+    except OSError as exc:
+        raise _StageFailure(_EnvironmentFailure(io_error, exc).body(tool, target_sha256=sha256)) from exc
+    sync_error = _fsync_path(destination)
+    found, why = _file_sha256(destination)
+    if sync_error or found is None:
+        raise _StageFailure(json.loads(_refuse(
+            tool, "ANALYSIS_LIMITED", "COPY_INTEGRITY_UNVERIFIABLE", fixable=False, target_sha256=sha256,
+            environment_error=sync_error or why, expected_sha256=expected,
+            fix="The copy could not be flushed or read back, so it was not verified and nothing was launched.")))
+    if found != expected:
+        raise _StageFailure(json.loads(_refuse(
+            tool, "ANALYSIS_LIMITED", "COPY_INTEGRITY_FAILED", fixable=False, target_sha256=sha256,
+            expected_sha256=expected, found_sha256=found,
+            fix="The copy does not hash to its source, so no session was started on it and it was not retried. "
+                "Check the disk and the file system holding the annotated or cache root.")))
+
+
 def _remove_owned_work(path):
     """Delete a work directory this call created: `scratch-*` or `recovery/<write id>`, under the
     annotated root, and nothing else. The only recursive delete in the annotated section."""
@@ -2435,7 +2469,8 @@ def _copy_pristine(exe, p, sha256, md5, destination, total_seconds, cancellation
                     "error": "PRISTINE_ANALYSIS_FAILED"})
             _enforce_cache_budget(slot)
         try:
-            shutil.copyfile(slot / _DB_NAME, destination)
+            _verified_copy(slot / _DB_NAME, destination, "ida_annotations_apply", sha256,
+                           io_error="IDA_DATABASE_UNREADABLE")
         except OSError as exc:
             raise _StageFailure(_EnvironmentFailure("IDA_DATABASE_UNREADABLE", exc).body(
                 "ida_annotations_apply", target_sha256=sha256)) from exc
@@ -2474,7 +2509,7 @@ def _copy_into_budget(source, destination, tool, sha256, cancellation_token):
                 annotated_bytes=total, needed_bytes=need, budget_bytes=budget)))
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, destination)
+            _verified_copy(source, destination, tool, sha256, io_error="IDA_ANNOTATED_IO_ERROR")
         except OSError as exc:
             raise _StageFailure(_EnvironmentFailure("IDA_ANNOTATED_IO_ERROR", exc).body(tool, target_sha256=sha256)) from exc
     finally:
@@ -2660,7 +2695,8 @@ def ida_rename_plan(path, label=None, renames=None, timeout_seconds=_DEFAULT_TIM
         work.mkdir(parents=True)
         try:
             if state["version"] > 0:
-                shutil.copyfile(state["db"], work / _DB_NAME)
+                _verified_copy(state["db"], work / _DB_NAME, tool, sha256, expected_sha256=state["db_sha256"],
+                               io_error="IDA_ANNOTATED_IO_ERROR")
             else:
                 _copy_pristine(exe, p, sha256, md5, work / _DB_NAME, total, cancellation_token)
             left = int(deadline - time.monotonic())
@@ -2840,7 +2876,8 @@ def ida_set_comments_plan(path, label=None, comments=None, timeout_seconds=_DEFA
         work.mkdir(parents=True)
         try:
             if state["version"] > 0:
-                shutil.copyfile(state["db"], work / _DB_NAME)
+                _verified_copy(state["db"], work / _DB_NAME, tool, sha256, expected_sha256=state["db_sha256"],
+                               io_error="IDA_ANNOTATED_IO_ERROR")
             else:
                 _copy_pristine(exe, p, sha256, md5, work / _DB_NAME, total, cancellation_token)
             left = int(deadline - time.monotonic())
@@ -3264,7 +3301,18 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
             attempt = {"attempt": verify["attempt_count"], "scratch": verify_dir.name}
             verify["attempts"].append(attempt)
             verify_dir.mkdir(parents=True)
-            shutil.copyfile(promoted, verify_dir / _DB_NAME)
+            try:
+                _verified_copy(promoted, verify_dir / _DB_NAME, tool, sha256, expected_sha256=promoted_sha)
+            except _StageFailure as failure:
+                # A damaged or unverifiable copy is refused, not retried: no verification session is started
+                # on it and a second copy would only hide the first one's damage.
+                bad = failure.body
+                attempt.update({"error": bad.get("error"), "copy_verified": False})
+                verify["retried"] = verify["attempt_count"] > 1
+                return abort("copy_integrity_failed" if bad.get("error") == "COPY_INTEGRITY_FAILED"
+                             else "copy_unverifiable",
+                             copy_failure=bad.get("error"),
+                             **{k: bad[k] for k in ("expected_sha256", "found_sha256", "environment_error") if k in bad})
             try:
                 verify_job = (
                     {"operation": "comment_verify", "write_mode": "verify",

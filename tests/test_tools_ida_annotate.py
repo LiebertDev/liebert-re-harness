@@ -1110,6 +1110,120 @@ class PromotionAndJournalTests(AnnotateCase):
 
 
 # ---------------------------------------------------------------------------
+# a copy handed to a child process is verified first
+# ---------------------------------------------------------------------------
+def _damaging_copy(kind, selector):
+    """A stand-in for shutil.copyfile that copies, then damages the copy when `selector(source)` holds."""
+    real = shutil.copyfile
+
+    def copy(src, dst, *args, **kwargs):
+        out = real(src, dst, *args, **kwargs)
+        if selector(Path(src)):
+            data = Path(dst).read_bytes()
+            damaged = {"zero": b"", "prefix": data[:len(data) // 2],
+                       "flip": data[:-1] + bytes([data[-1] ^ 0xFF])}[kind]
+            Path(dst).write_bytes(damaged)
+        return out
+    return copy
+
+
+def _from_versions(path):
+    return "versions" in path.parts
+
+
+class VerifiedCopyTests(AnnotateCase):
+    """A damaged copy is refused before any engine session is opened on it; it is never retried."""
+
+    def verify_sessions(self, session):
+        return [c for c in session.call_args_list if c.args[2]["operation"].endswith("_verify")]
+
+    def damaged_apply(self, kind):
+        plan = self.plan()
+        with mock.patch.object(ti, "_annotated_session", wraps=ti._annotated_session) as session,                 mock.patch.object(shutil, "copyfile", side_effect=_damaging_copy(kind, _from_versions)):
+            out = self.apply(self.sealed(plan))
+        return out, session
+
+    def check_refused(self, out, session):
+        self.assertEqual((out["ok"], out["error"]), (False, "COPY_INTEGRITY_FAILED"))
+        self.assertEqual(self.verify_sessions(session), [], "no verification session on a damaged copy")
+        self.assertIsNone(self.manifest())
+        self.assertEqual(out["verification"]["attempt_count"], 1, "a damaged copy is not retried")
+        self.assertRegex(out["expected_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(out["found_sha256"], r"^[0-9a-f]{64}$")
+        self.assertNotEqual(out["expected_sha256"], out["found_sha256"])
+        self.assertNoTargetLeak(json.dumps(out))
+
+    @pytest.mark.contract
+    def test_a_zero_byte_copy_that_reports_success_is_refused(self):
+        self.check_refused(*self.damaged_apply("zero"))
+
+    @pytest.mark.contract
+    def test_a_copy_holding_only_a_prefix_of_the_source_is_refused(self):
+        self.check_refused(*self.damaged_apply("prefix"))
+
+    @pytest.mark.contract
+    def test_a_same_size_copy_with_one_changed_byte_is_refused(self):
+        out, session = self.damaged_apply("flip")
+        self.check_refused(out, session)
+
+    @pytest.mark.contract
+    def test_a_damaged_base_copy_never_reaches_the_plan_session(self):
+        self.assertTrue(self.write()["ok"])
+        with mock.patch.object(ti, "_annotated_session") as session,                 mock.patch.object(shutil, "copyfile", side_effect=_damaging_copy("zero", _from_versions)):
+            out = self.plan(label="first-pass")
+        session.assert_not_called()
+        self.assertEqual((out["ok"], out["error"]), (False, "COPY_INTEGRITY_FAILED"))
+        self.assertEqual(out["expected_sha256"], self.manifest()["db_sha256"])
+
+    @pytest.mark.contract
+    def test_a_copy_that_raises_is_a_structured_refusal(self):
+        self.assertTrue(self.write()["ok"])
+        with mock.patch.object(ti, "_annotated_session") as session,                 mock.patch.object(shutil, "copyfile", side_effect=PermissionError(13, "denied")):
+            out = self.plan(label="first-pass")
+        session.assert_not_called()
+        self.assertEqual((out["ok"], out["error"]), (False, "IDA_ANNOTATED_IO_ERROR"))
+        self.assertNoTargetLeak(json.dumps(out))
+
+    @pytest.mark.contract
+    def test_a_copy_that_raises_at_verification_aborts_without_a_session_or_retry(self):
+        plan = self.plan()
+        real = shutil.copyfile
+
+        def copy(src, dst, *a, **k):
+            if _from_versions(Path(src)):
+                raise OSError(5, "io error")
+            return real(src, dst, *a, **k)
+        with mock.patch.object(ti, "_annotated_session", wraps=ti._annotated_session) as session,                 mock.patch.object(shutil, "copyfile", side_effect=copy):
+            out = self.apply(self.sealed(plan))
+        self.assertEqual((out["ok"], out["error"]), (False, "COPY_UNVERIFIABLE"))
+        self.assertEqual(out["copy_failure"], "IDA_COPY_FAILED")
+        self.assertEqual(self.verify_sessions(session), [])
+        self.assertEqual(out["verification"]["attempt_count"], 1)
+
+    @pytest.mark.contract
+    def test_an_intact_copy_still_passes(self):
+        out = self.write()
+        self.assertEqual((out["ok"], out["status"]), (True, "OK"))
+        self.assertIs(out["verification"]["verification_measured"], True)
+        self.assertFalse(out["verification"]["retried"])
+
+    @pytest.mark.contract
+    def test_the_helper_alone_compares_hashes_not_sizes(self):
+        src, dst = self.root / "s.bin", self.root / "d.bin"
+        src.write_bytes(bytes(range(200)))
+        with mock.patch.object(shutil, "copyfile", side_effect=_damaging_copy("flip", lambda p: True)):
+            with self.assertRaises(ti._StageFailure) as caught:
+                ti._verified_copy(src, dst, "t", "x" * 64)
+        self.assertEqual(src.stat().st_size, dst.stat().st_size)
+        body = caught.exception.body
+        self.assertEqual(body["error"], "COPY_INTEGRITY_FAILED")
+        self.assertEqual(body["expected_sha256"], hashlib.sha256(src.read_bytes()).hexdigest())
+        self.assertEqual(body["found_sha256"], hashlib.sha256(dst.read_bytes()).hexdigest())
+        self.assertNotIn(str(self.root), json.dumps(body))
+        ti._verified_copy(src, self.root / "ok.bin", "t", "x" * 64)
+
+
+# ---------------------------------------------------------------------------
 # the byte budget
 # ---------------------------------------------------------------------------
 class BudgetTests(AnnotateCase):
