@@ -213,7 +213,8 @@ class KernelCallbackRegistrationsTests(unittest.TestCase):
     def test_truncated_scan_is_never_not_found(self):
         imports = {"ntoskrnl.exe": ["IoCreateDevice"]}
         p = build("trunc.sys", imports, [(6 * i, 0) for i in range(8)])
-        with mock.patch.object(binary, "_RIA_HARD_LIMIT", 3):
+        # The scan now filters before it counts, so the limit that can stop it with no match is the examine limit.
+        with mock.patch.object(binary, "_RIA_EXAMINE_LIMIT", 3):
             body = run(p)
         self.assertTrue(body["scan_truncation"]["truncated"])
         self.assertNotEqual(body["outcome"], "NOT_FOUND")
@@ -254,6 +255,59 @@ class KernelCallbackRegistrationsTests(unittest.TestCase):
         self.assertIn("callback address was not recovered", text)
         self.assertIn("name list is not exhaustive", text)
         self.assertEqual(len(body["caveats"]), len(scan["caveats"]) + 2)
+
+class FilteredScanTests(unittest.TestCase):
+    """A big driver has thousands of import references and a handful of registration calls: the scan must look at
+    all of them but only keep the registration ones, so the output limit is not spent on unrelated references."""
+
+    IMPORTS = {"ntoskrnl.exe": ["IoCreateDevice", "PsSetLoadImageNotifyRoutine"]}
+
+    def _many_then_one(self, name):
+        calls = [(6 * i, 0) for i in range(8)] + [(6 * 8, 1)]
+        return build(name, self.IMPORTS, calls)
+
+    def test_registration_after_many_unrelated_references_is_found_not_unknown(self):
+        p = self._many_then_one("many_then_one.sys")
+        with mock.patch.object(binary, "_RIA_HARD_LIMIT", 3):
+            body = run(p)
+        self.assertEqual(body["outcome"], "FOUND")
+        self.assertNotIn("reason", body)
+        self.assertEqual([r["api"] for r in body["registrations"]], ["PsSetLoadImageNotifyRoutine"])
+        self.assertIs(body["scan_truncation"]["truncated"], False)
+
+    def test_filtered_scan_keeps_only_matching_references_and_counts_the_rest(self):
+        p = self._many_then_one("filter_unit.sys")
+        body = json.loads(binary.rip_relative_iat_scan(str(p), 3, import_filter=lambda imp: imp.endswith("!PsSetLoadImageNotifyRoutine")))
+        self.assertEqual(len(body["findings"]), 1)
+        self.assertIs(body["truncation"]["truncated"], False)
+        self.assertEqual(body["truncation"]["examined_total"], 9)
+        self.assertEqual(body["truncation"]["not_matching_filter"], 8)
+
+    def test_unfiltered_scan_output_is_unchanged(self):
+        p = self._many_then_one("unfiltered.sys")
+        body = json.loads(binary.rip_relative_iat_scan(str(p), 3))
+        self.assertEqual(sorted(body["truncation"]),
+                         ["found_total", "limit", "limit_name", "omitted", "returned", "truncated"])
+        self.assertIs(body["truncation"]["truncated"], True)
+        self.assertEqual(body["truncation"]["found_total"], 9)
+
+    def test_matches_over_the_output_limit_are_still_reported_truncated(self):
+        p = build("many_matches.sys", {"ntoskrnl.exe": ["PsSetLoadImageNotifyRoutine"]}, [(6 * i, 0) for i in range(8)])
+        with mock.patch.object(binary, "_RIA_HARD_LIMIT", 3):
+            body = run(p)
+        self.assertEqual(body["outcome"], "FOUND")
+        self.assertIs(body["scan_truncation"]["truncated"], True)
+        self.assertEqual(len(body["registrations"]), 3)
+
+    def test_scan_stopped_before_examining_everything_is_reported_truncated_and_never_not_found(self):
+        p = self._many_then_one("examine_cap.sys")
+        with mock.patch.object(binary, "_RIA_EXAMINE_LIMIT", 4):
+            body = run(p)
+        self.assertIs(body["scan_truncation"]["truncated"], True)
+        self.assertEqual(body["scan_truncation"]["examine_omitted"], 5)
+        self.assertEqual(body["outcome"], "UNKNOWN")
+        self.assertEqual(body["reason"], "SCAN_TRUNCATED")
+        self.assertEqual(body["registrations"], [])
 
 
 if __name__ == "__main__":

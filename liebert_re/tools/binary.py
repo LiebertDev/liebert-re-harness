@@ -989,6 +989,7 @@ def driver_major_function_scan(path,max_bytes=_DMF_WINDOW):
 # an address inside the table that is not a slot start) is ignored, not guessed at.
 _RIA_MAX_FINDINGS=200
 _RIA_HARD_LIMIT=5000
+_RIA_EXAMINE_LIMIT=250000   # with an import_filter: most references the scan will look at before it says it stopped
 _RIA_CODE_FLAGS=0x20000020   # IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE (same test driver_major_function_scan uses)
 IAT_SCAN_STATEMENT=("A first-pass byte-pattern heuristic, not a call graph: a finding is a byte sequence whose target is an "
                     "import slot, not proof that the code runs, and the absence of one is not proof the import is unused.")
@@ -1041,7 +1042,7 @@ def _ria_find(buf,sec_rva,image_base,x64,names,spans):
                     "target_basis":basis,"confidence":"heuristic","proves_call":False})
     return out,ignored
 
-def rip_relative_iat_scan(path,max_findings=_RIA_MAX_FINDINGS):
+def rip_relative_iat_scan(path,max_findings=_RIA_MAX_FINDINGS,import_filter=None):
     """First-pass byte-pattern search for calls/jumps made through the import address table. No disassembler.
 
     Recognises FF 15 and FF 25. On x86_64 the target is RIP-relative (instruction end RVA + disp32); on x86 the same
@@ -1052,7 +1053,13 @@ def rip_relative_iat_scan(path,max_findings=_RIA_MAX_FINDINGS):
     has no import directory at all, ``reason`` NO_IMPORT_DIRECTORY); ``ok`` true, ``findings`` empty. NOT_LOOKED:
     ``ok`` false with an ``error`` -- PATH_REFUSED, FILE_NOT_FOUND, FILE_NOT_ACCESSIBLE, INVALID_PE, UNSUPPORTED_MACHINE,
     IMPORT_DIRECTORY_UNREADABLE or CODE_SECTION_UNREADABLE. ``truncation`` always says how many findings were
-    found, returned and omitted, and which limit (``max_findings``) applied."""
+    found, returned and omitted, and which limit (``max_findings``) applied.
+
+    ``import_filter`` (a Python callable on the ``dll!name`` string, not exposed through the tool schema) keeps only
+    the references it accepts, BEFORE ``max_findings`` is applied, so a caller interested in a few imports of a driver
+    with thousands of references does not spend the output limit on the rest. Every reference is still examined; at
+    most ``_RIA_EXAMINE_LIMIT`` of them, and ``truncation`` says so (``examine_omitted``) if the scan stops earlier.
+    Without a filter nothing about the result changes."""
     try:
         p=safe_path(path)
     except PermissionError as e:
@@ -1090,11 +1097,23 @@ def rip_relative_iat_scan(path,max_findings=_RIA_MAX_FINDINGS):
     for rva,buf in bufs:
         f,ig=_ria_find(buf,rva,image_base,x64,names,spans)
         found+=f;ignored+=ig
+    examined=len(found);examine_omitted=0;kept_out=0
+    if import_filter is not None:
+        examine_omitted=max(0,examined-_RIA_EXAMINE_LIMIT)
+        looked=found[:_RIA_EXAMINE_LIMIT]
+        found=[f for f in looked if import_filter(f["import"])]
+        kept_out=len(looked)-len(found)
     total=len(found);returned=found[:limit]
     trunc={"truncated":total>limit,"limit_name":"max_findings","limit":limit,"found_total":total,"returned":len(returned),"omitted":total-len(returned)}
+    if import_filter is not None:
+        trunc.update(truncated=total>limit or examine_omitted>0,examined_total=examined,not_matching_filter=kept_out,
+                     examine_limit=_RIA_EXAMINE_LIMIT,examine_omitted=examine_omitted)
     rationale=[];reason=None
     if returned:
         rationale.append(f"{total} reference(s) landed on an import slot; none is proof the code runs")
+    elif import_filter is not None and examined:
+        reason="NO_REFERENCE_MATCHED_THE_FILTER"
+        rationale.append(f"{examined} reference(s) landed on an import slot and none matched the filter")
     elif not entries:
         reason="NO_IMPORT_DIRECTORY"
         rationale.append("the PE has no import directory, so there is no slot a call could resolve to; this is a read fact about the file, not a failure")
@@ -1103,6 +1122,8 @@ def rip_relative_iat_scan(path,max_findings=_RIA_MAX_FINDINGS):
         rationale.append(f"{sum(len(b) for _,b in bufs)} byte(s) of executable section were read and no FF 15 / FF 25 target was an import slot")
         rationale.append("this does not show no import is called: see caveats for what the pattern cannot see")
     if total>limit:rationale.append(f"truncated: {total-limit} finding(s) omitted, the max_findings limit of {limit} was reached")
+    if examine_omitted:rationale.append(f"truncated: only the first {_RIA_EXAMINE_LIMIT} of {examined} reference(s) were examined against the filter")
+    if import_filter is not None and kept_out:rationale.append(f"{kept_out} reference(s) were examined and did not match the filter")
     if ignored:rationale.append(f"{ignored} FF 15 / FF 25 reference(s) whose target is not an import slot were ignored")
     if iprob:rationale.append(f"the import directory is only partly readable ({iprob}); imports past the break cannot be named")
     body={"ok":True,"tool":"rip_relative_iat_scan","status":"OK","path":relative(p),
@@ -1174,7 +1195,7 @@ def kernel_callback_registrations(path):
     IMPORTS_PARTIAL: a looked-at part is not the whole); NOT_LOOKED (every scan refusal passes through unchanged).
     ``imported_without_reference`` lists listed APIs that are imported but have no call site found: not a finding.
     The callback address is never recovered (``callback_address`` is "NOT_RECOVERED")."""
-    scan=json.loads(rip_relative_iat_scan(path,_RIA_HARD_LIMIT))
+    scan=json.loads(rip_relative_iat_scan(path,_RIA_HARD_LIMIT,import_filter=lambda imp:_kcr_lookup(imp) is not None))
     if not scan.get("ok"):
         scan["tool"]="kernel_callback_registrations"
         return json.dumps(scan,ensure_ascii=False,indent=2)
@@ -1199,10 +1220,11 @@ def kernel_callback_registrations(path):
     unref.sort(key=lambda u:(u["dll"],u["api"]))
     trunc=scan["truncation"];state=scan["entry"]["imports_state"]
     rationale=[];reason=scan.get("reason")
+    if reason=="NO_REFERENCE_MATCHED_THE_FILTER":reason=None
     if regs:
         outcome="FOUND";reason=None
         rationale.append(f"{len(regs)} import-table reference(s) name a listed registration API; none is proof the code runs")
-        if trunc["truncated"]:rationale.append(f"the scan was truncated ({trunc['omitted']} reference(s) omitted), so more may exist")
+        if trunc["truncated"]:rationale.append(f"the scan was truncated ({trunc['omitted']+trunc.get('examine_omitted',0)} reference(s) omitted), so more may exist")
     elif trunc["truncated"]:
         outcome="UNKNOWN";reason="SCAN_TRUNCATED"
         rationale.append("the scan stopped at its limit, so part of the code was not examined; no listed API was seen in the part that was")
