@@ -219,7 +219,10 @@ def test_published_tool_name_set_is_unchanged():
     # guest-marker slice: 746 -> 748, two private top-level functions added in
     # liebert_re/dynamic/frida_trace_client.py, none removed: _read_guest_marker and
     # _guest_marker_refusal. No new module. Digest recomputed from the source.
-    assert digest == "f757943341c864071b28e5f5dfa093e70106c995678d7026dafa035ff72de1bd"
+    # control-code decode slice: 748 -> 750, two top-level names added in liebert_re/tools/binary.py,
+    # none removed: ioctl_control_code_decode (public; declared in FAMILIES["windows-kernel"] but
+    # undefined until now) and _icd_one (private). No new module. Digest recomputed from the source.
+    assert digest == "8939707c5b91d1c011851406a9b3dcfe27363fbcb6f4f8f2292c1c78a66afee4"
 
 
 def test_the_imported_package_is_this_checkout():

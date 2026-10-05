@@ -625,3 +625,58 @@ def kernel_triage(path):
         "pe":info,"indicators":ind,"driver_likelihood":likelihood,"rationale":rationale,
         "statement":KERNEL_TRIAGE_STATEMENT,"limitations":limitations,"unknown_fields":unknown,
     },ensure_ascii=False,indent=2)
+
+
+# --- ioctl_control_code_decode: pure bit arithmetic, no file, no disassembly, no external tool ---------------
+# CTL_CODE layout: method 0-1, function 2-12, custom 13, access 14-15, device_type 16-30, reserved 31.
+# Function is 11 bits (mask 0x7FF), NOT 12: bit 13 is the custom/vendor flag, not part of the function number.
+_IOCTL_METHODS={0:"METHOD_BUFFERED",1:"METHOD_IN_DIRECT",2:"METHOD_OUT_DIRECT",3:"METHOD_NEITHER"}
+_IOCTL_ACCESS={0:"FILE_ANY_ACCESS",1:"FILE_READ_ACCESS",2:"FILE_WRITE_ACCESS",3:"FILE_READ_ACCESS|FILE_WRITE_ACCESS"}
+_IOCTL_DEVICE_TYPES={
+    0x01:"FILE_DEVICE_BEEP",0x02:"FILE_DEVICE_CD_ROM",0x03:"FILE_DEVICE_CD_ROM_FILE_SYSTEM",0x04:"FILE_DEVICE_CONTROLLER",
+    0x05:"FILE_DEVICE_DATALINK",0x06:"FILE_DEVICE_DFS",0x07:"FILE_DEVICE_DISK",0x08:"FILE_DEVICE_DISK_FILE_SYSTEM",
+    0x09:"FILE_DEVICE_FILE_SYSTEM",0x0A:"FILE_DEVICE_INPORT_PORT",0x0B:"FILE_DEVICE_KEYBOARD",0x0C:"FILE_DEVICE_MAILSLOT",
+    0x0D:"FILE_DEVICE_MIDI_IN",0x0E:"FILE_DEVICE_MIDI_OUT",0x0F:"FILE_DEVICE_MOUSE",0x10:"FILE_DEVICE_MULTI_UNC_PROVIDER",
+    0x11:"FILE_DEVICE_NAMED_PIPE",0x12:"FILE_DEVICE_NETWORK",0x13:"FILE_DEVICE_NETWORK_BROWSER",
+    0x14:"FILE_DEVICE_NETWORK_FILE_SYSTEM",0x15:"FILE_DEVICE_NULL",0x16:"FILE_DEVICE_PARALLEL_PORT",
+    0x17:"FILE_DEVICE_PHYSICAL_NETCARD",0x18:"FILE_DEVICE_PRINTER",0x19:"FILE_DEVICE_SCANNER",0x1A:"FILE_DEVICE_SERIAL_MOUSE_PORT",
+    0x1B:"FILE_DEVICE_SERIAL_PORT",0x1C:"FILE_DEVICE_SCREEN",0x1D:"FILE_DEVICE_SOUND",0x1E:"FILE_DEVICE_STREAMS",
+    0x1F:"FILE_DEVICE_TAPE",0x20:"FILE_DEVICE_TAPE_FILE_SYSTEM",0x21:"FILE_DEVICE_TRANSPORT",0x22:"FILE_DEVICE_UNKNOWN",
+    0x23:"FILE_DEVICE_VIDEO",0x24:"FILE_DEVICE_VIRTUAL_DISK",0x25:"FILE_DEVICE_WAVE_IN",0x26:"FILE_DEVICE_WAVE_OUT",
+    0x27:"FILE_DEVICE_8042_PORT",0x28:"FILE_DEVICE_NETWORK_REDIRECTOR",0x29:"FILE_DEVICE_BATTERY",0x2A:"FILE_DEVICE_BUS_EXTENDER",
+    0x2B:"FILE_DEVICE_MODEM",0x2C:"FILE_DEVICE_VDM",0x2D:"FILE_DEVICE_MASS_STORAGE",0x2E:"FILE_DEVICE_SMB",
+    0x2F:"FILE_DEVICE_KS",0x30:"FILE_DEVICE_CHANGER",0x31:"FILE_DEVICE_SMARTCARD",0x32:"FILE_DEVICE_ACPI",
+    0x33:"FILE_DEVICE_DVD",0x34:"FILE_DEVICE_FULLSCREEN_VIDEO",0x35:"FILE_DEVICE_DFS_FILE_SYSTEM",
+    0x36:"FILE_DEVICE_DFS_VOLUME",0x37:"FILE_DEVICE_SERENUM",0x38:"FILE_DEVICE_TERMSRV",0x39:"FILE_DEVICE_KSEC",
+    0x3A:"FILE_DEVICE_FIPS",0x3B:"FILE_DEVICE_INFINIBAND",0x3E:"FILE_DEVICE_VMBUS",0x3F:"FILE_DEVICE_CRYPT_PROVIDER",
+    0x40:"FILE_DEVICE_WPD",0x41:"FILE_DEVICE_BLUETOOTH",0x42:"FILE_DEVICE_MT_COMPOSITE",0x43:"FILE_DEVICE_MT_TRANSPORT",
+    0x44:"FILE_DEVICE_BIOMETRIC",0x45:"FILE_DEVICE_PMI",
+}
+
+def _icd_one(code):
+    if isinstance(code,bool) or not isinstance(code,int):
+        return {"status":"INVALID_VALUE","error":"NOT_AN_INTEGER","value":repr(code)}
+    if code<0:
+        return {"status":"INVALID_VALUE","error":"NEGATIVE","value":code}
+    if code>0xFFFFFFFF:
+        return {"status":"INVALID_VALUE","error":"OUT_OF_RANGE_U32","value":code}
+    device=(code>>16)&0x7FFF
+    method=code&0x3
+    access=(code>>14)&0x3
+    name=_IOCTL_DEVICE_TYPES.get(device)
+    return {"status":"DECODED","code":code,"code_hex":f"0x{code:08X}",
+            "device_type":device,"device_type_name":name,"device_type_known":name is not None,
+            "function":(code>>2)&0x7FF,"is_custom":bool((code>>13)&1),
+            "method":method,"method_name":_IOCTL_METHODS[method],
+            "access":access,"access_name":_IOCTL_ACCESS[access],
+            "reserved_bit_set":bool((code>>31)&1)}
+
+def ioctl_control_code_decode(codes):
+    """Split caller-supplied CTL_CODE integers into their declared bit fields. Reads nothing else.
+
+    Per code: DECODED (a device_type missing from our table is still DECODED, with device_type_known false and
+    the name None) or INVALID_VALUE (not an integer, negative, above 32 bits). Unknown is not invalid."""
+    if not isinstance(codes,(list,tuple)) or not codes:
+        return json.dumps({"ok":False,"tool":"ioctl_control_code_decode","status":"INVALID_INPUT","error":"CODES_NOT_A_NONEMPTY_LIST",
+                           "fixable":True,"fix":"Pass a non-empty list of CTL_CODE integers."},ensure_ascii=False,indent=2)
+    return json.dumps({"ok":True,"tool":"ioctl_control_code_decode","results":[_icd_one(c) for c in codes]},ensure_ascii=False,indent=2)
