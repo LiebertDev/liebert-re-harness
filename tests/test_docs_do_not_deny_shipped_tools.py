@@ -10,6 +10,18 @@ checker and it only knows what is listed. Extend it when a tool lands, adding th
 the docs used before; a longer table is the intended direction. It is not a ``KNOWN_*``
 allowlist, and growing it is good.
 
+Both tables below are NARROW by design, and the narrowness is a known weakness, not a feature:
+a sentence this checker does not know passes unseen. A table that grows is good; a table that
+shrinks, or a pattern loosened until it no longer matches the wording it was written for, is bad.
+Removing an entry needs a reason in the commit message.
+
+A second shape of error is covered by ABSENCES: the denial is not about the tool but about a
+gap IN ANOTHER tool, and the tool that closes the gap is the one that shipped. "ioctl_control_code_decode
+has no feeder in this package" says nothing against ioctl_control_code_decode; it denies that
+ioctl_candidate_scan exists. DENIALS, keyed by the tool a sentence is about, cannot see that.
+ABSENCES is keyed by the tool that FILLS the gap, and its patterns match wording that states a
+gap ("no feeder", "nothing in the package produces its input").
+
 Scope: ``docs/CAPABILITIES_AND_LIMITS.md`` (DENIALS) and ``README.md`` (README_DENIALS). No other
 file is read. README_DENIALS patterns stay inside one table row ([^|]*) so a denial about one
 tool cannot be matched against another tool's row.
@@ -37,10 +49,23 @@ DENIALS = {
     "rip_relative_iat_scan": (r"No module parses[^.]*any other kernel-specific structure",),
 }
 
+# Wording that states an absence which a shipped tool closes. Key: the tool that closes it.
+ABSENCES = {
+    "ioctl_candidate_scan": (
+        r"\bno feeder\b",
+        r"Nothing in the package produces its input",
+        r"which no operation does for this",
+        r"\bhas no [^.|]{0,60}\bin this package",
+    ),
+}
+
 README_DENIALS = {
     "kernel_triage": (r"`kernel_triage`:[^|]*not wired to the CLI",),
     "ghidra_program_facts": (r"`ghidra_status`:[^|]*not wired to the CLI",),
 }
+
+
+README_ABSENCES = ABSENCES
 
 
 def _offences(doc, table):
@@ -63,13 +88,33 @@ class DocsDoNotDenyShippedTools(unittest.TestCase):
                     offences.append(f"{tool}: {pat!r}")
         self.assertEqual(offences, [], "docs/CAPABILITIES_AND_LIMITS.md denies a tool that exists in code")
 
+    def test_an_absence_closed_by_a_defined_tool_is_a_failure(self):
+        self.assertEqual(_offences(DOC, ABSENCES), [], "docs state a gap that a tool in code closes")
+
+    def test_readme_states_no_absence_closed_by_a_defined_tool(self):
+        self.assertEqual(_offences(README, README_ABSENCES), [], "README.md states a gap that a tool in code closes")
+
+    def test_absence_patterns_still_match_the_old_wording(self):
+        # Guards the table itself: each pattern must match the sentence it was written against.
+        old = ("`ioctl_control_code_decode` splits caller-supplied `CTL_CODE` integers into fields and has no feeder in this "
+               "package. Nothing in the package produces its input; disassembly, which no operation does for this.")
+        for pat in ABSENCES["ioctl_candidate_scan"]:
+            self.assertRegex(old, pat)
+
+    def test_absence_patterns_do_not_match_legitimate_sentences(self):
+        # Narrowness check: ordinary negative statements that are not a gap closed by a tool must stay allowed.
+        fine = ("This does not prove an IOCTL. No disassembler is used by the byte-pattern scan. "
+                "The scan has no boolean field. There is no CLI wiring for this.")
+        for pat in ABSENCES["ioctl_candidate_scan"]:
+            self.assertIsNone(re.search(pat, fine), pat)
+
     def test_readme_does_not_deny_a_defined_tool(self):
         self.assertEqual(_offences(README, README_DENIALS), [], "README.md denies a tool that exists in code")
 
     def test_every_listed_tool_is_defined(self):
         # A renamed or removed tool must not leave a dead row that silently checks nothing.
         defined = tool_families._locally_defined_tool_names()
-        self.assertEqual([t for t in (*DENIALS, *README_DENIALS) if t not in defined], [])
+        self.assertEqual([t for t in (*DENIALS, *README_DENIALS, *ABSENCES) if t not in defined], [])
 
 
 if __name__ == "__main__":

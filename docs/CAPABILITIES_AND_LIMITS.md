@@ -344,13 +344,49 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
     about other names or other ways to register, and is never returned for a
     truncated scan (that is `UNKNOWN`). The callback address is not recovered.
   - `ioctl_control_code_decode`: bit arithmetic that splits `CTL_CODE`
-    integers into their fields. Nothing in the package produces its input:
-    reading the `cmp eax, <code>` comparisons in a handler needs
-    disassembly, which no operation does for this. It is a leaf with no
-    feeder; the caller supplies the integers.
+    integers into their fields. It does not find the integers itself; the
+    caller supplies them, by hand or from `ioctl_candidate_scan` (below).
+- Two further operations in `tools/binary.py`, both reachable only as Python
+  functions: neither is wired to the CLI.
+  - `ioctl_candidate_scan`: the feeder for `ioctl_control_code_decode`. It
+    disassembles a code region linearly from a start RVA and lists immediates
+    that are compared, each split by the decoder. It lists compared
+    immediates; it does not list "the driver's IOCTLs", because a compared
+    value can equally be a constant, a mask or a status code.
+    `proves_ioctl` is `false` in every result and there is no boolean "is an
+    IOCTL" field; each candidate carries named criteria instead. Searched:
+    `cmp reg, imm`, `cmp [mem], imm` and `sub reg, imm` chains. Not searched,
+    and declared in `scope.patterns_not_searched`: `mov reg, imm`, register
+    or memory comparisons, `lea`/`add` biases, jump-table switches, other
+    operand widths, and any function-end signal other than `ret` (`int3` runs
+    and `nop` padding are not treated as boundaries). The scan is linear: it
+    does not follow `jmp` or `call`. A value below `0x10000`, a stack-pointer
+    operand or `0xFFFFFFFF` is not admitted; each is counted by reason and
+    listed in `excluded`. The scan does not stop at `ret`, because handlers
+    return early and stopping would scan too little; instead every `ret`
+    passed is reported (`scope.rets_passed`, capped at 50 listed with the
+    total count) and every candidate and exclusion carries `rets_before`. A
+    candidate with `rets_before > 0` lies after a `ret` and may belong to
+    another function than the one scanned. It is not chained automatically
+    from `driver_major_function_scan`: the start address is given explicitly
+    and its source is recorded (`scope.start.source`, `start_note`). A
+    truncated or partly undecodable scan that found nothing is `UNKNOWN`;
+    `NOT_FOUND` is returned only for a complete, fully decoded scan, and its
+    rationale names the patterns searched.
+  - `disassemble_pe_structured`: disassembly with the same output contract as
+    the rizin-backed disassembly, plus numeric `immediates` and `rip_relative`
+    fields per instruction. An ARM64 image is refused with
+    `STRUCTURED_UNSUPPORTED_MACHINE`.
+  - Measurement, one driver, one start address, 200 instructions (a
+    Microsoft-signed system driver used as a read-only sample): from the
+    handler start the scan passed 5 `ret` instructions, and `sub rsp` and
+    `cmp [rbx+0x38], 1` sites that it excluded lay after the fifth, at an
+    address that `driver_major_function_scan` lists (heuristically) as the
+    start of a different handler (`IRP_MJ_CREATE`). This shows
+    the boundary report working on real code; it is one case, not a rate.
 - No module proves a driver's dispatch table, callback registrations, device or
   control-code definitions, or any other kernel-specific structure. Beyond
-  `kernel_triage` and the four operations above, a kernel-mode PE is handled as
+  `kernel_triage` and the operations above, a kernel-mode PE is handled as
   an ordinary PE: headers, imports, strings, disassembly.
 - No exception/unwind data parser, so no function-boundary recovery for stripped
   x64 images.
