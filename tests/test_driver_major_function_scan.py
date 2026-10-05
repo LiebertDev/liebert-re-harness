@@ -155,5 +155,167 @@ class DriverMajorFunctionScanTests(unittest.TestCase):
         self.assertEqual([c["index"] for c in body["candidates"]], [0])
 
 
+# --- tail-jump following: MSVC /GS entry points (GsDriverEntry -> cookie init -> jmp real DriverEntry) ------------
+TEXT2_RAW = 0x600     # file offset of the second code section (RVA 0x2000)
+TWO_CODE = ((".text", 0x60000020), (".text2", 0x60000020))
+PROLOGUE = bytes.fromhex("4883EC28") + bytes.fromhex("E800000000") + bytes.fromhex("4883C428")   # sub/call/add: 13 bytes
+STORE_IDX3_DISP8 = bytes.fromhex("48894178")          # mov [rcx+0x78], rax -> index 3 WRITE
+LEA_RAX_2000 = bytes.fromhex("488D05F9000000")        # at RVA 0x2000 -> handler 0x2100 (in .text2)
+
+
+def jmp32(at_rva, to_rva):
+    return b"\xE9" + struct.pack("<i", to_rva - (at_rva + 5))
+
+
+def jmp8(at_rva, to_rva):
+    return b"\xEB" + struct.pack("<b", to_rva - (at_rva + 2))
+
+
+def make2(name, patches, **kw):
+    """Two code sections (.text at RVA 0x1000, .text2 at 0x2000); ``patches`` maps file offset -> bytes."""
+    path = build_owned_pe_sections(ROOT / name, subsystem=1, sections=TWO_CODE,
+                                   imports={"ntoskrnl.exe": ["IoCreateDevice"]}, **kw)
+    data = bytearray(path.read_bytes())
+    for off, code in patches.items():
+        data[off:off + len(code)] = code
+    path.write_bytes(bytes(data))
+    return path
+
+
+REAL_DRIVER_ENTRY = LEA_RAX_2000 + STORE_IDX0_DISP8 + STORE_IDX2_DISP32
+
+
+class TailJumpTests(unittest.TestCase):
+    def test_rel32_tail_jump_after_a_prologue_is_followed_and_reported(self):
+        # entry: sub/call/add (13 bytes) then jmp rel32 into the second section, outside the scan window.
+        body = scan(make2("gs.sys", {TEXT_RAW: PROLOGUE + jmp32(0x100D, 0x2000), TEXT2_RAW: REAL_DRIVER_ENTRY}))
+        self.assertEqual(body["outcome"], "FOUND")
+        self.assertEqual({c["index"] for c in body["candidates"]}, {0, 2})
+        self.assertEqual(body["candidates"][0]["store_rva"], hex(0x2007))
+        tj = body["tail_jump"]
+        self.assertEqual(tj["state"], "FOLLOWED")
+        self.assertEqual(len(tj["hops"]), 1)
+        hop = tj["hops"][0]
+        self.assertEqual((hop["from_rva"], hop["jump_rva"], hop["to_rva"], hop["encoding"]),
+                         (hex(0x1000), hex(0x100D), hex(0x2000), "jmp_rel32"))
+        self.assertEqual(body["entry"]["rva"], hex(0x1000))
+        self.assertEqual(body["entry"]["scanned_rva"], hex(0x2000))
+        self.assertIs(body["proves_dispatch"], False)
+        for c in body["candidates"]:
+            self.assertIs(c["proves_dispatch"], False)
+
+    def test_two_hops_rel8_then_rel32_are_both_listed(self):
+        patches = {TEXT_RAW: jmp8(0x1000, 0x1060), TEXT_RAW + 0x60: jmp32(0x1060, 0x2000),
+                   TEXT2_RAW: REAL_DRIVER_ENTRY}
+        body = scan(make2("two.sys", patches))
+        self.assertEqual(body["outcome"], "FOUND")
+        hops = body["tail_jump"]["hops"]
+        self.assertEqual([(h["from_rva"], h["to_rva"], h["encoding"]) for h in hops],
+                         [(hex(0x1000), hex(0x1060), "jmp_rel8"), (hex(0x1060), hex(0x2000), "jmp_rel32")])
+
+    def test_unresolvable_targets_carry_their_own_code_not_not_found(self):
+        cases = {
+            "outside": ({TEXT_RAW: jmp32(0x1000, 0x9000)}, "TARGET_OUTSIDE_IMAGE"),
+            "loop": ({TEXT_RAW: jmp32(0x1000, 0x1010), TEXT_RAW + 0x10: jmp32(0x1010, 0x1000)}, "JUMP_LOOP"),
+        }
+        for name, (patches, reason) in cases.items():
+            with self.subTest(name):
+                body = scan(make2(name + ".sys", patches))
+                self.assertTrue(body["ok"])
+                self.assertEqual(body["outcome"], "TAIL_JUMP_UNRESOLVED")
+                self.assertNotEqual(body["outcome"], "NOT_FOUND")
+                self.assertEqual(body["candidates"], [])
+                self.assertEqual(body["dispatch_table"], "UNKNOWN")
+                self.assertEqual(body["tail_jump"]["state"], "UNRESOLVED")
+                self.assertEqual(body["tail_jump"]["reason"], reason)
+                self.assertIs(body["proves_dispatch"], False)
+        # ...while a window with neither a jump nor a store stays a plain NOT_FOUND.
+        plain = scan(make2("plain.sys", {TEXT_RAW: PROLOGUE}))
+        self.assertEqual(plain["outcome"], "NOT_FOUND")
+        self.assertEqual(plain["tail_jump"]["state"], "NONE")
+
+    def test_indirect_jump_through_an_import_slot_is_named_not_guessed(self):
+        import pefile
+        path = make2("ind.sys", {})
+        pe = pefile.PE(str(path))
+        slot_va = pe.DIRECTORY_ENTRY_IMPORT[0].imports[0].address
+        rva = slot_va - pe.OPTIONAL_HEADER.ImageBase
+        pe.close()
+        data = bytearray(path.read_bytes())
+        code = b"\xFF\x25" + struct.pack("<i", rva - (0x1000 + 6))
+        data[TEXT_RAW:TEXT_RAW + len(code)] = code
+        path.write_bytes(bytes(data))
+        body = scan(path)
+        self.assertEqual(body["outcome"], "TAIL_JUMP_UNRESOLVED")
+        self.assertEqual(body["tail_jump"]["reason"], "INDIRECT_TARGET_IS_IMPORT")
+        self.assertEqual(body["tail_jump"]["import"], "ntoskrnl.exe!IoCreateDevice")
+        self.assertEqual(body["candidates"], [])
+
+    def test_indirect_jump_through_a_plain_data_slot_is_unresolved(self):
+        # A slot in .text2 holding some value: what it holds at run time is not knowable statically.
+        code = b"\xFF\x25" + struct.pack("<i", 0x2000 - (0x1000 + 6))
+        body = scan(make2("slot.sys", {TEXT_RAW: code, TEXT2_RAW: struct.pack("<Q", 0x140002100)}))
+        self.assertEqual(body["outcome"], "TAIL_JUMP_UNRESOLVED")
+        self.assertEqual(body["tail_jump"]["reason"], "INDIRECT_TARGET_NOT_STATIC")
+
+    def test_chain_limit_is_three_hops(self):
+        def chain(n):
+            patches = {TEXT2_RAW: REAL_DRIVER_ENTRY}
+            stops = [0x1000 + 0x20 * k for k in range(n)] + [0x2000]
+            for a, b in zip(stops, stops[1:]):
+                patches[TEXT_RAW + (a - 0x1000)] = jmp32(a, b) if b == 0x2000 else jmp8(a, b)
+            return patches
+        ok = scan(make2("c3.sys", chain(3)))
+        self.assertEqual(ok["outcome"], "FOUND")
+        self.assertEqual(len(ok["tail_jump"]["hops"]), 3)
+        over = scan(make2("c4.sys", chain(4)))
+        self.assertEqual(over["outcome"], "TAIL_JUMP_UNRESOLVED")
+        self.assertEqual(over["tail_jump"]["reason"], "CHAIN_LIMIT")
+        self.assertEqual(len(over["tail_jump"]["hops"]), 3)
+
+    def test_driver_without_a_jump_is_scanned_where_it_always_was(self):
+        # Narrowness guard: stores sit directly at the entry point. Over-eager following would move the scan.
+        body = scan(make2("direct.sys", {TEXT_RAW: LEA_RAX + STORE_IDX0_DISP8 + STORE_IDX2_DISP32}))
+        self.assertEqual(body["outcome"], "FOUND")
+        self.assertEqual(body["tail_jump"]["state"], "NONE")
+        self.assertEqual(body["tail_jump"]["hops"], [])
+        self.assertEqual(body["entry"]["scanned_rva"], body["entry"]["rva"])
+        self.assertEqual({c["index"] for c in body["candidates"]}, {0, 2})
+
+    def test_stores_at_the_entry_point_win_over_a_later_jump(self):
+        # Direct stores AND a later jmp whose target holds other stores: the entry's own stores are the answer.
+        patches = {TEXT_RAW: LEA_RAX + STORE_IDX0_DISP8 + jmp32(0x100B, 0x2000),
+                   TEXT2_RAW: LEA_RAX_2000 + STORE_IDX3_DISP8}
+        body = scan(make2("both.sys", patches))
+        self.assertEqual(body["outcome"], "FOUND")
+        self.assertEqual({c["index"] for c in body["candidates"]}, {0})
+        self.assertEqual(body["tail_jump"]["state"], "NONE")
+
+    def test_an_e9_byte_inside_an_operand_is_not_followed_as_a_jump(self):
+        # False-positive direction: a jump-looking byte that is really part of a mov immediate, with a garbage
+        # target. Following it would report stores from somewhere that is not code; the scan must leave it alone.
+        cases = {
+            "e9": bytes.fromhex("B8E900009000"),   # mov eax, imm32 whose bytes read as jmp rel32 -> 0x901006
+            "eb": bytes.fromhex("B8EB80000000"),   # ...and as jmp rel8 -0x80 -> before the image
+        }
+        for name, code in cases.items():
+            with self.subTest(name):
+                body = scan(make2("fake_" + name + ".sys", {TEXT_RAW: code, TEXT2_RAW: REAL_DRIVER_ENTRY}))
+                self.assertEqual(body["outcome"], "NOT_FOUND")
+                self.assertEqual(body["tail_jump"]["state"], "NONE")
+                self.assertEqual(body["tail_jump"]["hops"], [])
+                self.assertEqual(body["candidates"], [])
+                self.assertEqual(body["entry"]["scanned_rva"], body["entry"]["rva"])
+
+    def test_bytes_inside_a_call_operand_are_not_mistaken_for_a_jump(self):
+        # E8 <E9 FA 0F 00> 00: read from the operand's first byte, that is jmp rel32 to 0x2000, a real code
+        # section holding stores. The call operand must be skipped, so nothing is followed.
+        code = bytes.fromhex("E8E9FA0F0000")
+        body = scan(make2("callop.sys", {TEXT_RAW: code, TEXT2_RAW: REAL_DRIVER_ENTRY}))
+        self.assertEqual(body["outcome"], "NOT_FOUND")
+        self.assertEqual(body["tail_jump"]["state"], "NONE")
+        self.assertEqual(body["candidates"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

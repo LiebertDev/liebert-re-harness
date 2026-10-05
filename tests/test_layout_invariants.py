@@ -229,7 +229,10 @@ def test_published_tool_name_set_is_unchanged():
     # none removed: driver_major_function_scan (public; declared in FAMILIES["windows-kernel"] but undefined
     # until now) and the private _dmf_refuse, _dmf_index, _dmf_find. No new module. Digest recomputed
     # from the source.
-    assert digest == "b9ab4d72fa6485025f81f724aeb4618ba4dbb087f33b7821da56bdd0e01499a4"
+    # dispatch-scan tail-jump slice: 755 -> 757, two private top-level functions added in
+    # liebert_re/tools/binary.py, none removed: _dmf_read and _dmf_tail_jump (the two constants are
+    # assignments and add nothing). No new module. Digest recomputed from the source.
+    assert digest == "31898527fa3932d889cf0bcc62d1b1e38177f1f763194455ce0e8b93638bae7d"
 
 
 def test_the_imported_package_is_this_checkout():

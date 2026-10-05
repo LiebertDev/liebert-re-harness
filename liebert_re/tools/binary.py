@@ -701,10 +701,17 @@ _DMF_LAYOUT={0x8664:(0x70,8,True),0x14c:(0x38,4,False)}   # machine -> (MajorFun
 _DMF_WINDOW=1024
 _DMF_MAX_WINDOW=4096
 _DMF_PAIR_DISTANCE=64
+_DMF_JUMP_SEARCH=64   # a tail jump is looked for only in the first this-many bytes of a scanned window
+_DMF_MAX_HOPS=3       # at most this many tail jumps are followed from the entry point
 DISPATCH_SCAN_STATEMENT=("A first-pass byte-pattern heuristic, not a recovery: a candidate store is not proof of a "
                          "dispatch assignment, and the absence of one is not proof that none exists.")
-_DMF_CAVEATS=("Only a bounded window from the DriverEntry address is read; a stub that tail-jumps to the real "
-              "DriverEntry (common with compiler security-cookie wrappers) puts the stores outside it.",
+_DMF_CAVEATS=("Only a bounded window from the DriverEntry address is read. When it holds no store pattern, a "
+              "jmp rel8/rel32/[mem] in its first bytes is followed (a few hops at most, see tail_jump); a tail call "
+              "made any other way, or a jump further in, is not seen.",
+              "A jump is recognised by bytes, not on an instruction boundary (an E8 call's 4 operand bytes are skipped), "
+              "so a followed jump is a heuristic reading; tail_jump lists every hop so it can be checked. A jump-looking byte "
+              "inside another instruction whose target happens to land in a code section cannot be told apart from a real "
+              "jump without a disassembler; only implausible targets are rejected.",
               "Patterns are matched at every byte offset, not on instruction boundaries; the base register is not known to be the DriverObject.",
               "Stores through a computed index, a loop or a copied table are not matched.")
 
@@ -766,10 +773,72 @@ def _dmf_find(buf,entry_rva,image_base,x64,base,stride,code_ranges):
                     "basis":basis,"proves_dispatch":False})
     return out
 
+def _dmf_read(pe,rva,window):
+    """Bytes at ``rva`` from the section holding it: ("OK",buf), ("NOT_IN_SECTION",None) or ("UNREADABLE",None)."""
+    sec=next((s for s in pe.sections if s.VirtualAddress<=rva<s.VirtualAddress+max(int(s.Misc_VirtualSize),int(s.SizeOfRawData))),None)
+    if sec is None:return "NOT_IN_SECTION",None
+    delta=rva-int(sec.VirtualAddress)
+    start=int(sec.PointerToRawData)+delta
+    stop=min(start+window,int(sec.PointerToRawData)+int(sec.SizeOfRawData),len(pe.__data__))
+    if delta>=int(sec.SizeOfRawData) or stop<=start:return "UNREADABLE",None
+    return "OK",bytes(pe.__data__[start:stop])
+
+def _dmf_tail_jump(pe,buf,at_rva,image_base,x64,code_ranges):
+    """The first tail jump in the first _DMF_JUMP_SEARCH bytes of ``buf`` (read from ``at_rva``), or None.
+
+    Recognised: EB cb (jmp rel8), E9 cd (jmp rel32), FF 25 cd (jmp [rip+disp32] on x64, jmp [abs32] on x86). A byte
+    pattern past offset 0 counts only if it points somewhere plausible (a relative target inside a code section, an
+    indirect slot inside the image) and an E8 call's operand bytes are skipped, because a prologue is not a jump.
+    The result has ``jump_rva``, ``encoding`` and either ``to_rva`` or a ``reason`` the target cannot be followed;
+    an indirect jump is resolved only when its slot is an import-table entry, and then ``import`` names it."""
+    def in_image(r):return any(s.VirtualAddress<=r<s.VirtualAddress+max(int(s.Misc_VirtualSize),int(s.SizeOfRawData)) for s in pe.sections)
+    def in_code(r):return any(a<=r<b for a,b in code_ranges)
+    i=0;n=min(len(buf),_DMF_JUMP_SEARCH)
+    while i<n:
+        b=buf[i]
+        if b==0xE8:i+=5;continue
+        found=None
+        if b==0xEB and i+2<=len(buf):
+            found=("jmp_rel8",at_rva+i+2+int.from_bytes(buf[i+1:i+2],"little",signed=True),False)
+        elif b==0xE9 and i+5<=len(buf):
+            found=("jmp_rel32",at_rva+i+5+int.from_bytes(buf[i+1:i+5],"little",signed=True),False)
+        elif b==0xFF and i+6<=len(buf) and buf[i+1]==0x25:
+            d=int.from_bytes(buf[i+2:i+6],"little",signed=x64)
+            found=("jmp_indirect_rip" if x64 else "jmp_indirect_abs",(at_rva+i+6+d) if x64 else d-image_base,True)
+        if found:
+            enc,target,indirect=found
+            plausible=in_image(target) if indirect else in_code(target)
+            if i==0 or plausible:
+                out={"jump_rva":hex(at_rva+i),"jump_offset":i,"encoding":enc}
+                if indirect:
+                    out["slot_rva"]=hex(target)
+                    imp=next((m for d in (getattr(pe,"DIRECTORY_ENTRY_IMPORT",None) or []) for m in d.imports
+                              if m.address is not None and int(m.address)-image_base==target),None)
+                    if imp is not None:
+                        dll=next(d.dll for d in pe.DIRECTORY_ENTRY_IMPORT if imp in d.imports)
+                        out["import"]=f"{dll.decode(errors='replace')}!{imp.name.decode(errors='replace') if imp.name else 'ordinal '+str(imp.ordinal)}"
+                        out["reason"]="INDIRECT_TARGET_IS_IMPORT"
+                    else:
+                        out["reason"]="INDIRECT_TARGET_NOT_STATIC" if in_image(target) else "TARGET_OUTSIDE_IMAGE"
+                elif not in_image(target):
+                    out["to_rva"]=hex(target) if target>=0 else None;out["reason"]="TARGET_OUTSIDE_IMAGE"
+                elif not in_code(target):
+                    out["to_rva"]=hex(target);out["reason"]="TARGET_NOT_IN_CODE_SECTION"
+                else:
+                    out["to_rva"]=hex(target)
+                return out
+        i+=1
+    return None
+
 def driver_major_function_scan(path,max_bytes=_DMF_WINDOW):
     """First-pass byte-pattern search for DriverObject->MajorFunction[IRP_MJ_*] stores near DriverEntry. No disassembler.
 
-    Three outcomes that never share a code. ``outcome`` FOUND: ``candidates`` lists stores, each with
+    If the entry point's window holds no store, a tail jump in its first bytes (jmp rel8, jmp rel32, jmp [mem]) is
+    followed, at most _DMF_MAX_HOPS deep and never revisiting an address, and the target is scanned instead;
+    ``tail_jump`` lists every hop (from, jump and to RVA) and ``entry.scanned_rva`` says what was scanned. A jump
+    that cannot be followed (target outside the image or unreadable, an indirect slot that is not statically known,
+    a loop, too many hops) gives ``outcome`` TAIL_JUMP_UNRESOLVED -- never NOT_FOUND -- with ``tail_jump.reason``.
+    Four outcomes that never share a code. ``outcome`` FOUND: ``candidates`` lists stores, each with
     ``confidence`` heuristic (paired with a load of an in-image code address) or heuristic_weak (store only),
     and ``proves_dispatch`` always false. NOT_FOUND: the window was read and no pattern matched; ``ok`` is true,
     ``candidates`` is empty and ``rationale`` says what was and was not covered. NOT_LOOKED: ``ok`` false with an
@@ -806,19 +875,37 @@ def driver_major_function_scan(path,max_bytes=_DMF_WINDOW):
             entry_rva=int(s.address);source="export:DriverEntry";break
     if not entry_rva:
         return _dmf_refuse("ANALYSIS_LIMITED","ENTRY_POINT_ABSENT",False,"The PE declares no entry point, so there is no DriverEntry address to read from.",path=relative(p))
-    sec=next((s for s in pe.sections if s.VirtualAddress<=entry_rva<s.VirtualAddress+max(int(s.Misc_VirtualSize),int(s.SizeOfRawData))),None)
-    if sec is None:
+    state,buf=_dmf_read(pe,entry_rva,window)
+    if state=="NOT_IN_SECTION":
         return _dmf_refuse("ANALYSIS_LIMITED","ENTRY_POINT_NOT_IN_SECTION",False,"The entry point RVA lies outside every section, so there are no bytes to read.",path=relative(p),entry_rva=hex(entry_rva),source=source)
-    delta=entry_rva-int(sec.VirtualAddress)
-    data=pe.__data__
-    start=int(sec.PointerToRawData)+delta
-    stop=min(start+window,int(sec.PointerToRawData)+int(sec.SizeOfRawData),len(data))
-    if delta>=int(sec.SizeOfRawData) or stop<=start:
+    if state=="UNREADABLE":
         return _dmf_refuse("ANALYSIS_LIMITED","ENTRY_POINT_UNREADABLE",False,"The section holding the entry point has no readable bytes at that address (file cut short, or the address is in zero-filled virtual space).",path=relative(p),entry_rva=hex(entry_rva),source=source)
-    buf=bytes(data[start:stop])
     code=[(int(s.VirtualAddress),int(s.VirtualAddress)+max(int(s.Misc_VirtualSize),int(s.SizeOfRawData)))
           for s in pe.sections if s.Characteristics&0x20000020]
-    cands=_dmf_find(buf,entry_rva,int(pe.OPTIONAL_HEADER.ImageBase),x64,base,stride,code)
+    image_base=int(pe.OPTIONAL_HEADER.ImageBase)
+    # Scan the entry point; only if it shows no store, follow a tail jump (at most _DMF_MAX_HOPS, no revisits).
+    scan_rva=entry_rva;hops=[];seen={entry_rva};blocked=None
+    while True:
+        cands=_dmf_find(buf,scan_rva,image_base,x64,base,stride,code)
+        if cands:break
+        jump=_dmf_tail_jump(pe,buf,scan_rva,image_base,x64,code)
+        if jump is None:break
+        if jump.get("reason"):blocked=jump;break
+        target=int(jump["to_rva"],16)
+        if len(hops)>=_DMF_MAX_HOPS:
+            blocked=dict(jump,reason="CHAIN_LIMIT");break
+        if target in seen:
+            blocked=dict(jump,reason="JUMP_LOOP");break
+        state,nbuf=_dmf_read(pe,target,window)
+        if state!="OK":
+            blocked=dict(jump,reason="TARGET_UNREADABLE");break
+        hops.append({"from_rva":hex(scan_rva),"jump_rva":jump["jump_rva"],"encoding":jump["encoding"],"to_rva":jump["to_rva"]})
+        seen.add(target);scan_rva=target;buf=nbuf
+    tail={"state":"UNRESOLVED" if blocked else ("FOLLOWED" if hops else "NONE"),"hops":hops,
+          "max_hops":_DMF_MAX_HOPS,"search_bytes":_DMF_JUMP_SEARCH}
+    if blocked:
+        tail["reason"]=blocked["reason"];tail["blocked_jump"]={k:v for k,v in blocked.items() if k not in ("reason","import")}
+        if "import" in blocked:tail["import"]=blocked["import"]
 
     subsystem=int(pe.OPTIONAL_HEADER.Subsystem)
     entries=getattr(pe,"DIRECTORY_ENTRY_IMPORT",None)
@@ -834,18 +921,22 @@ def driver_major_function_scan(path,max_bytes=_DMF_WINDOW):
         rationale.append(f"{len(cands)} candidate store(s) matched the MajorFunction offset pattern; none is proof of a dispatch assignment")
         if all(c["handler_rva"] is None for c in cands):
             rationale.append("no candidate could be paired with a load of an in-image code address")
+    elif blocked:
+        rationale.append(f"the entry point ({hex(entry_rva)}) holds no store pattern and its tail jump could not be followed: {blocked['reason']}; this is not a NOT_FOUND")
     else:
-        rationale.append(f"{len(buf)} byte(s) from {source} ({hex(entry_rva)}) were read and no MajorFunction store pattern matched")
+        rationale.append(f"{len(buf)} byte(s) from {hex(scan_rva)} were read and no MajorFunction store pattern matched")
         rationale.append("this does not show the driver sets no dispatch routines: see caveats for what the pattern cannot see")
+    if hops:rationale.append(f"scanned {hex(scan_rva)}, reached from the entry point {hex(entry_rva)} through {len(hops)} tail jump(s) listed in tail_jump.hops")
     if len(buf)<window:rationale.append("the window was cut short by the end of the section's raw data")
     if next(i for i in indicators if i["name"]=="subsystem_native")["present"] is False:
         rationale.append("subsystem is not NATIVE: this file may not be a driver; it was scanned anyway")
     return json.dumps({
         "ok":True,"tool":"driver_major_function_scan","status":"OK","path":relative(p),
-        "outcome":"FOUND" if cands else "NOT_FOUND",
+        "outcome":"FOUND" if cands else ("TAIL_JUMP_UNRESOLVED" if blocked else "NOT_FOUND"),
         "dispatch_table":"CANDIDATES_ONLY" if cands else "UNKNOWN","proves_dispatch":False,
-        "entry":{"source":source,"rva":hex(entry_rva),"scanned_bytes":len(buf),"requested_window":window,
+        "entry":{"source":source,"rva":hex(entry_rva),"scanned_rva":hex(scan_rva),"scanned_bytes":len(buf),"requested_window":window,
                  "architecture":"x86_64" if x64 else "x86"},
+        "tail_jump":tail,
         "candidates":cands,"indicators":indicators,"rationale":rationale,"caveats":list(_DMF_CAVEATS),
         "statement":DISPATCH_SCAN_STATEMENT,
     },ensure_ascii=False,indent=2)
