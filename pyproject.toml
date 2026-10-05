@@ -105,4 +105,4 @@ include = ["liebert_re*"]
 # The IDAPython worker that liebert_re/tools/ida.py copies into idat's work directory. It is a data
 # file (.idapy), not a module: it imports IDA's own modules and would fail the wheel's import smoke test.
 [tool.setuptools.package-data]
-"liebert_re.tools" = ["ida_scripts/*.idapy"]
+"liebert_re.tools" = ["ida_scripts/*.idapy", "ghidra_scripts/*.java"]

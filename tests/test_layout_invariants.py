@@ -20,7 +20,8 @@ import liebert_re.report.tool_families as tool_families
 # duplicates it.
 EVIDENCE_OWNERS = {
     "liebert_re.dynamic.apimonitor", "liebert_re.dynamic.lab_gate", "liebert_re.tools.binary", "liebert_re.tools.capa",
-    "liebert_re.tools.die", "liebert_re.tools.generic_static_probe", "liebert_re.tools.ida",
+    "liebert_re.tools.die", "liebert_re.tools.generic_static_probe", "liebert_re.tools.ghidra",
+    "liebert_re.tools.ida",
     "liebert_re.tools.pe_sieve", "liebert_re.tools.rizin",
     "liebert_re.tools.upx", "liebert_re.tools.yara_x",
 }
@@ -178,11 +179,27 @@ def test_published_tool_name_set_is_unchanged():
     # none removed: _read_log_tail (bounded, redacted tail of ida.log; absent told apart from unreadable),
     # _keep_failed_scratch and _retained_scratch (the default-off LIEBERT_RE_KEEP_FAILED_SCRATCH switch and
     # its response part). No new module. Digest recomputed from the source, not edited by hand.
+    # Ghidra headless slice 1, on top of the slices above (716 -> 737 once rebased onto main), twenty-one
+    # top-level names added, none removed (checked by diffing the sorted name sets of the two trees).
+    # Public: ghidra_status, ghidra_program_facts (liebert_re/tools/ghidra.py, both registered in
+    # tool_families.FAMILIES["native"]; the second is path-only, the first is listed under
+    # NATIVE_NOT_FILE_ROUTABLE). Private top-level helpers of that module: _count_error_lines,
+    # _discover_installs, _display_candidate, _facts_in_work, _headless_in, _int_or_none,
+    # _java_executable, _known_roots, _normalise_facts, _parse_java_major, _probe_java,
+    # _read_properties, _read_result, _remove_work, _scan_failures, _select_install, _sha256_file,
+    # _shown_path, _version_key. The other helpers it defines (_j, _redact, _tail, _checked_path,
+    # _tool_missing) share a name with existing ones, and the pin is a set, so they add nothing.
+    # (Within this slice's own history: 18 names at first, then the audit-fix commit added
+    # _facts_in_work, _normalise_facts, _remove_work, _shown_path and dropped _refusal: 18 + 4 - 1 = 21.)
+    # The new ghidra_scripts/ProgramFacts.java is a data file, not a module. One module was added
+    # (liebert_re/tools/ghidra.py): the CI module count is now 71. Digest recomputed from the source
+    # with sha256(repr(sorted(tool_families._locally_defined_tool_names())).encode()).
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    # Merged tree (engine-log + process-lock): 714 + 2 = 716 names; digest recomputed from the merged source.
-    assert digest == "6bd0577e688b4cf032b7d2a743869ead0f777be51961928f796b59b5c663df1e"
+    # Merged tree (engine-log + process-lock): 714 + 2 = 716 names; with the Ghidra slice's 21 names
+    # on top, 716 + 21 = 737 (measured, not summed); digest recomputed from the merged source.
+    assert digest == "e89ef6e0e5ea7f91ce897345ed59c7264009550a49564dae757260443fea3f7d"
 
 
 def test_the_imported_package_is_this_checkout():
