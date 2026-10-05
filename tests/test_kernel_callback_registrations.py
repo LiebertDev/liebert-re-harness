@@ -101,6 +101,7 @@ class KernelCallbackRegistrationsTests(unittest.TestCase):
             "KeRegisterNmiCallback": "nmi", "IoRegisterPlugPlayNotification": "pnp",
             "ExRegisterCallback": "executive", "PoRegisterCoalescingCallback": "power",
             "FsRtlRegisterFileSystemFilterCallbacks": "filesystem",
+            "IoRegisterBootDriverCallback": "boot", "SeRegisterImageVerificationCallback": "image_verification",
         }
         names = list(expected)
         p = build("batch2.sys", {"ntoskrnl.exe": names}, [(0x10 + 8 * i, i) for i in range(len(names))])
@@ -118,6 +119,27 @@ class KernelCallbackRegistrationsTests(unittest.TestCase):
         self.assertEqual(run(p)["registrations"], [])
         q = build("batch2wrong.sys", {"fltmgr.sys": ["KeRegisterNmiCallback"]}, [(0x10, 0)])
         self.assertEqual(run(q)["registrations"], [])
+
+    def test_names_checked_is_reported_filled_in_every_outcome(self):
+        found = run(build("scope_f.sys", {"ntoskrnl.exe": ["ObRegisterCallbacks"]}, [(0x10, 0)]))
+        nf = run(build("scope_n.sys", {"ntoskrnl.exe": ["IoCreateDevice"]}, [(0x10, 0)]))
+        self.assertEqual(found["outcome"], "FOUND")
+        self.assertEqual(nf["outcome"], "NOT_FOUND")
+        for body in (found, nf):
+            nc = body["names_checked"]
+            self.assertGreaterEqual(nc["count"], 25)
+            self.assertEqual(nc["count"], len(nc["names"]))
+            self.assertIs(nc["truncated"], False)
+            self.assertIn("ntoskrnl!ObRegisterCallbacks", nc["names"])
+            self.assertIn("fltmgr!FltRegisterFilter", nc["names"])
+            self.assertIn("ntoskrnl!SeRegisterImageVerificationCallback", nc["names"])
+
+    def test_not_found_rationale_cites_the_checked_scope_and_its_size(self):
+        nf = run(build("scope_r.sys", {"ntoskrnl.exe": ["IoCreateDevice"]}, [(0x10, 0)]))
+        text = " ".join(nf["rationale"])
+        self.assertIn("names_checked", text)
+        self.assertIn(str(nf["names_checked"]["count"]), text)
+        self.assertIn("nothing about names outside that list", text)
 
     def test_name_from_the_wrong_module_is_not_a_finding(self):
         p = build("wrongdll.sys", {"ntoskrnl.exe": ["FltRegisterFilter"]}, [(0x10, 0)])

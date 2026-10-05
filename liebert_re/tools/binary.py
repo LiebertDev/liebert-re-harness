@@ -1096,14 +1096,16 @@ _KCR_APIS={
     ("fltmgr","FltRegisterFilter"):"filesystem",
     ("ntoskrnl","PoRegisterPowerSettingCallback"):"power",
     # Second batch: name existence re-verified from the ntoskrnl.exe export table; the family labels are inference
-    # from the name only, NOT verified. Seven of nine candidates were added; IoRegisterBootDriverCallback and
-    # SeRegisterImageVerificationCallback were left out because the name alone does not settle what they register.
+    # from the name only, NOT verified. All nine candidates were added. For IoRegisterBootDriverCallback and
+    # SeRegisterImageVerificationCallback the name alone does not settle WHAT is registered, but the table reports
+    # that a registration-style API is called, not what it registers, so they are in with deliberately plain families.
     ("ntoskrnl","KeRegisterBugCheckCallback"):"bugcheck",("ntoskrnl","KeRegisterBugCheckReasonCallback"):"bugcheck",
     ("ntoskrnl","KeRegisterNmiCallback"):"nmi",
     ("ntoskrnl","IoRegisterPlugPlayNotification"):"pnp",
     ("ntoskrnl","ExRegisterCallback"):"executive",
     ("ntoskrnl","PoRegisterCoalescingCallback"):"power",
     ("ntoskrnl","FsRtlRegisterFileSystemFilterCallbacks"):"filesystem",
+    ("ntoskrnl","IoRegisterBootDriverCallback"):"boot",("ntoskrnl","SeRegisterImageVerificationCallback"):"image_verification",
 }
 KCR_STATEMENT=("A filter over a byte-pattern first pass: a registration is an import-table call the scan saw, not proof the code runs. "
                "Not seeing one means no direct call through the import table was seen, which is not the same as the driver not registering.")
@@ -1172,11 +1174,12 @@ def kernel_callback_registrations(path):
         rationale.append("the import directory was only partly readable, so imports past the break could not be named")
     else:
         outcome="NOT_FOUND"
-        rationale.append("no direct call through the import table to a listed registration API was seen")
+        rationale.append(f"no direct call through the import table to any of the {len(_KCR_APIS)} API names this tool knows "
+                         "(listed in names_checked) was seen; this says nothing about names outside that list")
         rationale.append("indirect calls and run-time name resolution (MmGetSystemRoutineAddress and the like) are not visible to this scan")
     if unref:rationale.append(f"{len(unref)} listed API(s) are imported but no call site was found for them; not a finding")
     body={"ok":True,"tool":"kernel_callback_registrations","status":"OK","path":scan["path"],"outcome":outcome,
-          "proves_call":False,"registrations":regs,"imported_without_reference":unref,"callback_address":"NOT_RECOVERED",
+          "proves_call":False,"registrations":regs,"imported_without_reference":unref,"names_checked":{"count":len(_KCR_APIS),"names":sorted(f"{d}!{n}" for d,n in _KCR_APIS),"truncated":False},"callback_address":"NOT_RECOVERED",
           "scan_truncation":trunc,"entry":scan["entry"],"rationale":rationale,
           "caveats":list(scan["caveats"])+list(_KCR_EXTRA_CAVEATS),"statement":KCR_STATEMENT}
     if reason:body["reason"]=reason
