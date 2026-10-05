@@ -157,3 +157,118 @@ class DeclaredNameIsDefinedTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _pe_without_exports(directory: Path) -> Path:
+    from liebert_re.recover.owned_binary_fixtures import build_owned_pe_sections
+    return build_owned_pe_sections(directory / "no_exports.exe")
+
+
+def _pe_with_empty_export_directory(directory: Path) -> Path:
+    """The owned PE with its export data directory pointed at an all-zero
+    IMAGE_EXPORT_DIRECTORY (NumberOfNames 0): the directory exists, holds nothing."""
+    import struct
+    data = bytearray(_pe_without_exports(directory).read_bytes())
+    struct.pack_into("<II", data, 200, 0x1000, 40)   # optional header data directory 0
+    out = directory / "empty_exports.dll"
+    out.write_bytes(bytes(data))
+    return out
+
+
+def _write_dll_with_exports(path: Path, names: list) -> Path:
+    """Owned PE whose export directory (inside .text, RVA 0x1010) names ``names``."""
+    import struct
+    data = bytearray(_pe_without_exports(path.parent).read_bytes())
+    base, n = 0x1000 + 0x10, len(names)
+    funcs_at, names_at, ords_at = 40, 40 + 4 * n, 40 + 8 * n
+    blob = bytearray(ords_at + 2 * n)
+    strings = bytearray()
+    for i, name in enumerate(names):
+        struct.pack_into("<I", blob, funcs_at + 4 * i, 0x1000)
+        struct.pack_into("<I", blob, names_at + 4 * i, base + len(blob) + len(strings))
+        struct.pack_into("<H", blob, ords_at + 2 * i, i)
+        strings += name.encode("ascii") + b"\x00"
+    blob += strings
+    struct.pack_into("<I", blob, 16, 1)             # Base
+    struct.pack_into("<I", blob, 20, n)             # NumberOfFunctions
+    struct.pack_into("<I", blob, 24, n)             # NumberOfNames
+    struct.pack_into("<I", blob, 28, base + funcs_at)
+    struct.pack_into("<I", blob, 32, base + names_at)
+    struct.pack_into("<I", blob, 36, base + ords_at)
+    data[0x400 + 0x10:0x400 + 0x10 + len(blob)] = blob
+    struct.pack_into("<II", data, 200, base, len(blob))
+    path.write_bytes(bytes(data))
+    return path
+
+
+class ZeroExportsIsNotAMeasurementOfAbsenceTests(unittest.TestCase):
+    """Searching zero export names answers nothing: the domain of the question
+    ("which export does this hash correspond to?") is empty. It must say it did
+    not look, not report an empty search as ok:true / match_count:0. Fixtures
+    are built in code (owned PE), no system file is involved."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+
+    @pytest.mark.contract
+    def test_pe_with_no_export_directory_is_not_looked(self):
+        result = crack_api_hash(0x12345678, dll_path=str(_pe_without_exports(self.dir)))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "NO_EXPORT_DIRECTORY")
+        self.assertIs(result["export_directory_present"], False)
+        self.assertNotIn("matches", result)
+
+    @pytest.mark.contract
+    def test_present_but_empty_export_directory_is_the_same_answer(self):
+        # Measured: pefile parses it (DIRECTORY_ENTRY_EXPORT exists) with zero
+        # symbols, and the old code returned the same ok:true/0/[] as for no
+        # directory. The analyst's situation is identical (nothing to hash
+        # against), so the code is the same; the detail field tells them apart.
+        result = crack_api_hash(0x12345678, dll_path=str(_pe_with_empty_export_directory(self.dir)))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "NO_EXPORT_DIRECTORY")
+        self.assertIs(result["export_directory_present"], True)
+
+    @pytest.mark.contract
+    def test_status_categories_are_distinct_and_error_strings_unchanged(self):
+        no_dir = crack_api_hash(1, dll_path=str(_pe_without_exports(self.dir)))
+        missing = crack_api_hash(1, dll_path=str(self.dir / "absent.dll"))
+        bad = self.dir / "bad.dll"
+        bad.write_bytes(b"not a pe at all")
+        malformed = crack_api_hash(1, dll_path=str(bad))
+        usage = crack_api_hash(1, dll_path=str(bad), algorithms=["nope"])
+        for refusal in (no_dir, missing, malformed):
+            self.assertFalse(refusal["ok"])
+            self.assertEqual(refusal["status"], "ANALYSIS_LIMITED")
+        self.assertTrue(missing["error"].startswith("DLL_NOT_FOUND:"))
+        self.assertTrue(malformed["error"].startswith("PEFormatError:"))
+        self.assertFalse(usage["ok"])
+        self.assertEqual(usage["status"], "INVALID_INPUT")   # a usage error, not "could not look"
+        self.assertEqual(usage["error"], "UNKNOWN_ALGORITHM")
+
+    @pytest.mark.contract
+    def test_tool_layer_carries_the_same_status(self):
+        import json
+        from liebert_re.recover.api_hash_recover import api_hash_recover
+        out = json.loads(api_hash_recover("0x1", dll_path=str(_pe_without_exports(self.dir))))
+        self.assertEqual((out["ok"], out["error"], out["status"]), (False, "NO_EXPORT_DIRECTORY", "ANALYSIS_LIMITED"))
+        bad_value = json.loads(api_hash_recover("zz", dll_path=str(_pe_without_exports(self.dir))))
+        self.assertFalse(bad_value["ok"])
+        self.assertEqual(bad_value["status"], "INVALID_INPUT")
+        self.assertEqual(bad_value["error"], "ValueError")
+
+    @pytest.mark.contract
+    def test_a_real_search_that_finds_nothing_is_still_ok(self):
+        # The narrow side: a PE that HAS exports, searched fully, matching
+        # nothing, is a real answer. Built in code, so no system file.
+        pe = self.dir / "named.dll"
+        _write_dll_with_exports(pe, ["AlphaExport", "BetaExport"])
+        result = crack_api_hash(0xDEADBEEF, dll_path=str(pe), algorithms=["crc32"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["export_count_searched"], 2)
+        self.assertEqual(result["match_count"], 0)
+        self.assertEqual(result["matches"], [])
