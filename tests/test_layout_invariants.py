@@ -225,7 +225,11 @@ def test_published_tool_name_set_is_unchanged():
     # CLI minidump provenance slice: 750 -> 751, one private top-level function added in
     # liebert_re/cli.py, none removed: _resolve_for_report. No new module. Digest recomputed from
     # the source.
-    assert digest == "7a68545baa9f50688850a69d224510862b1e5f2811738d020f64b5a66c489a55"
+    # dispatch-table first-pass slice: 751 -> 755, four top-level names added in liebert_re/tools/binary.py,
+    # none removed: driver_major_function_scan (public; declared in FAMILIES["windows-kernel"] but undefined
+    # until now) and the private _dmf_refuse, _dmf_index, _dmf_find. No new module. Digest recomputed
+    # from the source.
+    assert digest == "b9ab4d72fa6485025f81f724aeb4618ba4dbb087f33b7821da56bdd0e01499a4"
 
 
 def test_the_imported_package_is_this_checkout():

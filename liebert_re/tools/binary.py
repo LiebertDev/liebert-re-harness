@@ -682,3 +682,170 @@ def ioctl_control_code_decode(codes):
         return json.dumps({"ok":False,"tool":"ioctl_control_code_decode","status":"INVALID_INPUT","error":"CODES_NOT_A_NONEMPTY_LIST",
                            "fixable":True,"fix":"Pass a non-empty list of CTL_CODE integers."},ensure_ascii=False,indent=2)
     return json.dumps({"ok":True,"tool":"ioctl_control_code_decode","results":[_icd_one(c) for c in codes]},ensure_ascii=False,indent=2)
+
+
+# --- driver_major_function_scan: a byte-pattern first pass over DriverEntry, NO disassembler -----------------
+# DriverObject->MajorFunction[IRP_MJ_*] = handler usually compiles to a store at a constant offset:
+#   x64:  lea reg,[rip+handler] ; mov [base+disp],reg      (MajorFunction at DRIVER_OBJECT+0x70, stride 8)
+#   x86:  mov dword [base+disp],imm32 | mov reg,imm32 ; mov [base+disp],reg  (+0x38, stride 4)
+# The scan walks every byte offset of a bounded window looking for the store shape, so it can hit bytes
+# that are not an instruction boundary, and it cannot know the base register is the DriverObject. Every
+# candidate is therefore heuristic and proves nothing. No capstone/IDA: it runs with no external tool.
+_IRP_MJ_NAMES=("IRP_MJ_CREATE","IRP_MJ_CREATE_NAMED_PIPE","IRP_MJ_CLOSE","IRP_MJ_READ","IRP_MJ_WRITE",
+    "IRP_MJ_QUERY_INFORMATION","IRP_MJ_SET_INFORMATION","IRP_MJ_QUERY_EA","IRP_MJ_SET_EA","IRP_MJ_FLUSH_BUFFERS",
+    "IRP_MJ_QUERY_VOLUME_INFORMATION","IRP_MJ_SET_VOLUME_INFORMATION","IRP_MJ_DIRECTORY_CONTROL",
+    "IRP_MJ_FILE_SYSTEM_CONTROL","IRP_MJ_DEVICE_CONTROL","IRP_MJ_INTERNAL_DEVICE_CONTROL","IRP_MJ_SHUTDOWN",
+    "IRP_MJ_LOCK_CONTROL","IRP_MJ_CLEANUP","IRP_MJ_CREATE_MAILSLOT","IRP_MJ_QUERY_SECURITY","IRP_MJ_SET_SECURITY",
+    "IRP_MJ_POWER","IRP_MJ_SYSTEM_CONTROL","IRP_MJ_DEVICE_CHANGE","IRP_MJ_QUERY_QUOTA","IRP_MJ_SET_QUOTA","IRP_MJ_PNP")
+_DMF_LAYOUT={0x8664:(0x70,8,True),0x14c:(0x38,4,False)}   # machine -> (MajorFunction offset, stride, is_x64)
+_DMF_WINDOW=1024
+_DMF_MAX_WINDOW=4096
+_DMF_PAIR_DISTANCE=64
+DISPATCH_SCAN_STATEMENT=("A first-pass byte-pattern heuristic, not a recovery: a candidate store is not proof of a "
+                         "dispatch assignment, and the absence of one is not proof that none exists.")
+_DMF_CAVEATS=("Only a bounded window from the DriverEntry address is read; a stub that tail-jumps to the real "
+              "DriverEntry (common with compiler security-cookie wrappers) puts the stores outside it.",
+              "Patterns are matched at every byte offset, not on instruction boundaries; the base register is not known to be the DriverObject.",
+              "Stores through a computed index, a loop or a copied table are not matched.")
+
+def _dmf_refuse(status,error,fixable,fix,**extra):
+    """Refusal envelope (same keys as _kt_refuse, own tool name). outcome is always NOT_LOOKED: nothing was searched."""
+    body={"ok":False,"tool":"driver_major_function_scan","status":status,"error":error,"fixable":fixable,"fix":fix,
+          "outcome":"NOT_LOOKED"}
+    body.update(extra)
+    return json.dumps(body,ensure_ascii=False,indent=2)
+
+def _dmf_index(disp,base,stride):
+    rel=disp-base
+    if rel<0 or rel%stride:return None
+    idx=rel//stride
+    return idx if idx<len(_IRP_MJ_NAMES) else None
+
+def _dmf_find(buf,entry_rva,image_base,x64,base,stride,code_ranges):
+    """Candidate MajorFunction stores in ``buf`` (bytes read from ``entry_rva``). Pure function of its inputs."""
+    def code_rva(r):
+        return r if r is not None and any(a<=r<b for a,b in code_ranges) else None
+    loads=[]   # (offset, register, handler rva)
+    for i in range(len(buf)):
+        if x64:
+            if i+7<=len(buf) and buf[i] in (0x48,0x4C) and buf[i+1]==0x8D and (buf[i+2]&0xC7)==0x05:
+                rel=int.from_bytes(buf[i+3:i+7],"little",signed=True)
+                loads.append((i,((buf[i]&4)<<1)|((buf[i+2]>>3)&7),entry_rva+i+7+rel))
+        elif i+5<=len(buf) and 0xB8<=buf[i]<=0xBF:
+            loads.append((i,buf[i]-0xB8,int.from_bytes(buf[i+1:i+5],"little")-image_base))
+    out=[]
+    for i in range(len(buf)-2):
+        op=buf[i]
+        if x64:
+            if not (0x48<=op<=0x4F and buf[i+1]==0x89):continue
+            m=buf[i+2];reg=((op&4)<<1)|((m>>3)&7);at=i+3;imm=False
+        elif op==0x89:
+            m=buf[i+1];reg=(m>>3)&7;at=i+2;imm=False
+        elif op==0xC7:
+            m=buf[i+1];reg=None;at=i+2;imm=True
+            if (m>>3)&7:continue
+        else:continue
+        mod,rm=m>>6,m&7
+        if mod not in (1,2) or rm==4:continue
+        dlen=1 if mod==1 else 4
+        if at+dlen+(4 if imm else 0)>len(buf):continue
+        disp=int.from_bytes(buf[at:at+dlen],"little",signed=True)
+        idx=_dmf_index(disp,base,stride)
+        if idx is None:continue
+        handler=None;basis="store_only"
+        if imm:
+            handler=code_rva(int.from_bytes(buf[at+dlen:at+dlen+4],"little")-image_base);basis="store_of_immediate"
+        else:
+            near=[l for l in loads if l[1]==reg and 0<i-l[0]<=_DMF_PAIR_DISTANCE]
+            if near:
+                handler=code_rva(near[-1][2])
+                if handler is not None:basis="load_then_store"
+        out.append({"index":idx,"name":_IRP_MJ_NAMES[idx],"store_rva":hex(entry_rva+i),
+                    "handler_rva":hex(handler) if handler is not None else None,
+                    "confidence":"heuristic" if handler is not None else "heuristic_weak",
+                    "basis":basis,"proves_dispatch":False})
+    return out
+
+def driver_major_function_scan(path,max_bytes=_DMF_WINDOW):
+    """First-pass byte-pattern search for DriverObject->MajorFunction[IRP_MJ_*] stores near DriverEntry. No disassembler.
+
+    Three outcomes that never share a code. ``outcome`` FOUND: ``candidates`` lists stores, each with
+    ``confidence`` heuristic (paired with a load of an in-image code address) or heuristic_weak (store only),
+    and ``proves_dispatch`` always false. NOT_FOUND: the window was read and no pattern matched; ``ok`` is true,
+    ``candidates`` is empty and ``rationale`` says what was and was not covered. NOT_LOOKED: ``ok`` false with an
+    ``error`` -- PATH_REFUSED, FILE_NOT_FOUND, FILE_NOT_ACCESSIBLE, INVALID_PE, UNSUPPORTED_MACHINE,
+    EXPORT_DIRECTORY_UNREADABLE, ENTRY_POINT_ABSENT, ENTRY_POINT_NOT_IN_SECTION or ENTRY_POINT_UNREADABLE.
+    ``dispatch_table`` is CANDIDATES_ONLY or UNKNOWN, never a recovered table. The DriverEntry address is the
+    ``DriverEntry`` export when the export table is readable and has one, else AddressOfEntryPoint."""
+    try:
+        p=safe_path(path)
+    except PermissionError as e:
+        return _dmf_refuse("PATH_REFUSED",str(e),True,"Pass a path inside the workspace root.",path=str(path))
+    if not p.is_file():
+        return _dmf_refuse("FILE_MISSING","FILE_NOT_FOUND",True,"Pass the path of an existing file.",path=str(path))
+    try:
+        pe=_pe(p)
+    except OSError as e:
+        return _dmf_refuse("ANALYSIS_LIMITED","FILE_NOT_ACCESSIBLE",False,"The file could not be read; check permissions or whether another process holds it.",path=relative(p),error_type=type(e).__name__)
+    except Exception as e:
+        return _dmf_refuse("ANALYSIS_LIMITED","INVALID_PE",False,"The file is not a PE or its header is corrupt; nothing was read from it.",path=relative(p),detail=f"{type(e).__name__}: {e}")
+    machine=int(pe.FILE_HEADER.Machine)
+    layout=_DMF_LAYOUT.get(machine)
+    if layout is None:
+        return _dmf_refuse("UNSUPPORTED","UNSUPPORTED_MACHINE",False,"Only x86 and x86_64 byte patterns are searched.",path=relative(p),machine=hex(machine))
+    base,stride,x64=layout
+    window=max(16,min(int(max_bytes),_DMF_MAX_WINDOW))
+    parse_error=_parse_directories(pe)
+    problem=_directory_problem(pe,parse_error,0,"DIRECTORY_ENTRY_EXPORT","export")
+    if problem:
+        return _dmf_refuse("ANALYSIS_LIMITED","EXPORT_DIRECTORY_UNREADABLE",False,"The export table could not be read, so whether DriverEntry is exported is unknown; the entry point was not guessed.",path=relative(p),detail=problem)
+    entry_rva=int(pe.OPTIONAL_HEADER.AddressOfEntryPoint);source="AddressOfEntryPoint"
+    ex=getattr(pe,"DIRECTORY_ENTRY_EXPORT",None)
+    for s in (ex.symbols if ex else []):
+        if s.name==b"DriverEntry" and s.address and not getattr(s,"forwarder",None):
+            entry_rva=int(s.address);source="export:DriverEntry";break
+    if not entry_rva:
+        return _dmf_refuse("ANALYSIS_LIMITED","ENTRY_POINT_ABSENT",False,"The PE declares no entry point, so there is no DriverEntry address to read from.",path=relative(p))
+    sec=next((s for s in pe.sections if s.VirtualAddress<=entry_rva<s.VirtualAddress+max(int(s.Misc_VirtualSize),int(s.SizeOfRawData))),None)
+    if sec is None:
+        return _dmf_refuse("ANALYSIS_LIMITED","ENTRY_POINT_NOT_IN_SECTION",False,"The entry point RVA lies outside every section, so there are no bytes to read.",path=relative(p),entry_rva=hex(entry_rva),source=source)
+    delta=entry_rva-int(sec.VirtualAddress)
+    data=pe.__data__
+    start=int(sec.PointerToRawData)+delta
+    stop=min(start+window,int(sec.PointerToRawData)+int(sec.SizeOfRawData),len(data))
+    if delta>=int(sec.SizeOfRawData) or stop<=start:
+        return _dmf_refuse("ANALYSIS_LIMITED","ENTRY_POINT_UNREADABLE",False,"The section holding the entry point has no readable bytes at that address (file cut short, or the address is in zero-filled virtual space).",path=relative(p),entry_rva=hex(entry_rva),source=source)
+    buf=bytes(data[start:stop])
+    code=[(int(s.VirtualAddress),int(s.VirtualAddress)+max(int(s.Misc_VirtualSize),int(s.SizeOfRawData)))
+          for s in pe.sections if s.Characteristics&0x20000020]
+    cands=_dmf_find(buf,entry_rva,int(pe.OPTIONAL_HEADER.ImageBase),x64,base,stride,code)
+
+    subsystem=int(pe.OPTIONAL_HEADER.Subsystem)
+    entries=getattr(pe,"DIRECTORY_ENTRY_IMPORT",None)
+    iprob=_directory_problem(pe,parse_error,1,"DIRECTORY_ENTRY_IMPORT","import")
+    if entries:
+        imports={"state":"PARTIAL" if iprob else "PRESENT","dlls":[{"dll":(d.dll.decode(errors="replace") if d.dll else "?")} for d in entries]}
+    else:
+        imports={"state":"UNREADABLE" if iprob else "ABSENT","dlls":None if iprob else []}
+    secs=[{"name":s.Name.rstrip(b"\x00").decode(errors="replace")} for s in pe.sections]
+    indicators=_kt_indicators(subsystem,imports,secs)
+    rationale=[]
+    if cands:
+        rationale.append(f"{len(cands)} candidate store(s) matched the MajorFunction offset pattern; none is proof of a dispatch assignment")
+        if all(c["handler_rva"] is None for c in cands):
+            rationale.append("no candidate could be paired with a load of an in-image code address")
+    else:
+        rationale.append(f"{len(buf)} byte(s) from {source} ({hex(entry_rva)}) were read and no MajorFunction store pattern matched")
+        rationale.append("this does not show the driver sets no dispatch routines: see caveats for what the pattern cannot see")
+    if len(buf)<window:rationale.append("the window was cut short by the end of the section's raw data")
+    if next(i for i in indicators if i["name"]=="subsystem_native")["present"] is False:
+        rationale.append("subsystem is not NATIVE: this file may not be a driver; it was scanned anyway")
+    return json.dumps({
+        "ok":True,"tool":"driver_major_function_scan","status":"OK","path":relative(p),
+        "outcome":"FOUND" if cands else "NOT_FOUND",
+        "dispatch_table":"CANDIDATES_ONLY" if cands else "UNKNOWN","proves_dispatch":False,
+        "entry":{"source":source,"rva":hex(entry_rva),"scanned_bytes":len(buf),"requested_window":window,
+                 "architecture":"x86_64" if x64 else "x86"},
+        "candidates":cands,"indicators":indicators,"rationale":rationale,"caveats":list(_DMF_CAVEATS),
+        "statement":DISPATCH_SCAN_STATEMENT,
+    },ensure_ascii=False,indent=2)
