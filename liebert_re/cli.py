@@ -267,8 +267,39 @@ def _scan(a):
     return _load("liebert_re.tools.yara_x", "yara_x_scan")(a.path, rules_path=a.rules)
 
 
+def _resolve_for_report(raw):
+    """Resolve ``raw`` (``..`` and links followed) and say where it landed. Never refuses: a dump
+    and its PE in different directories is normal, so OUTSIDE_WORKSPACE is information. Returns
+    (path_to_use, {"resolved", "scope"}); the path shown is workspace-relative when inside, else
+    abbreviated by the same helper the Ghidra wrapper uses so no home or user name is exposed."""
+    try:
+        real = Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return raw, {"resolved": None, "scope": "UNRESOLVABLE"}
+    root = _current_root()
+    if root is None:
+        return str(real), {"resolved": None, "scope": "UNRESOLVABLE"}
+    try:
+        shown = real.relative_to(Path(root).resolve()).as_posix()
+        return str(real), {"resolved": shown, "scope": "INSIDE_WORKSPACE"}
+    except ValueError:
+        shown = _load("liebert_re.tools.ghidra", "_shown_path")(real, 3)
+        return str(real), {"resolved": shown, "scope": "OUTSIDE_WORKSPACE"}
+
+
 def _minidump(a):
-    return _load("liebert_re.recover.minidump_analyzer", "analyze_minidump")(a.path, pe_path=a.pe, pdb_path=a.pdb)
+    resolution = {}
+    paths = {}
+    for key, raw in (("path", a.path), ("pe", a.pe), ("pdb", a.pdb)):
+        if raw:
+            paths[key], resolution[key] = _resolve_for_report(raw)
+        else:
+            paths[key] = raw
+    report = _load("liebert_re.recover.minidump_analyzer", "analyze_minidump")(
+        paths["path"], pe_path=paths["pe"], pdb_path=paths["pdb"])
+    if isinstance(report, dict):
+        report["path_resolution"] = resolution
+    return report
 
 
 def _ida(a):

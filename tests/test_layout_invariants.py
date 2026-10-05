@@ -222,7 +222,10 @@ def test_published_tool_name_set_is_unchanged():
     # control-code decode slice: 748 -> 750, two top-level names added in liebert_re/tools/binary.py,
     # none removed: ioctl_control_code_decode (public; declared in FAMILIES["windows-kernel"] but
     # undefined until now) and _icd_one (private). No new module. Digest recomputed from the source.
-    assert digest == "8939707c5b91d1c011851406a9b3dcfe27363fbcb6f4f8f2292c1c78a66afee4"
+    # CLI minidump provenance slice: 750 -> 751, one private top-level function added in
+    # liebert_re/cli.py, none removed: _resolve_for_report. No new module. Digest recomputed from
+    # the source.
+    assert digest == "7a68545baa9f50688850a69d224510862b1e5f2811738d020f64b5a66c489a55"
 
 
 def test_the_imported_package_is_this_checkout():
