@@ -360,6 +360,30 @@ def _kernel_triage(a):
     return _load("liebert_re.tools.binary", "kernel_triage")(a.path)
 
 
+def _kernel_dispatch(a):
+    return _load("liebert_re.tools.binary", "driver_major_function_scan")(a.path, max_bytes=a.max_bytes)
+
+
+def _kernel_iat(a):
+    return _load("liebert_re.tools.binary", "rip_relative_iat_scan")(a.path, max_findings=a.max_findings)
+
+
+def _kernel_callbacks(a):
+    return _load("liebert_re.tools.binary", "kernel_callback_registrations")(a.path)
+
+
+def _ioctl_decode(a):
+    # Integers, not a file. A token that is not an integer literal is passed on as the string, so the
+    # module reports NOT_AN_INTEGER itself; the CLI does not rule on it.
+    codes = []
+    for token in a.codes:
+        try:
+            codes.append(int(token, 0))
+        except ValueError:
+            codes.append(token)
+    return _load("liebert_re.tools.binary", "ioctl_control_code_decode")(codes)
+
+
 def _ghidra_status(a):
     return _load("liebert_re.tools.ghidra", "ghidra_status")()
 
@@ -597,6 +621,13 @@ def _build_parser():
     sp.add_argument("--max-results", type=int, default=500, help="newest entries returned, 1-5000")
     sp.add_argument("--max-chars", type=int, default=60000, help="bound on the JSON response")
     sp = add("kerneltriage", _kernel_triage, "read-only first look at a PE that might be a Windows kernel driver (driver_likelihood stays UNKNOWN unless the evidence supports more)")
+    sp = add("kerneldispatch", _kernel_dispatch, "byte-pattern first pass for DriverObject->MajorFunction stores (candidates only: proves_dispatch stays false, no dispatch table is claimed)")
+    sp.add_argument("--max-bytes", type=int, default=1024, help="size of the window scanned from the entry point")
+    sp = add("kerneliat", _kernel_iat, "which imports are reached through RIP-relative import-table slots, and from where (read-only, no disassembler)")
+    sp.add_argument("--max-findings", type=int, default=200, help="cap on returned findings; a cut is reported, not hidden")
+    add("kernelcallbacks", _kernel_callbacks, "which kernel callback-registration imports a driver calls; NOT_FOUND speaks only for the names listed in names_checked")
+    sp = add("ioctldecode", _ioctl_decode, "split CTL_CODE integers into device type, function, method and access (takes integers, not a file)", path=False)
+    sp.add_argument("codes", nargs="+", metavar="CODE", help="one or more CTL_CODE integers (decimal or 0x hex); a non-integer is reported per code, not dropped")
     add("ghidrastatus", _ghidra_status, "report where Ghidra's analyzeHeadless is, its version and the Java it needs (does not launch Ghidra)", path=False)
     sp = add("ghidrafacts", _ghidra_facts, "import a file into a throwaway Ghidra project, run default analysis and report read-only facts about the program (the source file is not modified)")
     sp.add_argument("--timeout", type=int, default=300, help="seconds for the whole headless run")

@@ -247,7 +247,10 @@ def test_published_tool_name_set_is_unchanged():
     # liebert_re/cli.py, none removed: _truncation. No new module. Digest recomputed from the source.
     # DriverEntry call-trampoline slice: 766 -> 767 (measured), one private top-level function added in
     # liebert_re/tools/binary.py, none removed: _dmf_calls. No new module. Digest recomputed from the source.
-    assert digest == "f55999642c0d334a36d5cb40dfba4e13fed143a57510f13243fa76d2a4a1f911"
+    # CLI kernel-operations slice: 767 -> 771 (measured), four private top-level handlers added in
+    # liebert_re/cli.py, none removed: _kernel_dispatch, _kernel_iat, _kernel_callbacks, _ioctl_decode.
+    # No new module. Digest recomputed from the source.
+    assert digest == "eb3c8fa211d552ecb262b8e2f6572084ff82039d18a4d67f917f6074a8ba3b07"
 
 
 def test_the_imported_package_is_this_checkout():
