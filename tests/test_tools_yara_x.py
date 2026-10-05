@@ -501,5 +501,40 @@ class EvidenceIndexWriteTimeHookTests(unittest.TestCase):
         )
 
 
+class YaraXEmptyDocumentTests(unittest.TestCase):
+    """`{}` carries no `matches` structure at all: that is no measurement,
+    while `{"matches": []}` is a measured negative. (Empty stdout is already
+    RESULT_PARSE_FAILED; only a bare empty object reached the normalizer.)"""
+
+    def _run(self, stdout):
+        fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=0,
+                                 stdout=stdout, stderr="", output_truncated=False)
+        with mock.patch.object(ty, "_yara_x_binary", return_value="C:/fake/yr.exe"), \
+             mock.patch("liebert_re.tools.yara_x.safe_path", return_value=STUB_PE), \
+             mock.patch.object(ty, "relative", return_value=STUB_PE.name), \
+             mock.patch("liebert_re.tools.yara_x.run_bounded_process", return_value=fake_result):
+            return json.loads(ty.yara_x_scan(str(STUB_PE), rules_text="rule r{condition:true}"))
+
+    def test_empty_object_is_not_a_measurement_of_absence(self):
+        data = self._run("{}")
+        self.assertFalse(data["ok"], data)
+        self.assertEqual(data["status"], "RESULT_PARSE_FAILED")
+        self.assertEqual(data["error"], "YARA_X_OUTPUT_MISSING_MATCHES")
+        self.assertNotIn("matched", data)
+
+    def test_matches_that_is_not_a_list_is_not_a_measurement(self):
+        for body in ('{"version": "1.20.0"}', '{"matches": null}', '{"matches": "none"}'):
+            data = self._run(body)
+            self.assertFalse(data["ok"], (body, data))
+            self.assertEqual(data["error"], "YARA_X_OUTPUT_MISSING_MATCHES", body)
+
+    def test_empty_matches_list_is_still_a_measured_negative(self):
+        data = self._run('{"matches": []}')
+        self.assertTrue(data["ok"], data)
+        self.assertEqual(data["status"], "OK")
+        self.assertIs(data["matched"], False)
+        self.assertEqual(data["match_count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

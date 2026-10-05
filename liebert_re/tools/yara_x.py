@@ -376,6 +376,15 @@ def yara_x_scan(
             "ok": False, "tool": "yara_x_scan", "status": "RESULT_PARSE_FAILED",
             "error": "YARA_X_OUTPUT_NOT_AN_OBJECT",
         })
+    # `{"matches": []}` is a measured negative; a document with no `matches`
+    # list at all (e.g. `{}`) is no measurement, so it must not become
+    # `matched: false`.
+    if not isinstance(raw.get("matches"), list):
+        return _j({
+            "ok": False, "tool": "yara_x_scan", "status": "RESULT_PARSE_FAILED",
+            "error": "YARA_X_OUTPUT_MISSING_MATCHES",
+            "stdout_tail": stdout[-2000:],
+        })
 
     raw_out = EVIDENCE / f"{p.stem}_{uuid.uuid4().hex[:8]}_yarax.json"
     raw_out.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
