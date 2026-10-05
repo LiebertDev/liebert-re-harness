@@ -940,3 +940,139 @@ def driver_major_function_scan(path,max_bytes=_DMF_WINDOW):
         "candidates":cands,"indicators":indicators,"rationale":rationale,"caveats":list(_DMF_CAVEATS),
         "statement":DISPATCH_SCAN_STATEMENT,
     },ensure_ascii=False,indent=2)
+
+
+# ---- rip_relative_iat_scan -------------------------------------------------
+# Which imported function a binary calls through its import address table, and from where. A byte-pattern
+# first pass over the executable sections, no disassembler (deliberately: it needs no external tool and
+# its limits are stated rather than hidden). Recognised: FF 15 (call [mem]) and FF 25 (jmp [mem]).
+#   x86_64: the operand is RIP-relative, target = (RVA of the instruction's end) + signed disp32.
+#   x86:    the same bytes are an ABSOLUTE address (call [abs32]); target = disp32 - ImageBase. No RIP maths.
+# A reference is a finding only if its target is exactly an import-table slot; anything else (code, data,
+# an address inside the table that is not a slot start) is ignored, not guessed at.
+_RIA_MAX_FINDINGS=200
+_RIA_HARD_LIMIT=5000
+_RIA_CODE_FLAGS=0x20000020   # IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE (same test driver_major_function_scan uses)
+IAT_SCAN_STATEMENT=("A first-pass byte-pattern heuristic, not a call graph: a finding is a byte sequence whose target is an "
+                    "import slot, not proof that the code runs, and the absence of one is not proof the import is unused.")
+_RIA_CAVEATS=("Patterns are matched at every byte offset of the executable sections, not on instruction boundaries, so FF 15 / FF 25 "
+              "bytes inside another instruction's operand can be reported; the target landing on an import slot makes that "
+              "unlikely, not impossible.",
+              "Only direct FF 15 / FF 25 references are seen. Calls through a register loaded from a slot, delay-load stubs, "
+              "GetProcAddress-style or MmGetSystemRoutineAddress lookups and imports by a copied table are not.",
+              "Which function a slot holds is read from the import directory as written on disk; it is not what the loader "
+              "will have bound at run time.")
+
+def _ria_refuse(status,error,fixable,fix,**extra):
+    """Refusal envelope (same keys as _dmf_refuse, own tool name). outcome is always NOT_LOOKED: nothing was searched."""
+    body={"ok":False,"tool":"rip_relative_iat_scan","status":status,"error":error,"fixable":fixable,"fix":fix,
+          "outcome":"NOT_LOOKED"}
+    body.update(extra)
+    return json.dumps(body,ensure_ascii=False,indent=2)
+
+def _ria_slots(pe,image_base):
+    """{slot rva: "dll!name"} for every import entry that has an address, plus the (start,end) rva span of each table."""
+    names={};spans=[]
+    for d in (getattr(pe,"DIRECTORY_ENTRY_IMPORT",None) or []):
+        dn=d.dll.decode(errors="replace") if d.dll else "?"
+        lo=hi=None
+        for m in d.imports:
+            if m.address is None:continue
+            rva=int(m.address)-image_base
+            names[rva]=f"{dn}!{m.name.decode(errors='replace') if m.name else 'ordinal '+str(m.ordinal)}"
+            lo=rva if lo is None else min(lo,rva);hi=rva if hi is None else max(hi,rva)
+        if lo is not None:spans.append((lo,hi))
+    return names,spans
+
+def _ria_find(buf,sec_rva,image_base,x64,names,spans):
+    """Every FF 15 / FF 25 in ``buf`` (read from ``sec_rva``) whose target is an import slot. Pure function of its inputs.
+
+    Returns (findings, ignored): ``ignored`` counts references whose target is not an import slot."""
+    out=[];ignored=0
+    step=8 if x64 else 4
+    for i in range(len(buf)-5):
+        if buf[i]!=0xFF or buf[i+1] not in (0x15,0x25):continue
+        if x64:
+            target=sec_rva+i+6+int.from_bytes(buf[i+2:i+6],"little",signed=True);basis="rip_relative"
+        else:
+            target=int.from_bytes(buf[i+2:i+6],"little")-image_base;basis="absolute_disp32"
+        in_table=any(lo<=target<hi+step for lo,hi in spans)
+        if not in_table or target not in names:
+            ignored+=1;continue
+        out.append({"call_rva":hex(sec_rva+i),"encoding":"FF15" if buf[i+1]==0x15 else "FF25",
+                    "kind":"call" if buf[i+1]==0x15 else "jmp","slot_rva":hex(target),"import":names[target],
+                    "target_basis":basis,"confidence":"heuristic","proves_call":False})
+    return out,ignored
+
+def rip_relative_iat_scan(path,max_findings=_RIA_MAX_FINDINGS):
+    """First-pass byte-pattern search for calls/jumps made through the import address table. No disassembler.
+
+    Recognises FF 15 and FF 25. On x86_64 the target is RIP-relative (instruction end RVA + disp32); on x86 the same
+    bytes are an absolute address and the target is disp32 - ImageBase (RIP arithmetic is never applied to x86).
+    A reference counts only if its target is exactly an import slot, then ``import`` is ``dll!name`` (the format
+    driver_major_function_scan's tail_jump.import uses). Three outcomes that never share a code. FOUND: ``findings``,
+    each with ``proves_call`` false. NOT_FOUND: the code was read and no reference landed on an import slot (or the PE
+    has no import directory at all, ``reason`` NO_IMPORT_DIRECTORY); ``ok`` true, ``findings`` empty. NOT_LOOKED:
+    ``ok`` false with an ``error`` -- PATH_REFUSED, FILE_NOT_FOUND, FILE_NOT_ACCESSIBLE, INVALID_PE, UNSUPPORTED_MACHINE,
+    IMPORT_DIRECTORY_UNREADABLE or CODE_SECTION_UNREADABLE. ``truncation`` always says how many findings were
+    found, returned and omitted, and which limit (``max_findings``) applied."""
+    try:
+        p=safe_path(path)
+    except PermissionError as e:
+        return _ria_refuse("PATH_REFUSED",str(e),True,"Pass a path inside the workspace root.",path=str(path))
+    if not p.is_file():
+        return _ria_refuse("FILE_MISSING","FILE_NOT_FOUND",True,"Pass the path of an existing file.",path=str(path))
+    try:
+        pe=_pe(p)
+    except OSError as e:
+        return _ria_refuse("ANALYSIS_LIMITED","FILE_NOT_ACCESSIBLE",False,"The file could not be read; check permissions or whether another process holds it.",path=relative(p),error_type=type(e).__name__)
+    except Exception as e:
+        return _ria_refuse("ANALYSIS_LIMITED","INVALID_PE",False,"The file is not a PE or its header is corrupt; nothing was read from it.",path=relative(p),detail=f"{type(e).__name__}: {e}")
+    machine=int(pe.FILE_HEADER.Machine)
+    layout=_DMF_LAYOUT.get(machine)
+    if layout is None:
+        return _ria_refuse("UNSUPPORTED","UNSUPPORTED_MACHINE",False,"Only x86 and x86_64 byte patterns are searched.",path=relative(p),machine=hex(machine))
+    x64=layout[2]
+    limit=max(1,min(int(max_findings),_RIA_HARD_LIMIT))
+    parse_error=_parse_directories(pe)
+    iprob=_directory_problem(pe,parse_error,1,"DIRECTORY_ENTRY_IMPORT","import")
+    entries=getattr(pe,"DIRECTORY_ENTRY_IMPORT",None)
+    image_base=int(pe.OPTIONAL_HEADER.ImageBase)
+    arch="x86_64" if x64 else "x86"
+    if not entries and iprob:
+        return _ria_refuse("ANALYSIS_LIMITED","IMPORT_DIRECTORY_UNREADABLE",False,"The import directory could not be read, so no slot can be named; this is NOT the same as a binary with no imports.",path=relative(p),detail=iprob)
+    secs=[s for s in pe.sections if s.Characteristics&_RIA_CODE_FLAGS]
+    bufs=[]
+    for s in secs:
+        state,buf=_dmf_read(pe,int(s.VirtualAddress),int(s.SizeOfRawData))
+        if state=="OK" and buf:bufs.append((int(s.VirtualAddress),buf))
+    if not bufs:
+        return _ria_refuse("ANALYSIS_LIMITED","CODE_SECTION_UNREADABLE",False,"No executable section has readable bytes in the file (none declared, or the file is cut short); nothing was searched.",path=relative(p),executable_sections=len(secs))
+    names,spans=_ria_slots(pe,image_base)
+    found=[];ignored=0
+    for rva,buf in bufs:
+        f,ig=_ria_find(buf,rva,image_base,x64,names,spans)
+        found+=f;ignored+=ig
+    total=len(found);returned=found[:limit]
+    trunc={"truncated":total>limit,"limit_name":"max_findings","limit":limit,"found_total":total,"returned":len(returned),"omitted":total-len(returned)}
+    rationale=[];reason=None
+    if returned:
+        rationale.append(f"{total} reference(s) landed on an import slot; none is proof the code runs")
+    elif not entries:
+        reason="NO_IMPORT_DIRECTORY"
+        rationale.append("the PE has no import directory, so there is no slot a call could resolve to; this is a read fact about the file, not a failure")
+    else:
+        reason="NO_REFERENCE_LANDED_ON_AN_IMPORT_SLOT"
+        rationale.append(f"{sum(len(b) for _,b in bufs)} byte(s) of executable section were read and no FF 15 / FF 25 target was an import slot")
+        rationale.append("this does not show no import is called: see caveats for what the pattern cannot see")
+    if total>limit:rationale.append(f"truncated: {total-limit} finding(s) omitted, the max_findings limit of {limit} was reached")
+    if ignored:rationale.append(f"{ignored} FF 15 / FF 25 reference(s) whose target is not an import slot were ignored")
+    if iprob:rationale.append(f"the import directory is only partly readable ({iprob}); imports past the break cannot be named")
+    body={"ok":True,"tool":"rip_relative_iat_scan","status":"OK","path":relative(p),
+          "outcome":"FOUND" if returned else "NOT_FOUND","proves_call":False,
+          "entry":{"architecture":arch,"target_basis":"rip_relative" if x64 else "absolute_disp32","image_base":hex(image_base),
+                   "code_sections_read":len(bufs),"imports_state":"PARTIAL" if iprob else ("PRESENT" if entries else "ABSENT")},
+          "findings":returned,"ignored_references":ignored,"truncation":trunc,"rationale":rationale,
+          "caveats":list(_RIA_CAVEATS),"statement":IAT_SCAN_STATEMENT}
+    if reason:body["reason"]=reason
+    return json.dumps(body,ensure_ascii=False,indent=2)
