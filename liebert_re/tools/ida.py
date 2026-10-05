@@ -933,6 +933,23 @@ def _verdict(cp, work, db_path, *, expect_database, expect_operation=None, requi
     if parse_error:
         return None, "RESULT_PARSE_FAILED", {**signals, "parse_error": parse_error}
     if cp.returncode not in (0, None):
+        # The exit code decides the error, but every other signal was already read above and is reported
+        # with it: a non-zero exit after a complete result is a different event from one with no result.
+        if completed:
+            kind, meaning = "NONZERO_EXIT_RESULT_COMPLETE", (
+                "The worker finished and wrote a complete result file, and the process still exited non-zero. "
+                "This rules out 'the database never opened'; the failure is in how the process ended.")
+        elif result_present:
+            kind, meaning = "NONZERO_EXIT_RESULT_INCOMPLETE", (
+                "A result file exists but the worker did not mark it complete: the script started and stopped "
+                "part-way, or the file is not the worker's final write.")
+        else:
+            kind, meaning = "NONZERO_EXIT_NO_RESULT", (
+                "No result file was written. This is consistent with the database never opening or the worker "
+                "never running, but the log markers and stderr are the evidence for which.")
+        signals["exit_diagnosis"] = {"class": kind, "meaning": meaning, "exit_code": cp.returncode,
+                                     "result_file_present": result_present, "script_completed": completed,
+                                     "log_fatal_markers": markers}
         return data, "IDA_EXITED_NONZERO", signals
     if markers:
         return data, "IDA_LOG_REPORTS_FAILURE", signals
@@ -3128,9 +3145,13 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
         # 5. verification in a NEW engine process, over a copy of the promoted file
         promoted = version_dir / _DB_NAME
         promoted_sha, _ = _file_sha256(promoted)
-        verify = {"separate_process": True, "marker_matched": False, "write_session_pid": data.get("engine_pid")}
-        verify.update({"comments_matched": 0, "comments_expected": len(applied)} if comments
-                      else {"names_matched": 0, "names_expected": len(applied)})
+        # None means "not measured", never a measurement of zero or false. `verification_measured` turns true
+        # only once a separate verification session returned and the counts below were computed from it.
+        verify = {"separate_process": True, "verification_measured": False, "marker_matched": None,
+                  "write_session_pid": data.get("engine_pid"), "attempt_count": 0, "attempts": [],
+                  "retried": False, "passed_on_retry": False}
+        verify.update({"comments_matched": None, "comments_expected": len(applied)} if comments
+                      else {"names_matched": None, "names_expected": len(applied)})
 
         def abort(reason, **extra):
             ok, _why = _journal_append(sha256, {"event": "batch_aborted", "write_id": write_id, "label": label,
@@ -3146,32 +3167,61 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
         left = remaining()
         if left < 1:
             return abort("timeout_before_verification")
-        verify_dir.mkdir(parents=True)
-        shutil.copyfile(promoted, verify_dir / _DB_NAME)
-        try:
-            verify_job = (
-                {"operation": "comment_verify", "write_mode": "verify",
-                 "items": [{"address": a["address"], "address_kind": "va", "comment_kind": a["comment_kind"]}
-                           for a in applied]} if comments else
-                {"operation": "rename_verify", "write_mode": "verify",
-                 "items": [{"address": a["address"], "address_kind": "va"} for a in applied]})
-            checked, _signals, _prov = _annotated_session(
-                exe, verify_dir, verify_job,
-                tool=tool, sha256=sha256, md5=md5, invocation=invocation, temporary=True,
-                seconds=min(left, _MAX_ANNOTATE_TIMEOUT_SECONDS), cancellation_token=cancellation_token)
-        except _StageFailure as failure:
-            # Diagnosis only: what the separate verification process said. The tails were already passed
-            # through `_redact` (work directory, home paths, account name, licence line) by the failure body.
-            fb = failure.body
-            tails = {k: (fb.get(f"{k}_tail") or None) for k in ("stderr", "stdout")}
-            verify["exit_code"] = (fb.get("signals") or {}).get("exit_code")
-            for k, text in tails.items():
-                verify[f"{k}_excerpt"] = text
-                verify[f"{k}_excerpt_truncated"] = bool(text) and len(text) >= 2000   # `_tail` keeps the last 2000
-            verify["excerpt_redacted"] = any(t and re.search(r"<(?:WORK|INPUT|HOME|USER)>|License: <REDACTED>", t)
-                                             for t in tails.values()) or False
-            verify["ida_log_file"] = _LOG_NAME if (fb.get("signals") or {}).get("log_present") else None
-            return abort("verification_session_failed", verification_failure=fb.get("error"))
+        # One retry, announced. The published pointer moves only at step 6, after verification passed, so a
+        # second read-back of the same immutable stored file cannot publish anything the first one refused.
+        # Each attempt gets a NEW scratch directory and a fresh copy of the promoted file. Only a failed
+        # session is retried (not a timeout or cancellation, which would spend the caller's budget twice).
+        checked = None
+        while checked is None:
+            verify["attempt_count"] += 1
+            attempt = {"attempt": verify["attempt_count"], "scratch": verify_dir.name}
+            verify["attempts"].append(attempt)
+            verify_dir.mkdir(parents=True)
+            shutil.copyfile(promoted, verify_dir / _DB_NAME)
+            try:
+                verify_job = (
+                    {"operation": "comment_verify", "write_mode": "verify",
+                     "items": [{"address": a["address"], "address_kind": "va", "comment_kind": a["comment_kind"]}
+                               for a in applied]} if comments else
+                    {"operation": "rename_verify", "write_mode": "verify",
+                     "items": [{"address": a["address"], "address_kind": "va"} for a in applied]})
+                checked, _signals, _prov = _annotated_session(
+                    exe, verify_dir, verify_job,
+                    tool=tool, sha256=sha256, md5=md5, invocation=invocation, temporary=True,
+                    seconds=min(left, _MAX_ANNOTATE_TIMEOUT_SECONDS), cancellation_token=cancellation_token)
+            except _StageFailure as failure:
+                # Diagnosis only: what the separate verification process said. The tails were already passed
+                # through `_redact` (work directory, home paths, account name, licence line) by the failure body.
+                fb = failure.body
+                sig = fb.get("signals") or {}
+                tails = {k: (fb.get(f"{k}_tail") or None) for k in ("stderr", "stdout")}
+                attempt.update({"error": fb.get("error"), "status": fb.get("status"), "exit_code": sig.get("exit_code"),
+                                "result_file_present": sig.get("result_file_present"),
+                                "script_completed": sig.get("result_script_completed"),
+                                "log_fatal_markers": sig.get("log_fatal_markers"),
+                                "exit_diagnosis": sig.get("exit_diagnosis"),
+                                "ida_log_file": _LOG_NAME if sig.get("log_present") else None})
+                for k, text in tails.items():
+                    attempt[f"{k}_excerpt"] = text
+                    attempt[f"{k}_excerpt_truncated"] = bool(text) and len(text) >= 2000   # `_tail` keeps the last 2000
+                attempt["excerpt_redacted"] = any(t and re.search(r"<(?:WORK|INPUT|HOME|USER)>|License: <REDACTED>", t)
+                                                  for t in tails.values()) or False
+                # the last attempt's diagnosis also stays at the top level (the shape before the retry existed)
+                for k in ("exit_code", "stderr_excerpt", "stderr_excerpt_truncated", "stdout_excerpt",
+                          "stdout_excerpt_truncated", "excerpt_redacted", "ida_log_file"):
+                    verify[k] = attempt[k]
+                verify["retried"] = verify["attempt_count"] > 1
+                if fb.get("status") in ("TIMEOUT", "CANCELLED") or verify["attempt_count"] >= 2 or remaining() < 1:
+                    return abort("verification_session_failed", verification_failure=fb.get("error"))
+                _remove_owned_work(verify_dir)
+                verify_dir = label_dir / f"scratch-{uuid.uuid4().hex[:8]}"
+                left = remaining()
+        verify["retried"] = verify["attempt_count"] > 1
+        verify["passed_on_retry"] = verify["retried"]
+        if verify["retried"]:
+            verify["retry_note"] = ("The first verification session failed and was retried once in a new scratch "
+                                    "directory; attempt 1's diagnosis is in `attempts`. Nothing was published "
+                                    "between the attempts.")
         verify["verify_session_pid"] = checked.get("engine_pid")
         verify["harness_pid"] = os.getpid()
         if comments:
@@ -3185,6 +3235,7 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
             matched, expected = verify["names_matched"], verify["names_expected"]
         stored = checked.get("annotation_marker")
         verify["marker_matched"] = isinstance(stored, dict) and all(stored.get(k) == marker[k] for k in marker)
+        verify["verification_measured"] = True
         verify["marker_version"] = stored.get("version") if isinstance(stored, dict) else None
         if checked.get("ok") is not True or matched != expected or not verify["marker_matched"] \
                 or verify["verify_session_pid"] in (None, verify["write_session_pid"], verify["harness_pid"]):

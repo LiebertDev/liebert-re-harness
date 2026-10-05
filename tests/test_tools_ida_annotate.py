@@ -77,6 +77,9 @@ class AnnotateFakeIdat:
         self.verify = "ok"
         self.timeout_on = None
         self.exit_code, self.stdout_text, self.stderr_text = 3, "", ""    # used by verify == "nonzero_exit"
+        self.verify_fail_calls = 0      # the first N verification launches exit non-zero
+        self.fail_leaves_result = True  # ... with a complete result file (True) or without one (False)
+        self.verify_calls = 0
         self.pid = 4000
         self.pristine = {START: "start"}
         self.comments = {}      # (address, comment_kind) -> text the database holds
@@ -108,6 +111,12 @@ class AnnotateFakeIdat:
             return _cp(None, timed_out=True)
         (work / ti._LOG_NAME).write_text(CLEAN_LOG, encoding="utf-8")
         db = work / ti._DB_NAME
+        failing = False
+        if operation.endswith("_verify"):
+            self.verify_calls += 1
+            failing = self.verify_calls <= self.verify_fail_calls
+            if failing and not self.fail_leaves_result:
+                return _cp(self.exit_code, stderr=self.stderr_text)
         if job["mode"] == "create":
             db.write_bytes(b"IDA-DB" * 100)
             body = _result("summary", self.sha256, self.md5, **SUMMARY)
@@ -118,6 +127,8 @@ class AnnotateFakeIdat:
             body.setdefault("engine_input_md5", self.md5)
             body["script_completed"] = True
         (work / ti._RESULT_NAME).write_text(json.dumps(body), encoding="utf-8")
+        if failing:
+            return _cp(self.exit_code, stderr=self.stderr_text)
         if self.verify == "nonzero_exit" and operation.endswith("_verify"):
             return _cp(self.exit_code, stdout=self.stdout_text, stderr=self.stderr_text)
         return _cp(0)
@@ -649,6 +660,96 @@ class VerificationTests(AnnotateCase):
         self.assertEqual(out["error"], "VERIFICATION_SESSION_FAILED")
         self.assertIsNone(self.manifest())
         self.assertEqual(self.events(), ["batch_prepared", "batch_aborted"])
+
+
+class VerificationDiagnosisAndRetryTests(AnnotateCase):
+    """A failed read-back says what happened, never presents an unmeasured value as a measurement, and is
+    retried exactly once in a new scratch directory with the retry announced."""
+
+    def pristine_db(self):
+        return {k: v for k, v in self.snapshot(self.cache).items() if k.endswith("db.i64")}
+
+    def scratch_names(self):
+        return [c["cwd"].name for c in self.fake.calls if c["job"]["operation"] == "rename_verify"]
+
+    @pytest.mark.contract
+    def test_nonzero_exit_with_a_complete_result_is_told_apart_from_one_without(self):
+        self.fake.verify_fail_calls, self.fake.fail_leaves_result = 2, True
+        complete = self.write(label="a")["verification"]["attempts"][-1]
+        self.assertEqual((complete["result_file_present"], complete["script_completed"]), (True, True))
+        self.assertNotEqual(complete["exit_code"], 0)
+        self.assertEqual(complete["exit_diagnosis"]["class"], "NONZERO_EXIT_RESULT_COMPLETE")
+        self.assertIn("rules out", complete["exit_diagnosis"]["meaning"])
+        self.fake.verify_calls, self.fake.fail_leaves_result = 0, False
+        absent = self.write(label="b")["verification"]["attempts"][-1]
+        self.assertEqual((absent["result_file_present"], absent["script_completed"]), (False, False))
+        self.assertNotEqual(absent["exit_code"], 0)
+        self.assertEqual(absent["exit_diagnosis"]["class"], "NONZERO_EXIT_NO_RESULT")
+        self.assertIn("log_fatal_markers", absent)
+
+    @pytest.mark.contract
+    def test_a_verification_that_never_ran_is_unmeasured_not_zero_or_false(self):
+        self.fake.verify_fail_calls = 2
+        out = self.write()
+        v = out["verification"]
+        self.assertEqual(out["error"], "VERIFICATION_SESSION_FAILED")
+        self.assertIs(v["verification_measured"], False)
+        self.assertIsNone(v["marker_matched"])
+        self.assertIsNone(v["names_matched"])
+        self.assertEqual(v["names_expected"], 1)
+        self.fake.verify_fail_calls, self.fake.verify_calls = 0, 0
+        ok = self.write(label="b")["verification"]
+        self.assertIs(ok["verification_measured"], True)
+        self.assertEqual((ok["names_matched"], ok["marker_matched"]), (1, True))
+
+    @pytest.mark.contract
+    def test_first_attempt_fails_second_passes_and_the_response_says_so(self):
+        self.fake.verify_fail_calls = 1
+        self.fake.stderr_text = "first attempt died"
+        out = self.write()
+        self.assertEqual((out["ok"], out["status"]), (True, "OK"))
+        v = out["verification"]
+        self.assertEqual((v["attempt_count"], v["retried"], v["passed_on_retry"]), (2, True, True))
+        first, second = v["attempts"]
+        self.assertEqual(first["error"], "IDA_EXITED_NONZERO")
+        self.assertEqual(first["exit_code"], 3)
+        self.assertEqual(first["exit_diagnosis"]["class"], "NONZERO_EXIT_RESULT_COMPLETE")
+        self.assertEqual(first["stderr_excerpt"], "first attempt died")
+        self.assertNotIn("error", second)
+        self.assertIn("retried once", v["retry_note"])
+        self.assertIsNotNone(self.manifest())
+
+    @pytest.mark.contract
+    def test_both_attempts_failing_rejects_keeps_the_version_and_reports_both(self):
+        self.fake.verify_fail_calls = 2
+        plan = self.plan()
+        pristine = self.pristine_db()
+        out = self.apply(self.sealed(plan))
+        self.assertEqual((out["ok"], out["status"], out["error"]), (False, "ANALYSIS_LIMITED", "VERIFICATION_SESSION_FAILED"))
+        v = out["verification"]
+        self.assertEqual((v["attempt_count"], v["retried"], v["passed_on_retry"]), (2, True, False))
+        self.assertEqual([a["error"] for a in v["attempts"]], ["IDA_EXITED_NONZERO"] * 2)
+        self.assertTrue(all(a["exit_diagnosis"] for a in v["attempts"]))
+        self.assertIsNone(self.manifest())
+        self.assertEqual(out["version_retained_unpublished"], "v000001")
+        self.assertTrue(out["abort_record_written"])
+        self.assertEqual(self.events(), ["batch_prepared", "batch_aborted"])
+        self.assertEqual(self.pristine_db(), pristine, "the pristine database is byte-for-byte unchanged")
+        self.assertEqual(len(self.scratch_names()), 2, "never a third attempt")
+
+    @pytest.mark.contract
+    def test_the_retry_uses_a_new_scratch_directory(self):
+        self.fake.verify_fail_calls = 1
+        pristine_plan = self.plan()
+        pristine = self.pristine_db()
+        out = self.apply(self.sealed(pristine_plan))
+        self.assertTrue(out["ok"], out)
+        names = self.scratch_names()
+        self.assertEqual(len(names), 2)
+        self.assertNotEqual(names[0], names[1])
+        attempts = out["verification"]["attempts"]
+        self.assertEqual([a["scratch"] for a in attempts], names)
+        self.assertEqual(self.pristine_db(), pristine, "the pristine database is byte-for-byte unchanged")
 
 
 # ---------------------------------------------------------------------------
