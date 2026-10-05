@@ -47,7 +47,6 @@ _END = "# END-" + "PRIVATE-NAMES"
 # of being added here.
 KNOWN_UNREFERENCED = {
     "liebert_re.tools.asar_parser": "only reached indirectly via tools_formats.detect_asar; no direct test yet",
-    "liebert_re.evidence.process_lock": "only reached indirectly via claim_index/evidence_index/workspace_index; no direct test yet",
 }
 
 # Tracked files that contain a machine-specific user path today. Empty = none.
@@ -369,7 +368,7 @@ def test_allowlists_have_not_grown():
     # an entry would otherwise blind the scan while every test stays green.
     assert len(PRIVATE_IDS) == 17
     assert hashlib.sha256(repr(PRIVATE_IDS).encode()).hexdigest().startswith("d51a752750a0f2a7")
-    assert set(KNOWN_UNREFERENCED) == {"liebert_re.tools.asar_parser", "liebert_re.evidence.process_lock"}
+    assert set(KNOWN_UNREFERENCED) == {"liebert_re.tools.asar_parser"}
     assert set(KNOWN_USER_PATHS) == {"tests/test_public_provenance_and_fixtures.py", "liebert_re/workspace.py"}
     # 24 -> 23 entries, 41 -> 40 identifiers: tests/test_pe_resources.py now builds its fixtures
     # (docs/CORPUS.md) and no longer names a private-tree identifier, so its entry was removed.

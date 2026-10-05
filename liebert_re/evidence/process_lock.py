@@ -25,33 +25,99 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def pid_alive(pid: Any) -> bool:
-    """Best-effort liveness check for a PID recorded by a lock holder.
+_IS_WINDOWS = os.name == "nt"
 
-    Errs toward "alive" whenever liveness cannot be determined -- an
-    uncertain answer must never cause a live holder's lock to be reclaimed.
+# Win32 constants. Only ERROR_INVALID_PARAMETER from OpenProcess means "no such
+# process" for a valid, non-zero DWORD pid and constant valid arguments; access
+# denied means the process EXISTS but is not ours to inspect.
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+ERROR_INVALID_PARAMETER = 87
+STILL_ACTIVE = 259
+_MAX_DWORD = 0xFFFFFFFF
+
+
+class _WinApi:
+    """The three kernel32 calls used, plus ``get_last_error``, behind one seam.
+
+    Bound with ``use_last_error=True`` and explicit argtypes/restype. HANDLE is
+    pointer-width (``c_void_p``): truncating it to a C int would silently
+    corrupt 64-bit handles.
     """
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+        k32.GetExitCodeProcess.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.CloseHandle.restype = wintypes.BOOL
+        self._k32 = k32
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+
+    def open_process(self, pid: int):
+        return self._k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+
+    def get_exit_code(self, handle):
+        """Return the exit code, or None if the call itself failed."""
+        code = self._wintypes.DWORD()
+        if not self._k32.GetExitCodeProcess(handle, self._ctypes.byref(code)):
+            return None
+        return code.value
+
+    def close(self, handle) -> None:
+        self._k32.CloseHandle(handle)
+
+    def get_last_error(self) -> int:
+        return self._ctypes.get_last_error()
+
+
+def _windows_api() -> _WinApi:
+    return _WinApi()
+
+
+def _windows_pid_alive(pid: int, api: Any) -> bool | None:
+    handle = api.open_process(pid)
+    if not handle:
+        err = api.get_last_error()  # immediately, nothing in between
+        if err == ERROR_INVALID_PARAMETER:
+            return False
+        return None  # access denied, 0 and every other error: unknown
+    try:
+        code = api.get_exit_code(handle)
+        if code is None:
+            return None
+        return code == STILL_ACTIVE
+    finally:
+        api.close(handle)
+
+
+def pid_alive(pid: Any) -> bool | None:
+    """Three-valued liveness check for a PID recorded by a lock holder.
+
+    ``True``: running. ``False``: confirmed not running. ``None``: cannot be
+    determined (unreadable pid, access denied, any unclassified failure).
+    Callers must act on death only for ``is False``; ``None`` means keep the
+    lock.
+    """
+    if isinstance(pid, bool):
+        return None
     try:
         pid = int(pid)
-    except (TypeError, ValueError):
-        return False
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
-
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if pid <= 0 or pid > _MAX_DWORD:
+        return None
+    if _IS_WINDOWS:
         try:
-            exit_code = ctypes.c_ulong()
-            if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return True
-            STILL_ACTIVE = 259
-            return exit_code.value == STILL_ACTIVE
-        finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
+            api = _windows_api()
+        except Exception:
+            return None
+        return _windows_pid_alive(pid, api)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -59,7 +125,7 @@ def pid_alive(pid: Any) -> bool:
     except PermissionError:
         return True
     except OSError:
-        return True
+        return None
     return True
 
 
@@ -125,7 +191,11 @@ class DurableLock:
             return False
         holder = self._read_holder()
         pid = (holder or {}).get("pid")
-        if pid is None or pid_alive(pid):
+        # Age is not evidence of death: reclaim only on a confirmed False.
+        # None (owner unknown) keeps the lock; the wait ends by timeout and
+        # the next attempt re-measures. A lock that stays held when death
+        # cannot be established is the accepted availability cost.
+        if pid is None or pid_alive(pid) is not False:
             return False
         try:
             self.path.unlink()
