@@ -45,11 +45,24 @@ CLEAN_LOG = "INFO  HEADLESS: execution starts\nINFO  ProgramFacts.java> done\nIN
 JAVA_21 = 'openjdk version "21.0.12" 2026-07-21 LTS\nOpenJDK Runtime Environment\n'
 
 
+_EXEC_BITS: set[str] = set()
+"""Launchers given an exec bit. Windows has no exec bit, so a chmod there changes nothing observable;
+the Linux emulation below reads this record instead of the file system."""
+
+
+def mark_executable(path: Path) -> None:
+    os.chmod(path, 0o755)
+    _EXEC_BITS.add(str(path))
+
+
 def make_install(root: Path, version="12.1.3", java_min="21", with_properties=True) -> Path:
     (root / "support").mkdir(parents=True)
     (root / "Ghidra").mkdir()
     (root / "support" / "analyzeHeadless.bat").write_text("rem fake\n")
     (root / "support" / "analyzeHeadless").write_text("# fake\n")
+    # On Linux the status probe (correctly) refuses a launcher with no exec bit, before it ever
+    # reaches the Java check. The fake has to be launchable like the real one.
+    mark_executable(root / "support" / "analyzeHeadless")
     if with_properties:
         (root / "Ghidra" / "application.properties").write_text(
             f"application.version={version}\napplication.java.min={java_min}\n")
@@ -129,6 +142,57 @@ class GhidraBase(unittest.TestCase):
 
     def status(self):
         return json.loads(tg.ghidra_status())
+
+
+class _PosixOs:
+    """`tg.os` as it behaves on Linux: os.name is not "nt" and os.access(X_OK) reads an exec bit.
+    Everything else is the real os module, so path handling is untouched."""
+
+    name = "posix"
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
+
+    @staticmethod
+    def access(path, mode):
+        if mode == os.X_OK:
+            return str(path) in _EXEC_BITS
+        return os.access(path, mode)
+
+
+@pytest.mark.contract
+class LinuxLauncherEmulationTests(GhidraBase):
+    """The Linux-only failures, reproduced on any host. The code's LAUNCHER_NOT_EXECUTABLE check is
+    correct and stays; these pin that it fires for a launcher with no exec bit and does not for one
+    with it (so the Java checks behind it are reachable)."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(tg, "os", _PosixOs())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.launcher = self.install / "support" / "analyzeHeadless"
+
+    def test_launcher_without_exec_bit_is_refused(self):
+        _EXEC_BITS.discard(str(self.launcher))
+        data = self.status()
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["status"], "INSTALL_INCOMPLETE")
+        self.assertEqual(data["error"], "LAUNCHER_NOT_EXECUTABLE")
+
+    def test_launcher_with_exec_bit_reaches_the_ok_status(self):
+        data = self.status()
+        self.assertTrue(data["ok"], data)
+        self.assertEqual(data["status"], "OK")
+        self.assertIn("note", data)
+
+    def test_java_below_minimum_is_reachable_on_linux(self):
+        self.fake.java_text = 'openjdk version "17.0.9" 2023-10-17\n'
+        self.assertEqual(self.status()["status"], "JAVA_TOO_OLD")
+
+    def test_no_java_is_reachable_on_linux(self):
+        with mock.patch.object(tg, "_java_executable", return_value=(None, None)):
+            self.assertEqual(self.status()["status"], "JAVA_MISSING")
 
 
 @pytest.mark.contract

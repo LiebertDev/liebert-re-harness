@@ -8,6 +8,7 @@ to read a file outside the workspace.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -31,6 +32,19 @@ def _fake_jadx(layout):
             f.write_text(text, encoding="utf-8")
         return BoundedProcessResult(0, "", "")
     return run
+
+
+def _leaks_absolute_temp_dir(text, temp_dir):
+    """True when `text` carries the temp directory as an absolute path.
+
+    A bare substring test is wrong: on Linux the temp dir is /tmp and a relative piece such as
+    `workspace_x/tmpab12/t.dex` contains it. An absolute leak is the temp dir at the start of a path:
+    not preceded by a path or name character, and followed by a separator or the end of the path.
+    Backslashes are normalised first so a JSON-escaped Windows path is compared like a POSIX one.
+    """
+    flat = text.replace("\\\\", "/").replace("\\", "/")
+    base = temp_dir.replace("\\", "/").rstrip("/")
+    return re.search(r"(?<![\w.~/-])" + re.escape(base) + r"(?:/|(?![\w.~-]))", flat) is not None
 
 
 @pytest.fixture
@@ -82,8 +96,26 @@ class TestWrongClassIsNotReturned:
     def test_the_mismatch_reply_does_not_leak_an_absolute_path(self, kind, sample):
         out = _call(kind, sample, _wire(kind, "a.Foo"), {"sources/b/Foo.java": "x"})
         text = json.dumps(out)
-        assert tempfile.gettempdir().replace("\\", "/") not in text.replace("\\\\", "/")
+        assert not _leaks_absolute_temp_dir(text, tempfile.gettempdir())
         assert "jadx_out_" not in text and "jadx_jvm_out_" not in text
+
+    def test_the_same_holds_when_the_temp_dir_is_slash_tmp(self, kind, sample):
+        # Linux: gettempdir() is /tmp, and the sample's relative path (tmpXXXX/...) contains "/tmp".
+        # Reproduced here by pointing gettempdir at /tmp; this was red under the bare-substring check.
+        out = _call(kind, sample, _wire(kind, "a.Foo"), {"sources/b/Foo.java": "x"})
+        with mock.patch.object(tempfile, "gettempdir", return_value="/tmp"):
+            assert not _leaks_absolute_temp_dir(json.dumps(out), tempfile.gettempdir())
+
+    def test_a_real_absolute_temp_path_injected_into_the_reply_is_caught(self, kind, sample):
+        # The narrowing must not blind the check: put a real absolute temp path into an otherwise
+        # real reply, as the leak would, and require it to be flagged (host temp dir and /tmp).
+        out = _call(kind, sample, _wire(kind, "a.Foo"), {"sources/b/Foo.java": "x"})
+        for temp_dir in (tempfile.gettempdir(), "/tmp"):
+            leaky = dict(out, detail=f"read {temp_dir.replace(chr(92), '/')}/jadx_out_ab12/sources/b/Foo.java")
+            with mock.patch.object(tempfile, "gettempdir", return_value=temp_dir):
+                assert _leaks_absolute_temp_dir(json.dumps(leaky), tempfile.gettempdir()), temp_dir
+        windows = dict(out, detail="read " + tempfile.gettempdir() + "\\jadx_out_ab12")
+        assert _leaks_absolute_temp_dir(json.dumps(windows), tempfile.gettempdir())
 
     def test_nothing_with_that_name_stays_class_not_found(self, kind, sample):
         out = _call(kind, sample, _wire(kind, "a.Foo"), {"sources/b/Bar.java": "x"})
@@ -119,3 +151,17 @@ class TestLegitimateNamesStillWork:
     def test_layout_without_a_sources_directory_still_resolves(self, kind, sample):
         out = _call(kind, sample, _wire(kind, "a.Foo"), {"a/Foo.java": "BODY"})
         assert out["ok"] is True and out["content"] == "BODY"
+
+
+class TestAbsoluteTempDirCheck:
+    """The leak check itself: it must flag absolute temp paths and ignore look-alike relative pieces."""
+
+    def test_absolute_paths_are_flagged(self):
+        assert _leaks_absolute_temp_dir('"detail": "/tmp/x/Foo.java"', "/tmp")
+        assert _leaks_absolute_temp_dir("/tmp", "/tmp")
+        assert _leaks_absolute_temp_dir('{"p": "C:\\\\Temp\\\\x\\\\Foo.java"}', "C:\\Temp")
+
+    def test_relative_look_alikes_are_not_flagged(self):
+        assert not _leaks_absolute_temp_dir('"p": "e_redirect/tmp_pgtazwd/t.dex"', "/tmp")
+        assert not _leaks_absolute_temp_dir('"p": "work/tmp/t.dex"', "/tmp")
+        assert not _leaks_absolute_temp_dir('"p": "/tmpfoo/x"', "/tmp")
