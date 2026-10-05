@@ -628,8 +628,9 @@ def kernel_triage(path):
 
 
 # --- ioctl_control_code_decode: pure bit arithmetic, no file, no disassembly, no external tool ---------------
-# CTL_CODE layout: method 0-1, function 2-12, custom 13, access 14-15, device_type 16-30, reserved 31.
-# Function is 11 bits (mask 0x7FF), NOT 12: bit 13 is the custom/vendor flag, not part of the function number.
+# CTL_CODE (winioctl.h) = (Device<<16)|(Access<<14)|(Function<<2)|Method, so: method 0-1, function 2-13, access 14-15,
+# device_type 16-30, reserved 31. Convention: function = (code >> 2) & 0xFFF (12 bits); is_custom is derived as
+# function >= 0x800 (Microsoft reserves < 0x800; 0x800 and above is the vendor range, valid, never rejected).
 _IOCTL_METHODS={0:"METHOD_BUFFERED",1:"METHOD_IN_DIRECT",2:"METHOD_OUT_DIRECT",3:"METHOD_NEITHER"}
 _IOCTL_ACCESS={0:"FILE_ANY_ACCESS",1:"FILE_READ_ACCESS",2:"FILE_WRITE_ACCESS",3:"FILE_READ_ACCESS|FILE_WRITE_ACCESS"}
 _IOCTL_DEVICE_TYPES={
@@ -663,10 +664,11 @@ def _icd_one(code):
     device=(code>>16)&0x7FFF
     method=code&0x3
     access=(code>>14)&0x3
+    function=(code>>2)&0xFFF
     name=_IOCTL_DEVICE_TYPES.get(device)
     return {"status":"DECODED","code":code,"code_hex":f"0x{code:08X}",
             "device_type":device,"device_type_name":name,"device_type_known":name is not None,
-            "function":(code>>2)&0x7FF,"is_custom":bool((code>>13)&1),
+            "function":function,"is_custom":function>=0x800,
             "method":method,"method_name":_IOCTL_METHODS[method],
             "access":access,"access_name":_IOCTL_ACCESS[access],
             "reserved_bit_set":bool((code>>31)&1)}

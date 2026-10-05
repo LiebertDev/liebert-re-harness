@@ -1,6 +1,7 @@
 """ioctl_control_code_decode (liebert_re/tools/binary.py): pure bit arithmetic on caller-supplied CTL_CODE values.
 
-CTL_CODE layout: method 0-1, function 2-12, custom 13, access 14-15, device_type 16-30, reserved 31.
+CTL_CODE layout (winioctl.h): method 0-1, function 2-13 (12 bits, (code >> 2) & 0xFFF), access 14-15,
+device_type 16-30, reserved 31. Function >= 0x800 is the vendor range.
 Three outcomes are kept apart: decoded, invalid value (INVALID_VALUE), and decoded-but-device-unknown
 (DECODED with device_type_known false -- not an error).
 """
@@ -28,24 +29,45 @@ def test_known_real_ioctl_value():
 def test_known_value_with_all_fields():
     # CTL_CODE(0x22 = FILE_DEVICE_UNKNOWN, 0x800, METHOD_NEITHER=3, FILE_READ_ACCESS=1)
     # = (0x22<<16) | (1<<14) | (0x800<<2) | 3 = 0x220000 | 0x4000 | 0x2000 | 3 = 0x226003.
-    # 0x800 << 2 sets bit 13, so is_custom is true and function reads 0 (bits 2-12 are clear).
+    # 0x800 << 2 sets bit 13, which is the top bit of the 12-bit Function: function = 0x800, vendor range.
     r = _one(0x226003)
     assert r["device_type_name"] == "FILE_DEVICE_UNKNOWN"
     assert (r["method_name"], r["access_name"]) == ("METHOD_NEITHER", "FILE_READ_ACCESS")
     assert r["is_custom"] is True
-    assert r["function"] == 0
+    assert r["function"] == 0x800
 
 
-def test_bit_13_is_custom_and_does_not_leak_into_function():
+def test_canonical_0x222000_reads_function_0x800():
+    # CTL_CODE(FILE_DEVICE_UNKNOWN=0x22, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS) = 0x222000.
+    r = _one(0x222000)
+    assert (r["device_type"], r["function"], r["is_custom"], r["method"]) == (34, 0x800, True, 0)
+
+
+def test_function_is_twelve_bits_and_0x800_marks_the_vendor_range():
+    """Replaces test_bit_13_is_custom_and_does_not_leak_into_function.
+
+    The old test pinned a WRONG convention: it treated function as 11 bits and bit 13 as a separate
+    custom flag. CTL_CODE is ((Device)<<16)|((Access)<<14)|((Function)<<2)|(Method), so Function is
+    bits 2-13 (12 bits, mask 0xFFF) and bit 13 is its top bit (0x800). is_custom is derived:
+    function >= 0x800 (Microsoft reserves < 0x800, leaves 0x800 and above to vendors).
+    """
     base = 0x220000 | (0x155 << 2)
-    plain, custom = _one(base), _one(base | (1 << 13))
-    assert plain["function"] == custom["function"] == 0x155
-    assert plain["is_custom"] is False and custom["is_custom"] is True
+    plain, vendor = _one(base), _one(base | (1 << 13))
+    assert plain["function"] == 0x155 and plain["is_custom"] is False
+    assert vendor["function"] == 0x155 | 0x800 and vendor["is_custom"] is True
+    assert _one(0x220000 | (0x7FF << 2))["is_custom"] is False
+    assert _one(0x220000 | (0xFFF << 2))["function"] == 0xFFF
+
+
+def test_vendor_range_codes_are_valid_not_rejected():
+    for f in (0x800, 0x801, 0xFFF):
+        r = _one(0x220000 | (f << 2))
+        assert r["status"] == "DECODED" and r["function"] == f and r["is_custom"] is True
 
 
 def test_field_maxima_and_ranges():
-    r = _one(0x7FFF << 16 | 0x7FF << 2)
-    assert r["device_type"] == 0x7FFF and r["function"] == 0x7FF
+    r = _one(0x7FFF << 16 | 0xFFF << 2)
+    assert r["device_type"] == 0x7FFF and r["function"] == 0xFFF
     for m, n in enumerate(["METHOD_BUFFERED", "METHOD_IN_DIRECT", "METHOD_OUT_DIRECT", "METHOD_NEITHER"]):
         assert (_one(m)["method"], _one(m)["method_name"]) == (m, n)
     for a, n in enumerate(["FILE_ANY_ACCESS", "FILE_READ_ACCESS", "FILE_WRITE_ACCESS", "FILE_READ_ACCESS|FILE_WRITE_ACCESS"]):
