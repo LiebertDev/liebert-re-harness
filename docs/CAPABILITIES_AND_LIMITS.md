@@ -9,8 +9,10 @@ no plan; [ROADMAP.md](ROADMAP.md) owns direction.
 Read it with one fact in mind: **the capability set is general-purpose static
 inspection of Windows user-mode files, plus a small set of format-specific
 helpers. It is weak for kernel-level targets: `kernel_triage` gives a first
-look at whether a PE looks like a driver, but nothing here analyses a
-kernel-mode binary's dispatch table, IOCTLs or callbacks.**
+look at whether a PE looks like a driver, and four heuristic static operations
+(dispatch-store candidates, import-slot references, callback-registration
+imports, control-code decoding) give leads, not proofs. None of them proves a
+dispatch table, a call or a registration, and none loads or runs a driver.**
 
 ## Part 1: What it can do
 
@@ -257,8 +259,9 @@ return a named tool-missing status when absent. Function inventory
 - Workspace path sandbox, bounded subprocess with process-tree teardown, and a
   `liebert-re` CLI (`identify`, `probe`, `pe`, `disasm`, `packer`, `die`, `rzbin`, `flirt`, `flirtinventory`,
   `sieve`, `labgate`, `labregister`, `sievestatus`, `rzbinstatus`, `diestatus`, `yarastatus`, `upxstatus`,
-  `il2cppstatus`, `dexstatus`, `jvmstatus`, `capa`, `capastatus`, `ida`, `idamicrocode`, `idastatus`, `unpack`,
-  `scan`, `minidump`, `capabilities`; 29 subcommands, from `cli.py`):
+  `il2cppstatus`, `dexstatus`, `jvmstatus`, `capa`, `capastatus`, `ida`, `idamicrocode`, `idastatus`, `idaannotations`,
+  `kerneltriage`, `kerneldispatch`, `kerneliat`, `kernelcallbacks`, `ioctldecode`, `ghidrastatus`, `ghidrafacts`, `unpack`,
+  `scan`, `minidump`, `capabilities`; 37 subcommands, from `cli.py`):
   `workspace.py`, `bounded_subprocess.py`, `cli.py`.
 
 ### Dynamic and emulation
@@ -315,13 +318,40 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
   as a driver. Fields it could not determine are `null` and listed in
   `unknown_fields`; a truncated file or an unreadable directory is
   `ANALYSIS_LIMITED`; a non-PE or an unsupported machine is refused.
-- What `kernel_triage` does NOT do: it finds no dispatch routine, no IOCTL or
+- What `kernel_triage` alone does NOT do: it finds no dispatch routine, no IOCTL or
   control code, no callback registration, no device name, and it does not
-  disassemble, emulate or run anything. It is not wired to the CLI.
-- No module parses a driver's dispatch table, callback registrations, device or
-  control-code definitions, or any other kernel-specific structure. Beyond the
-  `kernel_triage` first look, a kernel-mode PE is handled as an ordinary PE:
-  headers, imports, strings, disassembly.
+  disassemble, emulate or run anything. It is reachable from the CLI as
+  `kerneltriage`. Four separate operations in `tools/binary.py` (below) cover
+  part of what it leaves out.
+- Four heuristic, static kernel operations (CLI `kerneldispatch`, `kerneliat`,
+  `kernelcallbacks`, `ioctldecode`). None loads or runs a driver, so Memory
+  Integrity (HVCI) and Core Isolation stay enabled. Each was run against real
+  Microsoft drivers in a measurement session; this document records no counts
+  and several drivers gave no result.
+  - `driver_major_function_scan`: byte-pattern search near `DriverEntry`, no
+    disassembler. It lists CANDIDATES for stores into
+    `DriverObject->MajorFunction[...]`. It does not prove a dispatch table:
+    `proves_dispatch` is always `false` and `dispatch_table` is only
+    `CANDIDATES_ONLY` or `UNKNOWN`. A driver can give no candidate, for
+    example when the stores sit at the end of a nested `call` chain or away
+    from the entry point.
+  - `rip_relative_iat_scan`: finds RIP-relative references to import slots.
+    `proves_call` is `false`. `max_findings` defaults to 200 and a large
+    driver exceeds it; the cut is reported in `truncation`.
+  - `kernel_callback_registrations`: reports which of a fixed list of
+    callback-registration APIs a driver references through its import table.
+    `NOT_FOUND` speaks only for the names in `names_checked`, says nothing
+    about other names or other ways to register, and is never returned for a
+    truncated scan (that is `UNKNOWN`). The callback address is not recovered.
+  - `ioctl_control_code_decode`: bit arithmetic that splits `CTL_CODE`
+    integers into their fields. Nothing in the package produces its input:
+    reading the `cmp eax, <code>` comparisons in a handler needs
+    disassembly, which no operation does for this. It is a leaf with no
+    feeder; the caller supplies the integers.
+- No module proves a driver's dispatch table, callback registrations, device or
+  control-code definitions, or any other kernel-specific structure. Beyond
+  `kernel_triage` and the four operations above, a kernel-mode PE is handled as
+  an ordinary PE: headers, imports, strings, disassembly.
 - No exception/unwind data parser, so no function-boundary recovery for stripped
   x64 images.
 - No bounded code-range emulation, so nothing can exercise a routine in
@@ -332,9 +362,10 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
   machine, `ida_query` supplies decompiled pseudocode and cross-references from IDA's analysis of
   the real bytes (read-only, symbol-server lookups off); without IDA there is neither, and the Ghidra
   wrapper does not decompile or cross-reference (facts only). `recover/native_xref.py` resolves only over an IR the caller supplies.
-- The package has never been demonstrated against a real kernel-mode file. The
-  only driver-flavoured artefact is a synthetic fixture in
-  `recover/owned_binary_fixtures.py`; kernel-oriented wording in
+- The kernel operations above were measured on real drivers only in a
+  measurement session, with no corpus kept in the repository; the test suite
+  uses synthetic fixtures, including one in
+  `recover/owned_binary_fixtures.py`. Kernel-oriented wording in
   `recover/api_hash_recover.py` and `recover/code_sweep_chunking.py` refers to
   upstream tools that are absent and is history, not capability.
 - Non-Windows kernels and their loadable modules have no parser at all.
