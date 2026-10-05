@@ -23,7 +23,15 @@ Primary tools for this department: `python -m liebert_re identify <path>` (file/
 `recommended_capabilities` hint), `python -m liebert_re capabilities` (which routing families this
 install can actually reach — see below), and direct calls to `liebert_re.tools.binary.find_binaries`
 / `liebert_re.evidence.workspace_index.workspace_index` when the question is "what else is in this
-tree" rather than "what is this one file." If a quick peek (`Read`/`Grep`, or one more CLI call) is
+tree" rather than "what is this one file." Two inventory helpers sit beside these. `liebert_re.tools.binary.kernel_triage` reads a driver-like
+PE and reports each indicator separately (`proves_driver: false`); `driver_likelihood` is
+LIKELY or UNKNOWN and never a verdict, and it reads no dispatch table, IOCTL or callback.
+`liebert_re.tools.ghidra.ghidra_status` reports whether a local Ghidra install is discoverable
+without launching it (`launcher_verified: false`); `ghidra_program_facts` gives read-only headless
+program facts (loader, language, endianness, image base, entry points, memory blocks, function
+count) and is the second engine for confirming IDA results independently. It does no decompilation,
+cross-references or P-code export and has no CLI command. Note in your routing whether it is
+available so a later department can ask the same question two ways. If a quick peek (`Read`/`Grep`, or one more CLI call) is
 the fastest way to answer a routing question yourself, do it and report what you found rather than
 deferring a trivial check.
 

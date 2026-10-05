@@ -36,6 +36,15 @@ toolkit; use it rather than assuming decompilation is the only path:
   decompiler either), `liebert_re.tools.il2cpp` (Unity IL2CPP metadata/native-method mapping via
   Il2CppDumper), `liebert_re.tools.dart` / `unity` / `unreal` / `godot` (engine-specific structural
   readers).
+- **Second engine (Ghidra, facts only)**: `liebert_re.tools.ghidra.ghidra_status` discovers and
+  reports a local Ghidra install and does **not** launch Ghidra (it says so with
+  `launcher_verified: false`). `liebert_re.tools.ghidra.ghidra_program_facts` runs a headless import
+  and returns read-only program facts: loader, language, processor, endianness, address width,
+  compiler spec, image base, entry points, memory blocks and function count. It never modifies the
+  source file and refuses with `SOURCE_MODIFIED` if the file changed. Ceiling: no decompilation, no
+  cross-references, no P-code export, no CLI subcommand. Its purpose is an independent second opinion
+  on IDA-derived results: two engines each analyse the same file on their own. Asking Ghidra to
+  interpret IDA's pseudocode is not a second path.
 - **Crash recovery**: `liebert_re.recover.crash_symbolize` / `minidump_analyzer` /
   `minidump_structural` (offline, read-only).
 - **Compression primitives**: `liebert_re.tools.lzma1_decode` / `liebert_re.recover
