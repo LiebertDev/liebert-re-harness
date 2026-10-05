@@ -236,7 +236,11 @@ def test_published_tool_name_set_is_unchanged():
     # none removed: rip_relative_iat_scan (public; declared in FAMILIES["windows-kernel"] but undefined
     # until now) and the private _ria_refuse, _ria_slots, _ria_find. No new module. Digest recomputed
     # from the source.
-    assert digest == "a4a7193653047f386350f72716cbdf8f589d194140e0159d9b3e3fee8d0e5ca0"
+    # api-hash name-mapping slice: 761 -> 762, one public top-level function added in
+    # liebert_re/recover/api_hash_recover.py, none removed: api_hash_recover (declared in
+    # FAMILIES["crypto"] but defined only as crack_api_hash / api_hash_recover_tool, so the def-line
+    # scan counted it missing). No new module. Digest recomputed from the source.
+    assert digest == "6b42652a75134c91e0c4726fab8c38878615520e85fed031e5a18aa3e33c6df1"
 
 
 def test_the_imported_package_is_this_checkout():

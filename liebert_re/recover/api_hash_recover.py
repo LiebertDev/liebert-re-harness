@@ -221,3 +221,14 @@ def api_hash_recover_tool(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=N
     except Exception as exc:
         result = {"ok": False, "error": type(exc).__name__, "detail": str(exc)}
     return json.dumps(result, ensure_ascii=False)
+
+
+def api_hash_recover(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None) -> str:
+    """The published tool name (FAMILIES["crypto"]) for this capability.
+
+    A thin surface: it only forwards to ``api_hash_recover_tool`` (JSON string
+    in, JSON string out), which itself calls ``crack_api_hash``. No logic lives
+    here, so every refusal (``UNKNOWN_ALGORITHM``, an unreadable DLL) and every
+    exception report passes through unchanged.
+    """
+    return api_hash_recover_tool(hash_values, dll_path=dll_path, algorithms=algorithms)

@@ -116,5 +116,44 @@ class CrackApiHashKnownExportRoundTripTests(unittest.TestCase):
             self.assertTrue(found, f"{algo_name} failed to round-trip")
 
 
+class DeclaredNameIsDefinedTests(unittest.TestCase):
+    """FAMILIES["crypto"] declares ``api_hash_recover``; the inventory only
+    counts a name that some ``def <name>(`` line defines. The implementation
+    lives under ``crack_api_hash``/``api_hash_recover_tool``, so the declared
+    name must exist as a thin surface over them."""
+
+    def test_declared_name_is_in_the_inventory(self):
+        from liebert_re.report import tool_families
+        self.assertIn("api_hash_recover", tool_families.FAMILIES["crypto"])
+        self.assertIn("api_hash_recover", tool_families._locally_defined_tool_names())
+        self.assertIn("api_hash_recover", tool_families.published_tools("crypto"))
+
+    @unittest.skipUnless(KERNEL32.exists(), "kernel32.dll not present (non-Windows host)")
+    def test_surface_returns_what_the_implementation_returns(self):
+        import json
+        from liebert_re.recover.api_hash_recover import api_hash_recover, api_hash_recover_tool
+        h = 0
+        for b in b"CreateFileW\x00":
+            h = (_ror(h, 13) + b) & 0xFFFFFFFF
+        kwargs = dict(dll_path=str(KERNEL32), algorithms=["ror13_add"])
+        out = api_hash_recover(h, **kwargs)
+        self.assertEqual(out, api_hash_recover_tool(h, **kwargs))
+        data = json.loads(out)
+        self.assertTrue(data["ok"])
+        self.assertTrue(any(m["export_name"] == "CreateFileW" for m in data["matches"]))
+        self.assertEqual(data, json.loads(json.dumps(crack_api_hash(h, **kwargs))))
+
+    def test_refusals_surface_unchanged(self):
+        import json
+        from liebert_re.recover.api_hash_recover import api_hash_recover
+        missing = json.loads(api_hash_recover(0x1, dll_path=r"C:\definitely\not\a\real\path.dll"))
+        self.assertFalse(missing["ok"])
+        self.assertTrue(missing["error"])
+        bad = json.loads(api_hash_recover(0x1, algorithms=["not_a_real_algorithm"]))
+        self.assertEqual(bad["error"], "UNKNOWN_ALGORITHM")
+        self.assertEqual(bad["unknown"], ["not_a_real_algorithm"])
+        self.assertIn("crc32", bad["available"])
+
+
 if __name__ == "__main__":
     unittest.main()
