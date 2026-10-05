@@ -243,7 +243,9 @@ def test_published_tool_name_set_is_unchanged():
     # callback-registration filter slice: 762 -> 765, three top-level names added in liebert_re/tools/binary.py,
     # none removed: kernel_callback_registrations (public; declared in FAMILIES["windows-kernel"] but undefined
     # until now) and the private _kcr_norm_dll, _kcr_lookup. No new module. Digest recomputed from the source.
-    assert digest == "e19015584048f05b78d5db0c56313754cf6c5eb22413954e2e308bc749d33896"
+    # CLI truncated-listing slice: 765 -> 766 (measured), one private top-level function added in
+    # liebert_re/cli.py, none removed: _truncation. No new module. Digest recomputed from the source.
+    assert digest == "40ad6b00397aa500507d59f84a1cdad8fd7dac5afa87462e21677fa7486ece40"
 
 
 def test_the_imported_package_is_this_checkout():
