@@ -163,6 +163,10 @@ def test_published_tool_name_set_is_unchanged():
     # envelope) and _kt_indicators (per-indicator confidence labels). Fixture builder in
     # liebert_re/recover/owned_binary_fixtures.py: build_owned_pe_sections. No new module: the CI
     # module count is unchanged. Digest recomputed from the source, not merged by hand.
+    # process_lock slice: 711 -> 713, two private top-level names added in
+    # liebert_re/evidence/process_lock.py, none removed: _windows_api (the kernel32 seam) and
+    # _windows_pid_alive (the three-valued Windows liveness decision). The binding class _WinApi is not
+    # a def. No new module. Digest recomputed from the source.
     # IDA comment plan slice: 706 -> 707, one top-level name added, none removed:
     # ida_set_comments_plan (public, liebert_re/tools/ida.py; plan only, nothing persists, apply is a
     # later slice). In tool_families.FAMILIES["native"] the never-implemented name ida_set_comments was
@@ -177,7 +181,8 @@ def test_published_tool_name_set_is_unchanged():
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "24e06196bb07e054bb968ed315b72508d8bc041b18271aa52e4793e774c4d05d"
+    # Merged tree (engine-log + process-lock): 714 + 2 = 716 names; digest recomputed from the merged source.
+    assert digest == "6bd0577e688b4cf032b7d2a743869ead0f777be51961928f796b59b5c663df1e"
 
 
 def test_the_imported_package_is_this_checkout():
