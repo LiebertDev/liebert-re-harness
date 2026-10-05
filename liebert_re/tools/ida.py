@@ -3401,6 +3401,81 @@ def ida_annotations_purge(path, label=None, targets=None, confirm_token=None, ca
         _release_slot_lock(lock)
 
 
+class _NotPurgeable:
+    """Read-only survey of artifact classes that sit on disk next to an annotated scope but are NOT purge targets.
+    It lives outside the purge functions on purpose: the purge source must never name the cache or evidence roots,
+    and this survey is the only place that reads them (listing and counting; it opens, writes and deletes nothing)."""
+
+    @staticmethod
+    def survey(sha256):
+        """Artifact classes that sit on disk next to this scope but are NOT purge targets. Listing and counting
+        only: no file is opened, nothing is written or deleted. Paths are fixed relative labels, and only counts
+        and byte totals come back, never a file name. A directory that is missing says so; one that cannot be read
+        says so too, with the error type, and is never reported as empty."""
+        dataset = Path(EVIDENCE_ANNOTATIONS).parent.parent
+        classes = [
+            ("pristine_target_database", "dataset/ida_cache", Path(CACHE_ROOT), None,
+             "The cache holds the pristine analysed database that annotated versions are copied from. It is owned by the "
+             "cache's own eviction and budget, not by this tool."),
+            ("evidence_files", "dataset/evidence/ida_*", Path(EVIDENCE_ANNOTATIONS).parent, "ida_",
+             "Evidence is the ledger of what the tools reported. Removing it would erase the record of what was done."),
+            ("write_journals", "dataset/ida_annotated/<sha256>.writes.jsonl", _annotated_root(), "=" + sha256 + _ANNOTATION_LOG_SUFFIX,
+             "This target's append-only audit journal (counted for this input hash only) is the record every purge itself is written to, and it is not re-derivable."),
+            ("claims", "dataset/claims", dataset / "claims", None,
+             "Claim event files are the source of truth for recorded claims; they belong to the claims ledger."),
+            ("claim_indexes", "dataset/metadata/claim_indexes", dataset / "metadata" / "claim_indexes", None,
+             "A derived index owned by the claims module; it is rebuilt by that module, not by purge."),
+            ("evidence_indexes", "dataset/metadata/evidence_indexes", dataset / "metadata" / "evidence_indexes", None,
+             "A derived index owned by the evidence module; it is rebuilt by that module, not by purge."),
+        ]
+        out = []
+        for name, label_text, root, marker, why in classes:
+            row = {"class": name, "path": label_text, "purgeable": False, "why_not_a_purge_target": why,
+                   "present": None, "files": None, "bytes": None, "read_errors": 0}
+            files, size, errors = 0, 0, []
+            try:
+                if not root.is_dir():
+                    row["present"] = False
+                else:
+                    row["present"] = True
+                    stack = [(root, True)]
+                    while stack:
+                        here, top = stack.pop()
+                        try:
+                            with os.scandir(here) as it:
+                                children = list(it)
+                        except OSError as exc:
+                            errors.append(type(exc).__name__)
+                            continue
+                        for child in children:
+                            try:
+                                is_dir = child.is_dir(follow_symlinks=False)
+                                if top and marker:
+                                    if marker.startswith("ida_"):
+                                        if not child.name.startswith(marker):
+                                            continue
+                                    elif is_dir or child.name != marker[1:]:
+                                        continue
+                                if is_dir:
+                                    stack.append((Path(child.path), False))
+                                    continue
+                                files += 1
+                                size += child.stat(follow_symlinks=False).st_size
+                            except OSError as exc:
+                                errors.append(type(exc).__name__)
+                    row["files"], row["bytes"] = files, size
+            except OSError as exc:
+                errors.append(type(exc).__name__)
+                row["present"] = None
+            if errors:
+                row["read_errors"] = len(errors)
+                row["read_error_types"] = sorted(set(errors))
+                row["files"] = row["bytes"] = None
+            out.append(row)
+        return {"note": "These classes remain on disk after a purge. None is a purge target; this call cannot delete them.",
+                "classes": out}
+
+
 def _purge_locked(tool, sha256, label, names, confirm_token):
     unverified, _actions = _recover_pending(sha256)
     if "*" in unverified:
@@ -3452,7 +3527,8 @@ def _purge_locked(tool, sha256, label, names, confirm_token):
               "annotated_bytes_held": held, "annotated_budget_bytes": budget,
               "would_delete": [{"target": e["target"], "bytes": e["bytes"], "state": e["state"]} for e in selected],
               "would_free_bytes": freed, "scope_unverified": bool(problem),
-              "unverified_reason": problem["reason"] if problem else None}
+              "unverified_reason": problem["reason"] if problem else None,
+              "not_purgeable": _NotPurgeable.survey(sha256)}
     if report["inventory_cut"]:
         report["inventory_note"] = f"the inventory is cut at {_PURGE_INVENTORY_LIMIT} of {len(entries)} entries"
     if confirm_token is None:

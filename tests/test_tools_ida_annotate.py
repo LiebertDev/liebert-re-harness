@@ -895,6 +895,30 @@ def _section_functions():
     return inside, cache_side
 
 
+def _section_nodes():
+    """Every top-level function AND class of the annotated section, same banner bounds as `_section_functions`.
+    Walking a node covers nested functions and class methods, so no code construct in the section is unscanned."""
+    source = Path(ti.__file__).read_text(encoding="utf-8")
+    lines = source.splitlines()
+    start = next(i for i, line in enumerate(lines) if "the annotation write path: ida_rename_plan" in line) + 1
+    end = next(i for i, line in enumerate(lines) if i > start and line.strip() == "# ida_status") + 1
+    return [n for n in ast.parse(source).body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and start <= n.lineno <= end]
+
+
+def _every_name(node):
+    """Names, attribute names and string constants under a node: `CACHE_ROOT`, `ti.CACHE_ROOT` and
+    `globals()["CACHE_ROOT"]` all count as a mention."""
+    out = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name):
+            out.add(sub.id)
+        elif isinstance(sub, ast.Attribute):
+            out.add(sub.attr)
+        elif isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            out.add(sub.value)
+    return out
+
+
 def _called_names(node):
     names = set()
     for sub in ast.walk(node):
@@ -2103,6 +2127,145 @@ class PurgeTests(PurgeCase):
                      "_copy_pristine", "_query_locked"}
         for fn in purge_functions:
             self.assertEqual(forbidden & (_referenced_names(fn) | _called_names(fn)), set(), fn.name)
+
+    # ---- the not-purgeable survey: visibility only ----
+    def survey_roots(self):
+        data = self.root / "dataset"
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(mock.patch.object(ti, "EVIDENCE_ANNOTATIONS", data / "evidence" / "ida_annotations"))
+        return data
+
+    SURVEY_CLASSES = ["pristine_target_database", "evidence_files", "write_journals", "claims", "claim_indexes",
+                      "evidence_indexes"]
+
+    @pytest.mark.contract
+    def test_the_survey_says_absent_for_every_class_when_no_directory_exists(self):
+        self.survey_roots()
+        self.two_versions()
+        shutil.rmtree(self.cache, ignore_errors=True)
+        for row in self.purge()["not_purgeable"]["classes"]:
+            if row["class"] == "write_journals":
+                self.assertEqual(row["files"], 1)
+                continue
+            self.assertIs(row["present"], False, row["class"])
+            self.assertIsNone(row["files"], row["class"])
+            self.assertIsNone(row["bytes"], row["class"])
+
+    @pytest.mark.contract
+    def test_the_survey_counts_what_is_there_and_marks_every_class_not_purgeable(self):
+        data = self.survey_roots()
+        self.two_versions()
+        base = {r["class"]: r for r in self.purge()["not_purgeable"]["classes"]}["pristine_target_database"]
+        (self.cache / "slot").mkdir(parents=True, exist_ok=True)
+        (self.cache / "slot" / "a.i64").write_bytes(b"12345")
+        (self.cache / "b.i64").write_bytes(b"123")
+        (data / "evidence" / "ida_annotations").mkdir(parents=True)
+        (data / "evidence" / "ida_annotations" / "x.json").write_bytes(b"{}")
+        (data / "evidence" / "other_tool").mkdir(parents=True)
+        (data / "evidence" / "other_tool" / "y.json").write_bytes(b"{}")
+        (data / "claims").mkdir(parents=True)
+        for n in range(3):
+            (data / "claims" / f"c{n}.json").write_bytes(b"abcd")
+        (data / "metadata" / "claim_indexes").mkdir(parents=True)
+        report = self.purge()["not_purgeable"]
+        rows = {r["class"]: r for r in report["classes"]}
+        self.assertEqual(list(rows), self.SURVEY_CLASSES)
+        self.assertEqual((rows["pristine_target_database"]["files"] - base["files"],
+                          rows["pristine_target_database"]["bytes"] - base["bytes"]), (2, 8))
+        self.assertEqual(rows["evidence_files"]["files"], 1)
+        self.assertEqual(rows["claims"]["files"], 3)
+        self.assertEqual(rows["claims"]["bytes"], 12)
+        self.assertEqual((rows["claim_indexes"]["present"], rows["claim_indexes"]["files"]), (True, 0))
+        self.assertIs(rows["evidence_indexes"]["present"], False)
+        self.assertGreaterEqual(rows["write_journals"]["files"], 1)
+        for row in rows.values():
+            self.assertIs(row["purgeable"], False, row["class"])
+            self.assertTrue(row["why_not_a_purge_target"], row["class"])
+
+    @pytest.mark.contract
+    def test_the_survey_reports_an_unreadable_directory_instead_of_zero(self):
+        data = self.survey_roots()
+        self.two_versions()
+        (data / "claims").mkdir(parents=True)
+        real = os.scandir
+
+        def deny(path):
+            if Path(path) == data / "claims":
+                raise PermissionError("denied")
+            return real(path)
+        with mock.patch.object(ti.os, "scandir", side_effect=deny):
+            row = {r["class"]: r for r in self.purge()["not_purgeable"]["classes"]}["claims"]
+        self.assertEqual((row["files"], row["bytes"], row["read_errors"]), (None, None, 1))
+        self.assertEqual(row["read_error_types"], ["PermissionError"])
+
+    @pytest.mark.contract
+    def test_the_survey_leaks_no_absolute_path_user_name_or_file_name(self):
+        data = self.survey_roots()
+        self.two_versions()
+        (data / "claims").mkdir(parents=True)
+        (data / "claims" / "secret-sample-name.json").write_bytes(b"x")
+        text = json.dumps(self.purge()["not_purgeable"])
+        self.assertNotIn("secret-sample-name", text)
+        for leak in (str(self.root), self.root.as_posix(), os.path.expanduser("~"), os.environ.get("USERNAME", "<none>")):
+            self.assertNotIn(leak, text)
+        self.assertNotRegex(text, r"[A-Za-z]:[\/]")
+
+    @pytest.mark.contract
+    def test_the_survey_does_not_change_targets_token_or_deletion(self):
+        self.survey_roots()
+        self.two_versions()
+        before = self.purge(["version:1"])
+        again = self.purge(["version:1"])
+        self.assertEqual(before["confirm_token"], again["confirm_token"])
+        self.assertEqual([e["target"] for e in before["inventory"]], ["version:1", "published:2"])
+        self.assertEqual([t["target"] for t in before["would_delete"]], ["version:1"])
+        (self.cache / "keep.i64").parent.mkdir(parents=True, exist_ok=True)
+        (self.cache / "keep.i64").write_bytes(b"k")
+        done = self.purge(["version:1"], before["confirm_token"])
+        self.assertEqual((done["status"], [r["target"] for r in done["results"]]), ("OK", ["version:1"]))
+        self.assertTrue((self.cache / "keep.i64").exists())
+        self.assertTrue(ti._journal_path(self.sha).exists())
+
+    @pytest.mark.contract
+    def test_the_survey_only_lists_and_never_writes_or_deletes(self):
+        source = Path(ti.__file__).read_text(encoding="utf-8")
+        cls = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "_NotPurgeable")
+        for banned in ("rmtree", "unlink", "write_text", "write_bytes", "open", "replace", "rename", "remove", "mkdir",
+                       "read_text", "read_bytes", "_journal_append"):
+            self.assertNotIn(banned, _called_names(cls), banned)
+
+    @pytest.mark.contract
+    def test_the_journal_row_counts_only_this_targets_journal(self):
+        self.survey_roots()
+        self.two_versions()
+        (self.annotated / ("f" * 64 + ".writes.jsonl")).write_bytes(b"other target")
+        row = {r["class"]: r for r in self.purge()["not_purgeable"]["classes"]}["write_journals"]
+        self.assertEqual(row["files"], 1)
+        self.assertEqual(row["bytes"], ti._journal_path(self.sha).stat().st_size)
+
+    @pytest.mark.contract
+    def test_no_construct_in_the_annotated_section_escapes_the_cache_and_evidence_guard(self):
+        # Named exemption: the class `_NotPurgeable` may mention exactly CACHE_ROOT and EVIDENCE_ANNOTATIONS, because
+        # its whole job is to COUNT what sits there (listing only). In exchange it is held to every other forbidden name
+        # and to the no-write/no-delete rule in test_the_survey_only_lists_and_never_writes_or_deletes. Anything else in
+        # the section, functions, nested functions, classes and methods alike, may mention none of them.
+        exempt = {"_NotPurgeable": {"CACHE_ROOT", "EVIDENCE_ANNOTATIONS"}}
+        forbidden = {"_cache_root", "CACHE_ROOT", "_slot_dir", "_slot_is_healthy", "_evict_slot", "_enforce_cache_budget",
+                     "_write_evidence", "EVIDENCE", "EVIDENCE_RENAME_PLAN", "EVIDENCE_ANNOTATE_APPLY", "EVIDENCE_ANNOTATIONS",
+                     "_copy_pristine", "_query_locked"}
+        nodes = _section_nodes()
+        classes = sorted(n.name for n in nodes if isinstance(n, ast.ClassDef))
+        self.assertEqual(classes, sorted(exempt), "a class was added to the annotated section: it needs its own reviewed exemption")
+        guarded = {"ida_annotations_purge", "_purge_locked", "_purge_remove", "_purge_inventory", "_purge_confirmation",
+                   "_tree_bytes"}
+        seen = 0
+        for node in nodes:
+            if isinstance(node, ast.ClassDef) or node.name in guarded:
+                seen += 1
+                hits = forbidden & (_every_name(node) | _called_names(node)) - exempt.get(node.name, set())
+                self.assertEqual(hits, set(), node.name)
+        self.assertEqual(seen, len(guarded) + 1)
 
     def test_it_is_a_published_name_distinct_from_the_apply_and_the_plan(self):
         published = tool_families.published_tools("native")
