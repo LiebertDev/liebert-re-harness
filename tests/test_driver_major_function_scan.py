@@ -317,5 +317,87 @@ class TailJumpTests(unittest.TestCase):
         self.assertEqual(body["candidates"], [])
 
 
+def call32(at_rva, to_rva):
+    return bytes.fromhex("E8") + struct.pack("<i", to_rva - (at_rva + 5))
+
+
+def trampoline(at_rva, cookie_rva, body_rva):
+    """The compiler's DriverEntry shape: save args, call cookie-init, call the real body, return. No jmp."""
+    return (bytes.fromhex("48895C2408") + bytes.fromhex("57") + bytes.fromhex("4883EC20")
+            + bytes.fromhex("488BDA") + bytes.fromhex("488BF9")
+            + call32(at_rva + 16, cookie_rva)
+            + bytes.fromhex("488BD3") + bytes.fromhex("488BCF")
+            + call32(at_rva + 27, body_rva)
+            + bytes.fromhex("488B5C2430") + bytes.fromhex("4883C420") + bytes.fromhex("5F") + bytes.fromhex("C3"))
+
+
+class CallTrampolineTests(unittest.TestCase):
+    def _set_entry(self, path, rva):
+        data = bytearray(path.read_bytes())
+        struct.pack_into("<I", data, ENTRY_FIELD, rva)
+        path.write_bytes(bytes(data))
+
+    def test_call_to_a_body_BEHIND_the_entry_is_followed(self):
+        # entry at 0x2000 (.text2): cookie call (empty stub at 0x2080), then a call BACK to 0x1000 holding the stores.
+        path = make2("back.sys", {TEXT2_RAW: trampoline(0x2000, 0x2080, 0x1000),
+                                  TEXT_RAW: LEA_RAX + STORE_IDX0_DISP8 + STORE_IDX2_DISP32})
+        self._set_entry(path, 0x2000)
+        body = scan(path)
+        self.assertEqual(body["outcome"], "FOUND")
+        self.assertEqual({c["index"] for c in body["candidates"]}, {0, 2})
+        hops = body["tail_jump"]["hops"]
+        self.assertEqual(body["tail_jump"]["state"], "FOLLOWED")
+        self.assertEqual([(h["from_rva"], h["to_rva"], h["encoding"], h["kind"], h["direction"]) for h in hops],
+                         [(hex(0x2000), hex(0x1000), "call_rel32", "call", "backward")])
+        self.assertEqual(body["entry"]["scanned_rva"], hex(0x1000))
+
+    def test_call_to_a_body_far_ahead_of_the_window_is_followed(self):
+        # entry 0x1000; cookie stub 0x1040; body at 0x2000, well past the 1024-byte window.
+        body = scan(make2("far.sys", {TEXT_RAW: trampoline(0x1000, 0x1040, 0x2000), TEXT2_RAW: REAL_DRIVER_ENTRY}))
+        self.assertEqual(body["outcome"], "FOUND")
+        self.assertEqual({c["index"] for c in body["candidates"]}, {0, 2})
+        hops = body["tail_jump"]["hops"]
+        self.assertEqual([(h["to_rva"], h["direction"], h["calls_seen"]) for h in hops],
+                         [(hex(0x2000), "forward", 2)])
+
+    def test_the_cookie_call_is_not_listed_as_a_hop_when_the_body_call_has_the_stores(self):
+        body = scan(make2("cookie.sys", {TEXT_RAW: trampoline(0x1000, 0x1040, 0x2000), TEXT2_RAW: REAL_DRIVER_ENTRY}))
+        self.assertNotIn(hex(0x1040), [h["to_rva"] for h in body["tail_jump"]["hops"]])
+
+    def test_stores_at_the_entry_point_win_over_a_call(self):
+        # Narrowness guard: direct stores AND a later call into a section with other stores. Calls are not followed.
+        patches = {TEXT_RAW: LEA_RAX + STORE_IDX0_DISP8 + call32(0x100B, 0x2000),
+                   TEXT2_RAW: LEA_RAX_2000 + STORE_IDX3_DISP8}
+        body = scan(make2("callboth.sys", patches))
+        self.assertEqual(body["outcome"], "FOUND")
+        self.assertEqual({c["index"] for c in body["candidates"]}, {0})
+        self.assertEqual(body["tail_jump"]["state"], "NONE")
+        self.assertEqual(body["tail_jump"]["hops"], [])
+
+    def test_a_call_whose_target_shows_no_store_is_not_followed(self):
+        # A self-call and a call into an empty stub: nothing to find, so NOT_FOUND (read, nothing matched), no hops.
+        for name, code in {"self": call32(0x1000, 0x1000), "stub": call32(0x1000, 0x1040)}.items():
+            with self.subTest(name):
+                body = scan(make2("nostore_" + name + ".sys", {TEXT_RAW: code}))
+                self.assertEqual(body["outcome"], "NOT_FOUND")
+                self.assertEqual(body["tail_jump"]["hops"], [])
+
+    def test_a_call_after_a_full_jump_chain_is_the_chain_limit_not_not_found(self):
+        # Three jmp hops reach 0x10C0, which calls a body holding stores: the hop budget is spent, so UNRESOLVED.
+        patches = {TEXT_RAW: jmp8(0x1000, 0x1040), TEXT_RAW + 0x40: jmp8(0x1040, 0x1080),
+                   TEXT_RAW + 0x80: jmp8(0x1080, 0x10C0), TEXT_RAW + 0xC0: call32(0x10C0, 0x2000),
+                   TEXT2_RAW: REAL_DRIVER_ENTRY}
+        body = scan(make2("callafterchain.sys", patches))
+        self.assertEqual(body["outcome"], "TAIL_JUMP_UNRESOLVED")
+        self.assertEqual(body["tail_jump"]["reason"], "CHAIN_LIMIT")
+        self.assertEqual(len(body["tail_jump"]["hops"]), 3)
+        self.assertEqual(body["tail_jump"]["blocked_jump"]["encoding"], "call_rel32")
+
+    def test_a_call_to_outside_the_code_sections_is_not_followed(self):
+        body = scan(make2("callout.sys", {TEXT_RAW: call32(0x1000, 0x7000)}))
+        self.assertEqual(body["outcome"], "NOT_FOUND")
+        self.assertEqual(body["tail_jump"]["hops"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

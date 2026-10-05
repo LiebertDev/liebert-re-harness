@@ -706,7 +706,8 @@ _DMF_MAX_HOPS=3       # at most this many tail jumps are followed from the entry
 DISPATCH_SCAN_STATEMENT=("A first-pass byte-pattern heuristic, not a recovery: a candidate store is not proof of a "
                          "dispatch assignment, and the absence of one is not proof that none exists.")
 _DMF_CAVEATS=("Only a bounded window from the DriverEntry address is read. When it holds no store pattern, a "
-              "jmp rel8/rel32/[mem] in its first bytes is followed (a few hops at most, see tail_jump); a tail call "
+              "jmp rel8/rel32/[mem] in its first bytes is followed, and failing that an E8 call (the compiler's "
+              "cookie-init + body trampoline), backward targets included (a few hops at most, see tail_jump); a tail call "
               "made any other way, or a jump further in, is not seen.",
               "A jump is recognised by bytes, not on an instruction boundary (an E8 call's 4 operand bytes are skipped), "
               "so a followed jump is a heuristic reading; tail_jump lists every hop so it can be checked. A jump-looking byte "
@@ -830,11 +831,26 @@ def _dmf_tail_jump(pe,buf,at_rva,image_base,x64,code_ranges):
         i+=1
     return None
 
+def _dmf_calls(buf,at_rva,code_ranges):
+    """E8 rel32 calls in the first _DMF_JUMP_SEARCH bytes of ``buf`` (read from ``at_rva``) whose target is inside a code
+    section, in order, as dicts with call_rva, call_offset and to_rva. Target = end of the instruction + signed rel32, so
+    it may lie BEFORE ``at_rva``. rel32 == 0 (call-to-next, the get-PC idiom) is not a function call and is skipped. Byte pattern only, no instruction boundaries: an E8 inside another instruction can
+    match, and only a target outside every code section rejects it."""
+    out=[];i=0;n=min(len(buf),_DMF_JUMP_SEARCH)
+    while i<n:
+        if buf[i]==0xE8 and i+5<=len(buf):
+            rel=int.from_bytes(buf[i+1:i+5],"little",signed=True)
+            t=at_rva+i+5+rel
+            if rel and any(a<=t<b for a,b in code_ranges):
+                out.append({"call_rva":hex(at_rva+i),"call_offset":i,"to_rva":hex(t)});i+=5;continue
+        i+=1
+    return out
+
 def driver_major_function_scan(path,max_bytes=_DMF_WINDOW):
     """First-pass byte-pattern search for DriverObject->MajorFunction[IRP_MJ_*] stores near DriverEntry. No disassembler.
 
     If the entry point's window holds no store, a tail jump in its first bytes (jmp rel8, jmp rel32, jmp [mem]) is
-    followed, at most _DMF_MAX_HOPS deep and never revisiting an address, and the target is scanned instead;
+    followed (and, when there is no jump, the first E8 call, forward or backward, whose target window shows a store; hop encoding call_rel32, kind call), at most _DMF_MAX_HOPS deep and never revisiting an address, and the target is scanned instead;
     ``tail_jump`` lists every hop (from, jump and to RVA) and ``entry.scanned_rva`` says what was scanned. A jump
     that cannot be followed (target outside the image or unreadable, an indirect slot that is not statically known,
     a loop, too many hops) gives ``outcome`` TAIL_JUMP_UNRESOLVED -- never NOT_FOUND -- with ``tail_jump.reason``.
@@ -889,7 +905,28 @@ def driver_major_function_scan(path,max_bytes=_DMF_WINDOW):
         cands=_dmf_find(buf,scan_rva,image_base,x64,base,stride,code)
         if cands:break
         jump=_dmf_tail_jump(pe,buf,scan_rva,image_base,x64,code)
-        if jump is None:break
+        if jump is None:
+            # No jump: the entry point may CALL the real body (compiler trampoline: cookie-init call, then body call).
+            calls=_dmf_calls(buf,scan_rva,code)
+            if not calls:break
+            # Try every call in order and follow the first whose target window shows a store. In the measured
+            # cookie-init + body trampoline the first call has none and the second is the body. A call whose target
+            # shows no store is NOT followed: going on through an arbitrary call manufactures weak candidates.
+            pick=None;nbuf=None
+            for c in calls:
+                st,nb=_dmf_read(pe,int(c["to_rva"],16),window)
+                if st=="OK" and _dmf_find(nb,int(c["to_rva"],16),image_base,x64,base,stride,code):
+                    pick=c;nbuf=nb;break
+            if pick is None:break
+            target=int(pick["to_rva"],16)
+            if len(hops)>=_DMF_MAX_HOPS:
+                blocked=dict(pick,jump_rva=pick["call_rva"],encoding="call_rel32",reason="CHAIN_LIMIT");break
+            if target in seen:
+                blocked=dict(pick,jump_rva=pick["call_rva"],encoding="call_rel32",reason="JUMP_LOOP");break
+            hops.append({"from_rva":hex(scan_rva),"jump_rva":pick["call_rva"],"encoding":"call_rel32","kind":"call",
+                         "to_rva":pick["to_rva"],"direction":"backward" if target<scan_rva else "forward",
+                         "calls_seen":len(calls)})
+            seen.add(target);scan_rva=target;buf=nbuf;continue
         if jump.get("reason"):blocked=jump;break
         target=int(jump["to_rva"],16)
         if len(hops)>=_DMF_MAX_HOPS:
