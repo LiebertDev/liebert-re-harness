@@ -426,7 +426,17 @@ def run_bounded_process(
     max_memory_bytes: int | None = None,
     max_output_chars: int | None = 131_072,
 ) -> BoundedProcessResult:
-    """Run an owned process group and stop its exact tree on timeout/cancellation."""
+    """Run an owned process group and stop its exact tree on timeout/cancellation.
+
+    ``max_output_chars`` bounds the RESULT, not the memory read. Output is
+    accumulated by ``Popen.communicate()`` and only then passed to
+    ``_limit_text``, so a child writing gigabytes fills memory regardless of
+    the limit. Truncation itself is reported (``output_truncated``, an
+    ``[OUTPUT_TRUNCATED ...]`` marker and ``stdout_sha256``/``stderr_sha256``
+    of the full text). Bounding the read would need reader threads or
+    ``selectors`` (unusable on Windows pipes); deliberately not done. Pinned
+    by ``tests/test_bounded_subprocess_output_limit.py``.
+    """
     if bool(getattr(cancellation_token, "cancelled", False)):
         return BoundedProcessResult(None, "", "", cancelled=True)
     if max_memory_bytes is not None and not _memory_monitor_usable():
