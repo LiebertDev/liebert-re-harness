@@ -797,8 +797,15 @@ _ICS_PATTERNS_NOT_SEARCHED=[
     "lea reg, [reg-imm] and add reg, -imm (compilers also bias a switch this way)",
     "jump-table switches (cmp reg, N; ja; jmp [table+reg*8]): the table is not read",
     "sub [mem], imm, 8/16-bit operand widths, and any immediate outside the unsigned 32-bit range",
-    "control flow: the scan is linear from the start address, never follows jumps or calls, and does not stop at ret",
+    "control flow: the scan is linear from the start address and never follows jumps or calls. It does not stop at ret: "
+    "every ret passed is counted and listed in scope.rets_passed and each candidate and exclusion carries rets_before",
+    "function-end signals other than ret: runs of int3 and alignment nop padding are NOT treated as a boundary "
+    "(int3 can be a deliberate breakpoint and nop runs occur inside functions), so a boundary without a ret is not reported",
 ]
+_ICS_RET_MNEMONICS=("ret","retn","retf")
+_ICS_LISTED_RETS=50
+_ICS_BOUNDARY_NOTE=("this site lies after a ret in a linear scan, so it may belong to another function than the one the scan "
+                    "was started for; its value may be that function's, not this handler's")
 _ICS_STATEMENT=("Immediates that are compared in the scanned region, each split by ioctl_control_code_decode. This is "
                 "not a list of the driver's IOCTLs: a compared value may equally be a constant, a mask, a status code "
                 "or an offset. proves_ioctl is false for every entry. Which criteria a value meets is listed, never "
@@ -812,9 +819,10 @@ def _ics_fail(error,status,message,**extra):
 def _ics_walk(instrs):
     """Walk instructions linearly; return (matches, excluded). A match is a dict with pattern, value, raw, chain, entry."""
     chains={}
-    matches=[];excluded=[]
+    matches=[];excluded=[];rets=[]
     for e in instrs:
         m=e["mnemonic"];ops=e["operands"];imms=e.get("immediates")
+        if m in _ICS_RET_MNEMONICS:rets.append({"rva":e["address"].get("rva"),"va":e["address"].get("va")})
         parts=[x.strip() for x in ops.split(",")]
         if m in ("cmp","sub") and imms and len(parts)==2 and len(imms)==1:
             first=parts[0].lower()
@@ -823,7 +831,8 @@ def _ics_walk(instrs):
                 chains.clear();continue
             pattern="cmp_mem_imm" if is_mem else ("cmp_reg_imm" if m=="cmp" else "sub_reg_imm")
             imm=imms[0]
-            where={"address":{"rva":e["address"].get("rva"),"va":e["address"].get("va")},"mnemonic":m,"operands":ops,"pattern":pattern}
+            where={"address":{"rva":e["address"].get("rva"),"va":e["address"].get("va")},"mnemonic":m,"operands":ops,"pattern":pattern,
+                   "rets_before":len(rets),"after_ret_at":rets[-1] if rets else None}
             if not is_mem and first in _ICS_STACK_REGS:
                 excluded.append(dict(where,compared_immediate=imm["hex"],reason="stack_pointer_register"));chains.clear();continue
             if imm["size"] not in (4,8):
@@ -845,7 +854,7 @@ def _ics_walk(instrs):
         elif m.startswith("j") and m!="jmp":continue
         elif m in ("nop","test","cmp"):continue
         else:chains.clear()
-    return matches,excluded
+    return matches,excluded,rets
 
 def ioctl_candidate_scan(path,start_rva=None,max_instructions=200,start_note=None):
     """Scan a code region from ``start_rva`` for compared immediates and decode each with ioctl_control_code_decode.
@@ -882,7 +891,7 @@ def ioctl_candidate_scan(path,start_rva=None,max_instructions=200,start_note=Non
     if not d.get("ok"):
         return _ics_fail(d["error"],d["status"],d["message"])
     instrs=d["instructions"]
-    matches,excluded=_ics_walk(instrs)
+    matches,excluded,rets=_ics_walk(instrs)
     decoded=json.loads(ioctl_control_code_decode([m["value"] for m in matches]))["results"] if matches else []
     cands=[]
     for m,dec in zip(matches,decoded):
@@ -894,7 +903,10 @@ def ioctl_candidate_scan(path,start_rva=None,max_instructions=200,start_note=Non
         cands.append({"address":w["address"],"mnemonic":w["mnemonic"],"operands":w["operands"],"pattern":w["pattern"],
                       "basis":m["basis"],"compared_immediate":hex(m["raw"]),"chain":m["chain"],
                       "value":m["value"],"value_hex":f"0x{m['value']:08X}","decoded":dec,
-                      "criteria":crit,"criteria_met":sum(c["met"] for c in crit),"criteria_total":len(crit),"proves_ioctl":False})
+                      "criteria":crit,"criteria_met":sum(c["met"] for c in crit),"criteria_total":len(crit),"proves_ioctl":False,
+                      "rets_before":w["rets_before"],"after_ret_at":w["after_ret_at"],
+                      "may_be_in_another_function":w["rets_before"]>0,
+                      "boundary_note":_ICS_BOUNDARY_NOTE if w["rets_before"]>0 else None})
     cands.sort(key=lambda c:(-c["criteria_met"],int(c["address"]["rva"],16)))
     reasons={}
     for x in excluded:reasons[x["reason"]]=reasons.get(x["reason"],0)+1
@@ -915,6 +927,7 @@ def ioctl_candidate_scan(path,start_rva=None,max_instructions=200,start_note=Non
     else:
         rationale.append(f"in the {len(instrs)} instruction(s) scanned from {hex(rva)}, no comparison with an immediate was seen under the searched patterns ({searched}) that survived the admission rule")
         rationale.append("this does not show that the region holds no IOCTL: the patterns not searched are listed in scope.patterns_not_searched")
+    if any(c["rets_before"]>0 for c in cands):rationale.append("one or more candidates lie after a ret (rets_before > 0): they may belong to another function than the one scanned")
     if excluded:rationale.append(f"{len(excluded)} compared immediate(s) were set aside by the admission rule; see excluded")
     if source=="AddressOfEntryPoint":rationale.append("the start is the entry point: DriverEntry rarely compares control codes; the dispatch handler is a different address")
     res={"ok":True,"tool":"ioctl_candidate_scan","status":"ANALYSIS_LIMITED" if limited else "OK","path":relative(p),
@@ -923,6 +936,9 @@ def ioctl_candidate_scan(path,start_rva=None,max_instructions=200,start_note=Non
                   "architecture":d["architecture"],"instructions_scanned":len(instrs),"max_instructions":cap,
                   "truncated":truncated,"ended_at":"instruction_budget" if truncated else "section_end",
                   "instructions_undecodable":undec,
+                  "rets_passed":{"count":len(rets),"listed":rets[:_ICS_LISTED_RETS],"limit":_ICS_LISTED_RETS,
+                                 "listed_truncated":len(rets)>_ICS_LISTED_RETS,
+                                 "meaning":"the scan did not stop at these; a site after one may be in another function"},
                   "patterns_searched":list(_ICS_PATTERNS_SEARCHED),"patterns_not_searched":list(_ICS_PATTERNS_NOT_SEARCHED)},
          "admission":{"rule":"a compared immediate (or cumulative sub-chain value) becomes a candidate only if it is an unsigned 32-bit "
                              "value of at least 0x10000, so that the device_type field is not zero; the rest is listed in excluded",

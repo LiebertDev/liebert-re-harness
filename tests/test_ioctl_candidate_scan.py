@@ -95,6 +95,87 @@ def by_value(res):
     return out
 
 
+# Two "functions" in one region: a compare, a ret, then a DIFFERENT function's compare. Worked out by hand.
+FN_INSNS = [
+    (b"\x81\xF9\x00\x20\x22\x00", "cmp ecx, 0x222000"),   # function one: candidate, before any ret
+    (b"\x74\x00", "je"),
+    (b"\xC3", "ret"),                                     # first function ends here
+    (b"\x83\xF9\x20", "cmp ecx, 0x20"),                   # function two: excluded (small), after the ret
+    (b"\x81\xFA\x00\x40\x22\x00", "cmp edx, 0x224000"),   # function two: candidate, after the ret
+    (b"\x74\x00", "je"),
+    (b"\xC3", "ret"),                                     # second ret
+]
+FN_CODE = b"".join(b for b, _ in FN_INSNS)
+FN_RET_1 = TEXT_RVA + 6 + 2          # 6-byte cmp + 2-byte je
+FN_RET_2 = FN_RET_1 + 1 + 3 + 6 + 2  # ret, cmp ecx imm8, cmp edx imm32, je
+FN_CAND_2 = FN_RET_1 + 1 + 3
+FN_EXCL = FN_RET_1 + 1
+
+
+def fn_scan(name, code, n):
+    return scan(make(name, code=code), max_instructions=n)
+
+
+class ReturnBoundaryTests(unittest.TestCase):
+    """A linear scan walks past a ret into whatever follows; the output must say so, not stop silently."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.res = fn_scan("fn.sys", FN_CODE, len(FN_INSNS))
+        cls.by = {c["value"]: c for c in cls.res["candidates"]}
+
+    def test_candidate_before_any_ret_has_rets_before_zero(self):
+        c = self.by[0x222000]
+        self.assertEqual(c["rets_before"], 0)
+        self.assertFalse(c["may_be_in_another_function"])
+
+    def test_candidate_after_a_ret_has_rets_before_at_least_one(self):
+        c = self.by[0x224000]
+        self.assertEqual(c["address"]["rva"], hex(FN_CAND_2))
+        self.assertGreaterEqual(c["rets_before"], 1)
+        self.assertEqual(c["rets_before"], 1)
+        self.assertTrue(c["may_be_in_another_function"])
+        self.assertIn("another function", c["boundary_note"])
+
+    def test_scope_carries_the_ret_addresses_and_count(self):
+        r = self.res["scope"]["rets_passed"]
+        self.assertEqual(r["count"], 2)
+        self.assertEqual([x["rva"] for x in r["listed"]], [hex(FN_RET_1), hex(FN_RET_2)])
+        self.assertFalse(r["listed_truncated"])
+
+    def test_excluded_records_carry_the_same_information(self):
+        (x,) = self.res["excluded"]["listed"]
+        self.assertEqual(x["address"]["rva"], hex(FN_EXCL))
+        self.assertEqual(x["rets_before"], 1)
+        self.assertEqual(x["after_ret_at"]["rva"], hex(FN_RET_1))
+
+    def test_candidate_after_ret_names_which_ret(self):
+        self.assertEqual(self.by[0x224000]["after_ret_at"]["rva"], hex(FN_RET_1))
+        self.assertIsNone(self.by[0x222000]["after_ret_at"])
+
+    def test_no_ret_gives_empty_list_and_zero(self):
+        res = fn_scan("nr.sys", FN_CODE[:8], 2)
+        r = res["scope"]["rets_passed"]
+        self.assertEqual(r["count"], 0)
+        self.assertEqual(r["listed"], [])
+        self.assertEqual(res["candidates"][0]["rets_before"], 0)
+
+    def test_ret_is_not_a_stop_and_the_candidate_set_is_unchanged(self):
+        self.assertEqual(sorted(self.by), [0x222000, 0x224000])
+
+    def test_scope_declares_int3_and_padding_not_searched_as_boundary_signals(self):
+        txt = " ".join(self.res["scope"]["patterns_not_searched"])
+        self.assertIn("int3", txt)
+
+    def test_ret_list_is_capped_and_says_so(self):
+        n = 60
+        res = fn_scan("many.sys", b"\xC3" * n, n)
+        r = res["scope"]["rets_passed"]
+        self.assertEqual(r["count"], n)
+        self.assertEqual(len(r["listed"]), r["limit"])
+        self.assertTrue(r["listed_truncated"])
+
+
 class ContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
