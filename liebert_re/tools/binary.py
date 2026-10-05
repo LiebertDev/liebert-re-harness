@@ -776,6 +776,167 @@ def ioctl_control_code_decode(codes):
     return json.dumps({"ok":True,"tool":"ioctl_control_code_decode","results":[_icd_one(c) for c in codes]},ensure_ascii=False,indent=2)
 
 
+# --- ioctl_candidate_scan: the feeder for ioctl_control_code_decode -------------------------------------------
+# Scans a code region from a start address and collects the immediates that are COMPARED (cmp reg/mem, imm and
+# sub reg, imm chains), then hands them to ioctl_control_code_decode. It reports immediates compared in the
+# scanned region. It never says "the driver's IOCTLs": a compared immediate may be a constant, a mask, a
+# status code or an offset. proves_ioctl is always false and there is no boolean "is an IOCTL" field.
+_ICS_MAX_INSTRUCTIONS=5000
+_ICS_MIN_VALUE=0x10000
+_ICS_LISTED_EXCLUSIONS=50
+_ICS_STACK_REGS={"rsp","esp","sp","spl"}
+_ICS_PATTERNS_SEARCHED=[
+    "cmp reg, imm (32/64-bit operand; imm8/imm32 forms alike)",
+    "cmp [mem], imm (32/64-bit operand)",
+    "sub reg, imm (32/64-bit operand), chained across immediately following sub/cmp/test/conditional-jump "
+    "instructions on the same register: the cumulative amount is the value the original register is compared with",
+]
+_ICS_PATTERNS_NOT_SEARCHED=[
+    "mov reg, imm (a code loaded into a register and compared with another register)",
+    "cmp reg, reg and cmp reg, [mem] (nothing immediate to read)",
+    "lea reg, [reg-imm] and add reg, -imm (compilers also bias a switch this way)",
+    "jump-table switches (cmp reg, N; ja; jmp [table+reg*8]): the table is not read",
+    "sub [mem], imm, 8/16-bit operand widths, and any immediate outside the unsigned 32-bit range",
+    "control flow: the scan is linear from the start address, never follows jumps or calls, and does not stop at ret",
+]
+_ICS_STATEMENT=("Immediates that are compared in the scanned region, each split by ioctl_control_code_decode. This is "
+                "not a list of the driver's IOCTLs: a compared value may equally be a constant, a mask, a status code "
+                "or an offset. proves_ioctl is false for every entry. Which criteria a value meets is listed, never "
+                "summed into a verdict.")
+
+def _ics_fail(error,status,message,**extra):
+    out={"ok":False,"tool":"ioctl_candidate_scan","status":status,"error":error,"message":message}
+    out.update(extra)
+    return json.dumps(out,ensure_ascii=False,indent=2)
+
+def _ics_walk(instrs):
+    """Walk instructions linearly; return (matches, excluded). A match is a dict with pattern, value, raw, chain, entry."""
+    chains={}
+    matches=[];excluded=[]
+    for e in instrs:
+        m=e["mnemonic"];ops=e["operands"];imms=e.get("immediates")
+        parts=[x.strip() for x in ops.split(",")]
+        if m in ("cmp","sub") and imms and len(parts)==2 and len(imms)==1:
+            first=parts[0].lower()
+            is_mem=first.endswith("]")
+            if m=="sub" and is_mem:
+                chains.clear();continue
+            pattern="cmp_mem_imm" if is_mem else ("cmp_reg_imm" if m=="cmp" else "sub_reg_imm")
+            imm=imms[0]
+            where={"address":{"rva":e["address"].get("rva"),"va":e["address"].get("va")},"mnemonic":m,"operands":ops,"pattern":pattern}
+            if not is_mem and first in _ICS_STACK_REGS:
+                excluded.append(dict(where,compared_immediate=imm["hex"],reason="stack_pointer_register"));chains.clear();continue
+            if imm["size"] not in (4,8):
+                excluded.append(dict(where,compared_immediate=imm["hex"],reason="operand_width_not_32_or_64"));chains.pop(first,None);continue
+            raw=int(imm["hex"],16) if imm["size"]==4 else imm["value"]
+            if not 0<=raw<=0xFFFFFFFF:
+                excluded.append(dict(where,compared_immediate=imm["hex"],reason="not_unsigned_32_range"));chains.pop(first,None);continue
+            cum,chain=(0,[]) if is_mem else chains.get(first,(0,[]))
+            value=(cum+raw)&0xFFFFFFFF
+            if pattern=="sub_reg_imm":
+                chain=chain+[{"address":where["address"]["rva"],"subtracted":hex(raw)}]
+                chains[first]=(value,chain)
+            if value==0xFFFFFFFF:
+                excluded.append(dict(where,compared_immediate=hex(raw),value_hex=f"0x{value:08X}",reason="all_ones_sentinel"));continue
+            if value<_ICS_MIN_VALUE:
+                excluded.append(dict(where,compared_immediate=hex(raw),value_hex=f"0x{value:08X}",reason="below_0x10000_no_device_type"));continue
+            matches.append({"where":where,"value":value,"raw":raw,"chain":chain,
+                            "basis":"sub_chain_cumulative" if (len(chain)>1 if pattern=="sub_reg_imm" else bool(chain)) else "immediate"})
+        elif m.startswith("j") and m!="jmp":continue
+        elif m in ("nop","test","cmp"):continue
+        else:chains.clear()
+    return matches,excluded
+
+def ioctl_candidate_scan(path,start_rva=None,max_instructions=200,start_note=None):
+    """Scan a code region from ``start_rva`` for compared immediates and decode each with ioctl_control_code_decode.
+
+    ``start_rva`` is an RVA (int or "0x..." text). Left out, the scan starts at AddressOfEntryPoint; the origin is
+    recorded in ``scope.start.source`` (caller_supplied or AddressOfEntryPoint) and ``start_note`` is kept verbatim,
+    so an RVA taken from driver_major_function_scan is on the record as such. Nothing is chained automatically.
+
+    Searched: cmp reg/mem, imm and sub reg, imm chains. Not searched: see ``scope.patterns_not_searched``.
+    Immediates below 0x10000 (no room for a device type), stack-pointer operands and 0xFFFFFFFF are not candidates;
+    they are counted and listed in ``excluded`` with a reason. Each candidate lists named criteria
+    (device_type_in_known_table, reserved_bit_clear) and how many it meets; there is no boolean "is an IOCTL" field and
+    ``proves_ioctl`` is false. outcome FOUND, NOT_FOUND (only for the searched patterns, scan not truncated, every
+    byte decoded) or UNKNOWN (truncated or undecodable bytes and nothing found)."""
+    try:
+        p=safe_path(path)
+        pe=_pe(p)
+    except PermissionError as e:
+        return _ics_fail("PATH_REFUSED","ANALYSIS_LIMITED",str(e))
+    except Exception as e:
+        return _ics_fail("INVALID_PE","ANALYSIS_LIMITED",f"Invalid or corrupt PE file ({type(e).__name__}): {e}")
+    if start_rva is None:
+        rva=int(pe.OPTIONAL_HEADER.AddressOfEntryPoint)
+        source="AddressOfEntryPoint"
+        if rva==0:return _ics_fail("ENTRY_POINT_ABSENT","ANALYSIS_LIMITED","The PE has no entry point; pass start_rva.")
+    else:
+        try:rva=int(str(start_rva),0)
+        except ValueError:rva=-1
+        if rva<0:return _ics_fail("INVALID_START_RVA","ANALYSIS_LIMITED",f"start_rva must be a non-negative integer RVA, got {start_rva!r}.")
+        source="caller_supplied"
+    try:cap=max(1,min(int(max_instructions),_ICS_MAX_INSTRUCTIONS))
+    except (TypeError,ValueError):return _ics_fail("INVALID_MAX_INSTRUCTIONS","ANALYSIS_LIMITED",f"max_instructions must be an integer, got {max_instructions!r}.")
+    d=disassemble_pe_structured(str(path),va=pe.OPTIONAL_HEADER.ImageBase+rva,max_instructions=cap)
+    if not d.get("ok"):
+        return _ics_fail(d["error"],d["status"],d["message"])
+    instrs=d["instructions"]
+    matches,excluded=_ics_walk(instrs)
+    decoded=json.loads(ioctl_control_code_decode([m["value"] for m in matches]))["results"] if matches else []
+    cands=[]
+    for m,dec in zip(matches,decoded):
+        crit=[{"name":"device_type_in_known_table","met":bool(dec["device_type_known"]),
+               "basis":"device_type is a key of the decoder's FILE_DEVICE_* table"},
+              {"name":"reserved_bit_clear","met":not dec["reserved_bit_set"],
+               "basis":"bit 31 of the code is 0 under the decoder's field layout"}]
+        w=m["where"]
+        cands.append({"address":w["address"],"mnemonic":w["mnemonic"],"operands":w["operands"],"pattern":w["pattern"],
+                      "basis":m["basis"],"compared_immediate":hex(m["raw"]),"chain":m["chain"],
+                      "value":m["value"],"value_hex":f"0x{m['value']:08X}","decoded":dec,
+                      "criteria":crit,"criteria_met":sum(c["met"] for c in crit),"criteria_total":len(crit),"proves_ioctl":False})
+    cands.sort(key=lambda c:(-c["criteria_met"],int(c["address"]["rva"],16)))
+    reasons={}
+    for x in excluded:reasons[x["reason"]]=reasons.get(x["reason"],0)+1
+    truncated=bool(d["truncated"]);undec=d["decode_coverage"]["instructions_undecodable"]
+    limited=truncated or undec>0
+    outcome="FOUND" if cands else ("UNKNOWN" if limited else "NOT_FOUND")
+    searched="cmp reg, imm; cmp [mem], imm; sub reg, imm"
+    rationale=[]
+    if cands:
+        rationale.append(f"{len(cands)} immediate(s) were compared at the sites listed; none is shown to be a control code")
+        rationale.append("criteria are listed per candidate for ordering only; a value that meets none is still listed, and a value that meets all is not thereby an IOCTL")
+        rationale.append("custom device types (0x8000 and above) set bit 31 under this decoder's layout and so meet fewer criteria; they are not excluded for it")
+    elif limited:
+        why=[]
+        if truncated:why.append(f"the scan stopped at max_instructions={cap} and more code follows at {d['truncation']['more_at']['rva']}")
+        if undec:why.append(f"{undec} byte(s) did not decode")
+        rationale.append("no candidate was seen, but "+" and ".join(why)+"; this is UNKNOWN, not NOT_FOUND")
+    else:
+        rationale.append(f"in the {len(instrs)} instruction(s) scanned from {hex(rva)}, no comparison with an immediate was seen under the searched patterns ({searched}) that survived the admission rule")
+        rationale.append("this does not show that the region holds no IOCTL: the patterns not searched are listed in scope.patterns_not_searched")
+    if excluded:rationale.append(f"{len(excluded)} compared immediate(s) were set aside by the admission rule; see excluded")
+    if source=="AddressOfEntryPoint":rationale.append("the start is the entry point: DriverEntry rarely compares control codes; the dispatch handler is a different address")
+    res={"ok":True,"tool":"ioctl_candidate_scan","status":"ANALYSIS_LIMITED" if limited else "OK","path":relative(p),
+         "outcome":outcome,"proves_ioctl":False,
+         "scope":{"start":{"rva":hex(rva),"va":hex(pe.OPTIONAL_HEADER.ImageBase+rva),"source":source,"note":start_note},
+                  "architecture":d["architecture"],"instructions_scanned":len(instrs),"max_instructions":cap,
+                  "truncated":truncated,"ended_at":"instruction_budget" if truncated else "section_end",
+                  "instructions_undecodable":undec,
+                  "patterns_searched":list(_ICS_PATTERNS_SEARCHED),"patterns_not_searched":list(_ICS_PATTERNS_NOT_SEARCHED)},
+         "admission":{"rule":"a compared immediate (or cumulative sub-chain value) becomes a candidate only if it is an unsigned 32-bit "
+                             "value of at least 0x10000, so that the device_type field is not zero; the rest is listed in excluded",
+                      "min_value":hex(_ICS_MIN_VALUE),"excluded_registers":sorted(_ICS_STACK_REGS),"excluded_values":["0xFFFFFFFF"],
+                      "reason_for_min_value":"0, 1, 8, 0x20 and similar are loop counts, flags and stack or structure offsets far more often than control codes",
+                      "limits":"a counter, mask or status code of 0x10000 or more passes this rule; it narrows noise, it proves nothing"},
+         "candidates":cands,
+         "excluded":{"count":len(excluded),"reasons":reasons,"listed":excluded[:_ICS_LISTED_EXCLUSIONS],
+                     "listed_truncated":len(excluded)>_ICS_LISTED_EXCLUSIONS},
+         "rationale":rationale,"statement":_ICS_STATEMENT}
+    if truncated:res["scope"]["more_at"]=d["truncation"]["more_at"]
+    return json.dumps(res,ensure_ascii=False,indent=2)
+
+
 # --- driver_major_function_scan: a byte-pattern first pass over DriverEntry, NO disassembler -----------------
 # DriverObject->MajorFunction[IRP_MJ_*] = handler usually compiles to a store at a constant offset:
 #   x64:  lea reg,[rip+handler] ; mov [base+disp],reg      (MajorFunction at DRIVER_OBJECT+0x70, stride 8)
