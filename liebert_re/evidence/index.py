@@ -615,7 +615,16 @@ class EvidenceIndex:
             seen = set()
             changed = unchanged = malformed = errors = 0
             candidates = []
-            for dirpath, dirnames, filenames in os.walk(self.root):
+            walk_errors = 0
+
+            def _on_walk_error(_exc):
+                # An unreadable directory is skipped by os.walk; without this
+                # it would look like an empty one and its records would be
+                # deleted below. Count it so the scan is reported incomplete.
+                nonlocal walk_errors
+                walk_errors += 1
+
+            for dirpath, dirnames, filenames in os.walk(self.root, onerror=_on_walk_error):
                 dirnames[:] = [d for d in dirnames if not d.startswith(".")]
                 for name in filenames:
                     full = Path(dirpath) / name
@@ -648,7 +657,12 @@ class EvidenceIndex:
                 changed += 1
                 if is_malformed:
                     malformed += 1
-            saw_everything = not walk_truncated and total_eligible <= max_files
+            errors += walk_errors
+            # Any coverage error (walk or per-candidate) stops ALL deletions
+            # for this run, globally: no per-subtree permission, because the
+            # existing-minus-seen computation is global. Updates above still
+            # happened; `errors` and `truncated` report the incomplete scan.
+            saw_everything = not walk_truncated and total_eligible <= max_files and errors == 0
             removed_paths = sorted(set(existing) - seen) if saw_everything else []
             for rel in removed_paths:
                 old = existing[rel]
