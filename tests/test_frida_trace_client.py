@@ -106,6 +106,26 @@ class _FakeScriptWithBlockingExports(_FakeScript):
         self.exports_sync = _FakeBlockingExportsSync()
 
 
+class _FakeScriptInitRaises(_FakeScript):
+    """exports_sync.init exists but raises ``exc`` (a real agent init error)."""
+
+    def __init__(self, exc, source: str = "") -> None:
+        super().__init__(source)
+
+        class _Raising:
+            def __getattr__(_self, name):
+                def _call(*args, **kwargs):
+                    raise exc
+                return _call
+
+        self.exports_sync = _Raising()
+
+
+class _FakeScriptLoadRaises(_FakeScript):
+    def load(self) -> None:
+        raise RuntimeError("fake script.load() failure")
+
+
 def _make_first_fast_rest_slow_script_cls(sleep_seconds):
     """Factory (fresh state per call, so tests never share a counter) for a
     ``_FakeScript`` subclass where ``create_script()`` call #1 (the MAIN
@@ -587,6 +607,8 @@ class FridaTraceClientTest(unittest.TestCase):
         # unbounded/unknown -- resuming here would silently reopen the
         # unsynchronized-hook race rpc_sync exists to close.
         self.assertEqual(fake.device.resumed, [])
+        # ... and it is not leaked either: killed while still suspended.
+        self.assertEqual(fake.device.killed, [4242])
 
     def test_stdin_data_forces_pipe_stdio_and_delivers_via_device_input(self):
         # ROOT CAUSE regression guard (MEASURED live, 2026-09-16): stdio=
@@ -1244,6 +1266,101 @@ class FridaTraceClientTest(unittest.TestCase):
         # best-effort, rather than exiting in a way that breaks the run.
         self.assertIn(4242, device.resumed)
         self.assertIn(4242, device.killed)
+
+    # ---- agent init failure is not "no such export"; abandon scope ----
+
+    def test_init_error_is_reported_distinct_from_missing_export(self):
+        # An agent whose rpc.exports.init EXISTS but raises must not be
+        # folded into "this agent has no init export". UNVERIFIED against a
+        # real frida: the exact exception types frida raises are not measured.
+        script = _FakeScriptInitRaises(RuntimeError("agent init exploded: boom"))
+        result = client._init_agent_params_blocking(script, {"a": 1}, 1.0)
+        self.assertEqual(result.get("fallback_reason"), "init_failed")
+        self.assertEqual(result.get("rpc_error_type"), "RuntimeError")
+        self.assertIn("boom", result.get("rpc_error_detail") or "")
+
+    def test_missing_init_export_is_reported_as_export_missing(self):
+        script = _FakeScript("// no exports")  # no exports_sync -> AttributeError
+        result = client._init_agent_params_blocking(script, {"a": 1}, 1.0)
+        self.assertEqual(result.get("fallback_reason"), "export_missing")
+        self.assertEqual(result["method"], "post_async")
+
+    def test_init_error_visible_in_agent_params_sent_event(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = _write_temp_agent(Path(tmp))
+            fake = _FakeFridaModule(
+                script_cls=lambda src: _FakeScriptInitRaises(RuntimeError("agent init exploded: boom"), src)
+            )
+            code, lines = self._run([
+                "--spawn", r"C:\fake\target.exe", "--agent", str(agent),
+                "--agent-params", '{"a": 1}', "--duration-seconds", "0.2",
+            ], frida_module=fake)
+        sent = next(line for line in lines if line["event"] == "agent_params_sent")
+        self.assertEqual(sent.get("fallback_reason"), "init_failed")
+        self.assertIn("boom", sent.get("rpc_error_detail") or "")
+
+    def test_spawned_target_abandoned_when_agent_start_raises(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = _write_temp_agent(Path(tmp))
+            device = _FakeDevice(script_cls=_FakeScriptLoadRaises)
+            code, lines = self._run([
+                "--spawn", r"C:\fake\target.exe", "--agent", str(agent), "--duration-seconds", "0.2",
+            ], frida_module=_FakeFridaModule(device=device))
+        self.assertEqual(code, 5)
+        self.assertEqual(device.resumed, [])
+        self.assertEqual(device.killed, [4242])
+
+    def test_spawned_target_abandoned_when_init_times_out(self):
+        old_timeout = client.INIT_TIMEOUT_SECONDS
+        client.INIT_TIMEOUT_SECONDS = 0.05
+        try:
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmp:
+                agent = _write_temp_agent(Path(tmp))
+                device = _FakeDevice(script_cls=_FakeScriptWithBlockingExports)
+                code, lines = self._run([
+                    "--spawn", r"C:\fake\target.exe", "--agent", str(agent),
+                    "--agent-params", '{"a": 1}', "--duration-seconds", "0.2",
+                ], frida_module=_FakeFridaModule(device=device))
+        finally:
+            client.INIT_TIMEOUT_SECONDS = old_timeout
+        self.assertEqual(code, 5)
+        self.assertEqual(device.resumed, [])
+        self.assertEqual(device.killed, [4242])
+
+    def test_attached_target_never_abandoned_when_agent_start_raises(self):
+        # Narrowness: we did not spawn an attached process, so resuming or
+        # killing it would interfere with the user's own running program.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = _write_temp_agent(Path(tmp))
+            device = _FakeDevice(script_cls=_FakeScriptLoadRaises)
+            code, lines = self._run([
+                "--attach-pid", "999", "--agent", str(agent), "--duration-seconds", "0.2",
+            ], frida_module=_FakeFridaModule(device=device))
+        self.assertEqual(code, 5)
+        self.assertEqual(device.resumed, [])
+        self.assertEqual(device.killed, [])
+
+    def test_attached_target_never_abandoned_when_init_times_out(self):
+        old_timeout = client.INIT_TIMEOUT_SECONDS
+        client.INIT_TIMEOUT_SECONDS = 0.05
+        try:
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmp:
+                agent = _write_temp_agent(Path(tmp))
+                device = _FakeDevice(script_cls=_FakeScriptWithBlockingExports)
+                code, lines = self._run([
+                    "--attach-pid", "999", "--agent", str(agent),
+                    "--agent-params", '{"a": 1}', "--duration-seconds", "0.2",
+                ], frida_module=_FakeFridaModule(device=device))
+        finally:
+            client.INIT_TIMEOUT_SECONDS = old_timeout
+        self.assertEqual(code, 5)
+        self.assertEqual(device.resumed, [])
+        self.assertEqual(device.killed, [])
 
     def test_follow_children_disables_child_gating_on_clean_teardown(self):
         import tempfile

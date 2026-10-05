@@ -208,7 +208,11 @@ def test_published_tool_name_set_is_unchanged():
     # crash-symbolize PE binding slice: 740 -> 741, one private top-level name added in
     # liebert_re/recover/crash_symbolize.py, none removed: _bind_pe_to_dump_module. No new module.
     # Digest recomputed from the source.
-    assert digest == "84f7c6e02ea850dae8f3cf48e2f0e045ec4b4cd200f5a3ffeb23d90687eb7a72"
+    # frida init-error slice: 741 -> 742, one private top-level function added in
+    # liebert_re/dynamic/frida_trace_client.py, none removed: _classify_rpc_init_error (the marker
+    # tuple is an assignment, not a def, so it adds nothing). No new module.
+    # Digest recomputed from the source.
+    assert digest == "e9ad4a99d4364b058071d36d84face88843f77acbcc5ce0f56b66026f6a7a282"
 
 
 def test_the_imported_package_is_this_checkout():
