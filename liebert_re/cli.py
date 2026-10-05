@@ -373,7 +373,18 @@ def _ida_annotations(a):
 
 
 def _capabilities(a):
-    return {"families": _load("liebert_re.report.tool_families", "published_family_report")()}
+    # families: the existing {family: [named, implemented]} pair, unchanged.
+    # unimplemented: FAMILIES minus published_tools() per family -- the roadmap
+    # entries the counts only hinted at. Listed in full (about 100 short names,
+    # not worth a limit), so unimplemented_truncated is always False.
+    families = _load("liebert_re.report.tool_families", "FAMILIES")
+    published = _load("liebert_re.report.tool_families", "published_tools")
+    missing = {f: sorted(set(names) - published(f)) for f, names in families.items()}
+    missing = {f: names for f, names in missing.items() if names}
+    return {"families": _load("liebert_re.report.tool_families", "published_family_report")(),
+            "unimplemented": missing,
+            "unimplemented_total": sum(len(v) for v in missing.values()),
+            "unimplemented_truncated": False}
 
 
 def _shape(a):
