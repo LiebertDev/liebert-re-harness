@@ -150,6 +150,7 @@ class IndicatorTests(unittest.TestCase):
         r = triage("likely.sys", sections=(TEXT, INIT, PAGE), subsystem=1, imports=KERNEL_IMPORTS)
         self.assertEqual(r["driver_likelihood"], "LIKELY")
         self.assertIn("cannot be proven", r["statement"])
+        self.assertGreaterEqual(len(r["indicators"]), 1, "a LIKELY verdict came with no indicators")
         self.assertTrue(all(i["proves_driver"] is False for i in r["indicators"]))
 
     def test_conflicting_signals_give_unknown_with_the_conflict_named(self):

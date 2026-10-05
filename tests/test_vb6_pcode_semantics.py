@@ -134,6 +134,8 @@ class SemanticsFromHandlerBlocks(unittest.TestCase):
         prefix labelled 277 instructions of one procedure `PUSH_LOCAL_ADDRESS` when
         they are concatenations -- a reader would have trusted it.
         """
+        self.assertGreater(len(self.summary_entries), 0, "the runtime table produced no entries to check")
+        self.assertTrue(any(e.get("calls") for e in self.summary_entries), "no table entry calls a helper, so the check below has nothing to test")
         for entry in self.summary_entries:
             if entry.get("calls"):
                 self.assertIsNone(entry.get("semantics"),
