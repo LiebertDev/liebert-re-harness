@@ -253,7 +253,10 @@ def test_published_tool_name_set_is_unchanged():
     # structured disassembly slice: 771 -> 775 (measured), four top-level names added in liebert_re/tools/binary.py,
     # none removed: disassemble_pe_structured (public) and the private _dpe_open, _dps_form, _dps_entry.
     # No new module. Digest recomputed from the source.
-    assert digest == "5fa0ce0a1a605ef93596cf8982ed39aacf3322b2bbb1bea56a858b3e9eb658bd"
+    # control-code scan slice: 775 -> 778 (measured), three top-level names added in liebert_re/tools/binary.py,
+    # none removed: ioctl_candidate_scan (public) and the private _ics_fail, _ics_walk. No new module.
+    # Digest recomputed from the source.
+    assert digest == "df5ec6647a02f0cde09ded0de6217635d7ac0a12fa161cf9e034e12f144dbe3a"
 
 
 def test_the_imported_package_is_this_checkout():
