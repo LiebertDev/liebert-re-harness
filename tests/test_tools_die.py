@@ -318,5 +318,42 @@ class EvidenceIndexWriteTimeHookTests(unittest.TestCase):
         )
 
 
+class DieEmptyDocumentTests(unittest.TestCase):
+    """`{}` carries no `detects` structure at all: that is no measurement,
+    while `{"detects": []}` is a measured negative."""
+
+    def _run(self, stdout):
+        fake_result = mock.Mock(cancelled=False, timed_out=False, returncode=0,
+                                 stdout=stdout, stderr="", output_truncated=False)
+        with mock.patch.object(td, "_die_binary", return_value="C:/fake/diec.exe"), \
+             mock.patch("liebert_re.tools.die.safe_path", return_value=STUB_PE), \
+             mock.patch.object(td, "relative", return_value=STUB_PE.name), \
+             mock.patch("liebert_re.tools.die.run_bounded_process", return_value=fake_result):
+            return json.loads(td.die_identify(str(STUB_PE)))
+
+    @pytest.mark.contract
+    def test_empty_object_is_not_a_measurement_of_absence(self):
+        data = self._run("{}")
+        self.assertFalse(data["ok"], data)
+        self.assertEqual(data["status"], "RESULT_PARSE_FAILED")
+        self.assertEqual(data["error"], "DIE_OUTPUT_MISSING_DETECTS")
+        self.assertNotIn("protected", data)
+
+    @pytest.mark.contract
+    def test_detects_that_is_not_a_list_is_not_a_measurement(self):
+        for body in ('{"detects": null}', '{"detects": "none"}', '{"other": 1}'):
+            data = self._run(body)
+            self.assertFalse(data["ok"], (body, data))
+            self.assertEqual(data["error"], "DIE_OUTPUT_MISSING_DETECTS", body)
+
+    @pytest.mark.contract
+    def test_empty_detects_list_is_still_a_measured_negative(self):
+        data = self._run('{"detects": []}')
+        self.assertTrue(data["ok"], data)
+        self.assertEqual(data["status"], "OK")
+        self.assertIs(data["protected"], False)
+        self.assertEqual(data["protectors"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

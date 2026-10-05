@@ -352,6 +352,16 @@ def die_identify(path, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS, cancellation_to
     raw, fail = _parse_json(cp, tool)
     if fail:
         return fail
+    # `{"detects": []}` is a measured negative; a document with no `detects`
+    # list at all (e.g. `{}`) is no measurement, so it must not become
+    # `protected: false`.
+    if not isinstance(raw.get("detects"), list):
+        return _j({
+            "ok": False, "tool": tool, "status": "RESULT_PARSE_FAILED",
+            "error": "DIE_OUTPUT_MISSING_DETECTS",
+            "output_truncated": cp.output_truncated,
+            "stdout_tail": (cp.stdout or "")[-500:],
+        })
 
     evidence_name, evidence_error = _save_evidence(p.stem, "die", raw)
     normalized = _normalize(raw)
