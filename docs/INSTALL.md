@@ -5,7 +5,7 @@
 Only what you need to run and develop the analysis code. Concretely:
 
 - **68 Python modules** in the `liebert_re/` package — the analysis code itself.
-- **68 test files** in `tests/`, plus `conftest.py` and an empty `__init__.py`
+- **81 test files** in `tests/` (`tests/test_*.py`), plus `conftest.py` and an empty `__init__.py`
   (the latter is required so the flat top-level modules resolve on `sys.path`).
 - No challenge-solution scripts: they are not distributed in this public package (see [SOLVED_INDEX.md](../SOLVED_INDEX.md) for the record of what was solved).
 - Documentation, licence, CI configuration, and issue templates.
@@ -107,8 +107,8 @@ naming it — it does not silently degrade or guess.
 | **JADX** | Decompiling one named class from a DEX, APK-derived DEX or JVM `.class` / `.jar` (`liebert_re/tools/dex.py`, `liebert_re/tools/jvm.py`); structural listing works without it and the decompile operation returns `JADX_TOOL_MISSING` | `JADX_EXE`, else `jadx` on `PATH`, else a `teacher-tools/jadx/bin/jadx.bat` under the user's home directory |
 | **Il2CppDumper** | Unity IL2CPP type and method name to address mapping (`liebert_re/tools/il2cpp.py`); every operation returns `IL2CPPDUMPER_TOOL_MISSING` without it | `IL2CPPDUMPER_EXE`, else a `teacher-tools/il2cppdumper/Il2CppDumper.exe` under the user's home directory |
 | **UPX** | Static UPX unpacking with `upx -d` on a copy of the input (`liebert_re/tools/upx.py`); returns `TOOL_MISSING` without it | `UPX_HOME`, else `upx` on `PATH`, else a `teacher-tools/upx/upx.exe` under the user's home directory |
-| **IDA Pro 9.x** (licensed, with the Hex-Rays decompiler for `decompile_function`) | Read-only headless queries through `idat -A`: summary, function list, segments, function-at-address, pseudocode, cross-references, imports/exports, strings, and one function's microcode as a graph (`ida_microcode_cfg`; raw by default, with an opt-in d810 pass that needs the third-party d810 package in IDA's Python and says so in the answer) (`liebert_re/tools/ida.py`); returns `TOOL_MISSING` without it. also `ida_type_member_offset`, a patch *plan* (`ida_patch_plan`) and a read of the annotation log (`ida_annotations`, which needs no IDA). Persistent renames: `ida_rename_plan` then `ida_annotations_apply` (annotated data in its own root, byte ceiling `LIEBERT_IDA_ANNOTATED_BYTES`, default 2 GiB). Not wrapped: comments | `IDAT_EXE` (file or folder), else `IDA_HOME`, else `idat` on `PATH`, else the installer's default `IDA Professional 9*` / `IDA Pro 9*` folder under Program Files. Cache size cap: `LIEBERT_IDA_CACHE_BYTES` (default 5 GiB) |
-| **Ghidra** | Decompilation, cross-references, callers and callees | A wrapper for this lives in the upstream tree; this package does not ship it |
+| **IDA Pro 9.x** (licensed, with the Hex-Rays decompiler for `decompile_function`) | Headless queries through `idat -A` (reads, plus a plan-then-apply annotation write path): summary, function list, segments, function-at-address, pseudocode, cross-references, imports/exports, strings, and one function's microcode as a graph (`ida_microcode_cfg`; raw by default, with an opt-in d810 pass that needs the third-party d810 package in IDA's Python and says so in the answer) (`liebert_re/tools/ida.py`); returns `TOOL_MISSING` without it. also `ida_type_member_offset`, a patch *plan* (`ida_patch_plan`) and a read of the annotation log (`ida_annotations`, which needs no IDA). Persistent renames and comments: `ida_rename_plan` or `ida_set_comments_plan` then `ida_annotations_apply` (annotated data in its own root, byte ceiling `LIEBERT_IDA_ANNOTATED_BYTES`, default 2 GiB). Not wrapped: a disassembly listing, decompiler comments | `IDAT_EXE` (file or folder), else `IDA_HOME`, else `idat` on `PATH`, else the installer's default `IDA Professional 9*` / `IDA Pro 9*` folder under Program Files. Cache size cap: `LIEBERT_IDA_CACHE_BYTES` (default 5 GiB) |
+| **Ghidra** | Decompilation, cross-references, callers and callees | Slice 1 ships (`liebert_re/tools/ghidra.py`): `ghidra_status` and `ghidra_program_facts` (loader, language, processor, endianness, address width, compiler spec, image base, entry points, memory blocks, function count). No decompilation or cross-references yet. `analyzeHeadless` exits 0 even when its post-script fails, so success is judged from the log and the result file. Java script only (Jython does not run on a stock install). Not wired to the CLI. Located by `GHIDRA_INSTALL_DIR`, else `GHIDRA_HOME`, else `PATH`, else known install folders |
 
 Set an environment variable to the tool's install directory, for example:
 
@@ -186,7 +186,7 @@ whether the decompiler initialises.
 - **Your files are not modified.** The input is only read; the cache holds IDA's own database.
 - **What is returned is scrubbed.** Anything from IDA's log that reaches a result (failure tails) has the
   licence line, home-directory paths, and the input and scratch paths replaced.
-- Not shipped: comments. Only IDA 9.x is supported (IDA 9 has a
+- Not shipped: a disassembly listing and decompiler comments. Only IDA 9.x is supported (IDA 9 has a
   single `idat`; there is no `idat64`).
 
 ## The heavy test tier

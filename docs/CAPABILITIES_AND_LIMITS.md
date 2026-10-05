@@ -8,8 +8,9 @@ no plan; [ROADMAP.md](ROADMAP.md) owns direction.
 
 Read it with one fact in mind: **the capability set is general-purpose static
 inspection of Windows user-mode files, plus a small set of format-specific
-helpers. It is weak for kernel-level targets, and today it cannot analyse a
-kernel-mode binary in any meaningful way.**
+helpers. It is weak for kernel-level targets: `kernel_triage` gives a first
+look at whether a PE looks like a driver, but nothing here analyses a
+kernel-mode binary's dispatch table, IOCTLs or callbacks.**
 
 ## Part 1: What it can do
 
@@ -31,7 +32,8 @@ Module paths are relative to `liebert_re/`.
   `recover/native_pdb_toolchain.py`.
 - Partial: the PE surface does not cover delay imports, base relocations, the
   rich header or exception/unwind data. `tools/binary.py` reports the subsystem
-  number but nothing in the package branches on it.
+  number; the only code that branches on it is
+  `kernel_triage` (native subsystem as one indicator of a driver, see Part 2).
 
 ### Language-runtime and legacy formats (structure recovery)
 
@@ -111,7 +113,7 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
 
 ### Decompilation and cross-references (needs a licensed IDA)
 
-- `tools/ida.py`: `ida_query` (read-only), `ida_microcode_cfg` (below) and `ida_status`, driving IDA Pro 9.x headless
+- `tools/ida.py`: `ida_query` (read-only), `ida_microcode_cfg` (below), `ida_type_member_offset`, `ida_patch_plan` (a plan only), `ida_annotations` (reads the annotation log), the write path `ida_rename_plan` / `ida_set_comments_plan` / `ida_annotations_apply` / `ida_annotations_purge` (below) and `ida_status`, driving IDA Pro 9.x headless
   (`idat -A`) in a bounded subprocess. Operations: `summary`, `list_functions`, `segments`,
   `function_at_address`, `decompile_function` (Hex-Rays pseudocode), `xrefs_to` (any symbol or
   address, including import slots; calls are flagged, jumps are not calls), `imports_exports`,
@@ -189,12 +191,55 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
   `STALE_CONFIRMATION`. Targets are exact names (versions, kept candidates, leftover work directories, and
   `unverified-state`, which clears an unverified scope and says it did); there is no wildcard and no "all".
   It reaches only the annotated root and journals every deletion.
-- Not here: disassembly listing, decompiler comments, and any
-  Ghidra wrapper.
+- `not_purgeable` (in the purge report): purge also says what it does NOT delete. A read-only survey counts, per
+  class, the files and bytes of six artifact classes that sit beside the annotated scope and are never purge
+  targets: the pristine analysed-database cache (`dataset/ida_cache`, owned by the cache's own eviction and
+  budget), the evidence files (`dataset/evidence/ida_*`, the ledger of what the tools reported), this target's
+  write journal (counted for the input hash only; it is the record purge itself is written to), the claims
+  (`dataset/claims`, the source of truth for recorded claims) and the two derived index directories
+  (`dataset/metadata/claim_indexes`, `dataset/metadata/evidence_indexes`, rebuilt by their own modules). Each
+  row carries `purgeable: false` and a `why_not_a_purge_target`. The survey only lists directories and reads
+  sizes: it opens no file, writes nothing, deletes nothing, reads no content and returns no file name, only
+  fixed relative labels, counts and byte totals. A missing directory says `present: false`; one that cannot be
+  read reports `read_errors` and the error types, never an empty count.
+- Not here: disassembly listing and decompiler comments. Ghidra: see the next section.
+- A copy handed to an engine session is verified by hash: on a mismatch the session is not started. "The copy
+  differs" (`COPY_INTEGRITY_FAILED`) and "the copy could not be checked" (`COPY_INTEGRITY_UNVERIFIABLE`) are
+  separate refusals.
+- When a verification session fails, a bounded, redacted tail of the engine log comes back in the answer.
+  `LIEBERT_RE_KEEP_FAILED_SCRATCH` (off by default) keeps the failed scratch directory and the answer says it
+  holds sensitive content.
+- `ida_status` reads and reports the Lumina setting (`AutoUseLumina`). That is a CONFIGURATION READ, not an
+  observation of the network.
+- `pdb_lookup_declared` is a declaration about this tool's own command line, not a measurement of IDA.
+  `signals.log_network_text_found` is a scan of log text for listed markers; a lookup that writes none of them
+  is not seen, and the answer states that limit.
+
+### Ghidra (headless, slice 1: status and program facts)
+
+- `tools/ghidra.py`: `ghidra_status` and `ghidra_program_facts`, driving Ghidra's own `support/analyzeHeadless`.
+  Not wired to the CLI.
+- `ghidra_status` discovers the install (`GHIDRA_INSTALL_DIR`, `GHIDRA_HOME`, `PATH`, then known locations) and
+  reports the version, the Java the install needs and the Java found. It does NOT launch Ghidra
+  (`launcher_verified: false`): `OK` means files present and Java new enough, not that a run will succeed.
+- `ghidra_program_facts` imports one file into a throw-away project and returns, read-only: loader, language,
+  processor, endianness, address width, compiler spec, image base, entry points, memory blocks, function count
+  (what analysis found in the time bound, not a complete inventory) and imported library names. A fact the
+  script could not read is `null` and named, never guessed. The source file's SHA-256 is compared before and
+  after; a changed source is refused (`SOURCE_MODIFIED`).
+- **Exit code 0 is not success.** Measured: when the post-script fails, `analyzeHeadless` still exits 0. The
+  wrapper scans the log for failure markers and requires the result file to exist, parse and carry the
+  script's completion flag; anything less is `ANALYSIS_LIMITED`.
+- The script is Java. A Jython `.py` script does not run on a stock install ("Ghidra was not started with
+  PyGhidra"); PyGhidra needs a `pip install` and is not used or tested here.
+- Each run has its own temporary project (Ghidra locks per project), placed outside the checkout because Ghidra
+  refuses a project path with a dot-prefixed element.
+- Why it was added: it is free and runs in CI (an IDA licence does not), and "answer the same question two
+  ways" in the assessment order needs a second engine. Not here: decompilation, cross-references, writes.
 
 ### External-engine wrappers actually present
 
-rizin (listing, function inventory, patching, rz-bin structure reads, FLIRT matching), Detect It Easy, YARA-X, capa, IDA (read-only, see above), pe-sieve (one live process, see below), UPX,
+rizin (listing, function inventory, patching, rz-bin structure reads, FLIRT matching), Detect It Easy, YARA-X, capa, IDA (queries are read-only; annotations are written only through the plan-then-apply path, see above), pe-sieve (one live process, see below), UPX,
 JADX, Il2CppDumper, and the API Monitor catalogue only. All are optional and
 return a named tool-missing status when absent. Function inventory
 (`rizin_functions`) needs rizin; it is not pure Python.
@@ -210,8 +255,10 @@ return a named tool-missing status when absent. Function inventory
   `report/analysis_findings.py`, `report/exploit_validation.py`. Partial:
   nothing in the package produces an IR from a binary.
 - Workspace path sandbox, bounded subprocess with process-tree teardown, and a
-  `liebert-re` CLI (`identify`, `probe`, `pe`, `disasm`, `packer`, `die`, `diestatus`,
-  `capa`, `capastatus`, `ida`, `idastatus`, `rzbin`, `rzbinstatus`, `flirt`, `flirtinventory`, `sieve`, `sievestatus`, `yarastatus`, `upxstatus`, `il2cppstatus`, `dexstatus`, `jvmstatus`, `unpack`, `scan`, `minidump`, `capabilities`):
+  `liebert-re` CLI (`identify`, `probe`, `pe`, `disasm`, `packer`, `die`, `rzbin`, `flirt`, `flirtinventory`,
+  `sieve`, `labgate`, `labregister`, `sievestatus`, `rzbinstatus`, `diestatus`, `yarastatus`, `upxstatus`,
+  `il2cppstatus`, `dexstatus`, `jvmstatus`, `capa`, `capastatus`, `ida`, `idamicrocode`, `idastatus`, `unpack`,
+  `scan`, `minidump`, `capabilities`; 29 subcommands, from `cli.py`):
   `workspace.py`, `bounded_subprocess.py`, `cli.py`.
 
 ### Dynamic and emulation
@@ -238,7 +285,7 @@ return a named tool-missing status when absent. Function inventory
 
 ### Test coverage
 
-68 test files; a default run on this checkout gave 527 passed, 39 skipped,
+81 test files (`tests/test_*.py`); an earlier default run on this checkout gave 527 passed, 39 skipped,
 157 deselected (`heavy`), before the IDA wrapper's tests were added. Fixtures are built in code
 (`recover/owned_binary_fixtures.py`); no real binaries ship. Real-engine paths
 skip on a clean checkout, so CI does not demonstrate them.
@@ -248,17 +295,33 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
 
 ## Part 2: Where it is weak
 
-### Kernel-level targets are out of reach today
+### Kernel-level targets: a first look only
 
-- `report/tool_families.py` names a `windows-kernel` family of 15 tools. Only the
-  generic `tool_missing` sentinel is defined in this package; the other 14 are
-  names of upstream tools that are not here. The family routes and then has
-  nothing to dispatch. The other names are a roadmap, not capability: this package cannot analyse a kernel
-  driver.
+- `report/tool_families.py` names a `windows-kernel` family of 15 tools. Two are
+  defined in this package: the generic `tool_missing` sentinel and
+  `kernel_triage`. The other 13 are names of upstream tools that are not here;
+  they are a roadmap, not capability.
+- `kernel_triage` (`tools/binary.py`) is read-only and reads one PE with
+  `pefile`: machine, subsystem, sections (including `INIT` and `PAGE` names),
+  the import directory, resources and the debug directory. Each signal is
+  reported separately as an `indicators` entry with its `confidence`
+  (`deterministic` for the native subsystem and a `ntoskrnl.exe` / `hal.dll`
+  import, `heuristic` for `INIT` and `PAGE` section names), and every entry
+  carries `proves_driver: false`. `driver_likelihood` is `LIKELY` only when the
+  native subsystem and a kernel import are both observed and the imports were
+  fully readable; every other case, including conflicting or unreadable
+  evidence, is `UNKNOWN`, with a `rationale` saying what is missing. It never
+  returns a flat verdict because no static read of a file proves it will load
+  as a driver. Fields it could not determine are `null` and listed in
+  `unknown_fields`; a truncated file or an unreadable directory is
+  `ANALYSIS_LIMITED`; a non-PE or an unsupported machine is refused.
+- What `kernel_triage` does NOT do: it finds no dispatch routine, no IOCTL or
+  control code, no callback registration, no device name, and it does not
+  disassemble, emulate or run anything. It is not wired to the CLI.
 - No module parses a driver's dispatch table, callback registrations, device or
-  control-code definitions, or any other kernel-specific structure. A
-  kernel-mode PE is handled as an ordinary PE: headers, imports, strings,
-  disassembly.
+  control-code definitions, or any other kernel-specific structure. Beyond the
+  `kernel_triage` first look, a kernel-mode PE is handled as an ordinary PE:
+  headers, imports, strings, disassembly.
 - No exception/unwind data parser, so no function-boundary recovery for stripped
   x64 images.
 - No bounded code-range emulation, so nothing can exercise a routine in
@@ -267,8 +330,8 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
   formats. Only `MDMP`-format dumps are read.
 - No decompiler and no cross-reference engine of its own. With a licensed IDA Pro 9.x on the
   machine, `ida_query` supplies decompiled pseudocode and cross-references from IDA's analysis of
-  the real bytes (read-only, symbol-server lookups off); without IDA there is neither, and no Ghidra
-  wrapper exists. `recover/native_xref.py` resolves only over an IR the caller supplies.
+  the real bytes (read-only, symbol-server lookups off); without IDA there is neither, and the Ghidra
+  wrapper does not decompile or cross-reference (facts only). `recover/native_xref.py` resolves only over an IR the caller supplies.
 - The package has never been demonstrated against a real kernel-mode file. The
   only driver-flavoured artefact is a synthetic fixture in
   `recover/owned_binary_fixtures.py`; kernel-oriented wording in
@@ -315,8 +378,8 @@ sit on disk.
    instruction-semantics correction layer. It also lists function inventory
    there, but `rizin_functions` needs rizin.
 4. `INSTALL.md` counts: "64 Python modules at the repository root", "47 test
-   files". Actual: 68 modules inside the `liebert_re/` package (CI asserts 68),
-   68 test files. The "11 standalone challenge-solution scripts in
+   files". Actual at that check: 68 modules inside the `liebert_re/` package (CI asserts 68),
+   68 test files (81 when re-counted later with `ls tests/test_*.py`). The "11 standalone challenge-solution scripts in
    `crackme_solutions/`" claim was removed; those scripts are not distributed
    in this package.
 5. `BENCHMARKS.md` lists angr as a real in-process integration. Nothing in the
