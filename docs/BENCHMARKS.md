@@ -135,10 +135,10 @@ subset *of*:
 
 **Scope warning, so this table is not misread.** It describes the **wider private
 working tree**, not this package. This package drives **rizin, Detect It Easy,
-YARA-X, API Monitor, capa, IDA (read-only), UPX, JADX and Il2CppDumper** (plus a detect-only MSVC PDB
+YARA-X, API Monitor, capa, IDA, UPX, JADX and Il2CppDumper** (plus a detect-only MSVC PDB
 toolchain probe); see the README section "External tools are your responsibility".
-The Ghidra, FLOSS, pe-sieve, angr and Frida integrations listed below
-are *not* in this package, and **this package does not contain or redistribute a
+FLOSS, pe-sieve, angr and Frida integrations listed below
+are *not* in this package (Ghidra is, as a status and program-facts slice), and **this package does not contain or redistribute a
 capa, FLOSS or IDA binary** — capa and IDA are driven only if you install them, and
 there is no driver for FLOSS. The README lists what is
 deliberately excluded.
@@ -149,8 +149,8 @@ distinction is usually where tool inventories lie.
 
 | Engine | Integration |
 |---|---|
-| IDA (Professional) | **Real, read-only subset in this package** — `idat -A` batch in a bounded subprocess, database cache keyed by the input file's SHA-256 and size-capped; write operations are in the private tree only; microcode reading, type-member offsets, patch planning and the annotation-log read are here |
-| Ghidra | **Real** — `analyzeHeadless`, session-scoped project |
+| IDA (Professional) | **Real subset in this package** — `idat -A` batch in a bounded subprocess, database cache keyed by the input file's SHA-256 and size-capped; the annotation write path (rename and comment plans, `ida_annotations_apply`, `ida_annotations_purge`), microcode reading, type-member offsets, patch planning (a plan only) and the annotation-log read are here; a disassembly listing is not |
+| Ghidra | **Real, slice 1 only in this package** — `analyzeHeadless`, one throw-away project per call; install status and read-only program facts, no decompilation; exit code 0 is not trusted, the log and result file decide |
 | rizin / radare2 | **Real** (rizin wrapper only in this package; no radare2 driver) — bounded subprocess wrapper |
 | Capstone, Unicorn | **Real** — in-process imports (Unicorn only for the VEX self-check in `recover/vex.py`; no range emulation ships) |
 | angr | **Not in this package** — nothing imports it |

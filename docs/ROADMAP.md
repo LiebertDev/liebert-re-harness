@@ -94,9 +94,8 @@ hidden feature.
   `case_purge` integration is not done: the annotated purge does not read case state today, so a case
   becoming `solved` or `abandoned` does not trigger it.
   **Still open:** `ida_disasm_listing` (read-only, next
-  round), a Ghidra
-  wrapper (the more approachable half, since `analyzeHeadless` is scriptable and free to
-  install), and normalising answers across engines.
+  round), Ghidra decompilation and cross-references (slice 1, `ghidra_status` and
+  `ghidra_program_facts`, has landed), and normalising answers across engines.
 - **Function-boundary recovery from exception-directory unwind data**, with
   prologue scanning and cross-checking against whatever a disassembly engine
   already found. Valuable specifically for stripped or partially-obfuscated x64
@@ -135,8 +134,11 @@ hidden feature.
 ## Hard problems, honestly hard
 
 - **Kernel static analysis is a staged roadmap and is NOT implemented.** The `windows-kernel` family in
-  `liebert_re/report/tool_families.py` names tools that are not in this package (one of 15 is defined, the
-  generic `tool_missing`). Treat those names as planned routing, not as capability. The first slice will be `kernel_triage`; the other 14 names in the `windows-kernel` family are roadmap.
+  `liebert_re/report/tool_families.py` names 15 tools, of which two are defined in this package: the generic
+  `tool_missing` sentinel and `kernel_triage`, the first slice. `kernel_triage` is a first look only (static
+  indicators and a `driver_likelihood` that is never a proof); it does not read dispatch tables, IOCTL codes or
+  callback registrations. The other 13 names in the `windows-kernel` family are roadmap: treat them as planned
+  routing, not as capability.
 
 These are real and known gaps, named so nobody rediscovers them by surprise. They
 are explicitly **not** good first contributions — each is a research problem on

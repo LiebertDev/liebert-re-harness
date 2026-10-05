@@ -17,9 +17,12 @@ working tree this project is developed in, which is far larger than what is
 published here (see README.md, "What is in this repository, and what is
 not"). Most names below are not implemented anywhere in this published
 package -- ``"windows-kernel"`` is the extreme case: of its 15 named tools,
-only the generic ``tool_missing`` sentinel is actually defined here, so this
-package cannot analyse a kernel driver even though the family exists and
-routes for one. Do not read membership in a ``FAMILIES[...]`` set as "this
+only two are defined here, the generic ``tool_missing`` sentinel and
+``kernel_triage``. ``kernel_triage`` is a first look only: it reports
+indicators and a ``driver_likelihood`` of LIKELY or UNKNOWN (``proves_driver``
+is always false). There is no dispatch-table, IOCTL or callback analysis, so
+this package still cannot analyse a kernel driver in any real depth even
+though the family exists and routes for one. Do not read membership in a ``FAMILIES[...]`` set as "this
 package can do that."  Call :func:`published_tools` for the subset of a
 family this package can actually dispatch (a real, locally-defined function),
 computed by introspection so it can never silently drift from reality the
@@ -29,9 +32,10 @@ A name in a family that is not locally defined is a ROADMAP entry: it records
 where the tool would route, not that it exists here. Nothing in the set marks
 it, so the machine-readable form of "not implemented" is the difference
 between ``FAMILIES[family]`` and :func:`published_tools` (counts per family:
-:func:`published_family_report`). Measured at the time of writing (named /
-locally defined): workspace 15/10, identity 14/4, source 7/3, binary 4/4,
-native 78/54, windows-kernel 15/1, dotnet 9/4, archive 2/2, android 6/6,
+:func:`published_family_report`). Measured at the time of writing, from
+:func:`published_family_report` (named / locally defined): workspace 15/10,
+identity 14/4, source 7/3, binary 4/4,
+native 80/57, windows-kernel 15/2, dotnet 9/4, archive 2/2, android 6/6,
 game-engine 11/9, network 3/3, database 2/2, structured 3/2, jvm 5/5,
 webassembly 2/2, correlation 18/5, debug 9/6, web 2/2, dynamic 39/8,
 crypto 7/4, emulation 6/1. Re-measure rather than trust this list.
