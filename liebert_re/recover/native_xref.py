@@ -376,7 +376,19 @@ def native_xref_analyze(ir_json: str, observations_json: str, max_observations: 
         return json.dumps({"ok": False, "status": "INVALID_INPUT", "error_type": type(exc).__name__})
     if not isinstance(observations, list):
         return json.dumps({"ok": False, "status": "INVALID_SCHEMA"})
-    report = resolve_native_xrefs(ir, observations[: max(1, min(int(max_observations), 20_000))])
+    limit = max(1, min(int(max_observations), 20_000))
+    report = resolve_native_xrefs(ir, observations[:limit])
+    not_examined = max(0, len(observations) - limit)
+    report["observations_received"] = len(observations)
+    report["observations_examined"] = len(observations) - not_examined
+    report["observations_not_examined"] = not_examined
+    report["observations_truncated"] = not_examined > 0
+    report["limit_reached"] = "max_observations" if not_examined else None
+    if not_examined:
+        # A claim over a subset of the observations is not proven for the rest.
+        report["status"] = "PARTIAL"
+        report["limitations"] = [*report["limitations"],
+                                 f"{not_examined} observation(s) beyond max_observations={limit} were not examined"]
     report["ir"] = ir.to_dict()
     return json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True, default=str)
 

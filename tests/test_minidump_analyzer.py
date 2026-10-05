@@ -294,5 +294,40 @@ class FamiliesRegistrationTests(unittest.TestCase):
         self.assertIn("minidump_analyzer", tool_families.FAMILIES["debug"])
 
 
+class StackScanLimitTests(unittest.TestCase):
+    """A reached candidate limit must be reported, not read as a full scan."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=tools_workspace.WORKSPACE)
+        self.root = Path(self.temp.name)
+        self.rsds = build_rsds(guid=GUID_LE, age=AGE, pdb=b"owned.pdb\0")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _scan(self, planted, limit=20):
+        dump = build_full_minidump(
+            self.root / "limit.mdmp", rsds=self.rsds,
+            stack_qwords=[PLANTED_CANDIDATE_VA] * planted,
+        )
+        return analyze_minidump(str(dump), max_stack_candidates=limit)["threads"]["items"][0]
+
+    def test_candidates_over_the_limit_are_reported_as_truncated(self):
+        thread = self._scan(21)
+        self.assertEqual(len(thread["stack_scan_candidates"]), 20)
+        self.assertNotEqual(thread["stack_scan_status"], "SCANNED")
+        self.assertTrue(thread["stack_scan_truncated"])
+        self.assertEqual(thread["stack_scan_limits_reached"], ["max_stack_candidates"])
+        self.assertEqual(thread["stack_scan_candidates_omitted"], 1)
+
+    def test_candidates_at_or_under_the_limit_are_a_complete_scan(self):
+        for planted in (19, 20):
+            thread = self._scan(planted)
+            self.assertEqual(thread["stack_scan_status"], "SCANNED")
+            self.assertFalse(thread["stack_scan_truncated"])
+            self.assertEqual(thread["stack_scan_limits_reached"], [])
+            self.assertEqual(thread["stack_scan_candidates_omitted"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

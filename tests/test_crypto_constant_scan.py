@@ -406,5 +406,34 @@ class RealTargetReplayTests(unittest.TestCase):
         self.assertIsNone(_named(result, "SHA-3 / Keccak"))
 
 
+class HitLimitReportingTests(unittest.TestCase):
+    """A reached per-signature hit limit must be reported in the response."""
+
+    @staticmethod
+    def _repeated(count):
+        word = _words_le([_group("SHA-256", "K_table_head")[0]])
+        return b"".join(b"\x22" * 4 + word for _ in range(count))
+
+    @staticmethod
+    def _match(result):
+        return _named(result, "SHA-256")["matched_groups"][0]["matches"][0]
+
+    def test_per_signature_limit_is_reported_as_truncation(self):
+        result = _scan_bytes(self._repeated(tools_crypto_id._MAX_HITS_PER_SIGNATURE + 1))
+        match = self._match(result)
+        self.assertEqual(match["hit_count"], tools_crypto_id._MAX_HITS_PER_SIGNATURE)
+        self.assertTrue(result["hit_output_truncated"])
+        self.assertEqual(result["hit_limits_reached"], ["per_signature"])
+        self.assertTrue(match["hits_truncated"])
+
+    def test_hits_at_the_per_signature_limit_are_not_truncated(self):
+        result = _scan_bytes(self._repeated(tools_crypto_id._MAX_HITS_PER_SIGNATURE))
+        match = self._match(result)
+        self.assertEqual(match["hit_count"], tools_crypto_id._MAX_HITS_PER_SIGNATURE)
+        self.assertFalse(result["hit_output_truncated"])
+        self.assertEqual(result["hit_limits_reached"], [])
+        self.assertFalse(match["hits_truncated"])
+
+
 if __name__ == "__main__":
     unittest.main()

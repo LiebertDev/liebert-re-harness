@@ -367,6 +367,7 @@ def _scan(path, offset, length, only_algorithms):
     results = []
     total_hits = 0
     truncated = False
+    limits_reached = set()
     for algo, groups in _SIGNATURES.items():
         if selected and algo not in selected:
             continue
@@ -378,14 +379,20 @@ def _scan(path, offset, length, only_algorithms):
             for index, value in enumerate(group["values"]):
                 if total_hits >= _MAX_TOTAL_HITS:
                     truncated = True
+                    limits_reached.add("total")
                     break
                 if not _searchable(kind, value):
                     skipped_as_too_common.append(_label(kind, value))
                     continue
                 for encoding, needle in _needles(kind, value):
-                    positions = _find_all(data, needle, _MAX_HITS_PER_SIGNATURE)
+                    positions = _find_all(data, needle, _MAX_HITS_PER_SIGNATURE + 1)
                     if not positions:
                         continue
+                    hits_truncated = len(positions) > _MAX_HITS_PER_SIGNATURE
+                    if hits_truncated:
+                        positions = positions[:_MAX_HITS_PER_SIGNATURE]
+                        truncated = True
+                        limits_reached.add("per_signature")
                     total_hits += len(positions)
                     hits = []
                     for p in positions:
@@ -396,6 +403,7 @@ def _scan(path, offset, length, only_algorithms):
                         hits.append(entry)
                     matched.append({"index": index, "constant": _label(kind, value),
                                     "encoding": encoding, "hit_count": len(positions),
+                                    "hits_truncated": hits_truncated,
                                     "hits": hits})
             expected = len(group["values"])
             searchable = expected - len(skipped_as_too_common)
@@ -454,6 +462,8 @@ def _scan(path, offset, length, only_algorithms):
         "algorithms_in_table": len(_SIGNATURES),
         "candidates": results,
         "hit_output_truncated": truncated,
+        "hit_limits_reached": sorted(limits_reached),
+        "hit_limits": {"per_signature": _MAX_HITS_PER_SIGNATURE, "total": _MAX_TOTAL_HITS},
     }
 
 

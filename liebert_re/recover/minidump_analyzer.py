@@ -112,12 +112,16 @@ def analyze_minidump(path: str, *, pe_path: str = "", pdb_path: str = "", max_st
         any_captured_stack = True
         raw = bytes.fromhex(mem["data_hex"])
         truncated = read_size < data_size
+        limits_reached = ["max_stack_scan_bytes"] if truncated else []
+        omitted = 0
         for offset in range(0, len(raw) - 7, 8):
-            if len(candidates) >= max_stack_candidates:
-                break
             value = int.from_bytes(raw[offset:offset + 8], "little")
             hit = _module_containing_address(modules_items, value)
             if hit is None:
+                continue
+            if len(candidates) >= max_stack_candidates:
+                # Keep counting (without symbolizing) so the omission is stated.
+                omitted += 1
                 continue
             candidate = {
                 "stack_offset": offset,
@@ -140,7 +144,14 @@ def analyze_minidump(path: str, *, pe_path: str = "", pdb_path: str = "", max_st
                 except Exception:
                     pass
             candidates.append(candidate)
-        thread["stack_scan_status"] = "SCANNED_TRUNCATED" if truncated else "SCANNED"
+        if omitted:
+            limits_reached.append("max_stack_candidates")
+        thread["stack_scan_limits_reached"] = limits_reached
+        thread["stack_scan_truncated"] = bool(limits_reached)
+        # Candidates omitted by the candidate limit; the bytes beyond the byte
+        # limit were never read, so no count exists for them.
+        thread["stack_scan_candidates_omitted"] = omitted
+        thread["stack_scan_status"] = "SCANNED_TRUNCATED" if limits_reached else "SCANNED"
 
     # 3. Claims ceiling + limitations.
     ceiling = dict(structural.get("claims_ceiling") or {})
