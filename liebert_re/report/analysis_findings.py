@@ -234,7 +234,20 @@ def counter_evidence_verify(hypothesis_json: str, candidates_json: str, known_ev
     return json.dumps({"ok": True, "status": result.get("status"), "hypothesis": result}, ensure_ascii=False, indent=2, sort_keys=True)
 
 
-def finding_report_generate(findings_json: str, artifact_hashes_json: str = "{}", scope_notes: list[str] | None = None) -> str:
+def finding_report_generate(
+    findings_json: str, artifact_hashes_json: str = "{}", scope_notes: list[str] | None = None,
+    evidence: str | None = None,
+) -> str:
+    """Render the finding report and, when ``evidence`` is supplied, audit its claims.
+
+    The added ``claim_guard`` field has three distinguishable states:
+    ``CHECKED_CLEAN`` (guard ran, no issues), ``CHECKED_ISSUES`` (guard ran and
+    found claims with no counterpart in ``evidence``) and ``NOT_CHECKED``
+    (no evidence text supplied, so nothing was audited; ``issues`` is ``None``,
+    not ``[]``). Issues never flip ``ok``/``status``: the guard is regex based
+    and can produce false positives, so it informs the reader instead of
+    rejecting the report.
+    """
     try:
         findings = json.loads(findings_json)
         artifact_hashes = json.loads(artifact_hashes_json or "{}")
@@ -243,7 +256,26 @@ def finding_report_generate(findings_json: str, artifact_hashes_json: str = "{}"
     if not isinstance(findings, list) or not isinstance(artifact_hashes, dict):
         return json.dumps({"ok": False, "status": "INVALID_SCHEMA"})
     report = render_finding_report(findings, artifact_hashes=artifact_hashes, scope_notes=scope_notes or ())
-    return json.dumps({"ok": report["status"] == "PASS", **report}, ensure_ascii=False, indent=2, sort_keys=True)
+    guard: dict[str, Any] = {
+        "checked": False, "state": "NOT_CHECKED", "issues": None, "contains_unproven_claims": None,
+        "note": "No evidence text was supplied, so the report's claims were not audited.",
+        "caveat": "The claim guard is regex based and can produce false positives; it flags, it does not reject.",
+    }
+    if evidence is not None and str(evidence).strip():
+        from liebert_re.evidence.claim_guard import claim_guard_issues
+
+        claim_text = "\n".join(
+            str(row.get(key) or "")
+            for row in report["findings"]
+            for key in ("observed_behavior", "hypothesis", "attacker_goal", "remediation", "location")
+        )
+        issues = claim_guard_issues(claim_text, evidence)
+        guard.update(
+            checked=True, state="CHECKED_ISSUES" if issues else "CHECKED_CLEAN", issues=issues,
+            contains_unproven_claims=bool(issues),
+            note="Claims were compared with the supplied evidence text.",
+        )
+    return json.dumps({"ok": report["status"] == "PASS", **report, "claim_guard": guard}, ensure_ascii=False, indent=2, sort_keys=True)
 
 
 __all__ = [
