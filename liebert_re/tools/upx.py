@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import shutil
+import tempfile
 from pathlib import Path
 from liebert_re.bounded_subprocess import run_bounded_process
 from liebert_re.workspace import PROJECT_ROOT, safe_path, relative
@@ -67,32 +68,41 @@ def upx_unpack(path, timeout_seconds=60, cancellation_token=None):
         original_sha256 = hashlib.sha256(original_bytes).hexdigest()
         original_size = len(original_bytes)
 
-        work_copy = EVIDENCE / f"{original_sha256}_input{p.suffix or '.exe'}"
-        work_copy.write_bytes(original_bytes)
-        output_path = EVIDENCE / f"{original_sha256}_unpacked{p.suffix or '.exe'}"
-        if output_path.exists():
-            output_path.unlink()
+        suffix = p.suffix or ".exe"
+        # The published path stays content-addressed (same input bytes, same name), but nothing is ever
+        # written to it directly and a published output is never deleted to make room: each call works
+        # in its own scratch directory and promotes with os.replace only on success. A failed or
+        # timed-out call therefore cannot remove or alter what an earlier call published.
+        output_path = EVIDENCE / f"{original_sha256}_unpacked{suffix}"
+        scratch = Path(tempfile.mkdtemp(prefix="scratch-", dir=EVIDENCE))
+        try:
+            work_copy = scratch / f"input{suffix}"
+            work_copy.write_bytes(original_bytes)
+            scratch_output = scratch / f"unpacked{suffix}"
 
-        cp = run_bounded_process(
-            [exe, "-d", "-o", str(output_path), str(work_copy)],
-            timeout_seconds=timeout_seconds,
-            cancellation_token=cancellation_token,
-        )
-        if cp.timed_out or cp.cancelled:
-            return _j({
-                "ok": False, "tool": "upx_unpack",
-                "status": "CANCELLED" if cp.cancelled else "TIMEOUT",
-                "stdout": cp.stdout, "stderr": cp.stderr,
-            })
-        if cp.returncode != 0 or not output_path.exists():
-            return _j({
-                "ok": False, "tool": "upx_unpack", "status": "UPX_UNPACK_FAILED",
-                "exit_code": cp.returncode, "stdout": cp.stdout, "stderr": cp.stderr,
-                "note": "Non-zero exit or missing output usually means the input is not actually UPX-packed, or uses a UPX variant/version this upx.exe cannot reverse.",
-            })
+            cp = run_bounded_process(
+                [exe, "-d", "-o", str(scratch_output), str(work_copy)],
+                timeout_seconds=timeout_seconds,
+                cancellation_token=cancellation_token,
+            )
+            if cp.timed_out or cp.cancelled:
+                return _j({
+                    "ok": False, "tool": "upx_unpack",
+                    "status": "CANCELLED" if cp.cancelled else "TIMEOUT",
+                    "stdout": cp.stdout, "stderr": cp.stderr,
+                })
+            if cp.returncode != 0 or not scratch_output.exists():
+                return _j({
+                    "ok": False, "tool": "upx_unpack", "status": "UPX_UNPACK_FAILED",
+                    "exit_code": cp.returncode, "stdout": cp.stdout, "stderr": cp.stderr,
+                    "note": "Non-zero exit or missing output usually means the input is not actually UPX-packed, or uses a UPX variant/version this upx.exe cannot reverse.",
+                })
 
-        unpacked_bytes = output_path.read_bytes()
-        unpacked_sha256 = hashlib.sha256(unpacked_bytes).hexdigest()
+            unpacked_bytes = scratch_output.read_bytes()
+            unpacked_sha256 = hashlib.sha256(unpacked_bytes).hexdigest()
+            os.replace(scratch_output, output_path)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
         return _j({
             "ok": True, "tool": "upx_unpack", "status": "UNPACKED",
             "input_path": relative(p),
