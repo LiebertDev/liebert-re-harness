@@ -93,7 +93,7 @@ D810_INFO = {
                 "block_rules_known": 17, "block_rules_active": 2},
     "raw_baseline": {"blocks": 3, "instructions": 2, "microcode_sha256": "a" * 64},
     "output": {"blocks": 3, "instructions": 1, "microcode_sha256": "b" * 64},
-    "transformed": True,
+    "transformed": True, "transform_equivalence": "NOT_CHECKED",
     "rules_fired": [{"name": "Add_HackersDelightRule_2", "kind": "instruction_rule", "fired": 1}],
     "optimizers_fired": {"PeepholeOptimizer": 1}, "rules_fired_count": 1,
     "config_isolation": {"mode": "isolated_state_directory", "user_options_unchanged": True},
@@ -143,6 +143,9 @@ class MicrocodeFakeIdat(FakeIdat):
             fields = dict(D810_FIELDS)
         elif self.microcode == "empty":
             fields = dict(fields, items=[], instruction_count=0, block_count=0)
+        elif self.microcode == "d810_no_equivalence_field":
+            info = {k: v for k, v in D810_INFO.items() if k != "transform_equivalence"}
+            fields = dict(D810_FIELDS, deobfuscation=info)
         body = {"ok": True, "tool": "ida_microcode_cfg", "operation": "microcode_cfg",
                 "engine_input_sha256": sha, "engine_input_md5": self.md5, "database_changes_discarded": True}
         body.update(fields)
@@ -385,6 +388,15 @@ class D810PassTests(MicrocodeCase):
         self.fake.microcode = "d810_for_raw"          # asked for raw, the worker answered d810
         body = self.m()
         self.assertEqual((body["ok"], body["error"]), (False, "MICROCODE_KIND_MISMATCH"))
+        self.assertNotIn("items", body)
+
+    @pytest.mark.contract
+    def test_a_d810_result_that_does_not_say_equivalence_was_not_checked_is_refused(self):
+        """`transformed: true` is a claim that the listing changed, not that the meaning survived."""
+        self.assertEqual(self.d810()["deobfuscation"]["transform_equivalence"], "NOT_CHECKED")
+        self.fake.microcode = "d810_no_equivalence_field"
+        body = self.d810()
+        self.assertEqual((body["ok"], body["error"]), (False, "DEOBFUSCATION_RESULT_UNLABELLED"))
         self.assertNotIn("items", body)
 
     @pytest.mark.contract
@@ -935,6 +947,8 @@ class WorkerMicrocodeTests(unittest.TestCase):
                                                 "fired": 1}])
         self.assertEqual(info["optimizers_fired"], {"PeepholeOptimizer": 1})
         self.assertIs(info["transformed"], True)
+        self.assertEqual(info["transform_equivalence"], "NOT_CHECKED")
+        self.assertIn("meaning", info["transform_equivalence_note"])
         self.assertEqual(info["raw_baseline"], {"blocks": 3, "instructions": 3,
                                                 "microcode_sha256": self.w._listing_digest(raw_mba())})
         self.assertEqual(info["output"]["instructions"], 1)
@@ -950,6 +964,7 @@ class WorkerMicrocodeTests(unittest.TestCase):
         info = data["deobfuscation"]
         self.assertEqual(info["rules_fired_count"], 1)
         self.assertIs(info["transformed"], False)
+        self.assertEqual(info["transform_equivalence"], "NOT_CHECKED")
         self.assertEqual(info["raw_baseline"]["microcode_sha256"], info["output"]["microcode_sha256"])
 
     def test_scanner_runs_first_and_skips_the_gui_package_then_load_project_start_in_order(self):
@@ -1174,6 +1189,7 @@ class IdaMicrocodeRealInstallTests(unittest.TestCase):
         self.assertGreater(info["project"]["instruction_rules_active"], 0)
         self.assertTrue(info["rules_fired"], info)
         self.assertIs(info["transformed"], True)
+        self.assertEqual(info["transform_equivalence"], "NOT_CHECKED")
         # the baseline is the raw microcode of the same function from the same session
         self.assertEqual(info["raw_baseline"]["microcode_sha256"], raw["microcode_sha256"])
         self.assertNotEqual(info["output"]["microcode_sha256"], raw["microcode_sha256"])

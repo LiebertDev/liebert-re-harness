@@ -1345,7 +1345,8 @@ def ida_microcode_cfg(path, function, maturity="MMAT_LVARS", deobfuscate=False,
     which rules and optimizers fired and how often (`rules_fired`,
     `optimizers_fired`), the raw microcode of the same function from the same
     session (`raw_baseline`) and whether the output differs from it
-    (`transformed`). A rule firing is not proof that the function was
+    (`transformed`; `transform_equivalence` is always `NOT_CHECKED`: a changed listing
+    is not a verified-equivalent one). A rule firing is not proof that the function was
     obfuscated, and a project whose rules did not fire is not proof that it
     wasn't. d810 missing is `TOOL_MISSING`; d810 present but not startable (no
     such project, did not load, optimizer not started) is `ANALYSIS_LIMITED`.
@@ -1415,6 +1416,7 @@ def ida_microcode_cfg(path, function, maturity="MMAT_LVARS", deobfuscate=False,
             project = info.get("project") if isinstance(info.get("project"), dict) else {}
             labelled = (kind == "d810_pass" and info.get("requested") is True and info.get("pass") == "d810"
                         and isinstance(info.get("rules_fired"), list) and isinstance(info.get("transformed"), bool)
+                        and info.get("transform_equivalence") == "NOT_CHECKED"
                         and bool(project.get("loaded")) and isinstance(info.get("config_isolation"), dict))
             return None if labelled else "DEOBFUSCATION_RESULT_UNLABELLED"
         return None if kind == "raw" and info.get("requested") is False else "MICROCODE_KIND_MISMATCH"
@@ -3806,6 +3808,126 @@ def _purge_locked(tool, sha256, label, names, confirm_token):
 # ida_status
 # --------------------------------------------------------------------------
 
+_D810_PROJECT_LIST_LIMIT = 50
+
+
+def _d810_probe():
+    """What `ida_microcode_cfg(deobfuscate=True)` depends on, read WITHOUT starting IDA
+    (file system and the registry only: the d810 package is never imported here).
+
+    Three answers, never merged: `FOUND` (a copy was seen, with its version and project
+    names), `NOT_FOUND` (the place that would hold it was read and has none) and
+    `UNKNOWN` (the place could not be read or located; `reason` says why). Two places are
+    looked at, each reported on its own: the pip copy in the site-packages of the Python
+    that IDA is registered to use, and the plugin copy under IDA's user plugins directory.
+    Which of them IDA's Python imports is not observable without running IDA, so
+    `loaded_copy` is `UNKNOWN` unless exactly one copy exists and the other place is
+    known to hold none."""
+    home = str(Path.home())
+
+    def shown(path):
+        text = str(path)
+        return "<HOME>" + text[len(home):] if home and text.lower().startswith(home.lower()) else text
+
+    def version_of(package_dir, dist_dirs):
+        for dist in dist_dirs:
+            try:
+                for line in (dist / "METADATA").read_text(encoding="utf-8", errors="replace").splitlines():
+                    if line.startswith("Version:"):
+                        return line.split(":", 1)[1].strip() or None
+            except OSError:
+                continue
+        try:
+            match = re.search(r"^__version__\s*=\s*['\"]([^'\"]+)['\"]",
+                              (package_dir / "__init__.py").read_text(encoding="utf-8", errors="replace"), re.M)
+            return match.group(1) if match else None
+        except OSError:
+            return None
+
+    def describe(kind, package_dir, dist_dirs=()):
+        entry = {"kind": kind, "status": "FOUND", "package": shown(package_dir),
+                 "version": version_of(package_dir, dist_dirs)}
+        if entry["version"] is None:
+            entry["version_note"] = "UNKNOWN: no readable version in the package metadata or __init__"
+        try:
+            names = sorted(f.stem for f in (package_dir / "conf").glob("*.json") if f.stem != "options")
+            entry["projects_total"] = len(names)
+            entry["projects"] = names[:_D810_PROJECT_LIST_LIMIT]
+            entry["projects_truncated"] = len(names) > _D810_PROJECT_LIST_LIMIT
+        except OSError as exc:
+            entry.update(projects="UNKNOWN", projects_total=None, projects_truncated=None,
+                         projects_reason=f"{type(exc).__name__}: conf directory unreadable")
+        return entry
+
+    def pip_copy():
+        base = {"kind": "pip", "status": "UNKNOWN"}
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Software\\Hex-Rays\\IDA") as key:
+                dll, _kind = winreg.QueryValueEx(key, "Python3TargetDLL")
+        except ImportError:
+            return dict(base, reason="registry unavailable on this platform: IDA's Python is not located")
+        except Exception as exc:
+            return dict(base, reason=f"{type(exc).__name__}: IDA's Python (Python3TargetDLL) could not be read")
+        if not isinstance(dll, str) or not dll.strip():
+            return dict(base, reason="Python3TargetDLL is not a path")
+        site = Path(dll).parent / "Lib" / "site-packages"
+        try:
+            if not site.is_dir():
+                return dict(base, reason="the Python named by Python3TargetDLL has no Lib/site-packages here",
+                            site_packages=shown(site))
+            package = site / "d810"
+            if not (package / "__init__.py").is_file():
+                return {"kind": "pip", "status": "NOT_FOUND", "site_packages": shown(site)}
+            return dict(describe("pip", package, sorted(site.glob("d810*.dist-info"))),
+                        site_packages=shown(site))
+        except OSError as exc:
+            return dict(base, reason=f"{type(exc).__name__}: site-packages unreadable")
+
+    def plugin_copy():
+        base = {"kind": "plugins", "status": "UNKNOWN"}
+        user = os.environ.get("IDAUSR", "").strip()
+        if not user:
+            appdata = os.environ.get("APPDATA", "").strip()
+            if not appdata:
+                return dict(base, reason="neither IDAUSR nor APPDATA is set: IDA's user directory is not located")
+            user = str(Path(appdata) / "Hex-Rays" / "IDA Pro")
+        plugins = Path(user.split(os.pathsep)[0]) / "plugins"
+        try:
+            if not plugins.is_dir():
+                return {"kind": "plugins", "status": "NOT_FOUND", "plugins_dir": shown(plugins)}
+            for candidate in sorted(plugins.glob("d810*/src/d810")) + sorted(plugins.glob("d810*")):
+                if (candidate / "__init__.py").is_file():
+                    return dict(describe("plugins", candidate), plugins_dir=shown(plugins))
+            return {"kind": "plugins", "status": "NOT_FOUND", "plugins_dir": shown(plugins)}
+        except OSError as exc:
+            return dict(base, reason=f"{type(exc).__name__}: plugins directory unreadable")
+
+    try:
+        copies = [pip_copy(), plugin_copy()]
+    except Exception as exc:                                    # a probe never takes the status down
+        return {"status": "UNKNOWN", "reason": f"{type(exc).__name__}: d810 could not be looked for",
+                "copies": [], "loaded_copy": "UNKNOWN"}
+    states = [c["status"] for c in copies]
+    found = [c for c in copies if c["status"] == "FOUND"]
+    overall = "FOUND" if found else ("UNKNOWN" if "UNKNOWN" in states else "NOT_FOUND")
+    out = {"status": overall, "copies": copies,
+           "measured_by": "file system and registry reads; IDA was not started and d810 was not imported"}
+    if len(found) == 1 and all(c["status"] in ("FOUND", "NOT_FOUND") for c in copies):
+        out["loaded_copy"] = found[0]["kind"]
+        out["loaded_copy_basis"] = "the only copy present; not observed in a running IDA"
+    else:
+        out["loaded_copy"] = "UNKNOWN"
+        out["loaded_copy_basis"] = ("which copy IDA's Python imports first cannot be read without running IDA"
+                                    if len(found) > 1 else "a place that may hold a copy could not be read")
+    if found:
+        versions = {c["version"] for c in found}
+        out["version"] = versions.pop() if len(versions) == 1 and None not in versions else "UNKNOWN"
+    if overall == "NOT_FOUND":
+        out["reason"] = "neither the IDA Python's site-packages nor the user plugins directory holds d810"
+    return out
+
+
 def ida_status():
     """Whether IDA is reachable, where from, and whether it actually works
     headless -- the probe to run before reporting IDA as unavailable.
@@ -3898,6 +4020,7 @@ def ida_status():
             "log_network_text_found": signals["log_network_text_found"],
             "log_network_text_evidence_limit": _NETWORK_SCAN_LIMIT,
             "lumina_config": lumina,
+            "d810": _d810_probe(),
             "warnings": warnings,
             "cache": _cache_summary(),
             "operations": ["ida_query", "ida_microcode_cfg", "ida_type_member_offset", "ida_patch_plan",
