@@ -164,6 +164,7 @@ def test_junction_as_case_dir_and_inside_tree_refused(env, tmp_path):
 # ------------------------------------------------------------ classification
 def test_keep_beats_every_purge_glob():
     samples = [g.replace("*", "x").replace("[0-9]", "1") for g in cp.PURGE_FILE_GLOBS]
+    assert samples, "cp.PURGE_FILE_GLOBS is empty, so the keep-beats-purge loop below would check nothing"
     for s in samples:
         for keepdir in ("knowledge", "keep"):
             assert cp.classify(f"{keepdir}/{s}") == "keep"

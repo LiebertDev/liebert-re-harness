@@ -359,7 +359,9 @@ class RoundTripTests(AnnotateCase):
         out = self.apply(self.sealed(plan))
         for text in (json.dumps(plan), json.dumps(out), ti._journal_path(self.sha).read_text(encoding="utf-8")):
             self.assertNoTargetLeak(text)
-        for evidence in self.ev.glob("*.json"):
+        evidence_files = list(self.ev.glob("*.json"))
+        self.assertGreaterEqual(len(evidence_files), 1, "a plan and an apply must leave evidence to scan; found none under %s" % self.ev)
+        for evidence in evidence_files:
             self.assertNoTargetLeak(evidence.read_text(encoding="utf-8"))
             self.assertNotIn(TARGET_NAME, evidence.name)
         self.assertNotIn("path", plan)
@@ -381,6 +383,7 @@ class RoundTripTests(AnnotateCase):
     def test_the_session_ceiling_is_its_own_constant_and_applies_to_each_session(self):
         self.write(timeout_seconds=600)
         sessions = [c["timeout"] for c in self.fake.calls if c["job"]["operation"].startswith("rename_")]
+        self.assertEqual(len(sessions), 3, "expected plan, apply and verify sessions; saw %s" % sessions)
         self.assertTrue(all(t <= ti._MAX_ANNOTATE_TIMEOUT_SECONDS for t in sessions), sessions)
 
     def test_the_reader_reads_the_journal_the_writer_wrote(self):
@@ -399,7 +402,9 @@ class RoundTripTests(AnnotateCase):
 
     def test_every_journal_record_hashes_to_its_own_digest(self):
         self.write()
-        for record in ti._journal_records(self.sha)[0]:
+        records = ti._journal_records(self.sha)[0]
+        self.assertGreaterEqual(len(records), 1, "a write must leave a journal record to check")
+        for record in records:
             body = {k: v for k, v in record.items() if k != "record_sha256"}
             self.assertEqual(ti._sha256_text(ti._canonical(body)), record["record_sha256"])
 
@@ -1123,6 +1128,7 @@ class CacheSeparationTests(AnnotateCase):
 
     def test_the_cache_lifecycle_code_never_mentions_the_annotated_root(self):
         _inside, cache_side = _section_functions()
+        self.assertEqual(len(cache_side), 14, "the cache-side function list shrank: %s" % [f.name for f in cache_side])
         for fn in cache_side:
             self.assertNotIn("ANNOTATED_ROOT", _referenced_names(fn), fn.name)
             self.assertNotIn("_annotated_root", _called_names(fn), fn.name)
@@ -1300,12 +1306,15 @@ class CommentPlanTests(AnnotateCase):
         self.assertEqual(out["internal_evidence_name"], evidence[0].name)
         # the audit journal is not touched by a plan, and no log-like file under any root holds the text
         self.assertEqual(ti._journal_records(self.sha)[0], [])
+        scanned = 0
         for root in (self.annotated, self.ev, self.cache):
             if not Path(root).exists():
                 continue
             for f in Path(root).rglob("*"):
                 if f.is_file() and f.suffix in (".json", ".jsonl", ".log"):
+                    scanned += 1
                     self.assertNotIn(SECRET_TEXT, f.read_text(encoding="utf-8", errors="ignore"), f.name)
+        self.assertGreaterEqual(scanned, 1, "no .json/.jsonl/.log file was found under any root, so nothing was scanned")
 
     @pytest.mark.contract
     def test_nothing_is_published_by_a_plan(self):
@@ -1413,12 +1422,15 @@ class CommentApplyTests(AnnotateCase):
         self.assertIn(ti._sha256_text(SECRET_TEXT), raw)
         # the caller's answer does carry the (redacted) text, and no file under any root holds it
         self.assertEqual(out["applied"][0]["new_comment"], SECRET_TEXT)
+        scanned = 0
         for root in (self.annotated, self.ev, self.cache):
             if not Path(root).exists():
                 continue
             for f in Path(root).rglob("*"):
                 if f.is_file() and f.suffix in (".json", ".jsonl", ".log"):
+                    scanned += 1
                     self.assertNotIn(SECRET_TEXT, f.read_text(encoding="utf-8", errors="ignore"), f.name)
+        self.assertGreaterEqual(scanned, 1, "no .json/.jsonl/.log file was found under any root, so nothing was scanned")
 
     @pytest.mark.contract
     def test_a_kept_candidate_holds_no_job_or_result_file_with_the_text(self):
@@ -1429,9 +1441,12 @@ class CommentApplyTests(AnnotateCase):
         self.assertTrue((candidate_dir / ti._DB_NAME).is_file())
         self.assertFalse((candidate_dir / "job.json").exists())
         self.assertFalse((candidate_dir / ti._RESULT_NAME).exists())
+        scanned = 0
         for f in self.annotated.rglob("*"):
             if f.is_file() and f.suffix in (".json", ".jsonl", ".log"):
+                scanned += 1
                 self.assertNotIn(SECRET_TEXT, f.read_text(encoding="utf-8", errors="ignore"), f.name)
+        self.assertGreaterEqual(scanned, 1, "no .json/.jsonl/.log file was found under the annotated root, so nothing was scanned")
 
     def failing_unlink(self):
         real = Path.unlink
@@ -2245,7 +2260,10 @@ class PurgeTests(PurgeCase):
         self.survey_roots()
         self.two_versions()
         shutil.rmtree(self.cache, ignore_errors=True)
-        for row in self.purge()["not_purgeable"]["classes"]:
+        classes = self.purge()["not_purgeable"]["classes"]
+        self.assertIn("write_journals", [row["class"] for row in classes], "the survey listed no write_journals class")
+        self.assertGreater(len(classes), 1, "the survey listed too few classes: %s" % [row["class"] for row in classes])
+        for row in classes:
             if row["class"] == "write_journals":
                 self.assertEqual(row["files"], 1)
                 continue

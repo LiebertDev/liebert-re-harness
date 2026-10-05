@@ -119,7 +119,9 @@ class BinaryVersionDiffTests(unittest.TestCase):
         self.assertNotIn("old behavior", encoded)
         self.assertNotIn("new behavior", encoded)
         change = report["function_changes"][0]
-        self.assertTrue(all(value.startswith("sha256:") for value in change["dimensions"]["strings"]["added"]))
+        added = change["dimensions"]["strings"]["added"]
+        self.assertGreaterEqual(len(added), 1, "the changed function reported no added strings: %s" % change["dimensions"]["strings"])
+        self.assertTrue(all(value.startswith("sha256:") for value in added), added)
 
     def test_output_is_deterministic(self):
         old_ir, _, _ = self.make_ir("77" * 32)
