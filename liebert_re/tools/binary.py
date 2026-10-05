@@ -204,17 +204,9 @@ def _failure(error,status,message):
     (generic_static_probe.ALLOWED_STATUSES), ``error`` is a stable machine code."""
     return {"ok":False,"status":status,"error":error,"message":message}
 
-def disassemble_pe(path,section=None,start_offset=0,max_instructions=250,va=None):
-    # `va` (Tier2 remediation roadmap Priority 3, Problem B; additive,
-    # default None -- zero behavior change for every existing caller):
-    # previously a caller who had a function's virtual address (e.g. from
-    # ghidra_query's list_functions/decompile_function) had to manually
-    # convert it to a section+start_offset pair via native_inspect's
-    # per-section RVA/raw-offset table before calling this tool -- a real,
-    # repeatedly-hand-done step (see WNL-T2-040/WNL-T2-073's manual
-    # raw-disassembly fallbacks) this was never automated for. Passing
-    # `va` directly (decimal or 0x-hex string, or int) now resolves the
-    # containing section and correct in-section offset internally.
+def _dpe_open(path,section,start_offset,va,detail=False,structured=False):
+    """Shared front half of disassemble_pe and disassemble_pe_structured: parse the PE,
+    pick the machine, resolve the section/offset. Returns (ctx, None) or (None, _failure)."""
     from capstone import Cs,CS_ARCH_X86,CS_MODE_32,CS_MODE_64,CS_ARCH_ARM64,CS_MODE_ARM
     p=safe_path(path)
     # Success is a plain-text listing; every FAILURE is a structured dict
@@ -223,12 +215,14 @@ def disassemble_pe(path,section=None,start_offset=0,max_instructions=250,va=None
     try:
         pe=_pe(p)
     except Exception as e:
-        return _failure("INVALID_PE","ANALYSIS_LIMITED",f"Invalid or corrupt PE file ({type(e).__name__}): {e}")
+        return None,_failure("INVALID_PE","ANALYSIS_LIMITED",f"Invalid or corrupt PE file ({type(e).__name__}): {e}")
     mach=pe.FILE_HEADER.Machine
     if mach==0x14c:md=Cs(CS_ARCH_X86,CS_MODE_32)
     elif mach==0x8664:md=Cs(CS_ARCH_X86,CS_MODE_64)
-    elif mach==0xaa64:md=Cs(CS_ARCH_ARM64,CS_MODE_ARM)
-    else:return _failure("UNSUPPORTED_MACHINE","UNSUPPORTED",f"Unsupported machine type {hex(mach)}")
+    elif mach==0xaa64:
+        if structured:return None,_failure("STRUCTURED_UNSUPPORTED_MACHINE","UNSUPPORTED","Structured disassembly is x86/x64 only: ARM64 has no skipdata and a different operand model, so no x86-shaped fields are produced. The text listing (disassemble_pe) still works.")
+        md=Cs(CS_ARCH_ARM64,CS_MODE_ARM)
+    else:return None,_failure("UNSUPPORTED_MACHINE","UNSUPPORTED",f"Unsupported machine type {hex(mach)}")
     # x86/x64 sections routinely have data-in-code (jump tables, alignment
     # padding, literal pools) before max_instructions/section end. Without
     # skipdata, Cs.disasm() (one native cs_disasm() call) STOPS the moment it
@@ -245,15 +239,16 @@ def disassemble_pe(path,section=None,start_offset=0,max_instructions=250,va=None
     # falsely-complete-looking list. ARM64 is unaffected (not exercised by
     # this fix; left as-is).
     if mach in (0x14c,0x8664):md.skipdata=True
+    if detail:md.detail=True  # structured path only; the text path never pays for operand detail
     chosen=None
     if va not in (None,""):
         try:va_int=int(str(va),0)
-        except ValueError:return _failure("INVALID_VA","ANALYSIS_LIMITED",f"Invalid va: {va!r}")
+        except ValueError:return None,_failure("INVALID_VA","ANALYSIS_LIMITED",f"Invalid va: {va!r}")
         rva=va_int-pe.OPTIONAL_HEADER.ImageBase
         for s in pe.sections:
             if s.VirtualAddress<=rva<s.VirtualAddress+max(s.Misc_VirtualSize,s.SizeOfRawData):
                 chosen=s;start_offset=rva-s.VirtualAddress;break
-        if chosen is None:return _failure("VA_NOT_IN_SECTION","ANALYSIS_LIMITED",f"va {hex(va_int)} (RVA {hex(rva)}) was not found inside any section.")
+        if chosen is None:return None,_failure("VA_NOT_IN_SECTION","ANALYSIS_LIMITED",f"va {hex(va_int)} (RVA {hex(rva)}) was not found inside any section.")
     elif section:
         for s in pe.sections:
             if s.Name.rstrip(b"\x00").decode(errors="replace").lower()==section.lower():chosen=s;break
@@ -262,9 +257,26 @@ def disassemble_pe(path,section=None,start_offset=0,max_instructions=250,va=None
         for s in pe.sections:
             if s.VirtualAddress<=ep<s.VirtualAddress+max(s.Misc_VirtualSize,s.SizeOfRawData):
                 chosen=s;start_offset=max(int(start_offset),ep-s.VirtualAddress);break
-    if chosen is None:return _failure("SECTION_NOT_FOUND","ANALYSIS_LIMITED","Section not found.")
+    if chosen is None:return None,_failure("SECTION_NOT_FOUND","ANALYSIS_LIMITED","Section not found.")
     data=chosen.get_data(); start_offset=max(0,min(int(start_offset),len(data)))
     base=pe.OPTIONAL_HEADER.ImageBase+chosen.VirtualAddress+start_offset
+    size=len(data)-start_offset
+    return {"pe":pe,"md":md,"mach":mach,"data":data,"start_offset":start_offset,"base":base,"size":size},None
+
+def disassemble_pe(path,section=None,start_offset=0,max_instructions=250,va=None):
+    # `va` (Tier2 remediation roadmap Priority 3, Problem B; additive,
+    # default None -- zero behavior change for every existing caller):
+    # previously a caller who had a function's virtual address (e.g. from
+    # ghidra_query's list_functions/decompile_function) had to manually
+    # convert it to a section+start_offset pair via native_inspect's
+    # per-section RVA/raw-offset table before calling this tool -- a real,
+    # repeatedly-hand-done step (see WNL-T2-040/WNL-T2-073's manual
+    # raw-disassembly fallbacks) this was never automated for. Passing
+    # `va` directly (decimal or 0x-hex string, or int) now resolves the
+    # containing section and correct in-section offset internally.
+    ctx,err=_dpe_open(path,section,start_offset,va)
+    if err is not None:return err
+    md=ctx["md"];data=ctx["data"];start_offset=ctx["start_offset"];base=ctx["base"]
     out=[]; more_at=None
     # md.disasm() is ONE native cs_disasm() call that allocates for its whole
     # input before yielding anything (~248 bytes of native heap per input
@@ -296,6 +308,86 @@ def disassemble_pe(path,section=None,start_offset=0,max_instructions=250,va=None
     if more_at is not None and out:
         out.append(f"[ANALYSIS_LIMITED: stopped after max_instructions={cap}; more code follows at 0x{more_at:X}]")
     return "\n".join(out) if out else "No instruction could be decoded."
+
+def _dps_form(pe,va):
+    """The shared AddressForm (pe_address.AddressForm, same hex-string spelling as
+    pe_address.normalize_address) for one VA, from the PE already open. A VA that no section
+    holds is {"resolved": False, "error": ...}, never a guessed form."""
+    base=pe.OPTIONAL_HEADER.ImageBase
+    if va<base:return {"resolved":False,"error":"VA_BELOW_IMAGE_BASE","va":hex(va)}
+    rva=va-base
+    s=pe.get_section_by_rva(rva)
+    if s is None:return {"resolved":False,"error":"RVA_NOT_IN_ANY_SECTION","va":hex(va)}
+    try:off=pe.get_offset_from_rva(rva)
+    except Exception:return {"resolved":False,"error":"RVA_HAS_NO_FILE_OFFSET","va":hex(va)}
+    return {"file_offset":hex(off),"rva":hex(rva),"va":hex(va),"image_base":hex(base),
+            "section":s.Name.rstrip(b"\x00").decode(errors="replace")}
+
+def _dps_entry(pe,ins):
+    """One capstone instruction (detail on) as the flat per-instruction contract of
+    rizin._instruction_entry, plus ``immediates`` and ``rip_relative`` (see disassemble_pe_structured)."""
+    from capstone import CS_GRP_CALL,CS_GRP_JUMP
+    from capstone.x86 import X86_OP_IMM,X86_OP_MEM,X86_REG_RIP
+    # skipdata's pseudo-instruction is the only thing capstone emits with id 0 (X86_INS_INVALID);
+    # its mnemonic is ".byte". Both must hold, so a real instruction is never mislabelled.
+    undecodable=ins.id==0 and ins.mnemonic==".byte"
+    entry={"address":_dps_form(pe,ins.address),"bytes":bytes(ins.bytes).hex(),"mnemonic":ins.mnemonic,
+           "operands":ins.op_str,"length":ins.size,"decode_status":"UNDECODABLE" if undecodable else "DECODED"}
+    if undecodable:return entry
+    direct=None
+    ops=list(ins.operands)
+    if len(ops)==1 and ops[0].type==X86_OP_IMM and (ins.group(CS_GRP_CALL) or ins.group(CS_GRP_JUMP)):
+        direct=ops[0]
+        entry["branch_target"]=_dps_form(pe,direct.imm&0xFFFFFFFFFFFFFFFF)
+    imms=[];rip=[]
+    for i,op in enumerate(ops):
+        if op.type==X86_OP_IMM and op is not direct:
+            imms.append({"value":op.imm,"hex":hex(op.imm&((1<<(8*op.size))-1)),"size":op.size})
+        elif op.type==X86_OP_MEM and op.mem.base==X86_REG_RIP:
+            rip.append({"operand_index":i,"disp":op.mem.disp,
+                        "target":_dps_form(pe,(ins.address+ins.size+op.mem.disp)&0xFFFFFFFFFFFFFFFF)})
+    if imms:entry["immediates"]=imms
+    if rip:entry["rip_relative"]=rip
+    return entry
+
+def disassemble_pe_structured(path,section=None,start_offset=0,max_instructions=250,va=None):
+    """Structured twin of disassemble_pe: the same section/va/entry-point selection, the same
+    max_instructions cap, the same skipdata, returned as a dict instead of text.
+
+    Per instruction: the rizin_disasm_listing contract (address form, bytes, mnemonic, operands,
+    length, decode_status DECODED|UNDECODABLE, branch_target for a direct call/jmp/jcc) plus
+    ``immediates`` ([{value, hex, size}], the IOCTL-recovery input) and ``rip_relative``
+    ([{operand_index, disp, target}], target = address+length+disp, the import-slot input).
+    A branch immediate is a target, not an immediate, so it appears only as branch_target.
+    A cap that cut the listing is ``truncated`` true, status ANALYSIS_LIMITED and
+    ``truncation`` {max_instructions, more_at}; it is never silent. x86/x64 only: ARM64 is
+    refused with STRUCTURED_UNSUPPORTED_MACHINE. Failures keep disassemble_pe's codes."""
+    ctx,err=_dpe_open(path,section,start_offset,va,detail=True,structured=True)
+    if err is not None:return err
+    pe=ctx["pe"];md=ctx["md"];data=ctx["data"];start_offset=ctx["start_offset"];base=ctx["base"]
+    from liebert_re.recover.code_sweep_chunking import chunk_boundaries,disasm_chunk
+    cap=max(1,int(max_instructions))
+    out=[];more_at=None
+    for t0,t1 in chunk_boundaries(ctx["size"],_DISASM_CHUNK_BYTES):
+        for ins,credited in disasm_chunk(md,data,start_offset,base,t0,t1):
+            if not credited:continue
+            if len(out)>=cap:more_at=ins.address;break
+            out.append(_dps_entry(pe,ins))
+        if more_at is not None:break
+    if not out:return _failure("DISASSEMBLY_FAILED","ANALYSIS_LIMITED","No instruction could be decoded.")
+    undec=sum(1 for e in out if e["decode_status"]=="UNDECODABLE")
+    dec=len(out)-undec
+    cov="FULLY_DECODED" if undec==0 else "NOTHING_DECODED" if dec==0 else "PARTIALLY_DECODED"
+    res={"ok":True,"tool":"disassemble_pe_structured","status":"OK","engine":"capstone",
+         "architecture":"x86_64" if ctx["mach"]==0x8664 else "x86_32",
+         "start":out[0]["address"],"count_requested":cap,"count_returned":len(out),
+         "decode_coverage":{"status":cov,"instructions_decoded":dec,"instructions_undecodable":undec,
+                            "bytes_covered":sum(e["length"] for e in out)},
+         "truncated":more_at is not None,"instructions":out}
+    if more_at is not None:
+        res["status"]="ANALYSIS_LIMITED"
+        res["truncation"]={"max_instructions":cap,"more_at":_dps_form(pe,more_at)}
+    return res
 
 def search_binary_bytes(path,pattern,max_results=100):
     p=safe_path(path); data=p.read_bytes()

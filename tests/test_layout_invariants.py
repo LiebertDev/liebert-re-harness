@@ -250,7 +250,10 @@ def test_published_tool_name_set_is_unchanged():
     # CLI kernel-operations slice: 767 -> 771 (measured), four private top-level handlers added in
     # liebert_re/cli.py, none removed: _kernel_dispatch, _kernel_iat, _kernel_callbacks, _ioctl_decode.
     # No new module. Digest recomputed from the source.
-    assert digest == "eb3c8fa211d552ecb262b8e2f6572084ff82039d18a4d67f917f6074a8ba3b07"
+    # structured disassembly slice: 771 -> 775 (measured), four top-level names added in liebert_re/tools/binary.py,
+    # none removed: disassemble_pe_structured (public) and the private _dpe_open, _dps_form, _dps_entry.
+    # No new module. Digest recomputed from the source.
+    assert digest == "5fa0ce0a1a605ef93596cf8982ed39aacf3322b2bbb1bea56a858b3e9eb658bd"
 
 
 def test_the_imported_package_is_this_checkout():
