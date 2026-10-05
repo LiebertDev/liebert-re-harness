@@ -245,7 +245,9 @@ def test_published_tool_name_set_is_unchanged():
     # until now) and the private _kcr_norm_dll, _kcr_lookup. No new module. Digest recomputed from the source.
     # CLI truncated-listing slice: 765 -> 766 (measured), one private top-level function added in
     # liebert_re/cli.py, none removed: _truncation. No new module. Digest recomputed from the source.
-    assert digest == "40ad6b00397aa500507d59f84a1cdad8fd7dac5afa87462e21677fa7486ece40"
+    # DriverEntry call-trampoline slice: 766 -> 767 (measured), one private top-level function added in
+    # liebert_re/tools/binary.py, none removed: _dmf_calls. No new module. Digest recomputed from the source.
+    assert digest == "f55999642c0d334a36d5cb40dfba4e13fed143a57510f13243fa76d2a4a1f911"
 
 
 def test_the_imported_package_is_this_checkout():
