@@ -429,6 +429,11 @@ def _run_with_d810(job, func_ea, maturity):
             "raw_baseline": raw_summary,
             "output": {"blocks": blocks, "instructions": instructions, "microcode_sha256": digest},
             "transformed": digest != raw_summary["microcode_sha256"],
+            "transform_equivalence": "NOT_CHECKED",
+            "transform_equivalence_note": (
+                "`transformed` says the listing changed, not that the meaning survived: nothing here "
+                "checked that the output computes what the raw microcode computed. A rewrite that is "
+                "wrong looks the same as one that is right."),
             "rules_fired": fired, "optimizers_fired": optimizers,
             "rules_fired_count": len(fired),
             "counters_note": (

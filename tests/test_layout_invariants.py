@@ -256,7 +256,10 @@ def test_published_tool_name_set_is_unchanged():
     # control-code scan slice: 775 -> 778 (measured), three top-level names added in liebert_re/tools/binary.py,
     # none removed: ioctl_candidate_scan (public) and the private _ics_fail, _ics_walk. No new module.
     # Digest recomputed from the source.
-    assert digest == "df5ec6647a02f0cde09ded0de6217635d7ac0a12fa161cf9e034e12f144dbe3a"
+    # d810 status slice: 778 -> 779 (measured), one private top-level function added in
+    # liebert_re/tools/ida.py, none removed: _d810_probe (helpers are nested). No new module.
+    # Digest recomputed from the source.
+    assert digest == "27699134799cff051d480470db2bdfea008edd208bda8571217c149be1243771"
 
 
 def test_the_imported_package_is_this_checkout():
