@@ -170,10 +170,14 @@ def test_published_tool_name_set_is_unchanged():
     # by itself). The new nested helper `digest` is not top-level. Worker annotate_write.idapy gained
     # a comment_plan operation (data file): the CI module count stays 70. Digest recomputed from the
     # source with sha256(repr(sorted(tool_families._locally_defined_tool_names())).encode()).
+    # IDA engine-log slice: 711 -> 714, three private top-level helpers in liebert_re/tools/ida.py,
+    # none removed: _read_log_tail (bounded, redacted tail of ida.log; absent told apart from unreadable),
+    # _keep_failed_scratch and _retained_scratch (the default-off LIEBERT_RE_KEEP_FAILED_SCRATCH switch and
+    # its response part). No new module. Digest recomputed from the source, not edited by hand.
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "7b4b513186e84248b81c7ed65c34538ef0eab3a1a7fbb44fa108f72757f2786b"
+    assert digest == "24e06196bb07e054bb968ed315b72508d8bc041b18271aa52e4793e774c4d05d"
 
 
 def test_the_imported_package_is_this_checkout():

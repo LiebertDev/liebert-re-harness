@@ -436,6 +436,67 @@ def _tail(text, work=None, target=None, limit=2000):
     return _redact(text, work=work, target=target)[-limit:]
 
 
+_LOG_TAIL_LIMIT = 4000          # characters of ida.log kept, from the end
+_LOG_READ_WINDOW = 64 * 1024    # bytes read from the end of the file before redaction
+KEEP_FAILED_SCRATCH_ENV = "LIEBERT_RE_KEEP_FAILED_SCRATCH"
+
+
+def _read_log_tail(work, target=None, limit=_LOG_TAIL_LIMIT):
+    """The end of `work/ida.log`, redacted, with how it was measured. idat prints "Check ida.log!" when
+    it cannot start; this is that check. Returns a dict:
+    ida_log_status   "READ" | "EMPTY" | "ABSENT" (no such file) | "UNREADABLE" (it exists, reading failed)
+    ida_log_tail     the redacted last `limit` characters, or None unless status is READ
+    ida_log_tail_truncated  True when text before the tail exists, None when nothing was read
+    ida_log_redacted True when redaction changed the text, None when nothing was read
+    Absent and unreadable are different findings and are never merged."""
+    path = Path(work) / _LOG_NAME
+    out = {"ida_log_status": None, "ida_log_tail": None, "ida_log_tail_truncated": None, "ida_log_redacted": None}
+    try:
+        if not path.is_file():
+            out["ida_log_status"] = "ABSENT"
+            return out
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            cut_front = size > _LOG_READ_WINDOW
+            if cut_front:
+                handle.seek(size - _LOG_READ_WINDOW)
+            raw = handle.read(_LOG_READ_WINDOW)
+    except OSError:
+        out["ida_log_status"] = "UNREADABLE"
+        return out
+    text = raw.decode("utf-8", errors="replace")
+    if cut_front:
+        # drop the partial first line: a licence line cut in half would no longer be recognised by redaction
+        text = text.partition("\n")[2]
+    if not text.strip():
+        out["ida_log_status"] = "EMPTY" if not cut_front else "READ"
+        if not cut_front:
+            return out
+    clean = _redact(text, work=work, target=target)
+    out.update({"ida_log_status": "READ", "ida_log_tail": clean[-limit:],
+                "ida_log_tail_truncated": cut_front or len(clean) > limit,
+                "ida_log_redacted": clean != text})
+    return out
+
+
+def _keep_failed_scratch():
+    return os.getenv(KEEP_FAILED_SCRATCH_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _retained_scratch(path, root, root_token):
+    """The response part that says a failed run's scratch directory was kept, where (root-relative, never an
+    absolute path) and that it holds sensitive content."""
+    try:
+        where = f"{root_token}/" + Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
+    except (OSError, ValueError):
+        where = None
+    return {"retained": True, "location": where, "contains_sensitive_content": True,
+            "enabled_by": KEEP_FAILED_SCRATCH_ENV,
+            "warning": ("Kept because " + KEEP_FAILED_SCRATCH_ENV + " is set. This directory holds the engine's log "
+                        "and the database it was working on, which carry absolute paths and the comment text of "
+                        "the input; treat it as sensitive and delete it when finished. It is off by default.")}
+
+
 def _sha256_md5(path):
     # md5 is only compared with the digest idat records for its input; it is not a security use
     # (and `usedforsecurity=False` keeps it working on FIPS-restricted Python builds).
@@ -988,6 +1049,7 @@ def _failure_response(tool, status, error, *, operation, signals, cp, work, targ
         "ok": False, "tool": tool, "status": status, "error": error, "operation": operation,
         "signals": signals,
         "log_tail": _tail(_read_text(work / _LOG_NAME), work, target),
+        **_read_log_tail(work, target),
         "stdout_tail": _tail(getattr(cp, "stdout", ""), work, target),
         "stderr_tail": _tail(getattr(cp, "stderr", ""), work, target),
         "detail": (
@@ -1737,6 +1799,7 @@ def _run_stage(exe, p, sha256, md5, slot, *, mode, operation, invocation, timeou
     # a measurement, not to the flag alone: the cached database file is hashed before and after.
     verify = not creating and bool(profile.get("verify_database_unchanged"))
     db_before = None
+    keep_work = False
     try:
         if verify:
             try:
@@ -1837,8 +1900,14 @@ def _run_stage(exe, p, sha256, md5, slot, *, mode, operation, invocation, timeou
         else:
             _touch_meta(slot, sha256)
         return data, signals, provenance
+    except _StageFailure as failure:
+        if _keep_failed_scratch() and work.is_dir():
+            keep_work = True
+            failure.body["scratch_retained"] = _retained_scratch(work, _cache_root(), "<CACHE>")
+        raise
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        if not keep_work:
+            shutil.rmtree(work, ignore_errors=True)
         if state_dir is not None:
             shutil.rmtree(state_dir, ignore_errors=True)
 
@@ -1850,6 +1919,7 @@ def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation
     operation = invocation["operation"]
     total = invocation["timeout_seconds"]
     deadline = time.monotonic() + total
+    scratch_kept = False      # a failed stage's scratch kept on request lives inside the slot, which then stays
     slot.mkdir(parents=True, exist_ok=True)
     # Under the lock, any scratch directory here is an abandoned earlier attempt.
     for stale in slot.glob("work-*"):
@@ -1951,10 +2021,11 @@ def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation
             omit_path=bool(profile.get("omit_path")),
         )
     except _StageFailure as failure:
+        scratch_kept = "scratch_retained" in failure.body
         return failure.body
     finally:
-        if not (slot / _DB_NAME).exists():
-            shutil.rmtree(slot, ignore_errors=True)  # a slot with no database is never kept
+        if not (slot / _DB_NAME).exists() and not scratch_kept:
+            shutil.rmtree(slot, ignore_errors=True)  # a slot with no database is never kept (unless it holds a retained failed scratch)
 
 
 # --------------------------------------------------------------------------
@@ -3018,6 +3089,7 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
                                                       if (m := _VERSION_DIR.fullmatch(d.name))]) + 1
     rdir = label_dir / "recovery" / write_id
     verify_dir = label_dir / f"scratch-{uuid.uuid4().hex[:8]}"
+    kept_scratch = set()      # failed-attempt directories kept on request (LIEBERT_RE_KEEP_FAILED_SCRATCH)
     journal = {"prepared": None, "committed": None}
     marker = {"schema": 1, "label": label, "version": version, "write_id": write_id,
               "plan_sha256": plan["plan_sha256"], "target_sha256": sha256}
@@ -3220,15 +3292,23 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
                     attempt[f"{k}_excerpt"] = text
                     attempt[f"{k}_excerpt_truncated"] = bool(text) and len(text) >= 2000   # `_tail` keeps the last 2000
                 attempt["excerpt_redacted"] = any(t and re.search(r"<(?:WORK|INPUT|HOME|USER)>|License: <REDACTED>", t)
-                                                  for t in tails.values()) or False
+                                                  for t in tails.values()) or bool(fb.get("ida_log_redacted"))
+                # the engine's own log, which idat tells us to check (bounded and redacted by the failure body)
+                for k in ("ida_log_status", "ida_log_tail", "ida_log_tail_truncated", "ida_log_redacted"):
+                    attempt[k] = fb.get(k)
+                if _keep_failed_scratch() and verify_dir.is_dir():
+                    kept_scratch.add(verify_dir)
+                    attempt["scratch_retained"] = _retained_scratch(verify_dir, _annotated_root(), "<ANNOTATED>")
                 # the last attempt's diagnosis also stays at the top level (the shape before the retry existed)
                 for k in ("exit_code", "stderr_excerpt", "stderr_excerpt_truncated", "stdout_excerpt",
-                          "stdout_excerpt_truncated", "excerpt_redacted", "ida_log_file"):
+                          "stdout_excerpt_truncated", "excerpt_redacted", "ida_log_file", "ida_log_status",
+                          "ida_log_tail", "ida_log_tail_truncated", "ida_log_redacted"):
                     verify[k] = attempt[k]
                 verify["retried"] = verify["attempt_count"] > 1
                 if fb.get("status") in ("TIMEOUT", "CANCELLED") or verify["attempt_count"] >= 2 or remaining() < 1:
                     return abort("verification_session_failed", verification_failure=fb.get("error"))
-                _remove_owned_work(verify_dir)
+                if verify_dir not in kept_scratch:
+                    _remove_owned_work(verify_dir)
                 verify_dir = label_dir / f"scratch-{uuid.uuid4().hex[:8]}"
                 left = remaining()
         verify["retried"] = verify["attempt_count"] > 1
@@ -3294,7 +3374,8 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
             p, "annotations_apply", evidence, EVIDENCE_ANNOTATE_APPLY, stem=sha256[:16])
         return _j(body)
     finally:
-        _remove_owned_work(verify_dir)
+        if verify_dir not in kept_scratch:
+            _remove_owned_work(verify_dir)
 
 
 # --------------------------------------------------------------------------
