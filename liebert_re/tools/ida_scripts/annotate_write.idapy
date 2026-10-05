@@ -1,5 +1,5 @@
-"""IDAPython worker for ``liebert_re.tools.ida`` (the annotation write path: ``ida_rename_plan``
-and ``ida_annotations_apply``).
+"""IDAPython worker for ``liebert_re.tools.ida`` (the annotation write path: ``ida_rename_plan``,
+``ida_set_comments_plan`` and ``ida_annotations_apply``).
 
 Runs INSIDE idat's own interpreter, never in the harness venv: only the standard library and IDA's
 ``ida_*`` / ``idc`` modules are importable here. This file must not import anything from

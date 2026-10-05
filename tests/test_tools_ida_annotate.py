@@ -76,6 +76,7 @@ class AnnotateFakeIdat:
         self.apply = "ok"
         self.verify = "ok"
         self.timeout_on = None
+        self.exit_code, self.stdout_text, self.stderr_text = 3, "", ""    # used by verify == "nonzero_exit"
         self.pid = 4000
         self.pristine = {START: "start"}
         self.comments = {}      # (address, comment_kind) -> text the database holds
@@ -117,6 +118,8 @@ class AnnotateFakeIdat:
             body.setdefault("engine_input_md5", self.md5)
             body["script_completed"] = True
         (work / ti._RESULT_NAME).write_text(json.dumps(body), encoding="utf-8")
+        if self.verify == "nonzero_exit" and operation.endswith("_verify"):
+            return _cp(self.exit_code, stdout=self.stdout_text, stderr=self.stderr_text)
         return _cp(0)
 
     def rename(self, job, db):
@@ -1418,6 +1421,35 @@ class CommentApplyTests(AnnotateCase):
         self.assertEqual(self.cplan()["plan"]["base_version"], 0)
 
     @pytest.mark.contract
+    def test_a_verification_session_that_exits_nonzero_reports_why_with_the_text_redacted(self):
+        leak = "\\".join(("C:", "Users", "someone_else", "cache.i64"))      # built, not spelled: no path literal in the source
+        self.fake.verify, self.fake.exit_code = "nonzero_exit", 3
+        self.fake.stderr_text = f"idat: cannot open {leak}\n" + "x" * 3000 + " TAIL_MARK"
+        self.fake.stdout_text = "License: ABCD-SECRET-ID\nprogress"
+        out = self.cwrite()
+        self.assertEqual((out["ok"], out["status"], out["error"], out["written"]),
+                         (False, "ANALYSIS_LIMITED", "VERIFICATION_SESSION_FAILED", False))
+        self.assertEqual(out["verification_failure"], "IDA_EXITED_NONZERO")
+        self.assertTrue(out["abort_record_written"])
+        self.assertIsNone(self.manifest())
+        v = out["verification"]
+        self.assertEqual(v["exit_code"], 3)
+        self.assertTrue(v["stderr_excerpt"].endswith("TAIL_MARK"))
+        self.assertLessEqual(len(v["stderr_excerpt"]), 2000)
+        self.assertTrue(v["stderr_excerpt_truncated"])
+        self.assertIn("License: <REDACTED>", v["stdout_excerpt"])
+        self.assertNotIn("ABCD-SECRET-ID", json.dumps(v))
+        self.assertTrue(v["excerpt_redacted"])
+        self.assertEqual(v["ida_log_file"], ti._LOG_NAME)
+        # a short stderr is kept whole, with the machine path replaced
+        self.fake.stderr_text = f"idat: cannot open {leak}"
+        out = self.cwrite(label="second")
+        v = out["verification"]
+        self.assertNotIn("someone_else", json.dumps(v))
+        self.assertIn("<HOME>", v["stderr_excerpt"])
+        self.assertFalse(v["stderr_excerpt_truncated"])
+
+    @pytest.mark.contract
     def test_a_marker_that_did_not_persist_or_the_wrong_one_is_not_published(self):
         for mode in ("apply", "verify"):
             with self.subTest(mode):
@@ -2163,11 +2195,19 @@ class AnnotateRealInstallTests(unittest.TestCase):
         self.assertEqual(again["plan"]["items"][0]["expect_name"], "liebert_start")
         self.assertEqual(ti._file_sha256(stored)[0], out["db_sha256"])
 
+    @staticmethod
+    def _why(answer):
+        """A failure message that carries the apply answer's own refusal fields, never the comment text."""
+        keys = ("ok", "status", "error", "message", "failed", "signals", "verification", "journal", "written")
+        return json.dumps({k: answer.get(k) for k in keys if k in answer}, default=str, sort_keys=True)[:4000]
+
     def test_the_second_version_replaces_the_pointer_atomically_and_leaves_the_first_file_alone(self):
         first = self.apply(self.plan([{"address": "0x140001000", "new_name": "liebert_start"}]))
+        self.assertTrue(first.get("ok"), "first apply: " + self._why(first))
         v1 = ti._version_file(ti._label_dir(self.sha, "first-pass"), 1)
         v1_digest = ti._file_sha256(v1)[0]
         second = self.apply(self.plan([{"address": "0x140001000", "new_name": "second_name"}]))
+        self.assertTrue(second.get("ok"), "second apply: " + self._why(second))
         self.assertEqual((first["version"], second["version"]), (1, 2))
         self.assertEqual(ti._file_sha256(v1)[0], v1_digest)
         manifest = ti._manifest_read(ti._label_dir(self.sha, "first-pass"))[0]
@@ -2178,7 +2218,8 @@ class AnnotateRealInstallTests(unittest.TestCase):
     def test_a_stale_plan_is_blocked_against_the_real_engine(self):
         one = self.plan([{"address": "0x140001000", "new_name": "writer_one"}])
         two = self.plan([{"address": "0x140001000", "new_name": "writer_two"}])
-        self.assertTrue(self.apply(one)["ok"])
+        first = self.apply(one)
+        self.assertTrue(first.get("ok"), "first apply: " + self._why(first))
         lost = self.apply(two)
         self.assertEqual((lost["status"], lost["error"], lost["written"]), ("PRECONDITION_FAILED", "STALE_BASE_VERSION", False))
         names = self.read_back_in_a_fresh_engine(1, [{"address": "0x140001000"}])
@@ -2247,6 +2288,7 @@ class AnnotateRealInstallTests(unittest.TestCase):
     def test_purge_deletes_a_real_version_and_a_kept_candidate_and_the_next_plan_follows(self):
         first = self.apply(self.plan([{"address": "0x140001000", "new_name": "liebert_start"}]))
         second = self.apply(self.plan([{"address": "0x140001000", "new_name": "second_name"}]))
+        self.assertTrue(first.get("ok") and second.get("ok"), "first: " + self._why(first) + " second: " + self._why(second))
         real = ti._replace_file
         with mock.patch.object(ti, "_replace_file",
                                side_effect=lambda s, d: "PermissionError" if Path(s).name == ti._DB_NAME else real(s, d)):
@@ -2293,9 +2335,11 @@ class AnnotateRealInstallTests(unittest.TestCase):
 
     def test_purge_clears_a_real_unverified_scope_and_says_so(self):
         out = self.apply(self.plan([{"address": "0x140001000", "new_name": "liebert_start"}]))
+        self.assertTrue(out.get("ok"), "first apply: " + self._why(out))
         stored = ti._version_file(ti._label_dir(self.sha, "first-pass"), 1)
         stored.write_bytes(stored.read_bytes() + b"x")                 # the file no longer matches its pointer
-        self.assertEqual(self.plan([{"address": "0x140001000", "new_name": "x_name"}])["error"], "ANNOTATED_STATE_UNVERIFIED")
+        refused = self.plan([{"address": "0x140001000", "new_name": "x_name"}])
+        self.assertEqual(refused.get("error"), "ANNOTATED_STATE_UNVERIFIED", "plan: " + self._why(refused))
         report = self.purge(["unverified-state"])
         done = self.purge(["unverified-state"], report["confirm_token"])
         self.assertEqual((done["status"], done["unverified_cleared"], done["unverified_reason_was"]),

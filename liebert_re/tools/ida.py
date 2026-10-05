@@ -93,7 +93,7 @@ the cache slots and never starts IDA. These three keep the target's name and pat
 answers and out of their evidence file names (the input hash names them), and each of the first two
 has its own reopen-session ceiling constant.
 
-**Annotations that persist (`ida_rename_plan`, `ida_annotations_apply`).** A plan and an apply are two
+**Annotations that persist (`ida_rename_plan`, `ida_set_comments_plan`, `ida_annotations_apply`).** A plan and an apply are two
 operations with two names, not a flag: a flag can be closed with the wrong default, a separate name cannot.
 The plan reads the scope's current names and binds itself to the annotation version it read; the apply
 cannot be called without a plan, recomputes the plan's digest, refuses a stale plan, and writes a NEW
@@ -109,8 +109,8 @@ contains write calls.
 
 Scope of this module: `ida_query`, `ida_microcode_cfg`, `ida_type_member_offset`, `ida_patch_plan`
 and `ida_annotations` (none of them writes the input or persists anything), `ida_rename_plan` and
-`ida_annotations_apply` (the one persistent write path; comments have a plan, `ida_set_comments_plan`, and
-no apply yet), `ida_annotations_purge`
+`ida_set_comments_plan` and `ida_annotations_apply` (the one persistent write path: it applies a rename plan or a
+comments plan), `ida_annotations_purge`
 (the only deletion of annotated data: named targets, report first, a confirmation bound to what it reports) and `ida_status`.
 """
 from __future__ import annotations
@@ -2822,8 +2822,8 @@ def ida_set_comments_plan(path, label=None, comments=None, timeout_seconds=_DEFA
 
 def _plan_problem(plan, kinds=("rename",)):
     """(error, field) when `plan` is not a well-formed plan of one of `kinds`, else (None, None). Pure.
-    The default is rename only, because apply writes only renames; a comments plan is checked by naming
-    "comments" in `kinds`. Each kind has its own item field set."""
+    The default is rename only; a comments plan is checked by naming "comments" in `kinds` (apply
+    passes both). Each kind has its own item field set."""
     if not isinstance(plan, dict):
         return "PLAN_NOT_AN_OBJECT", None
     for field, kind in (("schema", int), ("kind", str), ("target_sha256", str), ("label", str), ("base_version", int),
@@ -3160,7 +3160,18 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
                 tool=tool, sha256=sha256, md5=md5, invocation=invocation, temporary=True,
                 seconds=min(left, _MAX_ANNOTATE_TIMEOUT_SECONDS), cancellation_token=cancellation_token)
         except _StageFailure as failure:
-            return abort("verification_session_failed", verification_failure=failure.body.get("error"))
+            # Diagnosis only: what the separate verification process said. The tails were already passed
+            # through `_redact` (work directory, home paths, account name, licence line) by the failure body.
+            fb = failure.body
+            tails = {k: (fb.get(f"{k}_tail") or None) for k in ("stderr", "stdout")}
+            verify["exit_code"] = (fb.get("signals") or {}).get("exit_code")
+            for k, text in tails.items():
+                verify[f"{k}_excerpt"] = text
+                verify[f"{k}_excerpt_truncated"] = bool(text) and len(text) >= 2000   # `_tail` keeps the last 2000
+            verify["excerpt_redacted"] = any(t and re.search(r"<(?:WORK|INPUT|HOME|USER)>|License: <REDACTED>", t)
+                                             for t in tails.values()) or False
+            verify["ida_log_file"] = _LOG_NAME if (fb.get("signals") or {}).get("log_present") else None
+            return abort("verification_session_failed", verification_failure=fb.get("error"))
         verify["verify_session_pid"] = checked.get("engine_pid")
         verify["harness_pid"] = os.getpid()
         if comments:
