@@ -205,7 +205,10 @@ def test_published_tool_name_set_is_unchanged():
     # the same pair in liebert_re/tools/dex.py and liebert_re/tools/jvm.py (the pin is a set, so the
     # twin definitions count once each): _name_stays_in_root and _find_decompiled. No new module.
     # Digest recomputed from the source.
-    assert digest == "41f1039b7415b19eb20e2d980d774ef273293806e3bbff0a0c47b10005e2fdec"
+    # crash-symbolize PE binding slice: 740 -> 741, one private top-level name added in
+    # liebert_re/recover/crash_symbolize.py, none removed: _bind_pe_to_dump_module. No new module.
+    # Digest recomputed from the source.
+    assert digest == "84f7c6e02ea850dae8f3cf48e2f0e045ec4b4cd200f5a3ffeb23d90687eb7a72"
 
 
 def test_the_imported_package_is_this_checkout():

@@ -34,6 +34,9 @@ def symbolize_rva(
     }
     pe_rsds = None
     pe_sections = None
+    pe_own_rsds = None
+    pe_facts: dict = {}
+    dump_module = None
     # Upper bounds (exclusive) for a valid RVA, from whichever sources exist.
     range_bounds: dict[str, int] = {}
     if int(rva) < 0:
@@ -41,11 +44,14 @@ def symbolize_rva(
     if pe_path:
         pe_report = extract_pe_rsds(pe_path)
         pe_rsds = pe_report.get("rsds") if pe_report.get("ok") else None
+        pe_own_rsds = pe_rsds
+        pe_facts["rsds_error"] = None if pe_report.get("ok") else pe_report.get("error")
         section_report = extract_pe_section_map(pe_path)
         pe_sections = section_report.get("sections") if section_report.get("ok") else []
         result["pe_section_map_status"] = section_report.get("status")
-        if section_report.get("ok") and section_report.get("size_of_image"):
-            range_bounds["pe_size_of_image"] = int(section_report["size_of_image"])
+        if section_report.get("ok"):
+            pe_facts["size_of_image"] = section_report.get("size_of_image") or None
+            pe_facts["time_date_stamp"] = section_report.get("time_date_stamp")
         if pe_rsds is None and not pe_report.get("ok"):
             result["pe_rsds_error"] = pe_report.get("error")
     if minidump_path:
@@ -73,11 +79,24 @@ def symbolize_rva(
             return _confidence_describes_the_symbol(result)
         if candidates:
             item = candidates[0]
+            dump_module = item
             cv = (item.get("codeview") or {}).get("rsds")
             if cv and cv.get("ok"):
                 pe_rsds = cv
             if item.get("image_size"):
                 range_bounds["minidump_image_size"] = int(item["image_size"])
+    # The PDB is tied to the dump by RSDS, but the section map -- and so every
+    # symbol address -- comes from the caller's PE. Without proof that this PE is
+    # the module the dump loaded, that map can be another build's.
+    if pe_path:
+        binding = _bind_pe_to_dump_module(pe_own_rsds, pe_facts, dump_module)
+        result["pe_binding"] = binding
+        result["pe_bound_to_dump_module"] = {"BOUND": True, "MISMATCH": False}.get(binding["status"])
+        # Its SizeOfImage is only a valid bound if the file is the dump's module.
+        if binding["status"] in {"BOUND", "NOT_APPLICABLE"} and pe_facts.get("size_of_image"):
+            range_bounds["pe_size_of_image"] = int(pe_facts["size_of_image"])
+    else:
+        binding = None
     over = {k: v for k, v in range_bounds.items() if int(rva) >= v}
     if over:
         return _refuse_rva(result, range_bounds, "RVA is outside the module's image")
@@ -107,6 +126,13 @@ def symbolize_rva(
         result["status"] = "NO_PUBLIC_SYMBOLS"
         result["confidence"] = "MEDIUM"
         return _confidence_describes_the_symbol(result)
+    if binding is not None and binding["status"] not in {"BOUND", "NOT_APPLICABLE"}:
+        # Never derive an address from a section map that may belong to another
+        # build. The identity facts gathered above stay in the result.
+        result["status"] = "ANALYSIS_LIMITED"
+        result["confidence"] = "LOW"
+        result["limitation"] = "PE_NOT_BOUND_TO_DUMP_MODULE: " + binding["reason"]
+        return _confidence_describes_the_symbol(result)
     lookup = lookup_symbol_by_rva(symbols, int(rva), sections=pe_sections)
     match = lookup.get("match")
     result["lookup_status"] = lookup.get("status")
@@ -125,6 +151,50 @@ def symbolize_rva(
     result["status"] = "MATCH"
     result["confidence"] = "HIGH" if lookup.get("status") == "EXACT" else "MEDIUM"
     return _confidence_describes_the_symbol(result)
+
+
+def _bind_pe_to_dump_module(pe_rsds: dict | None, pe_facts: dict, dump_module: dict | None) -> dict:
+    """Is the caller's PE the file the dump's module was loaded from?
+
+    BOUND: the PE's own debug-directory CodeView record equals the dump
+    module's (GUID and age) and no supporting field contradicts it.
+    MISMATCH: the two were measured and differ.
+    UNVERIFIABLE: a side could not be read, so equality was never measured.
+    NOT_APPLICABLE: no dump module to bind to (PE queried on its own).
+    Supporting fields (SizeOfImage, COFF TimeDateStamp) can only veto: they are
+    the dump's image_size / timestamp, and an unreadable one is UNCHECKED, not a
+    failure. File checksum and whole-file hash are deliberately not required.
+    """
+    if dump_module is None:
+        return {"status": "NOT_APPLICABLE", "checks": {},
+                "reason": "no dump module matched; the PE is the only source of the section map"}
+    checks: dict[str, dict] = {}
+    dump_rsds = (dump_module.get("codeview") or {}).get("rsds")
+    if not (dump_rsds and dump_rsds.get("ok")):
+        checks["rsds"] = {"status": "DUMP_RSDS_UNAVAILABLE"}
+    elif not (pe_rsds and pe_rsds.get("ok")):
+        checks["rsds"] = {"status": "PE_RSDS_UNREADABLE", "error": pe_facts.get("rsds_error")}
+    else:
+        same = (str(pe_rsds.get("guid")).upper() == str(dump_rsds.get("guid")).upper()
+                and pe_rsds.get("age") == dump_rsds.get("age"))
+        checks["rsds"] = {"status": "MATCH" if same else "MISMATCH",
+                          "pe": pe_rsds.get("identity_key"), "dump": dump_rsds.get("identity_key")}
+    for name, pe_key, dump_key in (("size_of_image", "size_of_image", "image_size"),
+                                   ("timestamp", "time_date_stamp", "timestamp")):
+        pe_value, dump_value = pe_facts.get(pe_key), dump_module.get(dump_key)
+        if pe_value is None or dump_value is None:
+            checks[name] = {"status": "UNCHECKED", "pe": pe_value, "dump": dump_value}
+        else:
+            checks[name] = {"status": "MATCH" if int(pe_value) == int(dump_value) else "MISMATCH",
+                            "pe": int(pe_value), "dump": int(dump_value)}
+    mismatched = [k for k, v in checks.items() if v["status"] == "MISMATCH"]
+    if mismatched:
+        status, reason = "MISMATCH", "does not match the dump module: " + ", ".join(mismatched)
+    elif checks["rsds"]["status"] != "MATCH":
+        status, reason = "UNVERIFIABLE", "rsds could not be compared: " + checks["rsds"]["status"]
+    else:
+        status, reason = "BOUND", "rsds, and every readable supporting field, match the dump module"
+    return {"status": status, "checks": checks, "reason": reason}
 
 
 def _has_directory(name: str) -> bool:
