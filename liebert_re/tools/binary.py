@@ -1076,3 +1076,99 @@ def rip_relative_iat_scan(path,max_findings=_RIA_MAX_FINDINGS):
           "caveats":list(_RIA_CAVEATS),"statement":IAT_SCAN_STATEMENT}
     if reason:body["reason"]=reason
     return json.dumps(body,ensure_ascii=False,indent=2)
+
+
+# ---- kernel_callback_registrations -----------------------------------------
+# A thin filter over rip_relative_iat_scan: which of its import-slot references name a callback-registration API.
+# No scan logic of its own. Every API below was checked to be a real export, by reading the export table of the
+# OS kernel image (ntoskrnl.exe) or of fltmgr.sys on the build the table was made on; the module is the one that
+# exports it (FltRegisterFilter is in fltmgr.sys, not ntoskrnl.exe). The family labels are conceptual and were NOT
+# verified: an export proves the name exists, not what the function does. The list is not exhaustive.
+_KCR_APIS={
+    ("ntoskrnl","PsSetCreateProcessNotifyRoutine"):"process",("ntoskrnl","PsSetCreateProcessNotifyRoutineEx"):"process",
+    ("ntoskrnl","PsSetCreateProcessNotifyRoutineEx2"):"process",
+    ("ntoskrnl","PsSetCreateThreadNotifyRoutine"):"thread",("ntoskrnl","PsSetCreateThreadNotifyRoutineEx"):"thread",
+    ("ntoskrnl","PsSetLoadImageNotifyRoutine"):"image",("ntoskrnl","PsSetLoadImageNotifyRoutineEx"):"image",
+    ("ntoskrnl","ObRegisterCallbacks"):"object",
+    ("ntoskrnl","CmRegisterCallback"):"registry",("ntoskrnl","CmRegisterCallbackEx"):"registry",
+    ("ntoskrnl","IoRegisterShutdownNotification"):"shutdown",("ntoskrnl","IoRegisterLastChanceShutdownNotification"):"shutdown",
+    ("ntoskrnl","IoRegisterFsRegistrationChange"):"filesystem",("ntoskrnl","IoRegisterFsRegistrationChangeMountAware"):"filesystem",
+    ("fltmgr","FltRegisterFilter"):"filesystem",
+    ("ntoskrnl","PoRegisterPowerSettingCallback"):"power",
+}
+KCR_STATEMENT=("A filter over a byte-pattern first pass: a registration is an import-table call the scan saw, not proof the code runs. "
+               "Not seeing one means no direct call through the import table was seen, which is not the same as the driver not registering.")
+_KCR_EXTRA_CAVEATS=("The callback address was not recovered: argument set-up is interleaved with other code, for one API the argument "
+                    "points to a structure, the address may be a trampoline, and a lea target cannot be told apart as function or data.",
+                    "The API name list is not exhaustive and its family labels are conceptual, not verified; an export proves a name "
+                    "exists, not what it does.")
+
+def _kcr_norm_dll(dll):
+    """Lower-case and drop a trailing .sys / .exe / .dll, so FLTMGR.SYS and fltmgr.sys both become ``fltmgr``."""
+    d=str(dll).strip().lower()
+    for ext in (".sys",".exe",".dll"):
+        if d.endswith(ext):return d[:-len(ext)]
+    return d
+
+def _kcr_lookup(imp):
+    """(dll, api, family) for an exact "dll!name" import that is in the table, else None. Exact name, never a substring."""
+    dll,sep,name=str(imp).partition("!")
+    if not sep:return None
+    fam=_KCR_APIS.get((_kcr_norm_dll(dll),name))
+    return None if fam is None else (_kcr_norm_dll(dll),name,fam)
+
+def kernel_callback_registrations(path):
+    """Which callback-registration APIs a driver calls through its import table, as seen by rip_relative_iat_scan.
+
+    Outcomes: FOUND (``registrations``, each ``proves_call`` false, ``confidence`` heuristic); NOT_FOUND (the scan ran in
+    full and saw no direct call through the import table to a listed API; this does NOT say the driver does not register);
+    UNKNOWN (the scan was truncated, reason SCAN_TRUNCATED, or the import directory was only partly readable, reason
+    IMPORTS_PARTIAL: a looked-at part is not the whole); NOT_LOOKED (every scan refusal passes through unchanged).
+    ``imported_without_reference`` lists listed APIs that are imported but have no call site found: not a finding.
+    The callback address is never recovered (``callback_address`` is "NOT_RECOVERED")."""
+    scan=json.loads(rip_relative_iat_scan(path,_RIA_HARD_LIMIT))
+    if not scan.get("ok"):
+        scan["tool"]="kernel_callback_registrations"
+        return json.dumps(scan,ensure_ascii=False,indent=2)
+    regs=[];called=set()
+    for f in scan["findings"]:
+        hit=_kcr_lookup(f["import"])
+        if hit is None:continue
+        dll,api,fam=hit;called.add((dll,api))
+        regs.append({"api":api,"dll":dll,"family":fam,"call_rva":f["call_rva"],"encoding":f["encoding"],"kind":f["kind"],
+                     "slot_rva":f["slot_rva"],"proves_call":False,"confidence":"heuristic"})
+    unref=[]
+    try:
+        pe=_pe(safe_path(path))
+        names,_=_ria_slots(pe,int(pe.OPTIONAL_HEADER.ImageBase))
+        seen=set()
+        for imp in names.values():
+            hit=_kcr_lookup(imp)
+            if hit and (hit[0],hit[1]) not in called and (hit[0],hit[1]) not in seen:
+                seen.add((hit[0],hit[1]));unref.append({"api":hit[1],"dll":hit[0],"family":hit[2]})
+    except Exception:
+        pass
+    unref.sort(key=lambda u:(u["dll"],u["api"]))
+    trunc=scan["truncation"];state=scan["entry"]["imports_state"]
+    rationale=[];reason=scan.get("reason")
+    if regs:
+        outcome="FOUND";reason=None
+        rationale.append(f"{len(regs)} import-table reference(s) name a listed registration API; none is proof the code runs")
+        if trunc["truncated"]:rationale.append(f"the scan was truncated ({trunc['omitted']} reference(s) omitted), so more may exist")
+    elif trunc["truncated"]:
+        outcome="UNKNOWN";reason="SCAN_TRUNCATED"
+        rationale.append("the scan stopped at its limit, so part of the code was not examined; no listed API was seen in the part that was")
+    elif state=="PARTIAL":
+        outcome="UNKNOWN";reason="IMPORTS_PARTIAL"
+        rationale.append("the import directory was only partly readable, so imports past the break could not be named")
+    else:
+        outcome="NOT_FOUND"
+        rationale.append("no direct call through the import table to a listed registration API was seen")
+        rationale.append("indirect calls and run-time name resolution (MmGetSystemRoutineAddress and the like) are not visible to this scan")
+    if unref:rationale.append(f"{len(unref)} listed API(s) are imported but no call site was found for them; not a finding")
+    body={"ok":True,"tool":"kernel_callback_registrations","status":"OK","path":scan["path"],"outcome":outcome,
+          "proves_call":False,"registrations":regs,"imported_without_reference":unref,"callback_address":"NOT_RECOVERED",
+          "scan_truncation":trunc,"entry":scan["entry"],"rationale":rationale,
+          "caveats":list(scan["caveats"])+list(_KCR_EXTRA_CAVEATS),"statement":KCR_STATEMENT}
+    if reason:body["reason"]=reason
+    return json.dumps(body,ensure_ascii=False,indent=2)
