@@ -49,7 +49,7 @@ def extract_pe_section_map(path: str | Path) -> dict:
     if e_lfanew + 24 > len(data) or data[e_lfanew:e_lfanew + 4] != b"PE\0\0":
         return {"ok": False, "status": "ANALYSIS_LIMITED", "error": "INVALID_PE_SIGNATURE", "detail": {}}
     coff = e_lfanew + 4
-    _machine, section_count, _, _, _, optional_size = struct.unpack_from("<HHIIIH", data, coff)
+    _machine, section_count, time_date_stamp, _, _, optional_size = struct.unpack_from("<HHIIIH", data, coff)
     if section_count < 1 or section_count > 96:
         return {
             "ok": False,
@@ -81,6 +81,7 @@ def extract_pe_section_map(path: str | Path) -> dict:
         "ok": True,
         "status": "PROVEN",
         "size_of_image": size_of_image,
+        "time_date_stamp": time_date_stamp,
         "sections": sections,
         "section_count": len(sections),
         "execution_performed": False,

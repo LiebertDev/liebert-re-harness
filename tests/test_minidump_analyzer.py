@@ -49,7 +49,9 @@ def build_pe_with_rsds(path: Path, rsds: bytes) -> None:
     struct.pack_into("<Q", optional, 24, 0x140000000)
     struct.pack_into("<I", optional, 32, 0x1000)
     struct.pack_into("<I", optional, 36, 0x200)
-    struct.pack_into("<I", optional, 56, 0x2000)
+    # The dump's module record says this image is MODULE_IMAGE_SIZE; a PE that
+    # claimed another size would not be the module the dump was talking about.
+    struct.pack_into("<I", optional, 56, MODULE_IMAGE_SIZE)
     struct.pack_into("<I", optional, 60, 0x200)
     struct.pack_into("<H", optional, 68, 1)
     struct.pack_into("<I", optional, 108, 16)
