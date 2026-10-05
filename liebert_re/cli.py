@@ -377,13 +377,18 @@ def _capabilities(a):
     # unimplemented: FAMILIES minus published_tools() per family -- the roadmap
     # entries the counts only hinted at. Listed in full (about 100 short names,
     # not worth a limit), so unimplemented_truncated is always False.
+    # unimplemented_total: DISTINCT missing names ("how many tools are missing").
+    # unimplemented_family_entries: sum of the per-family list lengths; a name
+    # declared in several families is counted once per family there, so it is
+    # larger. The per-family lists are NOT deduplicated.
     families = _load("liebert_re.report.tool_families", "FAMILIES")
     published = _load("liebert_re.report.tool_families", "published_tools")
     missing = {f: sorted(set(names) - published(f)) for f, names in families.items()}
     missing = {f: names for f, names in missing.items() if names}
     return {"families": _load("liebert_re.report.tool_families", "published_family_report")(),
             "unimplemented": missing,
-            "unimplemented_total": sum(len(v) for v in missing.values()),
+            "unimplemented_total": len({n for v in missing.values() for n in v}),
+            "unimplemented_family_entries": sum(len(v) for v in missing.values()),
             "unimplemented_truncated": False}
 
 
