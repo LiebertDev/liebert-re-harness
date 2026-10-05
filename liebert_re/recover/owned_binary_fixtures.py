@@ -128,6 +128,108 @@ def build_owned_pe_with_code(path: Path, code: bytes) -> Path:
     return path
 
 
+def build_owned_pe_sections(
+    path: Path,
+    *,
+    sections: tuple = ((".text", 0x60000020),),
+    imports: dict | None = None,
+    bad_import_rva: bool = False,
+    subsystem: int = 3,
+    machine: int = 0x8664,
+    dll: bool = False,
+    rsds: bytes | None = None,
+) -> Path:
+    """Synthetic PE32+ with several named sections, an optional import directory
+    and an optional CodeView debug entry. Built from scratch; no third-party binary.
+
+    ``sections`` is ``(name, characteristics)`` pairs, 0x200 bytes each, the first
+    holding a single ``ret``. ``imports`` maps a DLL name to its symbol names and is
+    written to a trailing ``.rdata`` section; ``None`` leaves the import data
+    directory empty (a PE with no imports), ``bad_import_rva=True`` points it at an
+    RVA outside the image instead (a PE whose import table cannot be read).
+    ``rsds`` adds a debug directory with that CodeView record to the same section.
+    """
+    plan = [(name, chars) for name, chars in sections]
+    rdata = bytearray()
+    rdata_rva = 0x1000 * (len(plan) + 1)
+    import_dir = (0, 0)
+    debug_dir = (0, 0)
+    if imports:
+        n = len(imports)
+        rdata += bytes((n + 1) * 20)
+        for i, (dll_name, symbols) in enumerate(imports.items()):
+            thunk_bytes = (len(symbols) + 1) * 8
+            ilt_rva = rdata_rva + len(rdata)
+            ilt_at = len(rdata)
+            rdata += bytes(thunk_bytes)
+            iat_rva = rdata_rva + len(rdata)
+            iat_at = len(rdata)
+            rdata += bytes(thunk_bytes)
+            for k, sym in enumerate(symbols):
+                hint_rva = rdata_rva + len(rdata)
+                rdata += struct.pack("<H", 0) + sym.encode("ascii") + b"\0"
+                rdata += b"\0" * (len(rdata) % 2)
+                struct.pack_into("<Q", rdata, ilt_at + k * 8, hint_rva)
+                struct.pack_into("<Q", rdata, iat_at + k * 8, hint_rva)
+            name_rva = rdata_rva + len(rdata)
+            rdata += dll_name.encode("ascii") + b"\0"
+            rdata += b"\0" * (len(rdata) % 2)
+            struct.pack_into("<IIIII", rdata, i * 20, ilt_rva, 0, 0, name_rva, iat_rva)
+        import_dir = (rdata_rva, (n + 1) * 20)
+    if rsds is not None:
+        rdata += b"\0" * (-len(rdata) % 4)
+        dbg_at = len(rdata)
+        rdata += bytes(28)
+        rsds_at = len(rdata)
+        rdata += rsds
+        struct.pack_into("<IIHHIIII", rdata, dbg_at, 0, 0, 0, 0, 2, len(rsds),
+                         rdata_rva + rsds_at, 0x400 + 0x200 * len(plan) + rsds_at)
+        debug_dir = (rdata_rva + dbg_at, 28)
+    if bad_import_rva:
+        import_dir = (0x7F000, 40)   # far past SizeOfImage
+
+    has_rdata = bool(rdata)
+    plain = len(plan)
+    if has_rdata:
+        rdata += b"\0" * (-len(rdata) % 0x200)
+        plan.append((".rdata", 0x40000040))
+    raw_sizes = [0x200] * plain + ([len(rdata)] if has_rdata else [])
+    image_size = rdata_rva + ((len(rdata) + 0xFFF) & ~0xFFF) if has_rdata else 0x1000 * (plain + 1)
+
+    dos = bytearray(64)
+    dos[0:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, 64)
+    coff = struct.pack("<HHIIIHH", machine, len(plan), 0, 0, 0, 240, 0x2022 if dll else 0x0022)
+    optional = bytearray(240)
+    struct.pack_into("<H", optional, 0, 0x20B)
+    struct.pack_into("<I", optional, 16, 0x1000)
+    struct.pack_into("<I", optional, 20, 0x1000)
+    struct.pack_into("<Q", optional, 24, 0x140000000)
+    struct.pack_into("<I", optional, 32, 0x1000)
+    struct.pack_into("<I", optional, 36, 0x200)
+    struct.pack_into("<I", optional, 56, image_size)
+    struct.pack_into("<I", optional, 60, 0x400)
+    struct.pack_into("<H", optional, 68, subsystem)
+    struct.pack_into("<I", optional, 108, 16)
+    struct.pack_into("<II", optional, 112 + 8, *import_dir)
+    struct.pack_into("<II", optional, 112 + 6 * 8, *debug_dir)
+    table = bytearray()
+    for i, (name, chars) in enumerate(plan):
+        entry = bytearray(40)
+        entry[0:len(name)] = name.encode("ascii")
+        struct.pack_into("<IIIIIIHHI", entry, 8, raw_sizes[i], 0x1000 * (i + 1), raw_sizes[i],
+                         0x400 + 0x200 * i, 0, 0, 0, 0, chars)
+        table += entry
+    headers = bytes(dos) + b"PE\0\0" + coff + bytes(optional) + bytes(table)
+    body = bytearray(0x200 * plain)
+    body[0] = 0xC3
+    file_data = bytearray(0x400) + body + rdata
+    file_data[:len(headers)] = headers
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(file_data))
+    return path
+
+
 def ensure_owned_fixtures() -> dict[str, Path]:
     FIXTURE_DIR.mkdir(parents=True, exist_ok=True)
     paths = {
