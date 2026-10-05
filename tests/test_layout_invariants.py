@@ -232,7 +232,11 @@ def test_published_tool_name_set_is_unchanged():
     # dispatch-scan tail-jump slice: 755 -> 757, two private top-level functions added in
     # liebert_re/tools/binary.py, none removed: _dmf_read and _dmf_tail_jump (the two constants are
     # assignments and add nothing). No new module. Digest recomputed from the source.
-    assert digest == "31898527fa3932d889cf0bcc62d1b1e38177f1f763194455ce0e8b93638bae7d"
+    # import-slot scan slice: 757 -> 761, four top-level names added in liebert_re/tools/binary.py,
+    # none removed: rip_relative_iat_scan (public; declared in FAMILIES["windows-kernel"] but undefined
+    # until now) and the private _ria_refuse, _ria_slots, _ria_find. No new module. Digest recomputed
+    # from the source.
+    assert digest == "a4a7193653047f386350f72716cbdf8f589d194140e0159d9b3e3fee8d0e5ca0"
 
 
 def test_the_imported_package_is_this_checkout():
