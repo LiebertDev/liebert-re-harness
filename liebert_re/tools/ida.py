@@ -60,7 +60,10 @@ under the user's temp directory. That breaks determinism (the same file
 analyses differently with and without network) and tells a third party which
 file is being analysed. Every launch passes `-Opdb:off` (documented in IDA's
 own `cfg/pdb.cfg` and `idat -h`), and the log is scanned for any sign it
-happened anyway (`network_lookup_detected`). Symbols from a PDB you place next
+happened anyway (`log_network_text_found`, a text scan with a stated limit:
+it sees only the listed markers, so a lookup that writes none of them is not
+seen). `pdb_lookup_declared` is a statement about OUR command line, not a
+measurement of IDA's behaviour. Symbols from a PDB you place next
 to the input are therefore NOT loaded by this tool.
 
 **Privacy of what is reported.** IDA's log carries a licence line and absolute
@@ -295,9 +298,19 @@ _FATAL_MARKERS = (
     "traceback (most recent call last)",
     "switch '-o' can be used only when loading a new file",
 )
-# Any of these in the log means a symbol lookup left the machine (or was at
-# least attempted). With -Opdb:off none is expected.
+# Text patterns searched for in IDA's log. Finding one is a hint that a lookup
+# was attempted; NOT finding one proves nothing, because a lookup that does not
+# write any of these strings is invisible to the scan.
 _NETWORK_MARKERS = ("pdb: downloading", "http://", "https://")
+_NETWORK_SCAN_LIMIT = (
+    "text scan of IDA's log for the listed markers only; this is not a network observation. "
+    "A lookup that writes none of these strings is not detected, so false does not mean no query was sent."
+)
+_PDB_LOOKUP_DECLARED = {
+    "declared": "off",
+    "basis": "the command line passes -Opdb:off on every launch (declaration, not an observation)",
+    "observed_by": "log_network_text_found (log text scan, limited evidence)",
+}
 
 _WORKER_BOOKKEEPING = {"ok", "tool", "script_completed", "engine_input_sha256", "engine_input_md5"}
 # Operations whose `offset` indexes the result sequence, so a response that
@@ -926,7 +939,9 @@ def _verdict(cp, work, db_path, *, expect_database, expect_operation=None, requi
         "result_file_present": result_present,
         "result_script_completed": completed,
         "result_operation_matches": operation_matches,
-        "network_lookup_detected": bool(network),
+        "log_network_text_found": bool(network),
+        "log_network_text_markers_scanned": list(_NETWORK_MARKERS),
+        "log_network_text_evidence_limit": _NETWORK_SCAN_LIMIT,
     }
     if require_discard:
         signals["database_changes_discarded"] = data.get("database_changes_discarded") if completed else None
@@ -1059,7 +1074,7 @@ def _success_response(tool, p, sha256, md5, operation, data, *, cache_state, sig
         "invocation": invocation,
         "provenance": _provenance(sha256, md5, data),
         "signals": signals,
-        "pdb_lookup": "disabled",
+        "pdb_lookup_declared": dict(_PDB_LOOKUP_DECLARED),
     }
     if omit_path:
         del head["path"]       # the answer is keyed by the hash; the target's name and path stay out of it
@@ -3673,6 +3688,37 @@ def ida_status():
     in a throwaway directory under the cache root and leaves nothing behind.
     """
     tool = "ida_status"
+
+    def read_lumina_config() -> dict:
+        """Read IDA's per-user `AutoUseLumina` setting. A CONFIGURATION READ: it says
+        what the setting is, not whether any query was or was not sent. Anything
+        that stops the read yields UNKNOWN, never "off"."""
+        source = "HKCU\\Software\\Hex-Rays\\IDA\\AutoUseLumina"
+        out = {"kind": "configuration read (registry value), not an observation of network traffic",
+               "source": source, "measurement": "UNKNOWN", "value": None, "auto_lumina": "UNKNOWN",
+               "warning": None}
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Software\\Hex-Rays\\IDA") as key:
+                value, _kind = winreg.QueryValueEx(key, "AutoUseLumina")
+        except ImportError:
+            out["reason"] = "registry unavailable on this platform"
+            return out
+        except Exception as exc:                       # missing key/value, access denied, anything else
+            out["reason"] = f"{type(exc).__name__}: could not read the value"
+            return out
+        if isinstance(value, bool) or not isinstance(value, int):
+            out["reason"] = "value is not an integer"
+            return out
+        out.update(measurement="MEASURED", value=value)
+        if value == 0:
+            out["auto_lumina"] = "off"
+        else:
+            out["auto_lumina"] = "on"
+            out["warning"] = ("AutoUseLumina is not 0: IDA may send function hashes, the input file name, "
+                              "the IDB name and the input file MD5 to a Lumina server, identifying the target")
+        return out
+
     resolved_by, exe = _resolved_by_and_binary()
     if not exe:
         return _tool_missing(tool)
@@ -3711,14 +3757,19 @@ def ida_status():
                 extra={"binary": exe, "resolved_by": resolved_by,
                        "detail": "idat was found but did not complete a headless probe; see signals and log_tail."},
             ))
+        lumina = read_lumina_config()
+        warnings = [lumina["warning"]] if lumina.get("warning") else []
         return _j({
             "ok": True, "tool": tool, "status": "OK",
             "binary": exe, "resolved_by": resolved_by,
             "ida_kernel_version": data.get("ida_kernel_version"),
             "decompiler_available": bool(data.get("hexrays_available")),
             "decompiler_version": data.get("hexrays_version"),
-            "pdb_lookup": "disabled (-Opdb:off on every launch)",
-            "network_lookup_detected": signals["network_lookup_detected"],
+            "pdb_lookup_declared": dict(_PDB_LOOKUP_DECLARED),
+            "log_network_text_found": signals["log_network_text_found"],
+            "log_network_text_evidence_limit": _NETWORK_SCAN_LIMIT,
+            "lumina_config": lumina,
+            "warnings": warnings,
             "cache": _cache_summary(),
             "operations": ["ida_query", "ida_microcode_cfg", "ida_type_member_offset", "ida_patch_plan",
                            "ida_annotations", "ida_rename_plan", "ida_set_comments_plan", "ida_annotations_apply",

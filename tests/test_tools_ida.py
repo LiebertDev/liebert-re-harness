@@ -391,7 +391,11 @@ class InvocationTests(IdaCase):
         self.assertGreaterEqual(len(self.fake.calls), 3)
         for call in self.fake.calls:
             self.assertIn("-Opdb:off", call["command"])
-        self.assertEqual(self.q("summary")["pdb_lookup"], "disabled")
+        summary = self.q("summary")
+        declared = summary["pdb_lookup_declared"]
+        self.assertEqual(declared["declared"], "off")
+        self.assertIn("declaration", declared["basis"])
+        self.assertNotIn("pdb_lookup", summary)   # no bare status-looking field
 
     def test_query_travels_in_the_job_file_not_in_the_command_line(self):
         hostile = 'a "quoted" name with spaces & $(braces)'
@@ -928,10 +932,18 @@ class RedactionTests(IdaCase):
         self.fake.log = CLEAN_LOG + DOWNLOAD_LOG
         data = self.q()
         self.assertTrue(data["ok"])
-        self.assertTrue(data["signals"]["network_lookup_detected"])
+        self.assertTrue(data["signals"]["log_network_text_found"])
+
+    @pytest.mark.contract
+    def test_the_log_scan_states_its_markers_and_the_limit_of_its_evidence(self):
+        signals = self.q()["signals"]
+        self.assertEqual(signals["log_network_text_markers_scanned"], list(ti._NETWORK_MARKERS))
+        self.assertIn("not a network observation", signals["log_network_text_evidence_limit"])
+        self.assertIn("not detected", signals["log_network_text_evidence_limit"])
+        self.assertNotIn("network_lookup_detected", signals)
 
     def test_a_clean_run_reports_no_network_lookup(self):
-        self.assertFalse(self.q()["signals"]["network_lookup_detected"])
+        self.assertFalse(self.q()["signals"]["log_network_text_found"])
 
 
 # ---------------------------------------------------------------------------
@@ -1160,6 +1172,52 @@ class StatusTests(IdaCase):
     def status(self):
         with mock.patch.object(ti, "_resolved_by_and_binary", return_value=("PATH", "C:/fake/idat.exe")):
             return json.loads(ti.ida_status())
+
+    def _lumina(self, behaviour):
+        if isinstance(behaviour, Exception):
+            def query(key, name):
+                raise behaviour
+        else:
+            def query(key, name):
+                return behaviour, 4
+        fake = SimpleNamespace(
+            HKEY_CURRENT_USER=object(),
+            OpenKey=lambda root, sub: mock.MagicMock(),
+            QueryValueEx=query,
+        )
+        with mock.patch.dict(sys.modules, {"winreg": fake}):
+            return self.status()
+
+    @pytest.mark.contract
+    def test_lumina_zero_is_reported_as_off_without_a_warning(self):
+        data = self._lumina(0)
+        lum = data["lumina_config"]
+        self.assertEqual((lum["measurement"], lum["value"], lum["auto_lumina"]), ("MEASURED", 0, "off"))
+        self.assertIsNone(lum["warning"])
+        self.assertEqual(data["warnings"], [])
+        self.assertIn("not an observation", lum["kind"])
+
+    @pytest.mark.contract
+    def test_lumina_nonzero_is_a_visible_warning(self):
+        data = self._lumina(1)
+        self.assertEqual(data["lumina_config"]["auto_lumina"], "on")
+        self.assertEqual(len(data["warnings"]), 1)
+        self.assertIn("AutoUseLumina", data["warnings"][0])
+        self.assertIn("MD5", data["warnings"][0])
+
+    @pytest.mark.contract
+    def test_lumina_unreadable_is_unknown_not_off_and_does_not_crash(self):
+        for exc in (FileNotFoundError(2, "gone"), PermissionError(13, "denied"), OSError(5, "io")):
+            with self.subTest(exc=type(exc).__name__):
+                data = self._lumina(exc)
+                self.assertTrue(data["ok"], data)
+                lum = data["lumina_config"]
+                self.assertEqual((lum["measurement"], lum["auto_lumina"]), ("UNKNOWN", "UNKNOWN"))
+                self.assertIsNone(lum["value"])
+        with mock.patch.dict(sys.modules, {"winreg": None}):      # import fails: non-Windows
+            lum = self.status()["lumina_config"]
+        self.assertEqual((lum["measurement"], lum["value"]), ("UNKNOWN", None))
+        self.assertEqual(self._lumina("1")["lumina_config"]["measurement"], "UNKNOWN")
 
     def test_probe_runs_idat_on_an_empty_database_and_reports_what_it_read(self):
         data = self.status()
@@ -2147,7 +2205,7 @@ class IdaRealInstallTests(unittest.TestCase):
         data = json.loads(ti.ida_status())
         self.assertTrue(data["ok"], data)
         self.assertRegex(data["ida_kernel_version"], r"^9\.")
-        self.assertFalse(data["network_lookup_detected"])
+        self.assertFalse(data["log_network_text_found"])
 
     def test_analyse_then_reopen_keeps_exactly_one_database(self):
         first = self.q("summary")
@@ -2189,7 +2247,7 @@ class IdaRealInstallTests(unittest.TestCase):
         rsds = build_owned_pe_with_rsds(self.root / "with_rsds.exe")
         data = json.loads(ti.ida_query(str(rsds), "summary"))
         self.assertTrue(data["ok"], data)
-        self.assertFalse(data["signals"]["network_lookup_detected"])
+        self.assertFalse(data["signals"]["log_network_text_found"])
 
 
 if __name__ == "__main__":
