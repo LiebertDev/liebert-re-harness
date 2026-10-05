@@ -159,6 +159,33 @@ class NativeXrefTests(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertEqual(report["status"], "INVALID_SCHEMA")
 
+    def _call_rows(self, count):
+        return [{
+            "kind": "CALL", "source_function_id": self.f1.id, "callsite_rva": 0x1010 + index,
+            "target_rva": 0x1100, "evidence_id": self.evidence.id,
+        } for index in range(count)]
+
+    def test_observation_limit_reached_is_reported_and_not_proven(self):
+        raw = native_xref_analyze(json.dumps(self.ir.to_dict()), json.dumps(self._call_rows(2)), 1)
+        report = json.loads(raw)
+        self.assertEqual(len(report["calls"]), 1)
+        self.assertTrue(report["observations_truncated"])
+        self.assertEqual(report["limit_reached"], "max_observations")
+        self.assertEqual(report["observations_received"], 2)
+        self.assertEqual(report["observations_examined"], 1)
+        self.assertEqual(report["observations_not_examined"], 1)
+        self.assertNotEqual(report["status"], "PROVEN")
+
+    def test_observations_within_the_limit_are_complete_and_proven(self):
+        raw = native_xref_analyze(json.dumps(self.ir.to_dict()), json.dumps(self._call_rows(2)), 2)
+        report = json.loads(raw)
+        self.assertEqual(len(report["calls"]), 2)
+        self.assertFalse(report["observations_truncated"])
+        self.assertIsNone(report["limit_reached"])
+        self.assertEqual(report["observations_not_examined"], 0)
+        self.assertEqual(report["status"], "PROVEN")
+
+
 
 if __name__ == "__main__":
     unittest.main()
