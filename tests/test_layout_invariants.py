@@ -240,7 +240,10 @@ def test_published_tool_name_set_is_unchanged():
     # liebert_re/recover/api_hash_recover.py, none removed: api_hash_recover (declared in
     # FAMILIES["crypto"] but defined only as crack_api_hash / api_hash_recover_tool, so the def-line
     # scan counted it missing). No new module. Digest recomputed from the source.
-    assert digest == "6b42652a75134c91e0c4726fab8c38878615520e85fed031e5a18aa3e33c6df1"
+    # callback-registration filter slice: 762 -> 765, three top-level names added in liebert_re/tools/binary.py,
+    # none removed: kernel_callback_registrations (public; declared in FAMILIES["windows-kernel"] but undefined
+    # until now) and the private _kcr_norm_dll, _kcr_lookup. No new module. Digest recomputed from the source.
+    assert digest == "e19015584048f05b78d5db0c56313754cf6c5eb22413954e2e308bc749d33896"
 
 
 def test_the_imported_package_is_this_checkout():
