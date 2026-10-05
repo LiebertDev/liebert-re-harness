@@ -479,3 +479,149 @@ def authenticode_signature(path,cancellation_token=None):
     if cp.cancelled:return json.dumps({"ok":False,"status":"CANCELLED","error":"TOOL_CALL_CANCELLED","process_tree_terminated":cp.process_tree_terminated})
     if cp.timed_out:return json.dumps({"ok":False,"status":"TIMEOUT","error":"PROCESS_TIMEOUT","process_tree_terminated":cp.process_tree_terminated})
     return cp.stdout.strip() if cp.returncode==0 else cp.stderr.strip()
+
+
+# ---- kernel_triage ---------------------------------------------------------
+# First static tool of the windows-kernel family. It reads the PE facts through the same _pe /
+# _parse_directories / _directory_problem readers the tools above use and reports each driver
+# indicator on its own. Whether a file is a driver is not provable statically, so the verdict is
+# only ever "LIKELY" or "UNKNOWN", never a flat "driver".
+_KT_MACHINES={0x14c:("x86",32),0x8664:("x86_64",64),0xaa64:("ARM64",64)}
+_KT_SUBSYSTEMS={0:"UNKNOWN",1:"NATIVE",2:"WINDOWS_GUI",3:"WINDOWS_CUI",5:"OS2_CUI",7:"POSIX_CUI",9:"WINDOWS_CE_GUI",
+                10:"EFI_APPLICATION",11:"EFI_BOOT_SERVICE_DRIVER",12:"EFI_RUNTIME_DRIVER",13:"EFI_ROM",14:"XBOX",
+                16:"WINDOWS_BOOT_APPLICATION"}
+_KT_DEBUG_TYPES={0:"UNKNOWN",1:"COFF",2:"CODEVIEW",3:"FPO",4:"MISC",9:"BORLAND",10:"RESERVED10",11:"CLSID",
+                  12:"VC_FEATURE",13:"POGO",14:"ILTCG",16:"REPRO",20:"EX_DLLCHARACTERISTICS"}
+_KT_KERNEL_DLLS=("ntoskrnl.exe","hal.dll")
+KERNEL_TRIAGE_STATEMENT="Static indicators only: a PE file cannot be proven to be a kernel driver by reading it."
+
+def _kt_refuse(status,error,fixable,fix,**extra):
+    """Refusal envelope, same keys as the ida refusals: ok/tool/status/error/fixable/fix."""
+    body={"ok":False,"tool":"kernel_triage","status":status,"error":error,"fixable":fixable,"fix":fix}
+    body.update(extra)
+    return json.dumps(body,ensure_ascii=False,indent=2)
+
+def _kt_indicators(subsystem,imports,sections):
+    """The driver indicators, each with its own confidence label.
+
+    ``deterministic`` = the value is read exactly from a PE structure; ``heuristic`` = a naming
+    convention that any PE may follow or ignore. Neither kind proves a driver (``proves_driver``)."""
+    kernel_hits=sorted({d["dll"] for d in imports["dlls"] if d["dll"].lower() in _KT_KERNEL_DLLS}) if imports["dlls"] is not None else None
+    init=[s["name"] for s in sections if s["name"].upper()=="INIT"]
+    page=[s["name"] for s in sections if s["name"].upper().startswith("PAGE")]
+    return [
+        {"name":"subsystem_native","confidence":"deterministic","proves_driver":False,
+         "present":subsystem==1,"observed":subsystem},
+        {"name":"kernel_import","confidence":"deterministic","proves_driver":False,
+         "present":(bool(kernel_hits) if imports["state"] in ("PRESENT","ABSENT") else None),"observed":kernel_hits},
+        {"name":"init_section","confidence":"heuristic","proves_driver":False,"present":bool(init),"observed":init},
+        {"name":"page_section","confidence":"heuristic","proves_driver":False,"present":bool(page),"observed":page},
+    ]
+
+def kernel_triage(path):
+    """Read-only first look at a PE that might be a Windows kernel driver.
+
+    Returns a JSON string. Refusals (``ok`` false, with ``fixable`` and ``fix``): PATH_REFUSED,
+    NOT_FOUND, FILE_NOT_ACCESSIBLE, INVALID_PE (not a PE or the header is corrupt), UNSUPPORTED_MACHINE.
+    Otherwise ``ok`` true with ``status`` OK, or ANALYSIS_LIMITED when the file is cut short or a
+    directory could not be read; ``limitations`` says which. The ``pe.imports.state`` is one of PRESENT,
+    ABSENT (no import directory) or UNREADABLE (declared but cannot be parsed -- not the same as absent);
+    PARTIAL means some entries parsed and pefile reported problems with the rest.
+
+    ``indicators`` lists each signal separately with ``confidence`` deterministic or heuristic and
+    ``proves_driver`` always false. ``driver_likelihood`` is "LIKELY" only when the native subsystem and a
+    kernel import (ntoskrnl.exe or hal.dll) are both observed, with fully readable imports; every other
+    combination is "UNKNOWN" and ``rationale`` says which indicators are missing or conflicting. It is
+    never a flat verdict. ``unknown_fields`` lists every ``pe`` field that could not be determined (also
+    ``null`` in ``pe``)."""
+    try:
+        p=safe_path(path)
+    except PermissionError as e:
+        return _kt_refuse("PATH_REFUSED",str(e),True,"Pass a path inside the workspace root.",path=str(path))
+    if not p.is_file():
+        return _kt_refuse("NOT_FOUND","FILE_NOT_FOUND",True,"Pass the path of an existing file.",path=str(path))
+    try:
+        pe=_pe(p)
+    except OSError as e:
+        return _kt_refuse("ANALYSIS_LIMITED","FILE_NOT_ACCESSIBLE",False,"The file could not be read; check permissions or whether another process holds it.",path=relative(p),error_type=type(e).__name__)
+    except Exception as e:
+        return _kt_refuse("ANALYSIS_LIMITED","INVALID_PE",False,"The file is not a PE or its header is corrupt; nothing was read from it.",path=relative(p),detail=f"{type(e).__name__}: {e}")
+    machine=int(pe.FILE_HEADER.Machine)
+    if machine not in _KT_MACHINES:
+        return _kt_refuse("UNSUPPORTED","UNSUPPORTED_MACHINE",False,"Only x86, x86_64 and ARM64 PEs are read.",path=relative(p),machine=hex(machine))
+    arch,bits=_KT_MACHINES[machine]
+    size=p.stat().st_size
+    limitations=[]
+    parse_error=_parse_directories(pe)
+    if parse_error:limitations.append(f"data directories not fully parsed: {parse_error}")
+
+    sections=[{"name":s.Name.rstrip(b"\x00").decode(errors="replace"),"virtual_size":int(s.Misc_VirtualSize),
+               "raw_size":int(s.SizeOfRawData),"characteristics":hex(s.Characteristics)} for s in pe.sections]
+    cut=[s.Name.rstrip(b"\x00").decode(errors="replace") for s in pe.sections if s.SizeOfRawData and s.PointerToRawData+s.SizeOfRawData>size]
+    if cut:limitations.append("file ends before the raw data declared by section(s): "+", ".join(cut))
+
+    problem=_directory_problem(pe,parse_error,1,"DIRECTORY_ENTRY_IMPORT","import")
+    entries=getattr(pe,"DIRECTORY_ENTRY_IMPORT",None)
+    if entries:
+        dlls=[{"dll":(d.dll.decode(errors="replace") if d.dll else "?"),
+               "symbols":[(x.name.decode(errors="replace") if x.name else f"ordinal:{x.ordinal}") for x in d.imports]} for d in entries]
+        imports={"state":"PARTIAL" if problem else "PRESENT","dlls":dlls,"detail":problem or None}
+    elif problem:
+        imports={"state":"UNREADABLE","dlls":None,"detail":problem}
+    else:
+        imports={"state":"ABSENT","dlls":[],"detail":None}
+    if imports["state"] in ("UNREADABLE","PARTIAL"):
+        limitations.append(f"import directory {imports['state'].lower()}: {problem}")
+
+    if parse_error:
+        resources=None;debug=None
+    else:
+        top=getattr(pe,"DIRECTORY_ENTRY_RESOURCE",None)
+        resources={"present":top is not None,"top_level_entries":len(top.entries) if top is not None else 0}
+        dbg=getattr(pe,"DIRECTORY_ENTRY_DEBUG",None) or []
+        cv=[]
+        for d in dbg:
+            name=getattr(getattr(d,"entry",None),"PdbFileName",None)
+            if name:cv.append(name.rstrip(b"\x00").decode(errors="replace"))
+        debug={"directory_present":bool(dbg),
+               "entries":[{"type":int(d.struct.Type),"type_name":_KT_DEBUG_TYPES.get(int(d.struct.Type))} for d in dbg],
+               "pdb_paths":cv,"pdb_indicator":bool(cv)}
+
+    subsystem=int(pe.OPTIONAL_HEADER.Subsystem)
+    info={
+        "valid":True,"machine":hex(machine),"architecture":arch,"bits":bits,
+        "subsystem":subsystem,"subsystem_name":_KT_SUBSYSTEMS.get(subsystem),
+        "is_dll":bool(pe.FILE_HEADER.Characteristics&0x2000),
+        "image_base":hex(pe.OPTIONAL_HEADER.ImageBase),"entry_point_rva":hex(pe.OPTIONAL_HEADER.AddressOfEntryPoint),
+        "timestamp":int(pe.FILE_HEADER.TimeDateStamp),"size_bytes":size,
+        "sections":sections,"imports":imports,"resources":resources,"debug":debug,
+    }
+    unknown=[k for k,v in info.items() if v is None]
+    if imports["state"] in ("UNREADABLE","PARTIAL"):unknown.append("imports.dlls")
+
+    ind=_kt_indicators(subsystem,imports,sections)
+    by={i["name"]:i for i in ind}
+    rationale=[]
+    if imports["state"]!="PRESENT":
+        rationale.append(f"imports are {imports['state']}: absence or presence of kernel imports cannot be relied on")
+    if by["subsystem_native"]["present"] is False:
+        rationale.append(f"subsystem is {info['subsystem_name'] or subsystem}, not NATIVE")
+    if by["kernel_import"]["present"] is False:
+        rationale.append("no ntoskrnl.exe or hal.dll import")
+    if by["subsystem_native"]["present"] and by["kernel_import"]["present"] is False:
+        rationale.append("conflict: native subsystem without a kernel import")
+    if by["kernel_import"]["present"] and by["subsystem_native"]["present"] is False:
+        rationale.append("conflict: kernel import with a non-native subsystem")
+    strong=imports["state"]=="PRESENT" and by["subsystem_native"]["present"] and by["kernel_import"]["present"]
+    likelihood="LIKELY" if strong else "UNKNOWN"
+    if strong:
+        rationale.append("native subsystem and a kernel import are both observed")
+        rationale.append("INIT/PAGE section names "+("support this" if by["init_section"]["present"] or by["page_section"]["present"] else "are absent (they are not required)"))
+    else:
+        for name in ("init_section","page_section"):
+            if by[name]["present"]:rationale.append(f"{name} observed, heuristic only")
+    return json.dumps({
+        "ok":True,"tool":"kernel_triage","status":"ANALYSIS_LIMITED" if limitations else "OK","path":relative(p),
+        "pe":info,"indicators":ind,"driver_likelihood":likelihood,"rationale":rationale,
+        "statement":KERNEL_TRIAGE_STATEMENT,"limitations":limitations,"unknown_fields":unknown,
+    },ensure_ascii=False,indent=2)
