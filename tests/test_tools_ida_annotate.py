@@ -80,6 +80,8 @@ class AnnotateFakeIdat:
         self.verify_fail_calls = 0      # the first N verification launches exit non-zero
         self.fail_leaves_result = True  # ... with a complete result file (True) or without one (False)
         self.verify_calls = 0
+        self.log_text = None            # what the engine writes to ida.log (None: the clean log)
+        self.write_log = True           # False: the engine leaves no ida.log at all
         self.pid = 4000
         self.pristine = {START: "start"}
         self.comments = {}      # (address, comment_kind) -> text the database holds
@@ -109,7 +111,10 @@ class AnnotateFakeIdat:
         operation = job["operation"]
         if self.timeout_on == operation:
             return _cp(None, timed_out=True)
-        (work / ti._LOG_NAME).write_text(CLEAN_LOG, encoding="utf-8")
+        custom = operation.endswith("_verify")     # the log of the other sessions stays the clean one
+        if self.write_log or not custom:
+            text = CLEAN_LOG if (self.log_text is None or not custom) else self.log_text
+            (work / ti._LOG_NAME).write_bytes(text.encode("utf-8"))
         db = work / ti._DB_NAME
         failing = False
         if operation.endswith("_verify"):
@@ -755,6 +760,173 @@ class VerificationDiagnosisAndRetryTests(AnnotateCase):
         attempts = out["verification"]["attempts"]
         self.assertEqual([a["scratch"] for a in attempts], names)
         self.assertEqual(self.pristine_db(), pristine, "the pristine database is byte-for-byte unchanged")
+
+class EngineLogAndScratchTests(AnnotateCase):
+    """idat says "Check ida.log!" when it cannot start, so a failed run reports the end of that log (bounded,
+    redacted, absent told apart from unreadable), and a debugging switch, off by default, keeps the scratch
+    directory of a failed run."""
+
+    ENV = ti.KEEP_FAILED_SCRATCH_ENV
+
+    def failing_verify(self, env=None):
+        self.fake.verify_fail_calls = 2
+        self.fake.exit_code = 4
+        self.fake.fail_leaves_result = False
+        with mock.patch.dict(os.environ, env or {}):
+            if not env:
+                os.environ.pop(self.ENV, None)
+            return self.write()
+
+    def machine_path(self):
+        return "\\".join(("C:", "Users", "someone_else", "idadir", "ida.cfg"))
+
+    @pytest.mark.contract
+    def test_a_failed_verification_carries_the_end_of_the_engine_log_bounded_and_marked(self):
+        self.fake.log_text = "HEAD_OF_LOG\n" + "y" * 6000 + "\nFailed to initialize IDA as library (error code 4)\n"
+        out = self.failing_verify()
+        first = out["verification"]["attempts"][0]
+        self.assertEqual(first["ida_log_status"], "READ")
+        self.assertTrue(first["ida_log_tail"].endswith("(error code 4)\n"))
+        self.assertLessEqual(len(first["ida_log_tail"]), 4000)
+        self.assertNotIn("HEAD_OF_LOG", first["ida_log_tail"])
+        self.assertIs(first["ida_log_tail_truncated"], True)
+        self.assertEqual(first["ida_log_file"], ti._LOG_NAME, "the file name stays next to its content")
+        self.assertEqual(out["verification"]["ida_log_tail"], out["verification"]["attempts"][-1]["ida_log_tail"])
+
+    @pytest.mark.contract
+    def test_a_short_log_is_whole_and_not_marked_truncated(self):
+        work = self.root / "w"
+        work.mkdir()
+        (work / ti._LOG_NAME).write_bytes(b"one\ntwo\n")
+        got = ti._read_log_tail(work)
+        self.assertEqual((got["ida_log_status"], got["ida_log_tail"], got["ida_log_tail_truncated"]),
+                         ("READ", "one\ntwo\n", False))
+
+    @pytest.mark.contract
+    def test_no_log_file_and_an_unreadable_log_are_different_findings(self):
+        work = self.root / "w"
+        work.mkdir()
+        absent = ti._read_log_tail(work)
+        self.assertEqual((absent["ida_log_status"], absent["ida_log_tail"], absent["ida_log_tail_truncated"]),
+                         ("ABSENT", None, None))
+        (work / ti._LOG_NAME).write_text("present", encoding="utf-8")
+        real_open = Path.open
+
+        def refuse(self_, *a, **k):
+            if self_.name == ti._LOG_NAME:
+                raise PermissionError("denied")
+            return real_open(self_, *a, **k)
+
+        with mock.patch.object(Path, "open", refuse):
+            unreadable = ti._read_log_tail(work)
+        self.assertEqual((unreadable["ida_log_status"], unreadable["ida_log_tail"]), ("UNREADABLE", None))
+        self.assertNotEqual(absent["ida_log_status"], unreadable["ida_log_status"])
+        (work / ti._LOG_NAME).write_text("", encoding="utf-8")
+        self.assertEqual(ti._read_log_tail(work)["ida_log_status"], "EMPTY")
+
+    @pytest.mark.contract
+    def test_a_missing_log_in_a_failed_verification_is_reported_as_absent(self):
+        self.fake.write_log = False
+        out = self.failing_verify()
+        first = out["verification"]["attempts"][0]
+        self.assertEqual((first["ida_log_status"], first["ida_log_tail"]), ("ABSENT", None))
+        self.assertIsNone(first["ida_log_file"])
+
+    @pytest.mark.contract
+    def test_the_log_tail_never_carries_a_machine_path_or_the_licence_line(self):
+        self.fake.log_text = (f"cfg {self.machine_path()}\nLicense: ABCD-SECRET-ID\n"
+                              f"work {self.root}\nFailed to initialize IDA as library (error code 4)\n")
+        out = self.failing_verify()
+        text = json.dumps(out["verification"])
+        for raw in ("someone_else", "ABCD-SECRET-ID", str(self.root)):
+            self.assertNotIn(raw, text)
+        first = out["verification"]["attempts"][0]
+        self.assertIn("<HOME>", first["ida_log_tail"])
+        self.assertIn("License: <REDACTED>", first["ida_log_tail"])
+        self.assertIs(first["ida_log_redacted"], True)
+        self.assertIs(first["excerpt_redacted"], True)
+
+    @pytest.mark.contract
+    def test_a_licence_line_cut_by_the_read_window_is_not_left_half_visible(self):
+        work = self.root / "w"
+        work.mkdir()
+        body = "x" * (ti._LOG_READ_WINDOW + 10) + "License: SPLIT-SECRET\nend\n"
+        (work / ti._LOG_NAME).write_text(body, encoding="utf-8")
+        got = ti._read_log_tail(work)
+        self.assertNotIn("SPLIT-SECRET", got["ida_log_tail"])
+        self.assertIs(got["ida_log_tail_truncated"], True)
+
+    @pytest.mark.contract
+    def test_scratch_is_removed_by_default_after_a_failed_verification(self):
+        out = self.failing_verify()
+        self.assertNotIn("scratch_retained", out["verification"]["attempts"][0])
+        self.assertEqual(list(self.label_dir().glob("scratch-*")), [])
+
+    @pytest.mark.contract
+    def test_with_the_switch_on_a_failed_verification_keeps_its_scratch_and_says_where_and_that_it_is_sensitive(self):
+        out = self.failing_verify({self.ENV: "1"})
+        attempts = out["verification"]["attempts"]
+        kept = list(self.label_dir().glob("scratch-*"))
+        self.assertEqual(len(kept), 2, "both failed attempts are kept")
+        for a in attempts:
+            scratch = a["scratch_retained"]
+            self.assertIs(scratch["retained"], True)
+            self.assertIs(scratch["contains_sensitive_content"], True)
+            self.assertTrue(scratch["location"].startswith("<ANNOTATED>/"))
+            self.assertIn("sensitive", scratch["warning"])
+            self.assertTrue((self.annotated / scratch["location"].split("/", 1)[1] / ti._LOG_NAME).is_file())
+        self.assertNoTargetLeak(json.dumps(out))
+
+    @pytest.mark.contract
+    def test_a_passing_retry_removes_its_own_scratch_even_with_the_switch_on(self):
+        self.fake.verify_fail_calls = 1
+        with mock.patch.dict(os.environ, {self.ENV: "1"}):
+            out = self.write()
+        self.assertEqual((out["ok"], out["status"]), (True, "OK"))
+        self.assertEqual(len(list(self.label_dir().glob("scratch-*"))), 1, "only the failed attempt's directory")
+        self.assertIn("scratch_retained", out["verification"]["attempts"][0])
+        self.assertNotIn("scratch_retained", out["verification"]["attempts"][1])
+
+    @pytest.mark.contract
+    def test_success_without_failures_leaves_the_response_and_the_tree_as_before(self):
+        with mock.patch.dict(os.environ, {self.ENV: "1"}):
+            out = self.write()
+        self.assertEqual((out["ok"], out["status"]), (True, "OK"))
+        attempts = out["verification"]["attempts"]
+        self.assertEqual([sorted(a) for a in attempts], [["attempt", "scratch"]], "no retention key, no log fields")
+        self.assertNotIn("ida_log_tail", out["verification"])
+        self.assertEqual(list(self.label_dir().glob("scratch-*")), [])
+
+    def query_failure(self, env):
+        def engine(command, *, cwd=None, **_kw):
+            (Path(cwd) / ti._LOG_NAME).write_text("Failed to initialize IDA as library (error code 4)\n", encoding="utf-8")
+            return _cp(4, stdout="Check ida.log!")
+        with mock.patch.object(ti, "run_bounded_process", side_effect=engine), \
+                mock.patch.dict(os.environ, env):
+            if not env:
+                os.environ.pop(self.ENV, None)
+            return json.loads(ti.ida_query(str(self.sample), "summary"))
+
+    @pytest.mark.contract
+    def test_a_failed_first_analysis_reports_the_log_and_removes_scratch_by_default(self):
+        out = self.query_failure({})
+        self.assertEqual(out["error"], "IDA_EXITED_NONZERO")
+        self.assertEqual(out["ida_log_status"], "READ")
+        self.assertIn("error code 4", out["ida_log_tail"])
+        self.assertNotIn("scratch_retained", out)
+        self.assertEqual(list(self.cache.rglob("work-*")), [])
+
+    @pytest.mark.contract
+    def test_a_failed_first_analysis_keeps_scratch_only_when_asked(self):
+        out = self.query_failure({self.ENV: "1"})
+        self.assertIs(out["scratch_retained"]["retained"], True)
+        self.assertIs(out["scratch_retained"]["contains_sensitive_content"], True)
+        self.assertTrue(out["scratch_retained"]["location"].startswith("<CACHE>/"))
+        kept = list(self.cache.rglob("work-*"))
+        self.assertEqual(len(kept), 1)
+        self.assertTrue((kept[0] / ti._LOG_NAME).is_file())
+        self.assertNoTargetLeak(json.dumps(out))
+
 
 
 # ---------------------------------------------------------------------------
