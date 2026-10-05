@@ -57,7 +57,10 @@ _REFUSAL_ERRORS = frozenset({"FILE_NOT_FOUND", "FILE_NOT_ACCESSIBLE"})
 # otherwise it is an unclassifiable answer and exits 1 (see _decode).
 _TEXT_LIMITED_PREFIXES = ("IMPORT_DIRECTORY_UNREADABLE", "EXPORT_DIRECTORY_UNREADABLE")
 _TEXT_UNSUPPORTED_PREFIXES = ("Authenticode verification requires Windows",)
-_MARKER = r"\[(?:limit:\d+|[A-Z_]+: .*)\]"
+# The end-of-list line liebert_re.workspace._limit_marker writes for a listing cut at its cap.
+# Anchored and numeric on purpose: only this exact form is read as "truncated", nothing looser.
+_TRUNCATION_MARKER = r"\[limit:(\d+); truncated=true; returned=(\d+); total=(\d+|unknown \(more exist\))\]"
+_MARKER = rf"\[(?:limit:\d+|[A-Z_]+: .*)\]|{_TRUNCATION_MARKER}"
 # command/mode -> regex every line of a successful text answer must match.
 _TEXT_SHAPES = {
     "imports": re.compile(rf"(?:\S+!.+ @IAT 0x[0-9a-f]+|No import table\.|No matches\.|{_MARKER})"),
@@ -105,7 +108,32 @@ def _decode(raw, shape=None):
     elif shape is None or not all(shape.fullmatch(line) for line in raw.splitlines() if line):
         out.update(ok=False, status="FAILED", error="UNCLASSIFIED_OUTPUT",
                    message="The command returned text the CLI cannot classify as an answer or a known failure.")
+    else:
+        truncation = _truncation(raw)
+        if truncation == "INCONSISTENT":
+            out.update(ok=False, status="FAILED", error="UNCLASSIFIED_OUTPUT",
+                       message="The listing's truncation marker contradicts itself, so it is not trusted.")
+        elif truncation:
+            # A listing cut at its cap is a correct answer that says so: success, with the cut made
+            # visible as data (not only as the last line of text). Exit 0.
+            out.update(ok=True, status="OK", truncation=truncation)
     return out
+
+
+def _truncation(raw):
+    """The structured form of a listing's truncation marker, None if it has none, or
+    ``"INCONSISTENT"`` if the marker's own numbers contradict each other."""
+    for line in raw.splitlines():
+        m = re.fullmatch(_TRUNCATION_MARKER, line)
+        if not m:
+            continue
+        limit, returned = int(m.group(1)), int(m.group(2))
+        total = None if m.group(3).startswith("unknown") else int(m.group(3))
+        if returned > limit or (total is not None and total < returned):
+            return "INCONSISTENT"
+        return {"truncated": True, "limit": limit, "returned": returned, "total": total,
+                "omitted": None if total is None else total - returned}
+    return None
 
 
 def _exit_code(payload):
