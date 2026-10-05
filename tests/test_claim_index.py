@@ -559,5 +559,107 @@ class JsonlRecordTests(unittest.TestCase):
         self.assertTrue(row["parse_error"].startswith("TRUNCATED"))
 
 
+class RebuildRaceAndAtomicityTests(unittest.TestCase):
+    """K2: rebuild_from_events must list the event log under the same lock it
+    rebuilds with, and must swap the projection inside one explicit SQLite
+    transaction (executescript commits implicitly, so it cannot)."""
+
+    @staticmethod
+    def _claim_uids(claims):
+        # A fresh connection each call: what an independent reader would see.
+        connection = claims.connect()
+        try:
+            return sorted(r[0] for r in connection.execute("SELECT claim_uid FROM claims"))
+        finally:
+            connection.close()
+
+    def test_claim_written_between_listing_and_rebuild_survives(self):
+        import threading
+        with TemporaryDirectory() as tmp:
+            _, _, claims = _make_indices(Path(tmp))
+            first = claims.create_claim("t", "function", "FUN_1", "root_cause", "x")["claim_uid"]
+            second_uid = []
+            threads = []
+            real_glob = type(claims.events_root).glob
+            armed = {"on": True}
+
+            def second_writer():
+                result = claims.create_claim("t", "function", "FUN_2", "root_cause", "y", status="CANDIDATE")
+                second_uid.append(result["claim_uid"])
+
+            def wrapped_glob(path, pattern, *args, **kwargs):
+                listed = list(real_glob(path, pattern, *args, **kwargs))
+                if armed["on"] and path == claims.events_root and pattern == "*.json":
+                    armed["on"] = False
+                    thread = threading.Thread(target=second_writer)
+                    thread.start()
+                    threads.append(thread)
+                    thread.join(timeout=5)  # unlocked listing: finishes; fixed code: blocks on the lock
+                return iter(listed)
+
+            with mock.patch.object(type(claims.events_root), "glob", wrapped_glob):
+                claims.rebuild_from_events()
+            for thread in threads:
+                thread.join(timeout=60)
+            self.assertEqual(len(second_uid), 1)
+            self.assertIn(second_uid[0], self._claim_uids(claims), "claim written during the rebuild vanished")
+            self.assertIn(first, self._claim_uids(claims))
+            # The loss was transient: a later rebuild brings the event file back.
+            claims.rebuild_from_events()
+            self.assertEqual(sorted([first, second_uid[0]]), self._claim_uids(claims))
+
+    @staticmethod
+    def _poison_event(claims):
+        # Parses as JSON with a known event name, but cannot be applied: fails mid-replay.
+        _write_json(
+            claims.events_root / "9999999999999999__zz__claim_created.json",
+            {"event": "claim_created", "at": "2999-01-01T00:00:00Z", "claim_uid": "zz"},
+        )
+
+    @pytest.mark.contract
+    def test_a_json_event_that_is_not_an_object_is_malformed_not_a_crash(self):
+        with TemporaryDirectory() as tmp:
+            _, _, claims = _make_indices(Path(tmp))
+            first = claims.create_claim("t", "function", "FUN_1", "root_cause", "x")["claim_uid"]
+            for index, body in enumerate(("[1, 2]", '"text"', "42", "null")):
+                path = claims.events_root / f"9999999999999999__nd{index}__claim_created.json"
+                path.write_text(body, encoding="utf-8")
+            result = claims.rebuild_from_events()  # must not raise AttributeError
+            self.assertTrue(result["ok"])
+            self.assertEqual(4, result["malformed"])  # counted and reported, not silently skipped
+            self.assertEqual(result["events_scanned"] - 4, result["events_applied"])
+            self.assertEqual([first], self._claim_uids(claims))
+
+    def test_replay_failure_keeps_the_old_projection(self):
+        with TemporaryDirectory() as tmp:
+            _, _, claims = _make_indices(Path(tmp))
+            first = claims.create_claim("t", "function", "FUN_1", "root_cause", "x")["claim_uid"]
+            self._poison_event(claims)
+            with self.assertRaises(KeyError):
+                claims.rebuild_from_events()
+            self.assertEqual([first], self._claim_uids(claims))
+
+    def test_separate_connection_never_sees_a_half_rebuilt_projection(self):
+        with TemporaryDirectory() as tmp:
+            _, _, claims = _make_indices(Path(tmp))
+            first = claims.create_claim("t", "function", "FUN_1", "root_cause", "x")["claim_uid"]
+            self._poison_event(claims)
+            seen = []
+            real_apply = claims._apply_claim_created
+
+            def apply_then_peek(db, ev):
+                if ev["claim_uid"] == "zz":
+                    # Deletes already ran; read through ANOTHER connection, then blow up.
+                    seen.append(self._claim_uids(claims))
+                    raise RuntimeError("replay blew up")
+                return real_apply(db, ev)
+
+            with mock.patch.object(claims, "_apply_claim_created", apply_then_peek):
+                with self.assertRaises(RuntimeError):
+                    claims.rebuild_from_events()
+            self.assertEqual([[first]], seen, "a second connection saw a half-rebuilt projection")
+            self.assertEqual([first], self._claim_uids(claims))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -405,24 +405,35 @@ class ClaimIndex:
         tables from nothing else -- the recovery path a schema bump or a
         deleted/corrupted database relies on. Mirrors evidence_index
         .refresh()'s own "files are the source of truth" contract."""
-        files = sorted(self.events_root.glob("*.json"))
         applied = 0
         malformed = 0
+        # The lock is taken BEFORE the log is listed, so no writer can add an
+        # event between the listing and the replay and have its claim wiped
+        # from the tables. Listing, reading, validating, deleting and replaying
+        # all happen under it.
         with self._write_guard(), self._session() as db:
-            db.executescript(
-                "DELETE FROM claim_status_history; DELETE FROM claim_edges; "
-                "DELETE FROM claim_evidence; DELETE FROM claims;"
-            )
+            files = sorted(self.events_root.glob("*.json"))
+            events = []
             for path in files:
                 try:
                     ev = json.loads(path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     malformed += 1
                     continue
-                method_name = self._APPLIERS.get(ev.get("event"))
+                method_name = self._APPLIERS.get(ev.get("event")) if isinstance(ev, dict) else None
                 if not method_name:
                     malformed += 1
                     continue
+                events.append((method_name, ev))
+            # One explicit transaction: executescript() would COMMIT any pending
+            # transaction first and run each DELETE in autocommit, so a failed
+            # replay (or a reader on another connection) would see an empty or
+            # half-built projection. Separate execute() calls inside BEGIN
+            # IMMEDIATE roll back as a unit (_session() rolls back on error).
+            db.execute("BEGIN IMMEDIATE")
+            for table in ("claim_status_history", "claim_edges", "claim_evidence", "claims"):
+                db.execute(f"DELETE FROM {table}")
+            for method_name, ev in events:
                 getattr(self, method_name)(db, ev)
                 applied += 1
         return {
