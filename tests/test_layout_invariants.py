@@ -156,6 +156,13 @@ def test_published_tool_name_set_is_unchanged():
     # _sha256_text, _tree_bytes, _utc_now, _valid_label, _version_file. The new annotate_write.idapy
     # is a data file, not a module: the CI module count stays 70.
     #
+    # kernel_triage slice, on top of the comment plan slice below: 707 -> 711 (main's written pin was
+    # 440a45bb..., 707 names; measured after this change: 711), four top-level names added, none
+    # removed. Public: kernel_triage, already declared in FAMILIES["windows-kernel"], the family's
+    # first defined tool (liebert_re/tools/binary.py). Private helpers there: _kt_refuse (refusal
+    # envelope) and _kt_indicators (per-indicator confidence labels). Fixture builder in
+    # liebert_re/recover/owned_binary_fixtures.py: build_owned_pe_sections. No new module: the CI
+    # module count is unchanged. Digest recomputed from the source, not merged by hand.
     # IDA comment plan slice: 706 -> 707, one top-level name added, none removed:
     # ida_set_comments_plan (public, liebert_re/tools/ida.py; plan only, nothing persists, apply is a
     # later slice). In tool_families.FAMILIES["native"] the never-implemented name ida_set_comments was
@@ -166,7 +173,7 @@ def test_published_tool_name_set_is_unchanged():
     digest = hashlib.sha256(
         repr(sorted(tool_families._locally_defined_tool_names())).encode()
     ).hexdigest()
-    assert digest == "440a45bbf40ac3977c9ec280f2c46ddf36f5b1257a926c6e6942bcdf10c7259f"
+    assert digest == "7b4b513186e84248b81c7ed65c34538ef0eab3a1a7fbb44fa108f72757f2786b"
 
 
 def test_the_imported_package_is_this_checkout():
