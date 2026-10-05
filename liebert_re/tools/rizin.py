@@ -1545,7 +1545,9 @@ def binary_patch(path, operation="apply", patches=None, dry_run=True, backup=Tru
         if in_place and backup_written:
             try:
                 shutil.copy2(backup_written, target)
-                reverted_mismatch = True
+                # `reverted` is claimed only when the restored bytes hash to the backup's bytes.
+                reverted_mismatch = (_sha256_bytes(target.read_bytes())
+                                     == _sha256_bytes(Path(backup_written).read_bytes()))
             except OSError:
                 reverted_mismatch = False
         record = {
@@ -1577,7 +1579,8 @@ def binary_patch(path, operation="apply", patches=None, dry_run=True, backup=Tru
     if not pe_valid_after and in_place and backup_written:
         try:
             shutil.copy2(backup_written, target)
-            reverted = True
+            reverted = (_sha256_bytes(target.read_bytes())
+                        == _sha256_bytes(Path(backup_written).read_bytes()))
         except OSError:
             reverted = False
     if reverted:
