@@ -253,6 +253,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import sys
 import threading
 import time
@@ -660,6 +661,42 @@ def _abandon_spawned_target_best_effort(
         pass
 
 
+# --- guest-only entry guard -------------------------------------------------
+# This client is designed to run ONLY inside the isolated guest, but nothing
+# used to enforce that: the module is directly runnable and never called the
+# dynamic-lab gate. It is NOT wired to lab_gate.LabGate on purpose: that gate
+# answers ISOLATION_REQUIRED / ISOLATED_GUEST_NOT_VERIFIABLE for every
+# executing operation, so binding spawn/attach to it would kill guest use
+# permanently. Instead the guest is identified by an explicit, operator-set
+# marker. It is a self-asserted marker, not an attestation of isolation.
+GUEST_MARKER_ENV = "LIEBERT_RE_FRIDA_GUEST"
+GUEST_MARKER_VALUE = "isolated-guest"
+
+
+def _read_guest_marker() -> Optional[str]:
+    """The marker value, or None if absent. May raise if unreadable."""
+    return os.environ.get(GUEST_MARKER_ENV)
+
+
+def _guest_marker_refusal() -> Optional[dict]:
+    """None only when a valid marker is present; otherwise a structured
+    refusal. Absent, unreadable and malformed all refuse: failing to check
+    never means proceed."""
+    try:
+        value = _read_guest_marker()
+    except Exception as exc:  # noqa: BLE001 -- any failure to read is a refusal
+        return {"code": "GUEST_MARKER_UNREADABLE",
+                "detail": f"could not read the guest marker {GUEST_MARKER_ENV}: {type(exc).__name__}; refusing"}
+    if value is None:
+        return {"code": "GUEST_MARKER_ABSENT",
+                "detail": f"{GUEST_MARKER_ENV} is not set: this client runs only inside the isolated guest; "
+                          "refusing to spawn or attach on this machine"}
+    if value != GUEST_MARKER_VALUE:
+        return {"code": "GUEST_MARKER_UNREADABLE",
+                "detail": f"{GUEST_MARKER_ENV} is set but is not a valid guest marker; refusing"}
+    return None
+
+
 def run(
     args: argparse.Namespace,
     *,
@@ -680,6 +717,14 @@ def run(
     retained Windows handle under a real kernel32 in every non-test
     invocation, fakes in tests."""
     if frida_module is None:
+        # The real frida path: refuse before importing frida or opening anything.
+        # The marker check covers this real-frida path only; passing frida_module
+        # explicitly is the offline test seam and is not a supported bypass.
+        refusal = _guest_marker_refusal()
+        if refusal is not None:
+            sys.stdout.write(json.dumps({"event": "error", "timestamp": _now_iso(), **refusal}) + "\n")
+            sys.stdout.flush()
+            return 2
         import frida as frida_module  # noqa: PLC0415 -- intentionally local, see docstring
     if open_process_handle is None:
         open_process_handle = _open_process_handle

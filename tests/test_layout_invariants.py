@@ -216,7 +216,10 @@ def test_published_tool_name_set_is_unchanged():
     # none removed: _kernel_triage, _ghidra_status, _ghidra_facts, _ida_annotations (reached as
     # `kerneltriage`, `ghidrastatus`, `ghidrafacts`, `idaannotations`). No new module. Digest
     # recomputed from the source.
-    assert digest == "18cd9216087efb59eed9921724dcc353051d156cf7b5026c354c403855d3d3b3"
+    # guest-marker slice: 746 -> 748, two private top-level functions added in
+    # liebert_re/dynamic/frida_trace_client.py, none removed: _read_guest_marker and
+    # _guest_marker_refusal. No new module. Digest recomputed from the source.
+    assert digest == "f757943341c864071b28e5f5dfa093e70106c995678d7026dafa035ff72de1bd"
 
 
 def test_the_imported_package_is_this_checkout():
