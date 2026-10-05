@@ -93,7 +93,13 @@ def _decode(raw, shape=None):
 
     Text is an answer only if it carries a known failure code or every line fits
     ``shape``; otherwise it is an unclassifiable result and becomes a FAILED
-    payload (exit 1), never a silent success."""
+    payload (exit 1), never a silent success.
+
+    Contract: a text result always carries ``ok``. ``ok: true`` means the text passed the shape
+    check (complete, or cut at its cap with ``truncation`` saying so); ``ok: false`` means it did
+    not. The two known-code answers (UNSUPPORTED, ANALYSIS_LIMITED) are not successes: they carry
+    ``ok: false`` plus their ``status``, and ``_exit_code`` maps both statuses to EXIT_REFUSED (3)
+    before it looks at ``ok``, so adding ``ok`` changes no exit code. Absence of ``ok`` is not a state."""
     if not isinstance(raw, str):
         return raw
     try:
@@ -102,9 +108,9 @@ def _decode(raw, shape=None):
         pass
     out = {"result_format": "text", "text": raw}
     if raw.startswith(_TEXT_UNSUPPORTED_PREFIXES):
-        out["status"] = "UNSUPPORTED"
+        out.update(ok=False, status="UNSUPPORTED")
     elif raw.startswith(_TEXT_LIMITED_PREFIXES):
-        out["status"] = "ANALYSIS_LIMITED"
+        out.update(ok=False, status="ANALYSIS_LIMITED")
     elif shape is None or not all(shape.fullmatch(line) for line in raw.splitlines() if line):
         out.update(ok=False, status="FAILED", error="UNCLASSIFIED_OUTPUT",
                    message="The command returned text the CLI cannot classify as an answer or a known failure.")
@@ -117,6 +123,8 @@ def _decode(raw, shape=None):
             # A listing cut at its cap is a correct answer that says so: success, with the cut made
             # visible as data (not only as the last line of text). Exit 0.
             out.update(ok=True, status="OK", truncation=truncation)
+        else:
+            out.update(ok=True, status="OK")
     return out
 
 

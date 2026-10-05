@@ -93,6 +93,51 @@ class TruncatedListingIsAResultTests(unittest.TestCase):
         self.assertNotIn("error", body)
 
 
+class ShapeCheckedTextSaysSoTests(unittest.TestCase):
+    """Absence of ``ok`` is not a state: a complete, shape-conforming text answer is ok:true / OK."""
+
+    def test_complete_imports_listing_is_explicitly_ok(self):
+        path = _imports_pe("few2.exe", 5)
+        code, body = run("pe", "--imports", str(path))
+        self.assertEqual(code, 0)
+        self.assertIn("ok", body)
+        self.assertIs(body["ok"], True)
+
+    def test_complete_imports_listing_carries_status_ok(self):
+        path = _imports_pe("few3.exe", 5)
+        _, body = run("pe", "--imports", str(path))
+        self.assertEqual(body.get("status"), "OK")
+        self.assertNotIn("truncation", body)
+        self.assertNotIn("error", body)
+
+    def test_unshaped_text_is_still_not_ok(self):
+        body = cli._decode("the tool said something unexpected", cli._TEXT_SHAPES["imports"])
+        self.assertIs(body["ok"], False)
+        self.assertEqual(body["status"], "FAILED")
+        self.assertEqual(body["error"], "UNCLASSIFIED_OUTPUT")
+
+
+class KnownCodeTextCarriesOkTests(unittest.TestCase):
+    """The two known-code text answers are not successes: ok:false, and their exit code stays 3."""
+
+    def test_unsupported_text_carries_ok_false(self):
+        body = cli._decode("Authenticode verification requires Windows", cli._TEXT_SHAPES["imports"])
+        self.assertIs(body["ok"], False)
+        self.assertEqual(body["status"], "UNSUPPORTED")
+
+    def test_analysis_limited_text_carries_ok_false(self):
+        body = cli._decode("IMPORT_DIRECTORY_UNREADABLE: bad", cli._TEXT_SHAPES["imports"])
+        self.assertIs(body["ok"], False)
+        self.assertEqual(body["status"], "ANALYSIS_LIMITED")
+
+    def test_exit_code_is_refused_with_or_without_ok(self):
+        for text in ("Authenticode verification requires Windows", "EXPORT_DIRECTORY_UNREADABLE: bad"):
+            with self.subTest(text=text):
+                body = cli._decode(text)
+                self.assertEqual(cli._exit_code(body), cli.EXIT_REFUSED)
+                self.assertEqual(cli._exit_code({k: v for k, v in body.items() if k != "ok"}), cli.EXIT_REFUSED)
+
+
 class ClassifierStaysNarrowTests(unittest.TestCase):
     """Recognising the truncation marker must not turn the classifier into a catch-all."""
 
