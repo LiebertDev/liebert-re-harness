@@ -467,6 +467,26 @@ def _parse_agent_params(raw: Optional[str]) -> Any:
         raise ValueError(f"--agent-params value is neither an existing JSON file nor parseable JSON text: {exc}") from exc
 
 
+# UNVERIFIED (DOGRULANMADI): these substrings are an assumption about how a
+# real frida reports a call to an export the agent does not define; the real
+# exception types/messages were not measured. Anything not matching is
+# reported as "init_failed" (the export may exist and have thrown) -- the
+# fallback still happens either way, but the real error stays visible.
+_MISSING_EXPORT_MARKERS = ("unable to find method", "not a function", "no attribute", "has no")
+
+
+def _classify_rpc_init_error(exc: BaseException) -> str:
+    """"export_missing" for an AttributeError or a message that looks like a
+    missing RPC export; otherwise "init_failed". A heuristic, not a measured
+    contract (see _MISSING_EXPORT_MARKERS)."""
+    if isinstance(exc, AttributeError):
+        return "export_missing"
+    text = str(exc).lower()
+    if any(marker in text for marker in _MISSING_EXPORT_MARKERS):
+        return "export_missing"
+    return "init_failed"
+
+
 def _init_agent_params_blocking(script, agent_params: Any, timeout_seconds: float) -> dict:
     """Delivers ``agent_params`` to an already-``script.load()``-ed agent
     script, synchronously, with a hard bound -- the SAME mechanism for the
@@ -510,8 +530,11 @@ def _init_agent_params_blocking(script, agent_params: Any, timeout_seconds: floa
         try:
             script.exports_sync.init(agent_params)
             outcome["method"] = "rpc_sync"
-        except Exception:  # noqa: BLE001 -- agent has no rpc.exports.init
+        except Exception as exc:  # noqa: BLE001 -- classified below, never swallowed
             outcome["method"] = "rpc_unsupported"
+            outcome["error_type"] = type(exc).__name__
+            outcome["error_detail"] = str(exc)
+            outcome["reason"] = _classify_rpc_init_error(exc)
 
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
@@ -522,7 +545,12 @@ def _init_agent_params_blocking(script, agent_params: Any, timeout_seconds: floa
     if outcome["method"] == "rpc_sync":
         return {"timed_out": False, "method": "rpc_sync"}
     script.post({"type": "init", "params": agent_params})
-    return {"timed_out": False, "method": "post_async"}
+    return {
+        "timed_out": False, "method": "post_async",
+        "fallback_reason": outcome.get("reason"),
+        "rpc_error_type": outcome.get("error_type"),
+        "rpc_error_detail": outcome.get("error_detail"),
+    }
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -598,7 +626,9 @@ def _clamp_max_children(requested: int) -> int:
     return max(MIN_MAX_CHILDREN, min(MAX_MAX_CHILDREN, requested))
 
 
-def _abandon_spawned_target_best_effort(device, spawned_pid: Optional[int]) -> None:
+def _abandon_spawned_target_best_effort(
+    device, spawned_pid: Optional[int], *, resume_first: bool = True,
+) -> None:
     """Best-effort resume-then-kill of a target THIS launcher itself
     spawned, used only from a setup-failure path that is reached AFTER
     ``device.spawn()`` but BEFORE the normal resume/teardown flow further
@@ -615,10 +645,15 @@ def _abandon_spawned_target_best_effort(device, spawned_pid: Optional[int]) -> N
     caller's own refusal path."""
     if spawned_pid is None:
         return
-    try:
-        device.resume(spawned_pid)
-    except Exception:  # noqa: BLE001 -- best-effort only
-        pass
+    # resume_first=False: used where the agent's hook state is UNKNOWN (init
+    # timed out / agent start raised) -- resuming would run the target
+    # un-instrumented, so it is killed while still suspended. Default True
+    # keeps the original behaviour for the child-gating caller unchanged.
+    if resume_first:
+        try:
+            device.resume(spawned_pid)
+        except Exception:  # noqa: BLE001 -- best-effort only
+            pass
     try:
         device.kill(spawned_pid)
     except Exception:  # noqa: BLE001 -- best-effort only, e.g. already exited
@@ -943,10 +978,15 @@ def run(
                             f"script.exports_sync.init() did not return within {CHILD_INIT_TIMEOUT_SECONDS}s "
                             f"for child pid {child_pid}"
                         )
-                    writer.write({
+                    child_sent = {
                         "event": "child_agent_params_sent", "timestamp": _now_iso(),
                         "pid": child_pid, "method": init_result["method"],
-                    })
+                    }
+                    if init_result.get("fallback_reason") is not None:
+                        child_sent["fallback_reason"] = init_result["fallback_reason"]
+                        child_sent["rpc_error_type"] = init_result.get("rpc_error_type")
+                        child_sent["rpc_error_detail"] = init_result.get("rpc_error_detail")
+                    writer.write(child_sent)
                 writer.write({"event": "child_instrumented", "timestamp": _now_iso(), "pid": child_pid, "path": child_path})
             except Exception as exc:  # noqa: BLE001 -- a child we cannot instrument is REPORTED, never left gated
                 writer.write({
@@ -1103,8 +1143,14 @@ def run(
                             f"delivered, aborting before resume."
                         ),
                     })
+                    _abandon_spawned_target_best_effort(device, spawned_pid, resume_first=False)
                     return 5
-                writer.write({"event": "agent_params_sent", "timestamp": _now_iso(), "method": init_result["method"]})
+                sent_event = {"event": "agent_params_sent", "timestamp": _now_iso(), "method": init_result["method"]}
+                if init_result.get("fallback_reason") is not None:
+                    sent_event["fallback_reason"] = init_result["fallback_reason"]
+                    sent_event["rpc_error_type"] = init_result.get("rpc_error_type")
+                    sent_event["rpc_error_detail"] = init_result.get("rpc_error_detail")
+                writer.write(sent_event)
 
             if spawned_pid is not None and stdin_data is not None:
                 # Sent BEFORE resume, deliberately: the target is still
@@ -1126,6 +1172,7 @@ def run(
                 writer.write({"event": "resumed", "timestamp": _now_iso(), "pid": spawned_pid})
         except Exception as exc:  # noqa: BLE001
             writer.write({"event": "error", "timestamp": _now_iso(), "detail": f"could not load/start agent: {exc}"})
+            _abandon_spawned_target_best_effort(device, spawned_pid, resume_first=False)
             return 5
 
         deadline = time.monotonic() + duration
