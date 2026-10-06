@@ -300,10 +300,13 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
 
 ### Kernel-level targets: a first look only
 
-- `report/tool_families.py` names a `windows-kernel` family of 15 tools. Two are
-  defined in this package: the generic `tool_missing` sentinel and
-  `kernel_triage`. The other 13 are names of upstream tools that are not here;
-  they are a roadmap, not capability.
+- `report/tool_families.py` names a `windows-kernel` family of 15 tools. Six are
+  defined in this package: the generic `tool_missing` sentinel, `kernel_triage`
+  and four more operations in `tools/binary.py`, described below: three
+  byte-pattern scans whose findings never prove what they name, and one
+  decoder that splits CTL_CODE integers the caller already has. The
+  other nine are names of upstream tools that are not here; they are a roadmap,
+  not capability.
 - `kernel_triage` (`tools/binary.py`) is read-only and reads one PE with
   `pefile`: machine, subsystem, sections (including `INIT` and `PAGE` names),
   the import directory, resources and the debug directory. Each signal is
@@ -464,6 +467,6 @@ x86_64-only stack scan, API Monitor refusals, and the PE directories not covered
 
 ## Maintenance
 
-Counts here are point-in-time (checkout of 2026-10-01). CI's wheel smoke test
+Counts here are point-in-time (checkout of 2026-10-06). CI's wheel smoke test
 asserts the shipped module count; this document is not part of that check and
 adds no module.

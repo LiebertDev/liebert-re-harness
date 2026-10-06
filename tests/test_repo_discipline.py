@@ -971,3 +971,15 @@ def test_machine_identity_probes_see_this_machine():
 def test_no_privacy_leaks_in_repo():
     findings = scan_privacy(ROOT, _tracked())
     assert not findings, _report(findings)
+
+
+def test_tool_families_docstring_table_matches_live_report():
+    # Exists because the hand-written declared/implemented table drifted twice before a human noticed.
+    from liebert_re.report import tool_families as tf
+
+    doc = tf.__doc__ or ""
+    block = doc[doc.index("named / locally defined"):]
+    block = block[:block.index("Re-measure")]
+    parsed = {m.group(1): (int(m.group(2)), int(m.group(3)))
+              for m in re.finditer(r"([a-z][a-z-]*) (\d+)/(\d+)", block)}
+    assert parsed == tf.published_family_report()
