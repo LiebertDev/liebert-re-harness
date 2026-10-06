@@ -149,7 +149,7 @@ def _tool_missing(operation, arch="x64", required_capability=None):
     })
 
 
-def status(arch=None):
+def apimonitor_status(arch=None):
     """Report installation status: which architecture GUI binaries are
     present, the API/ definitions tree location and whether it looks intact,
     and the version string read from Settings.ini when readable. Never spawns

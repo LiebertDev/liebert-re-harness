@@ -45,7 +45,7 @@ between ``FAMILIES[family]`` and :func:`published_tools` (counts per family:
 identity 14/4, source 7/3, binary 4/4,
 native 80/57, windows-kernel 15/6, dotnet 9/4, archive 2/2, android 6/6,
 game-engine 11/9, network 3/3, database 2/2, structured 3/2, jvm 5/5,
-webassembly 2/2, correlation 18/5, debug 9/6, web 2/2, dynamic 39/8,
+webassembly 2/2, correlation 18/5, debug 9/6, web 2/2, dynamic 39/9,
 crypto 7/5, emulation 6/1. Re-measure rather than trust this list.
 """
 

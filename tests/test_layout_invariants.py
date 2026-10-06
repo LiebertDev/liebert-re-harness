@@ -259,7 +259,13 @@ def test_published_tool_name_set_is_unchanged():
     # d810 status slice: 778 -> 779 (measured), one private top-level function added in
     # liebert_re/tools/ida.py, none removed: _d810_probe (helpers are nested). No new module.
     # Digest recomputed from the source.
-    assert digest == "27699134799cff051d480470db2bdfea008edd208bda8571217c149be1243771"
+    # Updated again: a rename, not an addition. liebert_re/dynamic/apimonitor.py defined
+    # `def status(` while tool_families.FAMILIES["dynamic"] declared the name apimonitor_status,
+    # so published_tools() -- which matches `^def <name>(` in module source -- could not see a
+    # working tool and reported it as unimplemented. The function is now apimonitor_status, with
+    # no alias left behind, so the count stays 779 (measured: one name swapped for one) and the
+    # dynamic family goes 8 -> 9 published. Digest recomputed from the source.
+    assert digest == "e9f3956d46cfaafbac660387afadaa71099240b383b5c9321b65979e8f7d94ce"
 
 
 def test_the_imported_package_is_this_checkout():

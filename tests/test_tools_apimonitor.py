@@ -72,7 +72,7 @@ class ApiMonitorMissingTests(unittest.TestCase):
     def test_status_reports_unavailable_when_no_exe_present(self):
         with mock.patch.object(am, "_exe_path", return_value=None), \
              mock.patch.object(am, "_api_dir", return_value=Path("C:/does/not/exist")):
-            out = am.status()
+            out = am.apimonitor_status()
         data = json.loads(out)
         self.assertTrue(data["ok"])  # status() itself never fails, only reports
         self.assertFalse(data["available"])
@@ -241,7 +241,7 @@ class ApiMonitorRealInstallTests(unittest.TestCase):
         self.assertGreater(len(advapi["functions"]), 100)
 
     def test_real_status_reports_installed(self):
-        out = am.status()
+        out = am.apimonitor_status()
         data = json.loads(out)
         self.assertTrue(data["ok"])
         self.assertTrue(data["api_definitions_dir_present"])
@@ -249,3 +249,13 @@ class ApiMonitorRealInstallTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_apimonitor_status_is_visible_to_the_published_tools_scanner():
+    # published_tools() regex-scans for ``def <name>(``; a JSON "tool" string
+    # or a differently named def is invisible to it.
+    from liebert_re.report.tool_families import published_tools
+
+    assert "apimonitor_status" in published_tools("dynamic")
+    assert callable(am.apimonitor_status)
+    assert not hasattr(am, "status")
