@@ -16,14 +16,21 @@ As a hook (git feeds "<local ref> <local sha> <remote ref> <remote sha>" lines o
      loudly as "did not run"; it is never skipped silently. Discovery: LIEBERT_CONTRACT_PYTHONS (paths
      separated by os.pathsep), the venvs under ~/.liebert-venvs (override: LIEBERT_VENV_DIR), the repo
      .venv*, the running interpreter. LIEBERT_CONTRACT_STRICT=1 turns a missing version into a BLOCK.
+     The final line names any version whose contract tests did not run; "ok" alone is never printed then.
   4. the SAME identity probes that gate uses, over every commit's author, e-mail and message in
      the pushed range (the file scan cannot see commit messages or history).
+The installed hook never skips silently: if git cannot resolve the repository root, or this checkout has no
+scripts/pre_push_gate.py (an old branch), it prints why no checks ran and BLOCKS. Only the operator typing
+LIEBERT_GATE_ALLOW_MISSING=1 on that push turns this into a loud, deliberate skip (like
+LIEBERT_CONTRACT_STRICT=1, a named variable, never written to a file or hook).
+`--check` tells no hook, a current hook and a STALE hook (older template) apart; only current exits 0.
 A red or leaking tree cannot be pushed without `git push --no-verify`. Commits and all local work
 stay unrestricted: this runs on push only. It never pushes anything itself.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -41,9 +48,21 @@ ZERO = "0" * 40
 HOOK_TAG = "# liebert-pre-push-gate (managed by scripts/pre_push_gate.py install)"
 HOOK_TEMPLATE = """#!/bin/sh
 {tag}
-root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+# liebert-hook-template: {ver}
+skip_or_block() {{
+  echo "pre-push gate: NO CHECKS RAN: $1" >&2
+  if [ "$LIEBERT_GATE_ALLOW_MISSING" = "1" ]; then
+    echo "pre-push gate: SKIPPED ON PURPOSE (LIEBERT_GATE_ALLOW_MISSING=1): this push is UNCHECKED." >&2
+    exit 0
+  fi
+  echo "pre-push gate: BLOCKED, a gate that cannot run is not a pass." >&2
+  echo "  to push unchecked, on purpose: LIEBERT_GATE_ALLOW_MISSING=1 git push ..." >&2
+  exit 1
+}}
+root=$(git rev-parse --show-toplevel 2>/dev/null) || root=""
+[ -n "$root" ] || skip_or_block "git could not resolve the repository root from $(pwd)"
 script="$root/scripts/pre_push_gate.py"
-[ -f "$script" ] || exit 0
+[ -f "$script" ] || skip_or_block "$script does not exist (a checkout that predates the gate?)"
 PY='{py}'
 if [ ! -x "$PY" ]; then
   echo "pre-push gate: BLOCKED, the interpreter this hook was installed with is missing: $PY" >&2
@@ -52,6 +71,14 @@ if [ ! -x "$PY" ]; then
 fi
 exec "$PY" "$script" hook "$@"
 """
+# The template's own fingerprint, embedded in every installed hook. It changes whenever the template text
+# changes, with nothing to remember to bump, and `--check` compares it: an installed hook from an older
+# template is STALE, not "installed". Whitespace elsewhere in the hook file is irrelevant to the comparison.
+HOOK_VERSION = hashlib.sha256(HOOK_TEMPLATE.encode("utf-8")).hexdigest()[:12]
+
+
+def render_hook(py: str) -> str:
+    return HOOK_TEMPLATE.format(tag=HOOK_TAG, py=py, ver=HOOK_VERSION)
 
 
 # This repo's rule is never to mask a failure. A pytest run that prints a native crash report
@@ -139,6 +166,7 @@ def write_firstchance_record(verdict: int, env=None) -> Path | None:
 # details and must never be committed. Only failures write a file; the newest EVIDENCE_KEEP stay.
 EVIDENCE_DIR = ROOT / ".pytest_evidence_scratch" / "gate_failures"
 EVIDENCE_KEEP = 10
+_CONTRACT_MISSING: list[str] = []   # supported versions whose contract tests did not run, this gate run
 _LAST_RUN: tuple | None = None     # (cmd, rc, stdout, stderr) of the most recent run_pytest call
 
 
@@ -387,9 +415,11 @@ def run_contract_stage(env=None) -> bool:
     """Run `-m contract` on every supported interpreter. True means the stage failed (block)."""
     found, why = find_contract_interpreters(env)
     blocked = False
+    _CONTRACT_MISSING.clear()
     strict = (os.environ if env is None else env).get("LIEBERT_CONTRACT_STRICT") == "1"
     for ver in CONTRACT_VERSIONS:
         if ver not in found:
+            _CONTRACT_MISSING.append(ver)
             print(f"pre-push gate: WARNING, no usable Python {ver} found: the contract tests DID NOT RUN on "
                   f"{ver}. Python-version-dependent stdlib behaviour is unverified here "
                   "(set LIEBERT_CONTRACT_PYTHONS, or create a venv under ~/.liebert-venvs with "
@@ -573,6 +603,7 @@ def _run_gate(ranges: list[list[str]]) -> int:
     else:
         print("pre-push gate: [2/4] test suite: ok.", file=sys.stderr)
     print("pre-push gate: [3/4] contract tests on every supported Python ...", file=sys.stderr, flush=True)
+    _CONTRACT_MISSING.clear()
     if run_contract_stage():
         failed = True
     else:
@@ -592,15 +623,20 @@ def _run_gate(ranges: list[list[str]]) -> int:
         print("  fix: reword/rewrite those commits locally, or --no-verify if you accept the leak.",
               file=sys.stderr)
         failed = True
-    # The LAST line the operator sees names a rule that was off; "ok." is never the whole line then.
-    if rule_state == "active":
-        suffix = f" ({rule_text})"
+    # The LAST line the operator sees names every check that did not run; "ok." is never the whole line then.
+    notes = []
+    if _CONTRACT_MISSING:
+        notes.append("contract tests DID NOT RUN on Python " + ", ".join(_CONTRACT_MISSING))
+    if rule_state != "active":
+        notes.append(rule_text)
+    if failed:
+        if notes:
+            print("pre-push gate: BLOCKED, and note: " + "; AND ".join(notes), file=sys.stderr)
+    elif notes:
+        tail = f" ({rule_text})" if rule_state == "active" else ""
+        print("pre-push gate: ok, BUT " + "; AND ".join(notes) + tail, file=sys.stderr)
     else:
-        suffix = f" BUT {rule_text}"
-    if not failed:
-        print(f"pre-push gate: ok{'.' if rule_state == 'active' else ','}{suffix}", file=sys.stderr)
-    elif rule_state != "active":
-        print(f"pre-push gate: BLOCKED, and note: {rule_text}", file=sys.stderr)
+        print(f"pre-push gate: ok. ({rule_text})", file=sys.stderr)
     return 1 if failed else 0
 
 
@@ -609,9 +645,19 @@ def hook_path() -> Path:
     return (p if p.is_absolute() else ROOT / p) / "pre-push"
 
 
-def installed() -> bool:
+def hook_state() -> str:
+    """"none" (no managed hook), "current" (managed, from this template) or "stale" (managed, older template)."""
     hp = hook_path()
-    return hp.is_file() and HOOK_TAG in hp.read_text(encoding="utf-8", errors="replace")
+    if not hp.is_file():
+        return "none"
+    text = hp.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
+    if HOOK_TAG not in text:
+        return "none"
+    return "current" if f"# liebert-hook-template: {HOOK_VERSION}\n" in text else "stale"
+
+
+def installed() -> bool:
+    return hook_state() != "none"
 
 
 def main(argv=None) -> int:
@@ -623,12 +669,21 @@ def main(argv=None) -> int:
     ap.add_argument("--range", default="origin/main..HEAD")
     a = ap.parse_args(argv)
     if a.check:
-        print(f"pre-push hook {'INSTALLED' if installed() else 'NOT installed'}: {hook_path()}")
-        return 0 if installed() else 1
+        state = hook_state()
+        if state == "current":
+            print(f"pre-push hook INSTALLED: {hook_path()}")
+            return 0
+        if state == "stale":
+            print(f"pre-push hook STALE: {hook_path()} was installed from an older template than this script; "
+                  "it is not the hook this version would install. Fix: python scripts/pre_push_gate.py install")
+            return 1
+        print(f"pre-push hook NOT installed: {hook_path()}")
+        return 1
     if a.cmd == "install":
         hp = hook_path()
         if hp.exists() and not installed() and not a.force:
-            print(f"refusing: {hp} exists and is not ours (use --force)", file=sys.stderr)
+            print(f"refusing: {hp} exists and is not ours (use --force). A stale managed hook needs no --force: "
+                  "plain `install` replaces it.", file=sys.stderr)
             return 3
         py = Path(sys.executable).as_posix()
         if "'" in py:
@@ -636,7 +691,7 @@ def main(argv=None) -> int:
             return 3
         hp.parent.mkdir(parents=True, exist_ok=True)
         with open(hp, "w", encoding="utf-8", newline="\n") as f:
-            f.write(HOOK_TEMPLATE.format(tag=HOOK_TAG, py=py))
+            f.write(render_hook(py))
         try:
             os.chmod(hp, 0o755)
         except OSError:

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -528,3 +529,162 @@ def test_the_gates_own_pytest_runs_print_skip_reasons(monkeypatch):
     monkeypatch.setattr(gate, "message_findings", lambda ranges: [])
     gate.run_gate([["HEAD"]])
     assert len(seen) == 2 and all("-rs" in c for c in seen)
+
+
+# ---- the installed hook must never skip silently ------------------------------------------------
+def _run_hook(tmp_path, cwd, extra_env=None):
+    sh = shutil.which("sh")
+    git = shutil.which("git")
+    if not sh or not git:
+        pytest.skip("needs sh and git on PATH")
+    hook = tmp_path / "pre-push"
+    hook.write_text(gate.render_hook(Path(sys.executable).as_posix()), encoding="utf-8", newline="\n")
+    env = {k: v for k, v in os.environ.items() if k != "LIEBERT_GATE_ALLOW_MISSING"}
+    env["GIT_CEILING_DIRECTORIES"] = str(Path(cwd).parent)      # never climb into a repo above the temp dir
+    env.update(extra_env or {})
+    return subprocess.run([sh, str(hook)], cwd=cwd, env=env, input="", capture_output=True, text=True, timeout=60)
+
+
+def _bare_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    return repo
+
+
+def test_hook_refuses_and_says_why_when_the_gate_script_is_absent(tmp_path):
+    repo = _bare_repo(tmp_path)
+    r = _run_hook(tmp_path, repo)
+    assert r.returncode == 1
+    assert "NO CHECKS RAN" in r.stderr and "pre_push_gate.py does not exist" in r.stderr
+    assert "BLOCKED" in r.stderr and "LIEBERT_GATE_ALLOW_MISSING=1" in r.stderr
+
+
+def test_hook_skips_only_loudly_when_the_operator_names_the_opt_out(tmp_path):
+    repo = _bare_repo(tmp_path)
+    r = _run_hook(tmp_path, repo, {"LIEBERT_GATE_ALLOW_MISSING": "1"})
+    assert r.returncode == 0
+    assert "NO CHECKS RAN" in r.stderr and "SKIPPED ON PURPOSE" in r.stderr and "UNCHECKED" in r.stderr
+    assert _run_hook(tmp_path, repo, {"LIEBERT_GATE_ALLOW_MISSING": "yes"}).returncode == 1   # only "1" counts
+
+
+def test_hook_refuses_and_says_why_when_git_cannot_resolve_a_root(tmp_path):
+    outside = tmp_path / "not-a-repo"
+    outside.mkdir()
+    r = _run_hook(tmp_path, outside)
+    assert r.returncode == 1
+    assert "NO CHECKS RAN" in r.stderr and "could not resolve the repository root" in r.stderr
+    ok = _run_hook(tmp_path, outside, {"LIEBERT_GATE_ALLOW_MISSING": "1"})
+    assert ok.returncode == 0 and "SKIPPED ON PURPOSE" in ok.stderr
+
+
+def test_hook_template_has_no_silent_exit_zero_and_documents_its_opt_out():
+    hook = gate.HOOK_TEMPLATE
+    assert "|| exit 0" not in hook
+    assert [ln for ln in hook.splitlines() if "exit 0" in ln and ln.strip() != "exit 0"] == []
+    assert "LIEBERT_GATE_ALLOW_MISSING" in gate.__doc__
+
+
+# ---- the last line must name a contract version that did not run --------------------------------
+def _last_line(monkeypatch, capsys, missing, registry=None, tmp_path=None):
+    if registry is not None:
+        path = tmp_path / "targets.txt"
+        path.write_text(registry, encoding="utf-8")
+        monkeypatch.setenv("LIEBERT_RE_TARGETS", str(path))
+    found = {v: (Path(sys.executable), v + ".0") for v in gate.CONTRACT_VERSIONS if v not in missing}
+    monkeypatch.setattr(gate, "find_contract_interpreters",
+                        lambda env=None: (found, {v: [] for v in missing}))
+    monkeypatch.setattr(gate, "run_pytest", lambda cmd, **kw: (0, []))
+    monkeypatch.setattr(gate, "message_findings", lambda ranges: [])
+    monkeypatch.delenv("LIEBERT_CONTRACT_STRICT", raising=False)
+    rc = gate.run_gate([["HEAD"]])
+    return rc, [x for x in capsys.readouterr().err.splitlines() if x.strip()][-1]
+
+
+def test_final_line_names_a_version_whose_contract_tests_did_not_run(monkeypatch, capsys, tmp_path):
+    rc, last = _last_line(monkeypatch, capsys, ["3.10"], _PLACEHOLDER, tmp_path)
+    assert rc == 0                                          # default blocking behaviour is unchanged
+    assert last.startswith("pre-push gate: ok, BUT contract tests DID NOT RUN on Python 3.10")
+    assert "3.12" not in last and "3.14" not in last
+    assert "product-name rule active" in last               # the active-rule text is still shown
+
+
+def test_final_line_names_every_missing_version(monkeypatch, capsys, tmp_path):
+    rc, last = _last_line(monkeypatch, capsys, ["3.10", "3.14"], _PLACEHOLDER, tmp_path)
+    assert rc == 0 and "DID NOT RUN on Python 3.10, 3.14" in last
+
+
+def test_final_line_carries_both_notes_when_the_product_rule_is_also_inactive(monkeypatch, capsys):
+    rc, last = _last_line(monkeypatch, capsys, ["3.12"])    # autouse fixture: registry absent
+    assert rc == 0
+    assert "DID NOT RUN on Python 3.12" in last and "product-name rule INACTIVE" in last
+    assert last.startswith("pre-push gate: ok, BUT ")
+
+
+def test_final_line_is_a_plain_ok_only_when_nothing_was_skipped(monkeypatch, capsys, tmp_path):
+    rc, last = _last_line(monkeypatch, capsys, [], _PLACEHOLDER, tmp_path)
+    assert rc == 0 and last.startswith("pre-push gate: ok. ") and "DID NOT RUN" not in last
+    assert gate._CONTRACT_MISSING == []
+
+
+def test_strict_missing_version_blocks_and_the_final_line_still_names_it(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("LIEBERT_CONTRACT_STRICT", "1")
+    monkeypatch.setattr(gate, "find_contract_interpreters",
+                        lambda env=None: ({v: (Path(sys.executable), v + ".0") for v in ("3.12", "3.14")},
+                                          {"3.10": []}))
+    monkeypatch.setattr(gate, "run_pytest", lambda cmd, **kw: (0, []))
+    monkeypatch.setattr(gate, "message_findings", lambda ranges: [])
+    assert gate.run_gate([["HEAD"]]) == 1
+    last = [x for x in capsys.readouterr().err.splitlines() if x.strip()][-1]
+    assert "BLOCKED" in last and "DID NOT RUN on Python 3.10" in last
+
+
+# ---- --check tells none / current / stale apart -------------------------------------------------
+def _check(monkeypatch, capsys, repo):
+    monkeypatch.setattr(gate, "ROOT", repo)
+    rc = gate.main(["--check"])
+    return rc, capsys.readouterr().out
+
+
+def test_check_distinguishes_no_hook_current_and_stale(monkeypatch, capsys, tmp_path):
+    repo = _bare_repo(tmp_path)
+    rc, out = _check(monkeypatch, capsys, repo)
+    assert rc == 1 and "NOT installed" in out
+    assert gate.main(["install"]) == 0
+    capsys.readouterr()
+    rc, out = _check(monkeypatch, capsys, repo)
+    assert rc == 0 and out.startswith("pre-push hook INSTALLED")
+    hook = gate.hook_path()
+    old = hook.read_text(encoding="utf-8").replace(f"# liebert-hook-template: {gate.HOOK_VERSION}\n", "")
+    hook.write_text(old, encoding="utf-8", newline="\n")         # what a hook from before the marker looks like
+    rc, out = _check(monkeypatch, capsys, repo)
+    assert rc == 1 and "STALE" in out and "install" in out
+
+
+def test_a_foreign_hook_is_not_reported_as_ours(monkeypatch, capsys, tmp_path):
+    repo = _bare_repo(tmp_path)
+    monkeypatch.setattr(gate, "ROOT", repo)
+    gate.hook_path().parent.mkdir(parents=True, exist_ok=True)
+    gate.hook_path().write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    rc, out = _check(monkeypatch, capsys, repo)
+    assert rc == 1 and "NOT installed" in out
+
+
+def test_plain_install_replaces_a_stale_hook_but_refuses_a_foreign_one_and_says_how(monkeypatch, capsys, tmp_path):
+    repo = _bare_repo(tmp_path)
+    monkeypatch.setattr(gate, "ROOT", repo)
+    hook = gate.hook_path()
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text(f"#!/bin/sh\n{gate.HOOK_TAG}\nexit 0\n", encoding="utf-8")
+    assert gate.hook_state() == "stale"
+    assert gate.main(["install"]) == 0 and gate.hook_state() == "current"
+    hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    capsys.readouterr()
+    assert gate.main(["install"]) == 3
+    assert "--force" in capsys.readouterr().err
+
+
+def test_hook_version_follows_the_template_text():
+    import hashlib
+    assert gate.HOOK_VERSION == hashlib.sha256(gate.HOOK_TEMPLATE.encode()).hexdigest()[:12]
+    assert f"# liebert-hook-template: {gate.HOOK_VERSION}" in gate.render_hook("/x/python")
