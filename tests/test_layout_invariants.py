@@ -287,7 +287,8 @@ def test_published_tool_name_set_is_unchanged():
     # image) escaped Popen as a raw OSError, and -- worse -- a naive fix would have let
     # returncode=None read as success, so capa_status would have answered OK with a null
     # version. TOOL_UNLAUNCHABLE is now a distinct code from TOOL_MISSING across all
-    # thirteen callers of run_bounded_process. Digest recomputed from the source.
+    # thirteen callers of run_bounded_process (the count is asserted in
+    # tests/test_launch_contract.py, not by this digest). Digest recomputed from the source.
     # Updated again: 789 -> 793 (measured by diffing against the previous commit).
     # None removed. One new module, liebert_re/tools/pe_trailing.py, reporting what
     # lives past the last section -- the published tool pe_trailing_data, reached from
