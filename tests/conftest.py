@@ -5,29 +5,26 @@ ordinary ``pytest`` run to deposit files into the real evidence ledger
 (``dataset/evidence/``) that this product ships as proof of real analysis
 runs.
 
-Incident this closes: ``tests/test_tools_unpack.py`` monkeypatches only the
-guest (Hyper-V) layer of ``tools_unpack.unpack_iat_rebuild`` -- never its
-file-write side. That module's ``EVIDENCE`` directory, like every other
-``tools_*.py`` adapter's, is a hardcoded path computed once at import time
-with no test-time override, so every "fail-closed contract" test that
-reaches the write calls (``EVIDENCE / f"{run_tag}_unlicense_stdout.txt"``,
-``EVIDENCE / f"{run_tag}_{digest}_unpacked.exe"``) deposited a real file into
-``dataset/evidence/unpack/`` -- roughly 250 of them, all built from the same
-fabricated guest response and the same fixture file
-(``.venv/Lib/site-packages/setuptools/cli-64.exe``), indistinguishable at a
-glance from a genuine ``unlicense`` run recorded in the ledger.
+Incident this closes (history from the upstream tree this package was cut from; the code
+named here is NOT in this package): a test there monkeypatched only the guest-VM layer of an
+unpacking adapter, never its file-write side. That adapter's ``EVIDENCE`` directory, like every
+other adapter's, is a hardcoded path computed once at import time with no test-time override, so
+every "fail-closed contract" test that reached the write calls deposited a real file into the
+real ledger -- roughly 250 of them, all built from one fabricated response and one fixture
+file, indistinguishable at a glance from a genuine run recorded in the ledger.
+
+What this package has instead: no guest (Hyper-V) layer, and no ``tools_*.py`` modules. The
+wrappers live in ``liebert_re/tools/`` and ``liebert_re/dynamic/`` and several of them
+(``tools/capa.py``, ``tools/die.py``, ``tools/ida.py``, ``tools/rizin.py``, ``tools/ghidra.py``,
+``dynamic/lab_gate.py``, ...) bind a module-level ``EVIDENCE`` directory the same way.
 
 Mechanism: every already-imported module that owns a module-level
 ``EVIDENCE`` ``Path`` pointing inside the real ledger gets that attribute
 redirected, for the duration of each test, to a fresh per-test scratch
-directory (deleted again immediately after). This generalises the ad hoc
-pattern
-``tests/test_evidence_registration_more_tools.py`` already uses in one place
-(``patch.object(tools_decompiler, "EVIDENCE", root)``) so every test gets it
-automatically instead of each test author having to remember it -- and
-covers any future ``tools_*.py`` adapter that follows the same
-``EVIDENCE = APP_DIR / "dataset" / "evidence" / ...`` convention, by
-attribute discovery rather than a hardcoded module name list.
+directory (deleted again immediately after). Every test gets this automatically instead of
+each test author having to remember it -- and it covers any future module that follows the same
+``EVIDENCE = APP_DIR / "dataset" / "evidence" / ...`` convention, by attribute discovery
+rather than a hardcoded module name list.
 
 Production runs (anything not executed under pytest) are entirely
 unaffected: this file only loads when pytest collects the ``tests/``
@@ -135,7 +132,7 @@ def pytest_configure(config: pytest.Config) -> None:
 # output completely out of the real ``dataset/evidence/`` ledger.
 #
 # Process-scoped, not just test-scoped (added 2026-09-26 after a measured
-# ``FileNotFoundError`` in ``tools_emulate_range.py``'s ``_run_worker_once``
+# ``FileNotFoundError`` in a worker-launching adapter of the upstream tree (not in this package)
 # under concurrent test execution): pytest's ``tmp_path`` names are a
 # sanitized-nodeid-plus-counter scheme that restarts from 0 in every new
 # session, so two SEPARATE ``pytest`` processes running concurrently against
@@ -634,10 +631,10 @@ def _redirect_tool_evidence_dirs_away_from_the_real_ledger(tmp_path, monkeypatch
         monkeypatch.setattr(module, "EVIDENCE", target, raising=False)
         redirected[module] = target
 
-    # Several adapters (``tools_decompiler``, ``tools_capability_extract``,
-    # ``tools_emulation``, ``tools_emulate_range``, ``tools_isolated_dynamic``,
-    # ``tools_memory_scan``) set ``EVIDENCE`` to the real ledger ROOT itself
-    # (``relative == Path(".")``) and write flat files directly under it
+    # A module that set ``EVIDENCE`` to the real ledger ROOT itself would be handled here. No module
+    # of this package does today (every ``EVIDENCE`` here is a subdirectory; the upstream tree had
+    # several adapters that used the root), so this branch is a guard for a future module. Such a module
+    # has ``relative == Path(".")`` and writes flat files directly under it
     # (``EVIDENCE / f"{run_tag}_....json"``), not into a subdirectory. For
     # exactly those, "the real subdirectory this test's module owns" IS the
     # whole ~80k-file root, so a content diff on it is indistinguishable

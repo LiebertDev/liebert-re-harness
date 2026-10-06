@@ -75,8 +75,7 @@ KNOWN_PRIVATE_REFS = {
     "liebert_re/workspace.py": ({"TEACHER_", "teacher.py"}, _ENV + " (live code: TEACHER_WORKSPACE etc.)"),
     "liebert_re/tools/yara_x.py": ({"TEACHER_", "tools_capability_extract", "tools_decompiler"}, _DEAD + "; temp-dir prefix teacher_yarax_rule_"),
     "liebert_re/evidence/workspace_index.py": ({"TEACHER_", "tools_memory_scan"}, _ENV + "; plus a dead docstring reference"),
-    "tests/conftest.py": ({"TEACHER_", "mcp_server", "research_state", "teacher.py", "tools_capability_extract", "tools_decompiler",
-                           "tools_emulate_range", "tools_emulation", "tools_isolated_dynamic", "tools_memory_scan"}, _DEAD),
+    "tests/conftest.py": ({"TEACHER_", "mcp_server", "research_state", "teacher.py"}, _DEAD),
     "tests/test_artifact_provenance_absent_inputs.py": ({"TEACHER_"}, "names prompts/teacher_system.md; surfaced by the case-insensitive scan"),
     "tests/test_claim_guard.py": ({"TEACHER_", "teacher.py"}, _DEAD),
     "tests/test_disassemble_pe_va_resolution.py": ({"tools_emulation"}, _DEAD),
@@ -370,14 +369,15 @@ def test_allowlists_have_not_grown():
     assert hashlib.sha256(repr(PRIVATE_IDS).encode()).hexdigest().startswith("d51a752750a0f2a7")
     assert set(KNOWN_UNREFERENCED) == {"liebert_re.tools.asar_parser"}
     assert set(KNOWN_USER_PATHS) == {"tests/test_public_provenance_and_fixtures.py", "liebert_re/workspace.py"}
-    # 24 -> 23 entries, 41 -> 40 identifiers: tests/test_pe_resources.py now builds its fixtures
+    # tests/conftest.py: six stale tools_* identifiers removed (40 -> 34); earlier, 24 -> 23 entries,
+    # 41 -> 40 identifiers: tests/test_pe_resources.py now builds its fixtures
     # (docs/CORPUS.md) and no longer names a private-tree identifier, so its entry was removed.
     assert len(KNOWN_PRIVATE_REFS) == 23
-    assert sum(len(ids) for ids, _ in KNOWN_PRIVATE_REFS.values()) == 40
+    assert sum(len(ids) for ids, _ in KNOWN_PRIVATE_REFS.values()) == 34
     # Fingerprint of every (path, identifiers) pair: swapping an entry, not only
     # adding one, changes it. Update it only when REMOVING entries.
     digest = hashlib.sha256(repr(sorted((f, sorted(i)) for f, (i, _) in KNOWN_PRIVATE_REFS.items())).encode()).hexdigest()
-    assert digest.startswith("86d47f7f76afe246")
+    assert digest.startswith("63966aa9effe05b4")
     assert all(reason for _, reason in KNOWN_PRIVATE_REFS.values())
 
 
