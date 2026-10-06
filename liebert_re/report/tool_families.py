@@ -16,10 +16,12 @@ CAPABILITIES.  It records how tool routing works across the full private
 working tree this project is developed in, which is far larger than what is
 published here (see README.md, "What is in this repository, and what is
 not"). Most names below are not implemented anywhere in this published
-package -- ``"windows-kernel"`` is the extreme case: of its 15 named tools,
-only six are defined here: the generic ``tool_missing`` sentinel,
-``kernel_triage``, ``ioctl_control_code_decode``, ``driver_major_function_scan``,
-``rip_relative_iat_scan`` and ``kernel_callback_registrations``.
+package -- ``"windows-kernel"`` is the extreme case: of its 17 named tools,
+only eight are defined here: the generic ``tool_missing`` sentinel,
+``kernel_triage``, ``ioctl_control_code_decode``, ``ioctl_candidate_scan``,
+``driver_major_function_scan``, ``rip_relative_iat_scan``,
+``kernel_callback_registrations`` and ``ida_query`` (which needs a licensed IDA
+present on the machine and returns a tool-missing result without one).
 ``kernel_triage`` is a first look only: it reports indicators and a
 ``driver_likelihood`` of LIKELY or UNKNOWN (``proves_driver`` is always
 false). Three of the other four are byte-pattern searches over the image with
@@ -27,7 +29,9 @@ no disassembler, and none of them proves what it finds: ``proves_dispatch``
 and ``proves_call`` are always false, and ``kernel_callback_registrations``
 never recovers the callback address. ``ioctl_control_code_decode`` is not a
 scan at all: it splits caller-supplied CTL_CODE integers into their bit fields
-and reads no file. The remaining nine names are roadmap. This package
+and reads no file. ``ioctl_candidate_scan`` scans a code region for compared immediates and decodes
+each with that function; it proves nothing (``proves_ioctl`` is false). The
+remaining nine names are roadmap. This package
 therefore still cannot
 analyse a kernel driver in any real depth even though the family exists and
 routes for one. Do not read membership in a ``FAMILIES[...]`` set as "this
@@ -43,7 +47,7 @@ between ``FAMILIES[family]`` and :func:`published_tools` (counts per family:
 :func:`published_family_report`). Measured at the time of writing, from
 :func:`published_family_report` (named / locally defined): workspace 15/10,
 identity 14/4, source 7/3, binary 4/4,
-native 80/57, windows-kernel 15/6, dotnet 9/4, archive 2/2, android 6/6,
+native 81/58, windows-kernel 17/8, dotnet 9/4, archive 2/2, android 6/6,
 game-engine 11/9, network 3/3, database 2/2, structured 3/2, jvm 5/5,
 webassembly 2/2, correlation 18/5, debug 9/6, web 2/2, dynamic 39/9,
 crypto 7/5, emulation 6/1. Re-measure rather than trust this list.
@@ -61,8 +65,8 @@ FAMILIES = {
     "identity": {"file_identity", "generic_static_probe", "route_file", "capability_lookup", "capability_registry_v2", "capability_gap_report", "framework_detect", "specialist_gap_report", "tool_missing", "research_plan", "tool_provision_acquire", "tool_provision_status", "opencode_ask", "opencode_status"},
     "source": {"source_inspect", "semantic_security_analyze", "deep_source_analyze", "attack_surface_map", "project_inspect", "cross_file_graph", "research_graph"},
     "binary": {"binary_summary", "binary_strings", "search_binary_bytes", "hash_file"},
-    "native": {"native_inspect", "native_function_inventory", "native_xref_analyze", "binary_version_diff", "binary_security_analyze", "capa_analyze", "floss_analyze", "patch_preflight", "known_plaintext_scan", "pe_sections", "pe_imports", "pe_exports", "disassemble_pe", "ghidra_query", "ida_query", "ida_microcode_cfg", "ida_type_member_offset", "ida_rename_plan", "ida_annotations_apply", "ida_annotations_purge", "ida_set_comments_plan", "ida_annotations", "decompile_coverage_check", "runtime_resolved_api_recover", "resolve_incoming_parameter_source", "stack_string_recover", "upx_unpack", "cfg_deobfuscate", "vb6_inspect", "delphi_inspect", "cpp_rtti_inspect", "vb6_pcode", "analyze_obfuscation", "authenticode_signature", "plist_inspect", "analyze_tls_directory", "binary_patch", "dataflow_recover", "detection_reason_map", "decompiler_status", "die_identify", "die_entropy", "die_file_info", "die_format_check", "die_hashes", "die_structures", "die_struct_raw", "die_database_info", "die_status", "capa_status", "find_import_references", "find_code_references", "setopt_call_arguments", "find_function_by_body_shape", "functional_verification_evaluate", "ghidra_decompile", "ghidra_status", "ghidra_program_facts", "ida_disasm_listing", "ida_patch_plan", "ida_status", "pe_resources", "rizin_disasm_listing", "rizin_functions", "rizin_patch_apply", "rizin_patch_plan", "rizin_status", "rz_bin_imports", "rz_bin_sections", "rz_bin_headers", "rz_bin_relocations", "rz_bin_status", "rizin_flirt_match", "rizin_flirt_match_file", "rizin_flirt_inventory", "yara_x_scan", "yara_x_status", "upx_status", "binary_summary", "binary_strings"},
-    "windows-kernel": {"kernel_triage", "kernel_debug_analyze", "kernel_security_analyze", "semantic_security_analyze", "native_inspect", "ghidra_query", "ioctl_control_code_decode", "ioctl_code_recovery", "tool_missing", "kernel_callback_registrations", "detection_reason_map", "driver_major_function_scan", "iat_call_argument_recover", "passive_object_namespace_probe", "rip_relative_iat_scan"},
+    "native": {"native_inspect", "native_function_inventory", "native_xref_analyze", "binary_version_diff", "binary_security_analyze", "capa_analyze", "floss_analyze", "patch_preflight", "known_plaintext_scan", "pe_sections", "pe_imports", "pe_exports", "disassemble_pe", "disassemble_pe_structured", "ghidra_query", "ida_query", "ida_microcode_cfg", "ida_type_member_offset", "ida_rename_plan", "ida_annotations_apply", "ida_annotations_purge", "ida_set_comments_plan", "ida_annotations", "decompile_coverage_check", "runtime_resolved_api_recover", "resolve_incoming_parameter_source", "stack_string_recover", "upx_unpack", "cfg_deobfuscate", "vb6_inspect", "delphi_inspect", "cpp_rtti_inspect", "vb6_pcode", "analyze_obfuscation", "authenticode_signature", "plist_inspect", "analyze_tls_directory", "binary_patch", "dataflow_recover", "detection_reason_map", "decompiler_status", "die_identify", "die_entropy", "die_file_info", "die_format_check", "die_hashes", "die_structures", "die_struct_raw", "die_database_info", "die_status", "capa_status", "find_import_references", "find_code_references", "setopt_call_arguments", "find_function_by_body_shape", "functional_verification_evaluate", "ghidra_decompile", "ghidra_status", "ghidra_program_facts", "ida_disasm_listing", "ida_patch_plan", "ida_status", "pe_resources", "rizin_disasm_listing", "rizin_functions", "rizin_patch_apply", "rizin_patch_plan", "rizin_status", "rz_bin_imports", "rz_bin_sections", "rz_bin_headers", "rz_bin_relocations", "rz_bin_status", "rizin_flirt_match", "rizin_flirt_match_file", "rizin_flirt_inventory", "yara_x_scan", "yara_x_status", "upx_status", "binary_summary", "binary_strings"},
+    "windows-kernel": {"kernel_triage", "kernel_debug_analyze", "kernel_security_analyze", "semantic_security_analyze", "native_inspect", "ghidra_query", "ida_query", "ioctl_control_code_decode", "ioctl_candidate_scan", "ioctl_code_recovery", "tool_missing", "kernel_callback_registrations", "detection_reason_map", "driver_major_function_scan", "iat_call_argument_recover", "passive_object_namespace_probe", "rip_relative_iat_scan"},
     "dotnet": {"dotnet_inspect", "dotnet_security_analyze", "dotnet_relationship_analyze", "dotnet_metadata", "decompile_dotnet", "decompiler_status", "dotnet_deobfuscate", "dotnet_il_inspect", "dotnet_metadata_inspect"},
     "archive": {"archive_inspect", "rar_7z"},
     "android": {"archive_inspect", "framework_detect", "dex_decompiler", "dex_status", "android_resource_analyzer", "tool_missing"},
@@ -193,7 +197,8 @@ CORE_TOOLS = (
 # FAMILIES["native"] means a tool added to that family automatically starts
 # flowing (as "deep") instead of silently sitting inert. Every name in
 # _NATIVE_CORE_TOOL_NAMES must also be a member of FAMILIES["native"]
-# (enforced by test_native_tier_family_parity.py); binary_summary/
+# (enforced by tests/test_cli_capabilities_roadmap.py,
+# test_native_core_tools_are_all_in_the_native_family); binary_summary/
 # binary_strings were added to FAMILIES["native"] alongside this change so
 # that invariant holds without dropping them from the core native surface --
 # they previously lived only in FAMILIES["binary"], which state-driven
@@ -239,6 +244,7 @@ _NATIVE_PATH_ONLY_TOOL_NAMES = frozenset({
     "upx_unpack", "ghidra_query", "ida_query", "vb6_inspect", "vb6_pcode",
     "delphi_inspect", "cpp_rtti_inspect", "capa_analyze", "floss_analyze",
     "patch_preflight", "known_plaintext_scan", "native_function_inventory", "rizin_functions", "disassemble_pe",
+    "disassemble_pe_structured",  # same selection and defaults as disassemble_pe, dict instead of text
     "pe_resources", "analyze_tls_directory", "ghidra_decompile",
     # Headless import into a throwaway project; the path is the only required argument.
     "ghidra_program_facts",
@@ -262,10 +268,19 @@ NATIVE_COORDINATE_TOOLS = tuple(sorted(
 _WINDOWS_KERNEL_PATH_ONLY_TOOL_NAMES = frozenset({
     "kernel_triage", "kernel_security_analyze", "semantic_security_analyze",
     "native_inspect", "ghidra_query", "kernel_callback_registrations", "driver_major_function_scan",
+    "ida_query",  # bare {"path": ...} works (operation defaults to "summary"); needs a licensed IDA on
+        # the machine and returns a tool-missing result without one. Same schema as in the native set.
     "rip_relative_iat_scan",  # schema's only required param is "path" (a no-capstone
         # RIP-relative byte-pattern first pass), genuinely callable bare like
         # driver_major_function_scan.
 })
+# Deliberately NOT in the set above: ioctl_candidate_scan. Its schema requires
+# only a path, so the rule would admit it, but a bare call scans from the entry
+# point -- not where the compared immediates are. Its docstring says the start
+# RVA should come from driver_major_function_scan and that nothing is chained
+# automatically. Admitting it would repeat the b411965 regression recorded just
+# below, where a coordinate tool in the path-only set made file_router
+# recommend and auto-invoke it with a bare path.
 WINDOWS_KERNEL_NOT_FILE_ROUTABLE = tuple(sorted({
     "ioctl_control_code_decode",  # consumes a caller-declared code list, no path
     "tool_missing",  # generic sentinel, added separately by file_router.py

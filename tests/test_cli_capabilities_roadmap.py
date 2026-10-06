@@ -75,3 +75,30 @@ def test_repeated_name_is_listed_in_every_family_that_declares_it():
     for n in repeated:
         declaring = {f for f, v in _expected_missing().items() if n in v}
         assert {f for f, v in body["unimplemented"].items() if n in v} == declaring
+
+
+def test_shipped_tools_are_registered_in_their_family():
+    # An orphan (defined here, named in no family) can never be routed to.
+    assert "disassemble_pe_structured" in published_tools("native")
+    assert "ioctl_candidate_scan" in published_tools("windows-kernel")
+    assert "ida_query" in published_tools("windows-kernel")
+    assert "ida_query" in published_tools("native")
+
+
+def test_kernel_route_reaches_ida_query_and_keeps_the_roadmap_name():
+    from liebert_re.report import tool_families as tf
+    assert "ida_query" in tf.WINDOWS_KERNEL_PATH_ONLY_TOOLS
+    assert "ioctl_candidate_scan" in tf.WINDOWS_KERNEL_COORDINATE_TOOLS
+    assert "disassemble_pe_structured" in tf.NATIVE_PATH_ONLY_TOOLS
+    assert "ghidra_query" in tf.FAMILIES["windows-kernel"]  # roadmap name stays by design
+
+
+def test_native_core_tools_are_all_in_the_native_family():
+    # tool_families.py claimed this invariant was "enforced by
+    # test_native_tier_family_parity.py", a file that does not exist. The claim is
+    # now true: NATIVE_DEEP_TOOLS is derived from FAMILIES["native"], so a core
+    # name missing from that family would silently stop being recommended.
+    from liebert_re.report import tool_families as tf
+    assert tf._NATIVE_CORE_TOOL_NAMES <= tf.FAMILIES["native"], sorted(
+        tf._NATIVE_CORE_TOOL_NAMES - tf.FAMILIES["native"]
+    )
