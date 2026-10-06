@@ -82,7 +82,9 @@ class ArchiveMissing(_Base):
     CASES = (
         ("a.7z", b"7z\xbc\xaf\x27\x1c" + b"\x00" * 32, "py7zr", ("py7zr", "py7zr.io")),
         ("a.rar", b"Rar!\x1a\x07\x00" + b"\x00" * 32, "rarfile", ("rarfile",)),
-        ("a.zst", b"\x28\xb5\x2f\xfd" + b"\x00" * 32, "backports.zstd", ("backports", "backports.zstd")),
+        # compression.zstd is tried first on 3.14+, so blocking only the backport
+        # would leave a working zstd path and no TOOL_MISSING to assert.
+        ("a.zst", b"\x28\xb5\x2f\xfd" + b"\x00" * 32, "backports.zstd", ("compression.zstd", "backports", "backports.zstd")),
     )
 
     def test_each_missing_package_is_named_and_is_tool_missing(self):
@@ -93,7 +95,7 @@ class ArchiveMissing(_Base):
     def test_stdlib_codecs_do_not_need_any_optional_package(self):
         import gzip
         f = self._file("a.gz", gzip.compress(b"hello"))
-        with self._blocked("py7zr", "rarfile", "backports", "backports.zstd"):
+        with self._blocked("py7zr", "rarfile", "compression.zstd", "backports", "backports.zstd"):
             r = json.loads(rar_7z(f, "summary"))
         self.assertTrue(r["ok"])
         self.assertNotIn("status", r)

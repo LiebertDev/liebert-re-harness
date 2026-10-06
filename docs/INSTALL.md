@@ -94,9 +94,9 @@ file was never read:
 | `7z`, `rar`, `zstd` (or `archive` for all three) | `py7zr`, `rarfile`, `backports.zstd` | `liebert_re/tools/archive2.py` |
 
 `loguru` is only used to silence androguard's logger; androguard already depends on it, and
-`android.py` ignores a failed `loguru` import. `backports.zstd` is published for Python below 3.14
-only, so on 3.14 or newer the `zstd` extra installs nothing and the zstd path of `rar_7z` stays
-`TOOL_MISSING`. gzip, bzip2 and xz use the standard library and need none of these.
+`android.py` ignores a failed `loguru` import. zstd uses the standard library's `compression.zstd` on Python 3.14 or newer, where the `zstd` extra
+installs nothing and is not needed; `backports.zstd` (published for Python below 3.14 only) is the
+fallback on older interpreters, and the zstd path of `rar_7z` returns `TOOL_MISSING` only when neither is importable. gzip, bzip2 and xz use the standard library and need none of these.
 
 ## External applications — all optional
 

@@ -265,7 +265,11 @@ def test_published_tool_name_set_is_unchanged():
     # working tool and reported it as unimplemented. The function is now apimonitor_status, with
     # no alias left behind, so the count stays 779 (measured: one name swapped for one) and the
     # dynamic family goes 8 -> 9 published. Digest recomputed from the source.
-    assert digest == "e9f3956d46cfaafbac660387afadaa71099240b383b5c9321b65979e8f7d94ce"
+    # Updated again: 779 -> 780 (measured), one private top-level function added in
+    # liebert_re/tools/archive2.py, none removed: _zstd_module, which tries the standard
+    # library's compression.zstd before backports.zstd so the format is not refused on an
+    # interpreter that ships it. No new module. Digest recomputed from the source.
+    assert digest == "c49ceb4b87eadc8f4a8f9984d5ac7a87b9fde9e7d1f79b221b4dea75d5cd2016"
 
 
 def test_the_imported_package_is_this_checkout():

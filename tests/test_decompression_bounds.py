@@ -42,6 +42,16 @@ def _j(s):
     return json.loads(s)
 
 
+def _zstd():
+    # Same order as the module under test: standard library (3.14+), then the backport.
+    try:
+        from compression import zstd
+        return zstd
+    except ImportError:
+        from backports import zstd
+        return zstd
+
+
 def _legacy_stream(p: Path, fmt: str) -> bytes:
     data = p.read_bytes()
     if fmt == "GZIP":
@@ -50,8 +60,7 @@ def _legacy_stream(p: Path, fmt: str) -> bytes:
         return bz2.decompress(data)
     if fmt == "XZ":
         return lzma.decompress(data)
-    from backports import zstd
-    return zstd.decompress(data)
+    return _zstd().decompress(data)
 
 
 def _legacy_read(decompressed: bytes, max_chars: int) -> dict:
@@ -82,8 +91,7 @@ def _compress_chunks(fmt: str, chunks) -> bytes:
     elif fmt == "XZ":
         c = lzma.LZMACompressor()
     else:
-        from backports import zstd
-        c = zstd.ZstdCompressor()
+        c = _zstd().ZstdCompressor()
     out = [c.compress(ch) for ch in chunks]
     out.append(c.flush())
     return b"".join(out)
@@ -96,8 +104,8 @@ def _zeros(total: int):
 
 
 SUFFIX = {"GZIP": ".gz", "BZIP2": ".bz2", "XZ": ".xz", "ZSTD": ".zst"}
-try:  # optional dependencies: py7zr and backports.zstd are not in the published requirements
-    import backports.zstd  # noqa: F401
+try:  # optional dependencies: py7zr and, below Python 3.14, backports.zstd
+    _zstd()
     HAVE_ZSTD = True
 except ImportError:
     HAVE_ZSTD = False

@@ -128,6 +128,18 @@ def _rar_list(p):
     with rarfile.RarFile(str(p)) as rf:
         return [{'name':i.filename,'size':i.file_size,'compress_size':i.compress_size,'crc':i.CRC,'is_dir':i.is_dir()} for i in rf.infolist()]
 
+def _zstd_module():
+    # Standard library first (compression.zstd, Python 3.14+), then the
+    # backports.zstd distribution (Python below 3.14). Both expose open(path,'rb')
+    # returning an incremental file object, so the bounded read loop is the same.
+    import importlib
+    try:
+        return importlib.import_module('compression.zstd')
+    except ImportError:
+        pass
+    from backports import zstd
+    return zstd
+
 def _open_stream(p,fmt):
     # File-object wrappers over the incremental decompressors (zlib/bz2/lzma
     # decompressobj, zstd): every read(n) decompresses at most ~n bytes, and
@@ -136,8 +148,7 @@ def _open_stream(p,fmt):
     if fmt=='BZIP2':return bz2.open(str(p),'rb')
     if fmt=='XZ':return lzma.open(str(p),'rb')
     if fmt=='ZSTD':
-        from backports import zstd
-        return zstd.open(str(p),'rb')
+        return _zstd_module().open(str(p),'rb')
     raise ValueError(f'UNSUPPORTED_STREAM_FORMAT_{fmt}')
 
 def _scan_stream(p,fmt,keep):
@@ -156,7 +167,7 @@ def rar_7z(path,operation='summary',member='',max_results=200,max_chars=30000):
         hint=f'pip install -e ".[{extra}]"'
         return _j({'ok':False,'tool':'rar_7z','status':'TOOL_MISSING','error':f'{pkg.upper().replace(".","_")}_UNAVAILABLE',
                    'missing_dependency':pkg,'required_capability':f'{pkg} ({hint})','format':fmt,'path':path,'operation':operation,
-                   'detail':f'the optional Python package {pkg} could not be imported ({type(exc).__name__}: {exc}); install it with {hint}. The input was not examined.'+(' backports.zstd is published for Python below 3.14 only, so on 3.14 or newer this wrapper has no installable zstd backend.' if fmt=='ZSTD' else '')})
+                   'detail':f'the optional Python package {pkg} could not be imported ({type(exc).__name__}: {exc}); install it with {hint}. The input was not examined.'+(' Neither the standard library module compression.zstd (Python 3.14 or newer) nor backports.zstd (Python below 3.14) could be imported; on 3.14 or newer the standard library provides zstd, so this means that interpreter was built without it.' if fmt=='ZSTD' else '')})
     p=safe_path(path);max_results=max(1,min(int(max_results),2000));max_chars=max(1000,min(int(max_chars),120000))
     with p.open('rb') as fh:head=fh.read(8)
     fmt=_detect(head)

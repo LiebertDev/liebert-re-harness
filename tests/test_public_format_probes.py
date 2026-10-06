@@ -197,9 +197,9 @@ class FormatProbeNotThisFormatTests(unittest.TestCase):
             self.assertIn("error", result)
 
     def test_rar_7z_reports_a_structured_error_for_a_corrupt_zstd_body(self):
-        # Same reasoning again, for the backports.zstd dependency (stdlib's
-        # own zstd support does not ship until a later Python than this
-        # project targets, so the module falls back to the backport).
+        # Same reasoning again, for whichever zstd backend is reachable: the
+        # standard library's compression.zstd on Python 3.14 or newer, and
+        # backports.zstd below that. A corrupt body is a data fault on either.
         zst = self.root / "fake.zst"
         zst.write_bytes(b"\x28\xb5\x2f\xfd" + b"\x00" * 32)
         result = _j(rar_7z(str(zst)))
