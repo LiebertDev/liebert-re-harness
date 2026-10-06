@@ -96,15 +96,29 @@ hidden feature.
   **Still open:** `ida_disasm_listing` (read-only, next
   round), Ghidra decompilation and cross-references (slice 1, `ghidra_status` and
   `ghidra_program_facts`, has landed), and normalising answers across engines.
-- **Function-boundary recovery from exception-directory unwind data**, with
-  prologue scanning and cross-checking against whatever a disassembly engine
-  already found. Valuable specifically for stripped or partially-obfuscated x64
-  binaries where a linear sweep alone under- or over-counts functions. **Still
-  open.** ~~Start from the PE exception directory parsing that already exists for
-  other purposes in this repository and extend it into a boundary recoverer.~~
-  Correction: no exception-directory (`.pdata` / unwind data) parser ships in this
-  package — a search for one finds nothing — so the parser has to be written
-  first; there is no existing code to extend.
+- **Function-boundary recovery from exception-directory unwind data.** **Partly closed.**
+  `liebert_re/tools/pe_unwind.py` reads the x64 exception directory (`.pdata`): published tools
+  `pe_runtime_functions` (the table, summarised, with a bounded page of entries) and
+  `pe_function_extent` (the entry containing one address), CLI `pdata`. It needs no
+  disassembler session and gives exact begin and end of each function that has an entry.
+  (~~no `.pdata` parser ships~~ was the earlier statement; it is out of date.) **Still open:**
+  it is not function discovery. Leaf functions get no entry, and its own `coverage.ceiling`
+  says so: on one real x64 crackme it reported 48 primary entries where IDA had 88 functions,
+  a gap consistent with that. It does not help with an import's callers. Prologue scanning and
+  cross-checking against what a disassembly engine found are not built, and x86 has no such
+  table (`X86_NO_PDATA`).
+- **A cross-reference query answers an unresolved question as an empty one.** `ida --operation
+  xrefs_to` on an import name, an IAT slot or a jump thunk returns `status OK` with `items: []`.
+  That reads as "this import has no callers" when it means "the query was not resolved through the
+  import thunk and indirect uses were not searched": a negative that looks measured and is not.
+  The honest shape separates "no callers found" from "resolved to a thunk, callers not followed".
+  `kerneliat` comes closest, but it is explicitly heuristic (`proves_call: false`) and gives the
+  thunk, not the callers. **Open**, found on a second crackme.
+- **No caller search for an import's indirect uses, and no data-reference tool.** Settling "is
+  this import ever called" and "who reads this data blob" both needed a hand-written byte scan of
+  `.text` for rel32 and RIP-relative targets. Whole-program dataflow is already recorded under
+  "Interprocedural taint analysis / whole-program dataflow" below; the new part is narrower: no
+  shipped operation resolves an import's callers or a static data pointer's readers. **Open.**
 - **Crash symbolisation.** ~~Minidump *parsing* is already here
   (`liebert_re/recover/minidump_structural.py`); turning a raw address recovered from a dump into a
   symbol is not.~~ **Closed for its stated scope.** `liebert_re/recover/minidump_analyzer.py` maps
