@@ -108,6 +108,32 @@ skip cleanly when it is absent, with a message naming what is missing.
 - Never commit a sample's output uncritically; analysis artefacts routinely embed
   absolute paths and machine names.
 
+## Closing a case: `scripts/case_purge.py`
+
+Work on a target lives in `cases/<name>/`. When a case is finished or dropped, its scratch
+(samples, dumps, project files, tool output) is moved out of the repo; only `REPORT.md` and
+`knowledge/` stay. The rules are in [CASE_POLICY.md](CASE_POLICY.md); the tool is stdlib-only
+and is not shipped in the wheel.
+
+- Open a case: `python scripts/case_purge.py init <name>` (writes the `.liebert-case` marker;
+  a `cases/` directory without one is invisible to the tool).
+- Close a case: put `case: solved <name>` or `case: abandoned <name>` in a commit message. The
+  post-commit hook runs the purge. Install it once per clone with
+  `python scripts/case_purge.py install-hook` (`--check` says whether it is in place).
+- Manual purge: `python scripts/case_purge.py purge <name>` is a dry run; add `--execute` to
+  act. Files are moved, not deleted, to a quarantine under the OS temp directory and expire
+  after 7 days; `restore <name>` brings the newest purge back and never overwrites.
+- Look without touching: `list` (cases and purgeable size), `quarantine` (entries and expiry),
+  `doctor` (unmarked `cases/` directories, quarantine size, growth of `samples/ corpus/ out/
+  output/ artifacts/ runs/`). `doctor` changes nothing; every other command first sweeps
+  expired quarantine entries.
+
+Anything worth keeping goes into `REPORT.md` or `knowledge/` before the close. Exit code 3
+means the scope fence refused the request, 4 means some files could not be moved.
+
+(`scripts/session_health.py` is a local SessionStart hook that is not tracked in git; it calls
+`case_purge.py doctor` and stays silent when nothing needs attention, so it is not documented here.)
+
 ## Review
 
 Expect questions about evidence. "How do you know?" is not scepticism about you,

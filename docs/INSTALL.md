@@ -4,8 +4,8 @@
 
 Only what you need to run and develop the analysis code. Concretely:
 
-- **68 Python modules** in the `liebert_re/` package — the analysis code itself.
-- **81 test files** in `tests/` (`tests/test_*.py`), plus `conftest.py` and an empty `__init__.py`
+- **73<!-- count:modules --> Python modules** in the `liebert_re/` package — the analysis code itself.
+- **107<!-- count:test_files --> test files** in `tests/` (`tests/test_*.py`), plus `conftest.py` and an empty `__init__.py`
   (the latter is required so the flat top-level modules resolve on `sys.path`).
 - No challenge-solution scripts: they are not distributed in this public package (see [SOLVED_INDEX.md](../SOLVED_INDEX.md) for the record of what was solved).
 - Documentation, licence, CI configuration, and issue templates.
@@ -45,8 +45,8 @@ Python **3.10 or newer**.
 Expected result: `pytest -q` exits 0. Some tests skip unless optional dependencies
 (such as the `lattice` extra) or sample binaries are present; `pytest -rs` lists each
 skip and its reason. No pass/skip tally is promised. The default run also excludes
-tests marked `heavy` (`pytest.ini` sets `addopts = -m "not heavy"`; 9 test files are
-module-marked `heavy`). Run everything with `pytest -m ""`. If `pytest -q` fails on a
+tests marked `heavy` (`pytest.ini` sets `addopts = -m "not heavy"`; the marker is
+applied per test, per class or, in one file, to the whole module). Run everything with `pytest -m ""`. If `pytest -q` fails on a
 fresh clone after the install step, that is a bug worth reporting.
 
 ### Pre-push gate (contributors)
