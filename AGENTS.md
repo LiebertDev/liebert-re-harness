@@ -33,18 +33,25 @@ Each rule names how it is checked. A rule with no machine check is stated as a d
 
 Full text and the report template: `CASE_POLICY.md`.
 
-5. **Record the class, not the binary.** What a solved case leaves behind is what
-   was learned about the protection class: how it works, what defeats it, what to
-   try first next time. Addresses, offsets, serials and one-binary walkthroughs are
-   not knowledge to keep. The harness is not specialised for any target. Checked
+5. **Record the class, not the binary; for a real target, nothing more.** What a
+   solved case leaves behind is what was learned about the protection class: how it
+   works, what defeats it, what to try first next time. For a `TARGET-NN` commercial
+   or live application, addresses, offsets, serials and one-binary walkthroughs are
+   not knowledge to keep. A public crackme or CTF binary is the exception: its report
+   also records the recovered answer (or recipe) and enough derivation to check it,
+   because a `solved` with no answer is unfalsifiable. It counts as evidence only if
+   the harness derived it; if a writeup, comment or solver was read, the report says
+   so and it does not count. The harness is not specialised for any target. Checked
    by review of the report against the template.
 6. **Lifecycle: `active`, `solved`, `abandoned`.** Do not move, edit or clean the
    artifacts of an `active` case. When a case becomes `solved` or `abandoned`, its
    artifacts are purged by the purge mechanism; only generalized knowledge and the
    short report survive. Do not copy artifacts elsewhere to keep them.
 7. **Close with a short report.** Exactly four answers: which target (redacted),
-   what was done, what was gained for future targets, and what the run revealed
-   about this package's own tooling (`Harness:`). `CASE_POLICY.md` is the full text and the template.
+   what was done (`Done:`, which for a public crackme or CTF binary carries the
+   recovered answer and its derivation; never for a `TARGET-NN`), what was gained for
+   future targets, and what the run revealed about this package's own tooling
+   (`Harness:`). `CASE_POLICY.md` is the full text and the template.
 8. **Commercial or live applications are never named.** Use `TARGET-NN` plus a
    technical category tag. Public crackmes and CTF binaries may be named. Applies
    to code, comments, tests, docs, reports and commit messages. Checked by review.

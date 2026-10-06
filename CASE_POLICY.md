@@ -20,6 +20,10 @@ the same protection class? If not, it is target-specific and does not survive.
 Addresses, offsets, concrete serials and keys are target-specific. The harness is
 not being specialised for any one crackme.
 
+This section governs `Gained:` and every report on a `TARGET-NN` commercial or live
+application. For a public crackme or CTF binary the report additionally records the
+recovered answer; see section 3, "Public crackmes and CTF binaries".
+
 ## 2. Lifecycle
 
 | State | Meaning | Artifacts |
@@ -72,8 +76,9 @@ elsewhere to keep them past a close.
 ## 3. Case report
 
 Written when a case closes and a report or commit is produced. Four answers,
-nothing else. Aim for under 28 lines: the header takes 2, Target and Done about 3
-each, Gained about 5, and Harness up to 14, enough for four numbered findings.
+nothing else. Aim for under 34 lines: the header takes 2, Target about 3, Done about
+8 (up to 5 more when it carries a recovered answer and its derivation, see below),
+Gained about 5, and Harness up to 14, enough for four numbered findings.
 
 ```
 Case: <TARGET-NN or public name> | <category tag> | <solved|abandoned>
@@ -93,6 +98,33 @@ how that was checked (searched, or unchecked). A gap recorded in neither is the 
 valuable kind: mark it `UNRECORDED` so it is not lost. A finding is kept and a weapon
 is not: say what the tool did or refused to do, never how to use the target's
 weakness. If a fix is under way, say so; do not report it as done.
+
+### Public crackmes and CTF binaries: the answer is recorded
+
+For a target section 4a permits naming, the report records the **recovered answer**
+(or the **recipe**, when the answer depends on an input or on the date) under `Done:`,
+together with enough of the derivation that a reader can check it against the
+binary. This is not a weapon and must not be removed as one. A case marked `solved`
+with no answer in it is an unfalsifiable claim: the answer is the evidence that the
+harness drove the tools and reached the result, and without it a real solve cannot be
+told from a guess, an inference, or a read writeup. A public crackme is free to
+publish; nothing about a live product is involved.
+
+It goes under `Done:`, not `Gained:`, because it is what the run produced and
+`Gained:` is class-level only (above). The derivation stays method-level where it can;
+addresses and offsets are kept only as far as a reader needs them to check the answer.
+
+**The condition.** The answer counts as evidence **only if the harness derived it from
+the binary.** If anyone in the chain (operator, agent, sub-agent) read the target's
+published writeup, its comments, or a published solver before or during the run, the
+report says so in `Done:` and the answer does **not** count as evidence of a solve.
+An analyst who already knows the answer cannot measure where the harness stopped
+helping, because they steer around the gaps without noticing. The invalidation leaves
+no trace in the output, so it cannot be detected afterwards; that is why the report
+must state the exposure rather than leave it to be assumed.
+
+**Commercial or live applications (`TARGET-NN`) are unchanged:** no answer, no serial,
+no patch, no walkthrough, in any section of any report.
 
 Worked example (invented target):
 

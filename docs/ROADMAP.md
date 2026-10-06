@@ -119,6 +119,12 @@ hidden feature.
   `.text` for rel32 and RIP-relative targets. Whole-program dataflow is already recorded under
   "Interprocedural taint analysis / whole-program dataflow" below; the new part is narrower: no
   shipped operation resolves an import's callers or a static data pointer's readers. **Open.**
+- **No operation reads the bytes at a virtual address or resolves a data pointer's target to its
+  contents.** The opposite direction from the entry above (that one is who *reads* a pointer; this
+  is what the pointer *points at*), so the two are not to be merged. On three separate crackmes a
+  `.data` pointer, a `.rdata` string, a fill constant and a bit-text blob each had to be read by
+  hand in Python. Not covered by the dataflow or def-use entries below. **Open**, found on three
+  targets.
 - **Crash symbolisation.** ~~Minidump *parsing* is already here
   (`liebert_re/recover/minidump_structural.py`); turning a raw address recovered from a dump into a
   symbol is not.~~ **Closed for its stated scope.** `liebert_re/recover/minidump_analyzer.py` maps
