@@ -10,9 +10,9 @@ Each rule names how it is checked. A rule with no machine check is stated as a d
 ## Repository
 
 1. **Code lives in `liebert_re/`; every module has a test.** No `.py` at the repo
-   root. A new module ships with a `tests/test_*.py` that references it, and the
-   hard-coded module count in the `package` job of `.github/workflows/ci.yml` is
-   updated in the same commit. Checked by `tests/test_repo_discipline.py`
+   root. A new module ships with a `tests/test_*.py` that references it. The
+   `package` job measures the module count and the docs gate pins it; there is no
+   hand-maintained constant to update. Checked by `tests/test_repo_discipline.py`
    (`test_layout_matches_packaging`, `test_every_module_is_referenced_by_a_test`) and CI.
    One module, `liebert_re.tools.asar_parser`, is allowlisted in `KNOWN_UNREFERENCED` and
    excluded from that check; the list is pinned by tests and may only shrink.
@@ -45,8 +45,10 @@ Full text and the report template: `CASE_POLICY.md`.
    by review of the report against the template.
 6. **Lifecycle: `active`, `solved`, `abandoned`.** Do not move, edit or clean the
    artifacts of an `active` case. When a case becomes `solved` or `abandoned`, its
-   artifacts are purged by the purge mechanism; only generalized knowledge and the
-   short report survive. Do not copy artifacts elsewhere to keep them.
+   artifacts are purged by the purge mechanism: everything outside its keep-list is
+   purged whatever its extension, and only generalized knowledge and the short report
+   survive. Do not copy artifacts elsewhere to keep them. Checked by
+   `tests/test_case_purge.py`.
 7. **Close with a short report.** Exactly four answers: which target (redacted),
    what was done (`Done:`, which for a public crackme or CTF binary carries the
    recovered answer and its derivation; never for a `TARGET-NN`), what was gained for

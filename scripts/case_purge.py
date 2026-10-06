@@ -8,13 +8,14 @@ Layout it understands (and ONLY this layout):
     <repo>/cases/<name>/.liebert-case     marker file (JSON), required
     <repo>/cases/<name>/REPORT.md         kept
     <repo>/cases/<name>/knowledge/...     kept
-    <repo>/cases/<name>/<everything else> purged only if it matches PURGE rules
+    <repo>/cases/<name>/<everything else> purged on close (allow-list: only the KEEP rules survive)
 
 A purge MOVES files to a quarantine directory under the OS temp dir (never inside
 the repo): <tmp>/liebert-re-quarantine/<case>/<UTC stamp>/. Entries expire after
 7 days and are swept on every invocation (except `doctor`, which only reports).
-`.md` files are kept unless their name carries an explicit dump suffix AND they
-sit in a scratch directory.
+Kept: REPORT.md and the marker at the case root, anything under knowledge/ or keep/,
+and *.writeup.md, writeup.md, writeup-*.md, *.knowledge.md anywhere. Nothing else
+is kept, whatever its extension (see KEEP_* below).
 
 Subcommands:
     init NAME                  create cases/NAME with marker
@@ -165,60 +166,18 @@ def resolve_case_target(repo_arg, name) -> tuple[Path, Path]:
 
 
 # ---------------------------------------------------------------------------
-# CLASSIFICATION  (keep-list is evaluated FIRST and always wins)
+# CLASSIFICATION  (an allow-list: what is NOT kept is purged)
 # ---------------------------------------------------------------------------
-# KEEP: matched against the lower-cased posix path relative to the case dir.
+# On a close, a regular file in the case tree survives only if the KEEP rules below
+# name it. Everything else is scratch and is purged, whatever its extension or lack of
+# one. There is deliberately no list of "purgeable" extensions: such a list is chased
+# forever, and every format it missed (.txt, .json, .csv, .html, .hex, .jsonl, .db,
+# archives, extensionless files) survived a close. To keep something, put it in one of
+# the kept places. KEEP is matched against the lower-cased posix path relative to the
+# case dir.
 KEEP_EXACT = {"report.md", MARKER}                  # case root only
 KEEP_DIR_PREFIXES = ("knowledge/", "keep/")         # anything below these
 KEEP_BASENAME_GLOBS = ("*.writeup.md", "writeup.md", "writeup-*.md", "*.knowledge.md")
-
-# PURGE: only consulted for paths NOT kept.
-PURGE_DIR_GLOBS = (                                   # any ancestor dir with this name
-    "artifacts", "samples", "sample", "targets", "scratch", "traces", "dumps", "logs",
-    "ida", "ghidra", "ghidra_project*", "*.rep", "frida", "decomp", "disasm",
-    "decompiled", "x64dbg", "windbg", "ttd",
-)
-PURGE_FILE_GLOBS = (
-    # IDA databases + components + exports
-    "*.idb", "*.i64", "*.til", "*.nam", "*.id0", "*.id1", "*.id2", "*.id3", "*.id4",
-    "*.asm", "*.lst", "*.map",
-    # Ghidra
-    "*.gpr", "*.lock", "*.lock~", "*.gbf", "*.prp",
-    # other disassembler/decompiler databases and dumps
-    "*.bndb", "*.rzdb", "*.decomp.c", "*.decomp.txt", "*.decompiled.*", "*.pseudo.c",
-    "*.hexrays.*", "*.disasm", "*.disasm.*", "*.objdump", "*.objdump.*",
-    # debug symbols, Ghidra data types, IDA scripts/exports
-    "*.pdb", "*.gdt", "*.idc",
-    # memory dumps / cores
-    "*.dmp", "*.mdmp", "*.hdmp", "*.cdmp", "*.core", "core", "core.[0-9]*", "*.dump",
-    "*.wer", "*.hprof",
-    # debugger logs and traces
-    "*.log", "*.trace", "*.trc", "*.tti", "*.etl", "*.run", "*.dd32", "*.dd64", "*.pcap", "*.pcapng",
-    "*.pml", "*.pmc",                                  # Process Monitor log / config
-    # frida / script scratch output
-    "frida-*.js", "frida-*.json", "*.frida.*",
-    # target binaries / samples themselves
-    "*.exe", "*.dll", "*.sys", "*.so", "*.so.*", "*.dylib", "*.elf", "*.bin", "*.apk",
-    "*.msi", "*.ocx", "*.scr", "*.out", "*.crackme", "*.sample", "*.7z", "*.zip",
-    # per-target scratch notes (plain text only; markdown is governed by MD_DUMP_GLOBS)
-    "scratch*.txt", "*.scratch.txt", "notes.tmp*",
-    # editor/backup leftovers. DELIBERATELY absent (would destroy source, config, notes):
-    # .py .c .cpp .h .json .xml .txt (txt only via the scratch globs above) -- do not add.
-    "*.bak", "*.old", "*.orig", "*.swp", "*.swo", "*~", "*.tmp",
-)
-# A Windows Error Reporting bundle: a .cab is purgeable ONLY when a .wer sits in the
-# same directory. Decided at plan time (Plan.companions) because it depends on siblings.
-COMPANION_CAB_SUFFIX = ".cab"
-COMPANION_WER_SUFFIX = ".wer"
-# Markdown is human writing until proven otherwise. A .md file is purgeable ONLY
-# when (a) it sits under a PURGE_DIR_GLOBS directory AND (b) its basename ends in
-# one of these explicit tool-dump suffixes. Everything else (scratch-ideas.md,
-# notes.md, scratch.md, README.md, ...) is left alone. When in doubt: KEEP.
-MD_EXTENSIONS = (".md", ".markdown")
-MD_DUMP_GLOBS = (
-    "*.dump.md", "*.decomp.md", "*.decompiled.md", "*.disasm.md", "*.pseudo.md",
-    "*.hexrays.md", "*.objdump.md", "*.trace.md", "*.log.md",
-)
 
 
 def _rel_posix(rel: str) -> str:
@@ -235,24 +194,9 @@ def is_kept(rel: str) -> bool:
     return any(fnmatch.fnmatchcase(base, g) for g in KEEP_BASENAME_GLOBS)
 
 
-def is_purgeable(rel: str) -> bool:
-    """Pattern match only. Callers MUST check is_kept first (classify() does)."""
-    parts = _rel_posix(rel).split("/")
-    in_purge_dir = any(fnmatch.fnmatchcase(d, g) for d in parts[:-1] for g in PURGE_DIR_GLOBS)
-    if parts[-1].endswith(MD_EXTENSIONS):
-        return in_purge_dir and any(fnmatch.fnmatchcase(parts[-1], g) for g in MD_DUMP_GLOBS)
-    if in_purge_dir:
-        return True
-    return any(fnmatch.fnmatchcase(parts[-1], g) for g in PURGE_FILE_GLOBS)
-
-
-def classify(rel: str, companion: bool = False) -> str:
-    """`companion` is True only for a .cab the plan found beside a .wer."""
-    if is_kept(rel):
-        return "keep"
-    if companion and _rel_posix(rel).endswith(COMPANION_CAB_SUFFIX):
-        return "purge"
-    return "purge" if is_purgeable(rel) else "unclassified"
+def classify(rel: str) -> str:
+    """'keep' or 'purge' for a regular file. The keep-list is evaluated first."""
+    return "keep" if is_kept(rel) else "purge"
 
 
 # ---------------------------------------------------------------------------
@@ -263,8 +207,7 @@ class Plan:
         self.target = target
         self.purge: list[tuple[str, int]] = []       # (rel, size)
         self.keep: list[tuple[str, int]] = []
-        self.unclassified: list[tuple[str, int]] = []
-        self.companions: set[str] = set()            # .cab files purged only because of a sibling .wer
+        self.unclassified: list[tuple[str, int]] = []   # not regular files (sockets, devices): never touched
 
     @property
     def purge_bytes(self) -> int:
@@ -280,8 +223,6 @@ def build_plan(target: Path) -> Plan:
         here = target / rel_dir if rel_dir else target
         with os.scandir(here) as it:
             entries = list(it)
-        has_wer = any(x.name.lower().endswith(COMPANION_WER_SUFFIX)
-                      and x.is_file(follow_symlinks=False) for x in entries)
         for e in entries:
             rel = f"{rel_dir}/{e.name}" if rel_dir else e.name
             if is_reparse(e.path):
@@ -290,12 +231,7 @@ def build_plan(target: Path) -> Plan:
                 stack.append(rel)
             elif e.is_file(follow_symlinks=False):
                 size = e.stat(follow_symlinks=False).st_size
-                comp = has_wer and e.name.lower().endswith(COMPANION_CAB_SUFFIX)
-                kind = classify(rel, companion=comp)
-                if comp and kind == "purge" and not is_purgeable(rel):
-                    plan.companions.add(rel)
-                {"keep": plan.keep, "purge": plan.purge,
-                 "unclassified": plan.unclassified}[kind].append((rel, size))
+                {"keep": plan.keep, "purge": plan.purge}[classify(rel)].append((rel, size))
             else:
                 plan.unclassified.append((rel, 0))   # sockets/devices: never touched
     for L in (plan.purge, plan.keep, plan.unclassified):
@@ -330,7 +266,7 @@ def print_plan(plan: Plan, name: str, limit: int = 200, out=None) -> None:
     for rel, size in plan.keep[:limit]:
         w(f"  {human(size):>10}  {rel}")
     if plan.unclassified:
-        w(f"LEFT ALONE, not matched by any rule ({len(plan.unclassified)} files):")
+        w(f"LEFT ALONE, not a regular file ({len(plan.unclassified)} files):")
         for rel, size in plan.unclassified[:limit]:
             w(f"  {human(size):>10}  {rel}")
 
@@ -481,13 +417,12 @@ def _new_entry_dir(qroot: Path, case: str, now: float) -> tuple[Path, str]:
 # ---------------------------------------------------------------------------
 # EXECUTE (move to quarantine) / RESTORE
 # ---------------------------------------------------------------------------
-def _quarantine_one(target: Path, rel: str, dest_files: Path, want_sha: str,
-                    companion: bool = False) -> int:
+def _quarantine_one(target: Path, rel: str, dest_files: Path, want_sha: str) -> int:
     """Move one planned regular file into quarantine after re-verifying every safety
     property. The original is unlinked ONLY after the copy is hash-verified."""
     if is_kept(rel):
         raise ScopeError(f"keep-list violated at purge time: {rel}")
-    if classify(rel, companion=companion) != "purge":
+    if classify(rel) != "purge":
         raise ScopeError(f"not classified purge at purge time: {rel}")
     p = target / rel
     if not _norm(p).startswith(_norm(target) + os.sep):
@@ -532,8 +467,7 @@ def execute_plan(plan: Plan, repo, name: str, reason: str, now=None):
     for f in files:
         rel = f["rel"]
         try:
-            freed += _quarantine_one(plan.target, rel, entry / "files", f["sha256"],
-                                   companion=rel in plan.companions)
+            freed += _quarantine_one(plan.target, rel, entry / "files", f["sha256"])
             moved += 1
             d = rel.rsplit("/", 1)[0] if "/" in rel else ""
             while d:
@@ -598,8 +532,50 @@ def mark_closed(target: Path, status: str) -> None:
     path.write_bytes(text.encode("utf-8"))
 
 
+CLOSED_STATUSES = ("solved", "abandoned")
+OPEN_STATUSES = ("open", "active")
+
+
+def case_status(target: Path):
+    """The marker's status string, or None when it cannot be read as one."""
+    try:
+        meta = json.loads((target / MARKER).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    st = meta.get("status") if isinstance(meta, dict) else None
+    return st.strip().lower() if isinstance(st, str) else None
+
+
+def _require_closeable(target: Path, name: str, reason: str) -> None:
+    """Refuse, before anything is planned or moved, to purge a case that is still being
+    worked. The purge deletes everything outside the keep-list, so one call with the
+    wrong name would destroy an open case's working files.
+
+    A commit-marker close (reason solved/abandoned) is itself the act of closing, so the
+    marker still says open at that moment and that is allowed. A manual purge has no such
+    act behind it and needs the marker to already say solved or abandoned. An unreadable
+    or unrecognised status is refused in every case: unknown stays unknown."""
+    st = case_status(target)
+    if st is None:
+        raise ScopeError(f"case {name!r}: status in {MARKER} is missing or unreadable; "
+                         f"refusing to purge, nothing was touched")
+    if reason in CLOSED_STATUSES:
+        if st not in CLOSED_STATUSES + OPEN_STATUSES:
+            raise ScopeError(f"case {name!r}: unrecognised status {st!r} in {MARKER}; "
+                             f"refusing to purge, nothing was touched")
+        return
+    if st not in CLOSED_STATUSES:
+        raise ScopeError(
+            f"case {name!r} is {st!r}, not solved or abandoned; refusing to purge, nothing "
+            f"was touched. Close it with a 'case: solved {name}' or 'case: abandoned {name}' "
+            f"commit line, or run 'purge {name} --reason solved|abandoned' once its report "
+            f"is written.")
+
+
 def do_purge(repo, name, execute: bool, reason: str, confirm: bool = False) -> int:
     repo, target = resolve_case_target(repo, name)       # may raise ScopeError
+    if execute:
+        _require_closeable(target, name, reason)
     if reason == "solved" and not knowledge_recorded(target):
         # 'solved' means the lesson was kept. With no REPORT.md and no knowledge/ the
         # artifacts would be the only record and vanish after the quarantine expires.
