@@ -32,6 +32,9 @@ Status vocabulary (each one a distinct answer):
 
   ``OK``                    table read in full (``pe_runtime_functions``).
   ``FUNCTION_FOUND``        the address lies inside exactly one entry.
+                            ``classification`` is ``primary``, ``chained_fragment``
+                            or ``UNKNOWN``; ``is_fragment`` is true, false or
+                            null (null exactly when classification is UNKNOWN).
   ``ADDRESS_NOT_COVERED``   table read in full; no entry contains the address.
                             Says nothing about whether the address is code.
   ``AMBIGUOUS_COVERAGE``    more than one entry contains the address
@@ -70,6 +73,7 @@ _DIRECTORY_EXCEPTION = 3
 _MAGIC_PE32, _MAGIC_PE32PLUS = 0x10B, 0x20B
 _MACHINE_I386, _MACHINE_AMD64 = 0x14C, 0x8664
 _UNW_FLAG_CHAININFO = 0x4
+_KNOWN_FLAGS = 0x1 | 0x2 | _UNW_FLAG_CHAININFO  # EHANDLER, UHANDLER, CHAININFO
 _MAX_CHAIN_DEPTH = 64
 _DEFAULT_PAGE = 1000
 _MAX_PAGE = 100000
@@ -92,7 +96,7 @@ def _j(payload: dict) -> str:
 
 
 def _fail(tool: str, status: str, **extra) -> str:
-    return _j({"ok": False, "tool": tool, "status": status, **extra})
+    return _j({"ok": False, "tool": tool, "status": status, "coverage": _COVERAGE, **extra})
 
 
 def _read(pe, rva: int, size: int) -> bytes:
@@ -103,7 +107,8 @@ def _read(pe, rva: int, size: int) -> bytes:
 
 
 def _classify(pe, unwind_rva: int):
-    """``(kind, parent_begin, note)``; kind is PRIMARY, FRAGMENT or UNCLASSIFIED."""
+    """``(kind, parent, note)``; kind is PRIMARY, FRAGMENT or UNCLASSIFIED.
+    ``parent`` is the chained ``(begin, end)`` pair, or None."""
     if unwind_rva & 1:
         return "UNCLASSIFIED", None, "indirect unwind data (low bit set) is not followed"
     head = _read(pe, unwind_rva, 4)
@@ -112,13 +117,15 @@ def _classify(pe, unwind_rva: int):
     version, flags = head[0] & 7, head[0] >> 3
     if version not in (1, 2):
         return "UNCLASSIFIED", None, f"unwind info version {version} is not 1 or 2"
+    if flags & ~_KNOWN_FLAGS:
+        return "UNCLASSIFIED", None, f"unwind info has undefined flag bits (0x{flags & ~_KNOWN_FLAGS:x}); not classified"
     if not flags & _UNW_FLAG_CHAININFO:
         return "PRIMARY", None, None
     chain_at = unwind_rva + 4 + ((head[2] + 1) & ~1) * 2
     raw = _read(pe, chain_at, _ENTRY_SIZE)
     if len(raw) < _ENTRY_SIZE:
         return "FRAGMENT", None, "chained parent entry is not readable"
-    return "FRAGMENT", struct.unpack("<III", raw)[0], None
+    return "FRAGMENT", struct.unpack("<III", raw)[:2], None
 
 
 def _parse_table(pe, data: bytes) -> list:
@@ -132,27 +139,42 @@ def _parse_table(pe, data: bytes) -> list:
         kind, parent, note = _classify(pe, unwind)
         entries.append({"index": i, "begin_rva": begin, "end_rva": end, "kind": kind,
                         "parent_begin": parent, "note": note})
-    by_begin = {}
+    # The chained record names its parent by (begin, end); index by that pair and
+    # treat a pair held by more than one entry as unresolvable, never first-wins.
+    by_key = {}
     for e in entries:
         if e["kind"] != "MALFORMED":
-            by_begin.setdefault(e["begin_rva"], e)
+            by_key.setdefault((e["begin_rva"], e["end_rva"]), []).append(e)
     for e in entries:
         e["primary_begin"] = None
+        e["primary_index"] = None
+        e["chain_note"] = None
         if e["kind"] == "PRIMARY":
-            e["primary_begin"] = e["begin_rva"]
+            e["primary_begin"], e["primary_index"] = e["begin_rva"], e["index"]
         elif e["kind"] == "FRAGMENT":
             cur, seen = e["parent_begin"], set()
             for _ in range(_MAX_CHAIN_DEPTH):
-                if cur is None or cur in seen or cur not in by_begin:
+                if cur is None:
+                    break
+                if cur in seen:
+                    e["chain_note"] = "chain contains a cycle"
                     break
                 seen.add(cur)
-                target = by_begin[cur]
+                found = by_key.get(cur, [])
+                if not found:
+                    break
+                if len(found) > 1:
+                    e["chain_note"] = "more than one entry has the chained parent's begin and end; parent is ambiguous"
+                    break
+                target = found[0]
                 if target["kind"] == "PRIMARY":
-                    e["primary_begin"] = cur
+                    e["primary_begin"], e["primary_index"] = target["begin_rva"], target["index"]
                     break
                 if target["kind"] != "FRAGMENT":
                     break
                 cur = target["parent_begin"]
+            else:
+                e["chain_note"] = f"chain deeper than {_MAX_CHAIN_DEPTH}; not followed"
     return entries
 
 
@@ -165,6 +187,8 @@ def _public(e: dict, image_base: int) -> dict:
     }
     if e["kind"] == "FRAGMENT":
         out["primary_begin_rva"] = hex(e["primary_begin"]) if e["primary_begin"] is not None else "UNKNOWN"
+        if e.get("chain_note"):
+            out["chain_note"] = e["chain_note"]
     if e["note"]:
         out["note"] = e["note"]
     return out
@@ -297,7 +321,8 @@ def pe_function_extent(path, address, address_kind="va"):
     try:
         form, err = resolve_address_form(path, address, address_kind)
         if form is None:
-            return _fail(tool, "ADDRESS_UNRESOLVED", **info["base"], address=address, address_kind=address_kind,
+            return _fail(tool, "ADDRESS_UNRESOLVED", **info["base"], table_complete=info["complete"],
+                         raw_entry_count=len(info["entries"]), address=address, address_kind=address_kind,
                          error=err.get("error") if err else "UNKNOWN", detail=err)
         rva = int(form.rva, 0)
         entries, image_base = info["entries"], info["image_base"]
@@ -318,14 +343,18 @@ def pe_function_extent(path, address, address_kind="va"):
         e = hits[0]
         out = _public(e, image_base)
         out["begin"] = _begin_form(path, e["begin_rva"], image_base)
-        out["end_exclusive"] = {"rva": hex(e["end_rva"]), "va": hex(image_base + e["end_rva"])}
+        # The end is one past the last byte and may sit outside every section; then
+        # the same shape comes back with resolved: false and the reason.
+        out["end_exclusive"] = _begin_form(path, e["end_rva"], image_base)
         out["offset_from_begin"] = rva - e["begin_rva"]
         payload = {"ok": True, "tool": tool, "status": "FUNCTION_FOUND", **common, "covered": True,
-                   "is_fragment": e["kind"] == "FRAGMENT", "function": out}
+                   "classification": out["kind"],
+                   "is_fragment": {"PRIMARY": False, "FRAGMENT": True}.get(e["kind"]), "function": out}
         if e["kind"] == "FRAGMENT":
-            prim = next((x for x in entries if x["kind"] == "PRIMARY" and x["begin_rva"] == e["primary_begin"]), None)
-            payload["primary"] = _public(prim, image_base) if prim else "UNKNOWN"
+            pi = e["primary_index"]
+            payload["primary"] = _public(entries[pi], image_base) if pi is not None else "UNKNOWN"
         elif e["kind"] == "UNCLASSIFIED":
+            payload["classification"] = "UNKNOWN"
             payload["note"] = "extent is exact, but whether this entry is a primary function or a fragment is UNKNOWN"
         return _j(payload)
     finally:

@@ -13,7 +13,9 @@ from __future__ import annotations
 import json
 import struct
 import tempfile
+import sys
 import unittest
+from unittest import mock
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -43,10 +45,12 @@ def _chained(parent_begin, parent_end):
     return bytes([CHAIN_FLAG, 0, 0, 0]) + struct.pack("<III", parent_begin, parent_end, 0x1300)
 
 
-def _code(entries=ENTRIES):
-    code = bytearray(0x400)
+def _code(entries=ENTRIES, size=0x400):
+    code = bytearray(size)
     for i, (b, e, u) in enumerate(entries):
         struct.pack_into("<III", code, TABLE_RVA - 0x1000 + 12 * i, b, e, u)
+    if size != 0x400:
+        return bytes(code)
     code[0x300:0x304] = PRIMARY_INFO
     code[0x310:0x320] = _chained(0x1000, 0x1040)
     code[0x330:0x340] = _chained(0x1040, 0x1060)
@@ -59,6 +63,18 @@ def _build(dest: Path, *, dir_rva=TABLE_RVA, dir_size=12 * len(ENTRIES), machine
     data = bytearray(path.read_bytes())
     struct.pack_into("<II", data, _EXC_DIR_ENTRY, dir_rva, dir_size)
     struct.pack_into("<H", data, _COFF_MACHINE, machine)
+    path.write_bytes(bytes(data))
+    return path
+
+
+def _custom(dest: Path, entries, infos, *, dir_size=None, code_size=None) -> Path:
+    """A PE whose table is ``entries`` and whose unwind infos are ``{rva: bytes}``."""
+    code = bytearray(_code(entries, code_size or 0x400))
+    for rva, blob in infos.items():
+        code[rva - 0x1000:rva - 0x1000 + len(blob)] = blob
+    path = build_owned_pe_with_code(dest, bytes(code))
+    data = bytearray(path.read_bytes())
+    struct.pack_into("<II", data, _EXC_DIR_ENTRY, TABLE_RVA, dir_size or 12 * len(entries))
     path.write_bytes(bytes(data))
     return path
 
@@ -161,7 +177,156 @@ class ExtentTests(_Base):
         self.assertEqual(self.extent(path, "0x1030")["status"], "AMBIGUOUS_COVERAGE")
 
 
+class ReviewRegressionTests(_Base):
+    def test_unclassified_entry_is_unknown_not_primary(self):  # finding 1
+        cases = {"ind.exe": (0x1301, {}), "ver.exe": (0x1300, {0x1300: bytes([0x03, 0, 0, 0])}),
+                 "unr.exe": (0x9000, {})}
+        for name, (unwind, infos) in cases.items():
+            path = _custom(self.dir / name, [(0x1000, 0x1040, unwind)], infos)
+            r = self.extent(path, "0x1010")
+            self.assertEqual(r["status"], "FUNCTION_FOUND", name)
+            self.assertIsNone(r["is_fragment"], name)
+            self.assertEqual(r["classification"], "UNKNOWN", name)
+            self.assertEqual(r["function"]["kind"], "unclassified", name)
+            self.assertIn("UNKNOWN", r["note"], name)
+            self.assertEqual((r["function"]["begin_rva"], r["function"]["end_rva"]), ("0x1000", "0x1040"), name)
+            t = self.table(path)
+            self.assertEqual((t["unclassified_entry_count"], t["primary_function_count"]), (1, 0), name)
+
+    def test_known_classes_keep_a_real_boolean(self):  # finding 1
+        path = _build(self.dir / "k.exe")
+        a, b = self.extent(path, "0x1010"), self.extent(path, "0x1090")
+        self.assertEqual((a["classification"], a["is_fragment"]), ("primary", False))
+        self.assertEqual((b["classification"], b["is_fragment"]), ("chained_fragment", True))
+
+    def test_duplicate_begin_is_told_apart_by_the_parent_end(self):  # finding 2
+        # two entries begin at 0x1000; the chained record names (0x1000, 0x1040), which only one matches
+        entries = [(0x1000, 0x1020, 0x1310), (0x1000, 0x1040, 0x1300), (0x1080, 0x10A0, 0x1320)]
+        infos = {0x1300: PRIMARY_INFO, 0x1310: PRIMARY_INFO, 0x1320: _chained(0x1000, 0x1040)}
+        r = self.extent(_custom(self.dir / "d1.exe", entries, infos), "0x1090")
+        self.assertEqual(r["primary"]["end_rva"], "0x1040")
+        self.assertEqual(r["function"]["primary_begin_rva"], "0x1000")
+
+    def test_duplicate_begin_and_end_is_unknown_not_first_wins(self):  # finding 2
+        entries = [(0x1000, 0x1040, 0x1300), (0x1000, 0x1040, 0x1300), (0x1080, 0x10A0, 0x1320)]
+        infos = {0x1300: PRIMARY_INFO, 0x1320: _chained(0x1000, 0x1040)}
+        path = _custom(self.dir / "d2.exe", entries, infos)
+        r = self.extent(path, "0x1090")
+        self.assertEqual(r["primary"], "UNKNOWN")
+        self.assertIn("ambiguous", r["function"]["chain_note"])
+        self.assertEqual(self.extent(path, "0x1010")["status"], "AMBIGUOUS_COVERAGE")
+
+    def test_undefined_flag_bit_is_unclassified(self):  # finding 3
+        for bit in (0x8, 0x10):
+            info = bytes([0x01 | (bit << 3), 0, 0, 0])
+            path = _custom(self.dir / f"fl{bit}.exe", [(0x1000, 0x1040, 0x1300)], {0x1300: info})
+            r = self.extent(path, "0x1010")
+            self.assertEqual((r["classification"], r["is_fragment"]), ("UNKNOWN", None), bit)
+            self.assertIn("undefined flag", r["function"]["note"])
+            self.assertEqual(r["function"]["end_rva"], "0x1040")
+        for flags in (0x1, 0x2, 0x3):
+            info = bytes([0x01 | (flags << 3), 0, 0, 0])
+            path = _custom(self.dir / f"ok{flags}.exe", [(0x1000, 0x1040, 0x1300)], {0x1300: info})
+            self.assertEqual(self.extent(path, "0x1010")["classification"], "primary", flags)
+
+    def test_end_is_the_shared_address_shape_and_exact(self):  # finding 4
+        path = _custom(self.dir / "end.exe", [(0x1000, 0x1040, 0x1300)], {0x1300: PRIMARY_INFO})
+        r = self.extent(path, "0x103f")
+        end = r["function"]["end_exclusive"]
+        self.assertEqual(end["rva"], "0x1040")
+        self.assertEqual(end["va"], hex(0x140000000 + 0x1040))
+        self.assertEqual(end["file_offset"], hex(0x200 + 0x40))
+        self.assertEqual(end["section"], ".text")
+        self.assertIs(end["resolved"], True)
+        self.assertEqual(set(end) - {"resolved"}, set(r["address"]))
+        self.assertEqual(self.extent(path, "0x1040")["status"], "ADDRESS_NOT_COVERED")
+
+    def test_unresolvable_end_keeps_the_shape_and_says_why(self):  # finding 4
+        path = _custom(self.dir / "end2.exe", [(0x1000, 0x9000, 0x1300)], {0x1300: PRIMARY_INFO})
+        end = self.extent(path, "0x1010")["function"]["end_exclusive"]
+        self.assertEqual((end["resolved"], end["rva"]), (False, "0x9000"))
+        self.assertEqual(end["error"], "RVA_NOT_IN_ANY_SECTION")
+
+    def test_unresolved_address_carries_table_complete(self):  # finding 5
+        r = self.extent(_build(self.dir / "uc.exe"), "0x9000")
+        self.assertEqual((r["status"], r["table_complete"]), ("ADDRESS_UNRESOLVED", True))
+        r = self.extent(_build(self.dir / "uc2.exe", dir_size=12 * 4 - 5), "0x9000")
+        self.assertEqual((r["status"], r["table_complete"]), ("ADDRESS_UNRESOLVED", False))
+
+    def test_truncated_miss_carries_table_complete_false(self):  # finding 5
+        r = self.extent(_build(self.dir / "tm.exe", dir_size=12 * 4 - 5), "0x1100")
+        self.assertEqual((r["status"], r["table_complete"]), ("TABLE_TRUNCATED", False))
+
+    def test_every_failure_carries_coverage(self):  # finding 6
+        path = _build(self.dir / "cv.exe")
+        junk = self.dir / "junk.bin"
+        junk.write_bytes(b"nope")
+        results = [
+            self.table(path, max_entries="bad"), self.table(path, offset="bad"),
+            self.table(self.dir / "absent.exe"), self.table(junk),
+            self.table(_build(self.dir / "cv2.exe", dir_rva=0, dir_size=0)),
+            self.table(_build(self.dir / "cv3.exe", dir_rva=0x9000, dir_size=12)),
+            self.extent(path, "0x9000"),
+        ]
+        for r in results:
+            self.assertFalse(r["ok"], r)
+            self.assertIs(r["coverage"]["absence_is_evidence_of_no_function"], False, r["status"])
+
+    def test_invalid_offset_is_refused_by_name(self):
+        r = self.table(_build(self.dir / "io.exe"), offset="x")
+        self.assertEqual(r["status"], "INVALID_ARGUMENT")
+
+    def test_chain_cycle_is_unknown(self):
+        entries = [(0x1000, 0x1020, 0x1300), (0x1040, 0x1060, 0x1320)]
+        infos = {0x1300: _chained(0x1040, 0x1060), 0x1320: _chained(0x1000, 0x1020)}
+        r = self.extent(_custom(self.dir / "cy.exe", entries, infos), "0x1010")
+        self.assertEqual(r["primary"], "UNKNOWN")
+        self.assertEqual(r["function"]["chain_note"], "chain contains a cycle")
+
+    def test_chain_depth_limit_is_reported(self):
+        n = 70
+        entries = [(0x2000 + 0x10 * i, 0x2008 + 0x10 * i, 0x1800 + 0x20 * i) for i in range(n)]
+        infos = {}
+        for i in range(n - 1):
+            infos[0x1800 + 0x20 * i] = _chained(*entries[i + 1][:2])
+        infos[0x1800 + 0x20 * (n - 1)] = PRIMARY_INFO
+        path = _custom(self.dir / "deep.exe", entries, infos, code_size=0x2000)
+        r = self.table(path)
+        self.assertEqual(r["status"], "OK")
+        first = r["entries"][0]
+        self.assertEqual(first["primary_begin_rva"], "UNKNOWN")
+        self.assertIn("deeper than", first["chain_note"])
+        self.assertEqual(r["entries"][-2]["primary_begin_rva"], hex(entries[-1][0]))
+
+
 class NoTableOutcomesTests(_Base):
+    def test_missing_pefile_is_tool_missing(self):
+        path = _build(self.dir / "tm.exe")
+        with mock.patch.dict(sys.modules, {"pefile": None}):
+            r = self.table(path)
+        self.assertEqual((r["ok"], r["status"]), (False, "TOOL_MISSING"))
+
+    def test_path_outside_the_workspace_is_refused(self):
+        outside = Path(tempfile.gettempdir()).resolve() / "liebert_pe_unwind_outside.exe"
+        r = self.table(outside)
+        self.assertEqual((r["ok"], r["status"]), (False, "PATH_REFUSED"))
+
+    def test_bad_optional_header_magic(self):
+        path = _build(self.dir / "m.exe")
+        data = bytearray(path.read_bytes())
+        struct.pack_into("<H", data, _OPT, 0x107)
+        path.write_bytes(bytes(data))
+        r = self.table(path)
+        self.assertEqual((r["ok"], r["status"]), (False, "UNSUPPORTED_OPTIONAL_HEADER"))
+
+    def test_amd64_machine_with_pe32_magic_is_inconsistent(self):
+        path = _build(self.dir / "inc.exe")
+        data = bytearray(path.read_bytes())
+        struct.pack_into("<H", data, _OPT, 0x10B)
+        path.write_bytes(bytes(data))
+        r = self.table(path)
+        self.assertEqual((r["ok"], r["status"]), (False, "PE_HEADER_INCONSISTENT"))
+
     def test_no_exception_directory(self):
         path = _build(self.dir / "n.exe", dir_rva=0, dir_size=0)
         for r in (self.table(path), self.extent(path, "0x1010")):
