@@ -374,6 +374,10 @@ def _pdata(a):
     return _load("liebert_re.tools.pe_unwind", "pe_runtime_functions")(a.path, max_entries=a.max_entries, offset=a.offset)
 
 
+def _trailing(a):
+    return _load("liebert_re.tools.pe_trailing", "pe_trailing_data")(a.path)
+
+
 def _kernel_callbacks(a):
     return _load("liebert_re.tools.binary", "kernel_callback_registrations")(a.path)
 
@@ -636,6 +640,7 @@ def _build_parser():
     sp.add_argument("--address-kind", dest="address_kind", default="va", choices=("va", "rva", "file_offset"), help="representation of --address")
     sp.add_argument("--max-entries", type=int, default=1000, help="entries per page of the whole-table read; a cut is reported")
     sp.add_argument("--offset", type=int, default=0, help="first entry of the page")
+    add("trailing", _trailing, "what lies past the end of a PE's last section (the overlay): offset, size, fraction of the file, and the part explained by the security directory or a COFF symbol table; the rest is reported as UNKNOWN purpose (read-only)")
     add("kernelcallbacks", _kernel_callbacks, "which kernel callback-registration imports a driver calls; NOT_FOUND speaks only for the names listed in names_checked")
     sp = add("ioctldecode", _ioctl_decode, "split CTL_CODE integers into device type, function, method and access (takes integers, not a file)", path=False)
     sp.add_argument("codes", nargs="+", metavar="CODE", help="one or more CTL_CODE integers (decimal or 0x hex); a non-integer is reported per code, not dropped")

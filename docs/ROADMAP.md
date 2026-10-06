@@ -125,6 +125,23 @@ hidden feature.
   helper, not a relocation parser.) Each remaining one is a bounded,
   well-specified parsing task with public documentation, and any one of the
   three is a reasonable self-contained PR.
+- **Data past the end of the last section (the "overlay").** This gap was unrecorded: nothing in the
+  package computed the end of the last raw section against the file size, so a PE whose last
+  section ends at the file's last byte and one with most of the file past it looked the same.
+  **Partly closed.** `pe_trailing_data` (`liebert_re/tools/pe_trailing.py`, CLI `trailing`) reports
+  whether trailing data exists, its offset, size and fraction of the file, then labels the part the
+  headers explain: an Authenticode certificate table (the security directory holds a file offset,
+  so a signed file does not read as unexplained) and a range whose size is consistent with a COFF
+  symbol table plus string table (an arithmetic fit from `PointerToSymbolTable` and
+  `NumberOfSymbols`, not a decode; a table that does not fit is reported as not fitting). Whatever
+  is left is `UNKNOWN` purpose with a size and an entropy number, and the tool does not call it
+  benign, malicious, packed or debug data. **Still open:** the symbol and string records are not
+  decoded, so "consistent with" is as far as it goes; the certificate is located, not verified
+  (see `authenticode_signature`); no other appended-data format (installer or archive
+  payloads, CodeView or other debug data, appended resources) is recognised, so those stay
+  `UNKNOWN`; and the result does not yet feed `die_*`, `binary_summary` or any report. What it
+  explains is worth keeping in mind for a whole class of targets: an unstripped symbol table
+  past the last section is a reason a disassembler may hand back named functions.
 - **Page-based sliding-window entropy.** What exists today is whole-file and
   per-section entropy, which is enough for coarse triage but not for locating a
   small encrypted or packed region inside an otherwise-normal section. Worth

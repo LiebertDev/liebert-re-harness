@@ -136,7 +136,7 @@ jobs:
           assert not any(os.path.abspath(p or ".") == repo for p in sys.path), sys.path
           mods = sorted(m.name for m in pkgutil.walk_packages(liebert_re.__path__, "liebert_re.") if not m.ispkg)
           # Deliberate count: what the wheel ships cannot change without a
-          # reviewed edit here. 72 = 70 library modules + cli + __main__.
+          # reviewed edit here. 73 = 71 library modules + cli + __main__.
           # (+1 over 66: liebert_re/tools/capa.py, the capa wrapper.)
           # (+1 over 67: liebert_re/tools/ida.py, the IDA wrapper. Its IDAPython worker is a
           # data file under ida_scripts/ and is checked below, not imported.)
@@ -145,7 +145,8 @@ jobs:
           # (+1 over 70: liebert_re/tools/ghidra.py, the Ghidra headless wrapper. Its Java
           # post-script is a data file under ghidra_scripts/, not a module.)
           # (+1 over 71: liebert_re/tools/pe_unwind.py, the RUNTIME_FUNCTION (.pdata) reader.)
-          assert len(mods) == 72, (len(mods), mods)
+          # (+1 over 72: liebert_re/tools/pe_trailing.py, the trailing-data (overlay) reader.)
+          assert len(mods) == 73, (len(mods), mods)
           failed = []
           import importlib.resources as _res
           worker = _res.files("liebert_re.tools").joinpath("ida_scripts/query_program.idapy")

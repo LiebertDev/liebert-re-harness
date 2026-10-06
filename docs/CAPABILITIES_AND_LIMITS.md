@@ -25,6 +25,10 @@ Module paths are relative to `liebert_re/`.
   search, hashing, Authenticode inspection (Windows hosts only):
   `tools/binary.py`.
 - TLS directory and callback array: `tools/tls_directory.py`.
+- Data past the end of the last section: `pe_trailing_data` (`tools/pe_trailing.py`) reports its offset,
+  size and share of the file, labels an embedded Authenticode certificate table (located, not verified)
+  and a range consistent with a COFF symbol and string table (an arithmetic fit, records not decoded),
+  and reports the rest as `UNKNOWN` purpose with an entropy figure; it does not classify the rest.
 - RVA / VA / file-offset conversion, and dump-to-live address correlation over a
   single file: `recover/pe_address.py`, `tools/image_map.py`.
 - Capstone disassembly of a PE range, with a chunked sweep for large sections:

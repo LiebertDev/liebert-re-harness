@@ -288,7 +288,15 @@ def test_published_tool_name_set_is_unchanged():
     # returncode=None read as success, so capa_status would have answered OK with a null
     # version. TOOL_UNLAUNCHABLE is now a distinct code from TOOL_MISSING across all
     # thirteen callers of run_bounded_process. Digest recomputed from the source.
-    assert digest == "c1993bdf118ec3051a27ea665de09dbec80dc3d575bc285fc88a864dc44c7f92"
+    # Updated again: 789 -> 793 (measured by diffing against the previous commit).
+    # None removed. One new module, liebert_re/tools/pe_trailing.py, reporting what
+    # lives past the last section -- the published tool pe_trailing_data, reached from
+    # the CLI as `trailing`, plus the private helpers _security_directory, _coff and
+    # _entropy. It exists because a real target was 65% trailing data that nothing in
+    # this package could see, and that tail was the reason a disassembler returned
+    # named functions. Its other helpers share names that already existed, and the set
+    # is deduplicated by name, so they add nothing. Digest recomputed from the source.
+    assert digest == "469e9983c6a20c88f3b3a072de941c148549af5038fb5f1aa154b3b07ac0ea65"
 
 
 def test_the_imported_package_is_this_checkout():
