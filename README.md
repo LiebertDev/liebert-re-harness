@@ -145,8 +145,12 @@ import is the exact failure this project is organised against:
   wrapper *is* here (`ida_query`, `ida_microcode_cfg`, `ida_type_member_offset`, `ida_patch_plan` (a plan only), `ida_annotations`, `ida_status`, and a write path: `ida_rename_plan` / `ida_set_comments_plan` then `ida_annotations_apply`, with `ida_annotations_purge`); the
   disassembly-listing operation is not. `docs/INSTALL.md` is the authority on which
   engines this package can actually drive.
-- **Function-boundary recovery from exception-directory unwind data**, prologue
-  scanning, and engine cross-check. Not here.
+- **Function discovery and engine cross-check.** The exception directory is read
+  for x64 PEs (`pe_runtime_functions`, `pe_function_extent`, CLI `pdata`;
+  `liebert_re/tools/pe_unwind.py`) and gives the exact begin and end of the function
+  containing an address, but it is not function discovery: leaf functions have no entry,
+  x86 has no such table (`X86_NO_PDATA`), and the unwind records themselves are not
+  decoded. Prologue scanning and engine cross-check are not here.
 - **Crash-stack unwinding and source lines.** Minidump parsing and offline
   symbolisation of a single module + RVA to the nearest public symbol are here
   (`liebert_re/recover/minidump_analyzer.py`, `liebert_re/recover/crash_symbolize.py`); a real unwound call stack and

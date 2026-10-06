@@ -36,8 +36,12 @@ Module paths are relative to `liebert_re/`.
 - CodeView / PDB identity and container parsing: `recover/codeview_rsds.py`,
   `recover/msf_pdb.py`; detection of a local PDB toolchain:
   `recover/native_pdb_toolchain.py`.
+- Exception directory of a 64-bit PE: `pe_runtime_functions` / `pe_function_extent` (CLI `pdata`,
+  `tools/pe_unwind.py`) give the exact begin and end of the function containing an address, from the
+  file alone. Not function discovery: leaf functions get no entry, 32-bit x86 has no such table
+  (`X86_NO_PDATA`), and the unwind records are not decoded.
 - Partial: the PE surface does not cover delay imports, base relocations, the
-  rich header or exception/unwind data. `tools/binary.py` reports the subsystem
+  rich header or the decoded content of unwind records. `tools/binary.py` reports the subsystem
   number; the only code that branches on it is
   `kernel_triage` (native subsystem as one indicator of a driver, see Part 2).
 
@@ -265,7 +269,7 @@ return a named tool-missing status when absent. Function inventory
   `sieve`, `labgate`, `labregister`, `sievestatus`, `rzbinstatus`, `diestatus`, `yarastatus`, `upxstatus`,
   `il2cppstatus`, `dexstatus`, `jvmstatus`, `capa`, `capastatus`, `ida`, `idamicrocode`, `idastatus`, `idaannotations`,
   `kerneltriage`, `kerneldispatch`, `kerneliat`, `kernelcallbacks`, `ioctldecode`, `ghidrastatus`, `ghidrafacts`, `unpack`,
-  `scan`, `minidump`, `capabilities`; 37 subcommands, from `cli.py`):
+  `scan`, `minidump`, `pdata`, `trailing`, `capabilities`; 39 subcommands, from `cli.py`):
   `workspace.py`, `bounded_subprocess.py`, `cli.py`.
 
 ### Dynamic and emulation
@@ -292,8 +296,10 @@ return a named tool-missing status when absent. Function inventory
 
 ### Test coverage
 
-81 test files (`tests/test_*.py`); an earlier default run on this checkout gave 527 passed, 39 skipped,
-157 deselected (`heavy`), before the IDA wrapper's tests were added. Fixtures are built in code
+Current: 106 test files (`tests/test_*.py`); `pytest --collect-only` selects 2082 of 2155 tests, with 73
+deselected (`heavy`) (counted when this line was last updated; pass and skip counts are not recorded
+here, run `pytest -q` for them). Historical snapshot, not current: an early run on an older checkout
+gave 527 passed, 39 skipped, 157 deselected, from 81 test files, before the IDA wrapper's tests were added. Fixtures are built in code
 (`recover/owned_binary_fixtures.py`); no real binaries ship. Real-engine paths
 skip on a clean checkout, so CI does not demonstrate them.
 The IDA wrapper's default-tier tests drive the real wrapper code against a stand-in `idat` that writes
@@ -304,12 +310,13 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
 
 ### Kernel-level targets: a first look only
 
-- `report/tool_families.py` names a `windows-kernel` family of 15 tools. Six are
-  defined in this package: the generic `tool_missing` sentinel, `kernel_triage`
-  and four more operations in `tools/binary.py`, described below: three
-  byte-pattern scans whose findings never prove what they name, and one
-  decoder that splits CTL_CODE integers the caller already has. The
-  other nine are names of upstream tools that are not here; they are a roadmap,
+- `report/tool_families.py` names a `windows-kernel` family of 19 tools (counted from the code).
+  Ten are defined in this package: the generic `tool_missing` sentinel, `kernel_triage`,
+  five operations in `tools/binary.py`, described below (byte-pattern scans and a
+  disassembly-based candidate lister whose findings never prove what they name, and
+  one decoder that splits CTL_CODE integers the caller already has), `ida_query`,
+  and the two exception-directory operations `pe_runtime_functions` / `pe_function_extent`
+  (CLI `pdata`). The other nine are names of upstream tools that are not here; they are a roadmap,
   not capability.
 - `kernel_triage` (`tools/binary.py`) is read-only and reads one PE with
   `pefile`: machine, subsystem, sections (including `INIT` and `PAGE` names),
@@ -395,8 +402,10 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
   control-code definitions, or any other kernel-specific structure. Beyond
   `kernel_triage` and the operations above, a kernel-mode PE is handled as
   an ordinary PE: headers, imports, strings, disassembly.
-- No exception/unwind data parser, so no function-boundary recovery for stripped
-  x64 images.
+- Function-boundary recovery for stripped x64 images is limited to what the exception directory
+  lists (`pe_function_extent`, CLI `pdata`): leaf functions have no entry, so most small functions
+  are not recoverable this way, and there is no recovery for x86 images or from prologue patterns.
+  The unwind records are not decoded.
 - No bounded code-range emulation, so nothing can exercise a routine in
   isolation.
 - No kernel-debugger or live-kernel integration, and no parser for kernel-dump

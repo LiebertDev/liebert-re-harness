@@ -165,11 +165,15 @@ hidden feature.
 ## Hard problems, honestly hard
 
 - **Kernel static analysis is a staged roadmap and is NOT implemented.** The `windows-kernel` family in
-  `liebert_re/report/tool_families.py` names 15 tools, of which two are defined in this package: the generic
-  `tool_missing` sentinel and `kernel_triage`, the first slice. `kernel_triage` is a first look only (static
-  indicators and a `driver_likelihood` that is never a proof); it does not read dispatch tables, IOCTL codes or
-  callback registrations. The other 13 names in the `windows-kernel` family are roadmap: treat them as planned
-  routing, not as capability.
+  `liebert_re/report/tool_families.py` names 19 tools, of which ten are defined in this package (counted from the code): the generic
+  `tool_missing` sentinel, `kernel_triage` (the first slice: static indicators and a `driver_likelihood`
+  that is never a proof), five heuristic operations in `tools/binary.py`, `ida_query`, and the
+  exception-directory pair `pe_runtime_functions` / `pe_function_extent`. The binary.py operations
+  (`driver_major_function_scan`, `rip_relative_iat_scan`, `kernel_callback_registrations`,
+  `ioctl_candidate_scan`, `ioctl_control_code_decode`) are byte-pattern scans and a decoder, not parsers:
+  they list candidates, `proves_dispatch` is always false, and the decoder only splits control-code
+  integers the caller supplies. `docs/CAPABILITIES_AND_LIMITS.md` carries the full text. The other nine
+  names in the `windows-kernel` family are roadmap: treat them as planned routing, not as capability.
 
 These are real and known gaps, named so nobody rediscovers them by surprise. They
 are explicitly **not** good first contributions — each is a research problem on
@@ -197,6 +201,12 @@ upstream; they cannot be reproduced from this repository.
   trace across a bounded number of hops exists in the upstream tree, is not
   published here, and is not whole-program taint analysis either — it answers a
   much narrower question.
+- **Which buffers reach a compare operand.** No tool answers whether the bytes
+  of an extracted string are ever consumed, or which buffers feed a `memcmp`
+  or equivalent. This is the narrower form of the dataflow entry above and is
+  not a substitute for it. In a measured crackme, a dead value and a live
+  decoder input both looked plausible, and string extraction could not say
+  which was which; only decompilation and disassembly read by hand could.
 - **Symbolic or concolic execution.** There is no such engine anywhere in this
   project. A constant that is computed at runtime rather than written as an
   immediate typically comes back `UNKNOWN`, which is an honest answer and not a

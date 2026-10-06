@@ -14,6 +14,8 @@ Each rule names how it is checked. A rule with no machine check is stated as a d
    hard-coded module count in the `package` job of `.github/workflows/ci.yml` is
    updated in the same commit. Checked by `tests/test_repo_discipline.py`
    (`test_layout_matches_packaging`, `test_every_module_is_referenced_by_a_test`) and CI.
+   One module, `liebert_re.tools.asar_parser`, is allowlisted in `KNOWN_UNREFERENCED` and
+   excluded from that check; the list is pinned by tests and may only shrink.
 2. **Done means green.** `pytest -q` and `ruff check .` both pass before a commit.
    Never add an entry to a `KNOWN_*` table in `tests/test_repo_discipline.py`;
    entries may only be removed. Checked by `test_allowlists_have_not_grown`.
@@ -40,8 +42,9 @@ Full text and the report template: `CASE_POLICY.md`.
    artifacts of an `active` case. When a case becomes `solved` or `abandoned`, its
    artifacts are purged by the purge mechanism; only generalized knowledge and the
    short report survive. Do not copy artifacts elsewhere to keep them.
-7. **Close with a short report.** Exactly three answers: which target (redacted),
-   what was done, what was gained for future targets. Template in `CASE_POLICY.md`.
+7. **Close with a short report.** Exactly four answers: which target (redacted),
+   what was done, what was gained for future targets, and what the run revealed
+   about this package's own tooling (`Harness:`). `CASE_POLICY.md` is the full text and the template.
 8. **Commercial or live applications are never named.** Use `TARGET-NN` plus a
    technical category tag. Public crackmes and CTF binaries may be named. Applies
    to code, comments, tests, docs, reports and commit messages. Checked by review.

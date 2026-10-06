@@ -103,8 +103,8 @@ Target:  TARGET-07, commercial desktop application. Licence validated inside the
          main process; the validator hashes its own code section at start-up.
 Done:    Found the validator by following string references from the licence
          dialog. Patching the branch directly failed because the self-check
-         aborted. Located the checksum loop, confirmed it covers the patched range,
-         and satisfied it by feeding the original bytes to the hashing routine.
+         aborted. Located the checksum loop and confirmed it covers the patched range;
+         the harness reported the range but could not say what the loop compares it to.
 Gained:  For in-process validators with a self-checksum, find the hash loop before
          touching the licence branch; patch-then-debug cost the most time.
 Harness: 1. No tool answers "does any loop read its own code range"; it would have

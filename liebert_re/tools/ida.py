@@ -1212,7 +1212,9 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
                             (e.g. "0x140001000"); resolves the containing function.
     * `decompile_function`  same `query`; returns Hex-Rays pseudocode.
     * `xrefs_to`            `query` is a symbol name or virtual address; any
-                            target, including import-table slots. Calls are
+                            target, but a query on an import name, IAT slot or jump
+                            thunk returns OK with an empty list that cannot tell
+                            "no callers" from "not resolved through the thunk". Calls are
                             flagged (`is_call`); jumps are not calls.
     * `imports_exports`     IDA's own import resolution plus entry points.
     * `strings`             IDA's string list; a non-empty `query` filters

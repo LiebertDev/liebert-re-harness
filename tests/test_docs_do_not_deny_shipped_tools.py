@@ -48,6 +48,10 @@ DENIALS = {
     "ioctl_control_code_decode": (r"nothing here analyses[^.]*IOCTLs", r"No module parses[^.]*control-code definitions"),
     "kernel_callback_registrations": (r"nothing here analyses[^.]*callbacks", r"No module parses[^.]*callback registrations"),
     "rip_relative_iat_scan": (r"No module parses[^.]*any other kernel-specific structure",),
+    "pe_runtime_functions": (r"No exception/unwind data parser", r"the PE surface does not cover[^.]*exception/unwind data"),
+    "pe_function_extent": (r"no function-boundary recovery for stripped x64 images",),
+    "pe_trailing_data": (r"does not (?:report|cover)[^.]*(?:overlay|data past the end of the last section)",
+                         r"No module reports[^.]*(?:overlay|trailing data)"),
 }
 
 # Wording that states an absence which a shipped tool closes. Key: the tool that closes it.
@@ -63,6 +67,7 @@ ABSENCES = {
 README_DENIALS = {
     "kernel_triage": (r"`kernel_triage`:[^|]*not wired to the CLI",),
     "ghidra_program_facts": (r"`ghidra_status`:[^|]*not wired to the CLI",),
+    "pe_function_extent": (r"Function-boundary recovery from exception-directory unwind data[^|]{0,80}Not here",),
 }
 
 README_ABSENCES = ABSENCES
@@ -101,6 +106,22 @@ class DocsDoNotDenyShippedTools(unittest.TestCase):
         for pat in ABSENCES["ioctl_candidate_scan"]:
             self.assertRegex(old, pat)
 
+    def test_denial_patterns_still_match_the_old_wording(self):
+        # Guards DENIALS and README_DENIALS: each new entry must match the denial it replaced.
+        old_doc = ("No exception/unwind data parser, so no function-boundary recovery for stripped x64 images. "
+                   "Partial: the PE surface does not cover delay imports, base relocations, the rich header "
+                   "or exception/unwind data.")
+        for tool in ("pe_runtime_functions", "pe_function_extent"):
+            self.assertTrue(any(re.search(p, old_doc) for p in DENIALS[tool]), tool)
+        old_readme = ("Function-boundary recovery from exception-directory unwind data, prologue scanning, "
+                      "and engine cross-check. Not here.")
+        for pat in README_DENIALS["pe_function_extent"]:
+            self.assertRegex(old_readme, pat)
+        old_trailing = ("No module reports the overlay. The PE surface does not report data past the end "
+                        "of the last section.")
+        for pat in DENIALS["pe_trailing_data"]:
+            self.assertRegex(old_trailing, pat)
+
     def test_absence_patterns_do_not_match_legitimate_sentences(self):
         # Narrowness check: ordinary negative statements that are not a gap closed by a tool must stay allowed.
         fine = ("This does not prove an IOCTL. No disassembler is used by the byte-pattern scan. "
@@ -110,6 +131,20 @@ class DocsDoNotDenyShippedTools(unittest.TestCase):
 
     def test_readme_does_not_deny_a_defined_tool(self):
         self.assertEqual(_offences(README, README_DENIALS), [], "README.md denies a tool that exists in code")
+
+    def test_documented_cli_surface_equals_the_live_one(self):
+        # Exists because a hand-maintained list of a machine-knowable fact is a guarantee nobody is keeping.
+        import argparse
+        from liebert_re import cli
+        parser = cli._build_parser()
+        live = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction)).choices
+        text = " ".join(DOC.read_text(encoding="utf-8").split())
+        m = re.search(r"`liebert-re` CLI \((.*?)(\d+) subcommands", text)
+        self.assertIsNotNone(m, "the CLI list in CAPABILITIES_AND_LIMITS.md was not found")
+        documented = re.findall(r"`([a-z0-9_-]+)`", m.group(1))
+        self.assertEqual(sorted(set(documented)), sorted(live), "documented subcommands differ from the live CLI")
+        self.assertEqual(len(documented), len(set(documented)), "a subcommand is listed twice")
+        self.assertEqual(int(m.group(2)), len(live), "documented subcommand count differs from the live CLI")
 
     def test_every_listed_tool_is_defined(self):
         # A renamed or removed tool must not leave a dead row that silently checks nothing.
