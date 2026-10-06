@@ -85,11 +85,20 @@ capstone range is chosen independently.
 
 ### Acted on
 
-Findings 1, 4 and 49 are fixed in the same change that adds this section, and
-both drift classes are now machine-checked rather than left to review:
-`tests/test_repo_discipline.py` asserts the `tool_families.py` docstring table
-equals the live computed report, and
-`tests/test_docs_do_not_deny_shipped_tools.py` now also scans `.claude/agents/`.
+Findings 1 and 49 are fixed in the same change that adds this section. Finding 4's
+prompts were corrected before the scaffolding was untracked, so it no longer
+applies to the published repository and cannot be checked from it. The
+docstring-table drift is machine-checked: `tests/test_repo_discipline.py` asserts
+the `tool_families.py` docstring table equals the live computed report.
+`tests/test_docs_do_not_deny_shipped_tools.py` scans `README.md` and
+`docs/CAPABILITIES_AND_LIMITS.md` only.
+
+Note, 2026-10-06 (later the same day): an earlier version of this section said
+that test also scanned `.claude/agents/`. That scanning was removed when the
+multi-agent scaffolding was untracked. The agent prompts are development
+scaffolding kept out of the repository, so their drift risk left with them and
+is no longer machine-checked here.
+
 The remaining findings are unactioned at the time of writing.
 
 ---

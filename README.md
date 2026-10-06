@@ -14,6 +14,10 @@ set of narrow, typed operations a model can call, each of which either returns a
 measured answer or says explicitly that it could not determine one. The model
 decides *what* to ask. The harness makes sure the answer comes from the file.
 
+You drive it through its command-line interface (`python -m liebert_re`). Any cloud
+or local model that can run shell commands is enough: one model, no orchestration
+layer required.
+
 > **Read [DISCLAIMER.md](DISCLAIMER.md) before you use this.** It is dual-use
 > tooling: analyse only software you are authorised to analyse. There is no
 > warranty, and we accept no liability for misuse — see

@@ -103,7 +103,6 @@ cases/**
 # local working rules for the operator and must stay untracked so they can never be
 # pushed to the public remote. Do not force-add them.
 /CLAUDE.md
-/CASE_POLICY.md
 
 # Stray test temp dirs. conftest redirects these into .pytest_evidence_scratch/ above, but a
 # kill or timeout in an older checkout (or a tool run from the repo root) can still leave
@@ -112,7 +111,10 @@ cases/**
 /rizin_fab_*/
 /pid_*/
 
-# Sub-agent worktree checkouts are runtime state, not repository content. Untracked but
-# unignored, a bulk `git add -A` would stage them. Only this subdirectory is ignored:
-# .claude/agents and .claude/skills are tracked.
-.claude/worktrees/
+# Multi-agent development scaffolding (department prompts, hooks, skills, worktree
+# checkouts) is a development practice, not part of the published package. Kept on disk
+# for local use, never committed. scripts/session_health.py is only a hook for it.
+/.claude/
+/.codex/
+/.agents/
+/scripts/session_health.py

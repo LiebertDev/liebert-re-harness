@@ -85,9 +85,10 @@ Full text and the report template: `CASE_POLICY.md`.
     and 0 Skill calls that pulled ~210k tokens of tool output into the lead. When a
     threshold is hit and delegation genuinely does not fit, write the artifact to a
     scratch path and read back only the lines that answer the question; state the
-    exception in one sentence. The roster is `.codex/agents/`; the assessment order
-    is `.agents/skills/attack-resistance-assessment/SKILL.md`. Department output is
-    UNVERIFIED until checked against live evidence. Checked by review.
+    exception in one sentence. Delegated output is UNVERIFIED until checked against
+    live evidence. The multi-agent scaffolding used to develop this harness is a
+    development practice and is not part of the published package; the harness itself
+    needs only one model driving its CLI. Checked by review.
 14. **Commit messages carry no `Co-Authored-By` trailer.** Write the message
     without one, whatever a tool's default attribution suggests. No machine check;
     this one is held by hand.
