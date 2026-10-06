@@ -368,6 +368,12 @@ def _kernel_iat(a):
     return _load("liebert_re.tools.binary", "rip_relative_iat_scan")(a.path, max_findings=a.max_findings)
 
 
+def _pdata(a):
+    if a.address is not None:
+        return _load("liebert_re.tools.pe_unwind", "pe_function_extent")(a.path, a.address, address_kind=a.address_kind)
+    return _load("liebert_re.tools.pe_unwind", "pe_runtime_functions")(a.path, max_entries=a.max_entries, offset=a.offset)
+
+
 def _kernel_callbacks(a):
     return _load("liebert_re.tools.binary", "kernel_callback_registrations")(a.path)
 
@@ -625,6 +631,11 @@ def _build_parser():
     sp.add_argument("--max-bytes", type=int, default=1024, help="size of the window scanned from the entry point")
     sp = add("kerneliat", _kernel_iat, "which imports are reached through RIP-relative import-table slots, and from where (read-only, no disassembler)")
     sp.add_argument("--max-findings", type=int, default=200, help="cap on returned findings; a cut is reported, not hidden")
+    sp = add("pdata", _pdata, "read a 64-bit PE's RUNTIME_FUNCTION table (.pdata); with --address, the function extent containing it (no disassembler; leaf functions have no entry, so absence proves nothing)")
+    sp.add_argument("--address", default=None, help="return the entry containing this address instead of the whole table")
+    sp.add_argument("--address-kind", dest="address_kind", default="va", choices=("va", "rva", "file_offset"), help="representation of --address")
+    sp.add_argument("--max-entries", type=int, default=1000, help="entries per page of the whole-table read; a cut is reported")
+    sp.add_argument("--offset", type=int, default=0, help="first entry of the page")
     add("kernelcallbacks", _kernel_callbacks, "which kernel callback-registration imports a driver calls; NOT_FOUND speaks only for the names listed in names_checked")
     sp = add("ioctldecode", _ioctl_decode, "split CTL_CODE integers into device type, function, method and access (takes integers, not a file)", path=False)
     sp.add_argument("codes", nargs="+", metavar="CODE", help="one or more CTL_CODE integers (decimal or 0x hex); a non-integer is reported per code, not dropped")

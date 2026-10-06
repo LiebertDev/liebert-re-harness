@@ -269,7 +269,18 @@ def test_published_tool_name_set_is_unchanged():
     # liebert_re/tools/archive2.py, none removed: _zstd_module, which tries the standard
     # library's compression.zstd before backports.zstd so the format is not refused on an
     # interpreter that ships it. No new module. Digest recomputed from the source.
-    assert digest == "c49ceb4b87eadc8f4a8f9984d5ac7a87b9fde9e7d1f79b221b4dea75d5cd2016"
+    # Updated again: 780 -> 787 (measured by diffing the set against a git archive of
+    # the previous commit, not by counting the diff by hand -- a first count said six
+    # names and named the wrong four). None removed. One new module,
+    # liebert_re/tools/pe_unwind.py, reading the x64 exception directory so a function's
+    # end RVA is measured instead of guessed. Two are published tools,
+    # pe_runtime_functions and pe_function_extent, registered in FAMILIES["native"] and
+    # FAMILIES["windows-kernel"] and reached from the CLI as `pdata`; five are private
+    # top-level helpers whose names are new to the set: _begin_form, _classify,
+    # _parse_table, _pdata, _public. The module's other helpers share names with existing
+    # definitions, and the set is deduplicated by name, so they add nothing.
+    # Digest recomputed from the source.
+    assert digest == "7cc5d176d5bb20e843b31f3e004dcae6c1e26298478d2434c019591df3b49e8c"
 
 
 def test_the_imported_package_is_this_checkout():
