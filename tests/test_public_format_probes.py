@@ -71,6 +71,9 @@ class FormatProbeNotThisFormatTests(unittest.TestCase):
 
     @pytest.mark.contract
     def test_android_resource_analyzer_rejects_non_axml_non_apk(self):
+        # A parse error is only reachable with androguard importable; without it the
+        # answer is TOOL_MISSING (tests/test_missing_optional_dependencies.py).
+        pytest.importorskip("androguard")
         result = _j(android_resource_analyzer(str(self.garbage)))
         self.assertFalse(result["ok"])
         self.assertIn("ANDROID_MANIFEST_PARSE_ERROR", result["error"])
@@ -111,6 +114,7 @@ class FormatProbeNotThisFormatTests(unittest.TestCase):
         self.assertIn("NOT_A_PLIST_OR_PARSE_ERROR", result["error"])
 
     def test_pcap_analyzer_rejects_non_pcap(self):
+        pytest.importorskip("dpkt")
         result = _j(pcap_analyzer(str(self.garbage)))
         self.assertFalse(result["ok"])
         self.assertIn("PCAP_PARSE_ERROR", result["error"])
@@ -222,13 +226,9 @@ class UnityAssetAnalyzerTests(unittest.TestCase):
         #   - UnityPy installed (this repo's own dev environment): it does
         #     not raise on an unrecognised bundle, it reports an empty asset
         #     environment -- ok:true, object_count 0.
-        #   - UnityPy NOT installed (a plain install of the published
-        #     package, which does not list it as a dependency): the
-        #     `import UnityPy` inside the module's own try/except is caught
-        #     the same way a real load failure would be -- ok:false,
-        #     NOT_UNITY_ASSET_OR_LOAD_ERROR. This is the module's actual
-        #     "external tool absent" path, exercised for real rather than
-        #     mocked.
+        #   - UnityPy NOT installed (it is the optional `unity` extra): the
+        #     import failure is an environment fault, reported as ok:false,
+        #     status TOOL_MISSING -- never as a data fault.
         garbage = self.root / "garbage.bin"
         garbage.write_bytes(b"not any recognised container format\x00\x01\x02" * 4)
         result = _j(unity_asset_analyzer(str(garbage)))
@@ -236,7 +236,9 @@ class UnityAssetAnalyzerTests(unittest.TestCase):
             self.assertEqual(result["object_count"], 0)
             self.assertEqual(result["type_counts"], {})
         else:
-            self.assertIn("NOT_UNITY_ASSET_OR_LOAD_ERROR", result["error"])
+            self.assertEqual(result["status"], "TOOL_MISSING")
+            self.assertEqual(result["missing_dependency"], "UnityPy")
+            self.assertNotIn("NOT_UNITY_ASSET_OR_LOAD_ERROR", result["error"])
 
     def test_unity_list_surfaces_typetree_read_failure_instead_of_swallowing_it(self):
         try:

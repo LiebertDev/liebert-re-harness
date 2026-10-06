@@ -15,6 +15,9 @@ from liebert_re.workspace import safe_path,relative
 
 def _j(x):return json.dumps(x,ensure_ascii=False,indent=2,default=str)
 
+# format -> (pip distribution that must be importable, extra that declares it)
+_NEEDS={'7Z':('py7zr','7z'),'RAR':('rarfile','rar'),'ZSTD':('backports.zstd','zstd')}
+
 _MAGIC={
     b'7z\xbc\xaf\x27\x1c':'7Z',
     b'Rar!\x1a\x07\x00':'RAR',b'Rar!\x1a\x07\x01':'RAR',
@@ -147,6 +150,13 @@ def _scan_stream(p,fmt,keep):
     return scan.finish()
 
 def rar_7z(path,operation='summary',member='',max_results=200,max_chars=30000):
+    def _missing(fmt,exc,path,operation):
+        # An environment fault, not a data fault: the archive was never looked at.
+        pkg,extra=_NEEDS.get(fmt,('(unknown)','archive'))
+        hint=f'pip install -e ".[{extra}]"'
+        return _j({'ok':False,'tool':'rar_7z','status':'TOOL_MISSING','error':f'{pkg.upper().replace(".","_")}_UNAVAILABLE',
+                   'missing_dependency':pkg,'required_capability':f'{pkg} ({hint})','format':fmt,'path':path,'operation':operation,
+                   'detail':f'the optional Python package {pkg} could not be imported ({type(exc).__name__}: {exc}); install it with {hint}. The input was not examined.'+(' backports.zstd is published for Python below 3.14 only, so on 3.14 or newer this wrapper has no installable zstd backend.' if fmt=='ZSTD' else '')})
     p=safe_path(path);max_results=max(1,min(int(max_results),2000));max_chars=max(1000,min(int(max_chars),120000))
     with p.open('rb') as fh:head=fh.read(8)
     fmt=_detect(head)
@@ -184,5 +194,7 @@ def rar_7z(path,operation='summary',member='',max_results=200,max_chars=30000):
         return _j({**base,'ok':False,'error':'UNSUPPORTED_RAR_7Z_OPERATION'})
     except DecompressionLimit as e:
         return _j({**base,'ok':False,'error':'DECOMPRESSED_SIZE_LIMIT_EXCEEDED','limit_bytes':_MAX_DECOMPRESSED_BYTES,'bytes_seen_at_refusal':e.seen})
+    except ImportError as e:
+        return _missing(fmt,e,relative(p),operation)
     except Exception as e:
         return _j({**base,'ok':False,'error':f'{type(e).__name__}: {e}'})

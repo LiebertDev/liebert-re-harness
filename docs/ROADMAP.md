@@ -174,7 +174,7 @@ upstream; they cannot be reproduced from this repository.
   and there is no near-term plan to add it.~~ **Partly closed.** Structural
   support now ships: `liebert_re/tools/dex.py` (DEX header, class and string-pool parse),
   `liebert_re/tools/android.py` (manifest, permission and component inspection of an APK or
-  raw AXML, via the undeclared `androguard` dependency — see `docs/INSTALL.md`)
+  raw AXML, via the optional `androguard` extra (`android`) — see `docs/INSTALL.md`)
   and `liebert_re/tools/jvm.py` (JVM `.class` / `.jar`). Decompiling one named class needs
   the optional JADX tool. **Still open:** none of these disassembles Dalvik
   method bytecode itself, `liebert_re/tools/android.py` does not implement resource-table

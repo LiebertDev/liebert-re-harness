@@ -80,12 +80,23 @@ Optional extras: `pip install -e ".[lattice]"` adds `mpmath` (needed by
 `liebert_re/dynamic/frida_trace_client.py`, which is a client for an isolated-VM tracing setup and is
 not on the core analysis path.
 
-Some modules import a Python package the repository does **not** declare, neither as
-a dependency nor as an extra. Install one yourself if you want the operation it
-backs; without it the call returns an error containing the import failure rather
-than doing anything: `androguard` (`liebert_re/tools/android.py`), `UnityPy` (`liebert_re/tools/unity.py`),
-`dpkt` (`liebert_re/tools/pcap.py`), `py7zr`, `rarfile` and `backports.zstd`
-(`liebert_re/tools/archive2.py`).
+Format wrappers that need a third-party Python package declare it as an optional extra, never as
+a core dependency. Without the extra, the call returns `ok: false` with `status: "TOOL_MISSING"`,
+`missing_dependency` naming the package, `required_capability` with the install command and a
+`detail` saying the input was not examined. It is never reported as a parse error, because the
+file was never read:
+
+| Extra | Package | Module |
+| --- | --- | --- |
+| `unity` | `UnityPy` (held to `>=1.25.4,<1.26`: its README warns of breaking changes between releases) | `liebert_re/tools/unity.py` |
+| `android` | `androguard`, `loguru` | `liebert_re/tools/android.py` |
+| `pcap` | `dpkt` | `liebert_re/tools/pcap.py` |
+| `7z`, `rar`, `zstd` (or `archive` for all three) | `py7zr`, `rarfile`, `backports.zstd` | `liebert_re/tools/archive2.py` |
+
+`loguru` is only used to silence androguard's logger; androguard already depends on it, and
+`android.py` ignores a failed `loguru` import. `backports.zstd` is published for Python below 3.14
+only, so on 3.14 or newer the `zstd` extra installs nothing and the zstd path of `rar_7z` stays
+`TOOL_MISSING`. gzip, bzip2 and xz use the standard library and need none of these.
 
 ## External applications — all optional
 

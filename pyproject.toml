@@ -64,6 +64,17 @@ frida = ["frida"]
 # fails closed with a structured TOOL_MISSING result when it is absent, so it is
 # an extra rather than a required dependency. CI installs it so those tests run.
 lattice = ["mpmath"]
+# Optional wrappers. Each module returns a structured TOOL_MISSING result naming the
+# package when its extra is not installed, so none of these is a core dependency.
+# Bounds are lower bounds only except UnityPy: its own README warns that breaking
+# changes happen in active development, so it is held to one minor series.
+unity = ["UnityPy>=1.25.4,<1.26"]
+android = ["androguard>=4.1.4", "loguru"]
+pcap = ["dpkt"]
+"7z" = ["py7zr"]
+rar = ["rarfile"]
+zstd = ["backports.zstd; python_version < \"3.14\""]
+archive = ["py7zr", "rarfile", "backports.zstd; python_version < \"3.14\""]
 
 [project.scripts]
 liebert-re = "liebert_re.cli:main"

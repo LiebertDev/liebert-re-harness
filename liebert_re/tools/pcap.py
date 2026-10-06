@@ -102,10 +102,16 @@ def _flow_key_str(key):
     return f"{src}-{dst}"
 
 def pcap_analyzer(path,operation='summary',max_items=300,query='',max_chars=60000):
+    def _missing(exc,path,operation,fmt):
+        # An environment fault, not a data fault: the capture was never looked at.
+        return _j({'ok':False,'tool':'pcap_analyzer','status':'TOOL_MISSING','error':'DPKT_UNAVAILABLE',
+                   'missing_dependency':'dpkt','required_capability':'dpkt (pip install -e ".[pcap]")','path':path,'operation':operation,'format':fmt,
+                   'detail':f'the optional Python package dpkt could not be imported ({type(exc).__name__}: {exc}); install it with pip install -e ".[pcap]". The input was not examined.'})
     p=safe_path(path);max_items=max(1,min(int(max_items),5000));max_chars=max(1000,min(int(max_chars),400000))
     data=p.read_bytes()
     fmt='PCAPNG' if data[:4]==_PCAPNG_MAGIC else 'PCAP'
     try:rows=_decode_packets(data)
+    except ImportError as e:return _missing(e,relative(p),operation,fmt)
     except Exception as e:return _j({'ok':False,'tool':'pcap_analyzer','path':relative(p),'operation':operation,'format':fmt,'error':f'PCAP_PARSE_ERROR: {e}'})
     base={'ok':True,'tool':'pcap_analyzer','path':relative(p),'operation':operation,'format':fmt,'packet_count':len(rows)}
     if rows:base['capture_start']=rows[0]['timestamp'];base['capture_end']=rows[-1]['timestamp']

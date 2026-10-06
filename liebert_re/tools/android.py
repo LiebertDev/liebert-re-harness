@@ -76,12 +76,19 @@ def _from_apk(p,operation,max_items):
     return None
 
 def android_resource_analyzer(path,operation='summary',max_items=300):
+    def _missing(exc,path,operation):
+        # An environment fault, not a data fault: the file was never looked at.
+        return _j({'ok':False,'tool':'android_resource_analyzer','status':'TOOL_MISSING','error':'ANDROGUARD_UNAVAILABLE',
+                   'missing_dependency':'androguard','required_capability':'androguard (pip install -e ".[android]")','path':path,'operation':operation,
+                   'detail':f'the optional Python package androguard could not be imported ({type(exc).__name__}: {exc}); install it with pip install -e ".[android]". The input was not examined.'})
     _quiet_loguru()
     p=safe_path(path);max_items=max(1,min(int(max_items),2000))
     head=p.read_bytes()[:4]
     is_zip=head[:2]==b'PK'
     try:
         result=_from_apk(p,operation,max_items) if is_zip else _from_raw_axml(p.read_bytes(),operation,max_items)
+    except ImportError as e:
+        return _missing(e,relative(p),operation)
     except Exception as e:
         return _j({'ok':False,'tool':'android_resource_analyzer','path':relative(p),'operation':operation,'error':f'ANDROID_MANIFEST_PARSE_ERROR: {e}'})
     if result is None:

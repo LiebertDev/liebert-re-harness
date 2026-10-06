@@ -39,9 +39,17 @@ def _container_name(o):
     return getattr(af,'name',None) or str(af)
 
 def unity_asset_analyzer(path,operation='summary',path_id=None,container='',max_items=300):
+    def _missing(package,extra,hint,exc,path,operation):
+        # An environment fault, not a data fault: the file was never looked at.
+        return _j({'ok':False,'tool':'unity_asset_analyzer','status':'TOOL_MISSING','error':'UNITYPY_UNAVAILABLE',
+                   'missing_dependency':package,'required_capability':f'{package} ({hint})','path':path,'operation':operation,
+                   'detail':f'the optional Python package {package} could not be imported ({type(exc).__name__}: {exc}); install it with {hint} (extra "{extra}"). The input was not examined.'})
     p=safe_path(path);max_items=max(1,min(int(max_items),5000))
     try:
         import UnityPy
+    except ImportError as e:
+        return _missing('UnityPy','unity','pip install -e ".[unity]"',e,relative(p),operation)
+    try:
         env=UnityPy.load(str(p))
         objects=list(env.objects)
     except Exception as e:
