@@ -296,7 +296,7 @@ return a named tool-missing status when absent. Function inventory
 
 ### Test coverage
 
-Current: 107<!-- count:test_files --> test files (`tests/test_*.py`); `pytest --collect-only` selects 2082 of 2155 tests, with 73
+Current: 108<!-- count:test_files --> test files (`tests/test_*.py`); `pytest --collect-only` selects 2082 of 2155 tests, with 73
 deselected (`heavy`) (counted when this line was last updated; pass and skip counts are not recorded
 here, run `pytest -q` for them). Historical snapshot, not current: an early run on an older checkout
 gave 527 passed, 39 skipped, 157 deselected, from 81<!-- count:historic --> test files, before the IDA wrapper's tests were added. Fixtures are built in code
