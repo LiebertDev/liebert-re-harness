@@ -509,3 +509,66 @@ def test_abandoned_and_manual_purge_do_not_need_a_report(env):
         c = _new_case(repo, name)
         rc, _, _ = _run(repo, "purge", name, "--execute", "--yes", "--reason", reason)
         assert rc == 0 and not (c / "ida" / "x.i64").exists(), reason
+
+
+# ------------------------------------------------ close writes status to marker
+def _meta(c):
+    import json
+    return json.loads((c / ".liebert-case").read_text(encoding="utf-8"))
+
+
+def _crlf_marker(c, name):
+    (c / ".liebert-case").write_bytes(
+        ('{\r\n  "liebert_case": 1,\r\n  "name": "%s",\r\n  "status": "open",\r\n'
+         '  "created": "2026-01-02T03:04:05"\r\n}\r\n' % name).encode())
+
+
+def test_solved_close_writes_solved_and_keeps_other_fields(env):
+    repo, _ = env
+    c = repo / "cases" / "alpha"
+    _crlf_marker(c, "alpha")
+    rc, _, _ = _run(repo, "purge", "alpha", "--execute", "--yes", "--reason", "solved")
+    assert rc == 0
+    m = _meta(c)
+    assert m["status"] == "solved" and "closed" in m
+    assert (m["liebert_case"], m["name"], m["created"]) == (1, "alpha", "2026-01-02T03:04:05")
+    assert list(m) == ["liebert_case", "name", "status", "created", "closed"]
+    raw = (c / ".liebert-case").read_bytes()
+    assert raw.startswith(b'{\r\n  "liebert_case"') and raw.endswith(b"}\r\n")
+    assert raw.count(b"\n") == raw.count(b"\r\n")
+
+
+def test_abandoned_close_writes_abandoned(env):
+    repo, _ = env
+    rc, _, _ = _run(repo, "purge", "beta", "--execute", "--yes", "--reason", "abandoned")
+    assert rc == 0 and _meta(repo / "cases" / "beta")["status"] == "abandoned"
+
+
+def test_from_commit_dry_run_leaves_marker_untouched_then_execute_writes(env):
+    repo, _ = env
+    c = repo / "cases" / "alpha"
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "close\n\ncase: solved alpha")
+    before = (c / ".liebert-case").read_bytes()
+    rc, _, _ = _run(repo, "from-commit")
+    assert rc == 0 and (c / ".liebert-case").read_bytes() == before
+    rc, _, _ = _run(repo, "purge", "alpha", "--reason", "solved")
+    assert (c / ".liebert-case").read_bytes() == before
+    rc, _, _ = _run(repo, "from-commit", "--execute")
+    assert rc == 0 and _meta(c)["status"] == "solved"
+
+
+def test_manual_purge_does_not_change_status(env):
+    repo, _ = env
+    rc, _, _ = _run(repo, "purge", "alpha", "--execute", "--yes")
+    assert rc == 0 and _meta(repo / "cases" / "alpha")["status"] == "open"
+
+
+def test_list_reflects_closed_status(env):
+    repo, _ = env
+    _, out, _ = _run(repo, "list")
+    assert "open" in out
+    _run(repo, "purge", "alpha", "--execute", "--yes", "--reason", "solved")
+    _, out, _ = _run(repo, "list")
+    alpha = [ln for ln in out.splitlines() if ln.startswith("alpha")][0]
+    beta = [ln for ln in out.splitlines() if ln.startswith("beta")][0]
+    assert "solved" in alpha and "open" not in alpha and "open" in beta

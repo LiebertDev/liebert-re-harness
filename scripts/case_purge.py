@@ -582,6 +582,22 @@ def knowledge_recorded(target: Path) -> bool:
     return False
 
 
+def mark_closed(target: Path, status: str) -> None:
+    """Record a close in the case marker: status becomes 'solved'/'abandoned' and a
+    'closed' timestamp is added (same format as 'created'). Every other field, the key
+    order, the indent and the line-ending style are preserved."""
+    if status not in ("solved", "abandoned"):
+        return
+    path = target / MARKER
+    raw = path.read_bytes()
+    meta = json.loads(raw.decode("utf-8"))
+    meta["status"] = status
+    meta["closed"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    eol = "\r\n" if b"\r\n" in raw else "\n"
+    text = json.dumps(meta, indent=2).replace("\n", eol) + eol
+    path.write_bytes(text.encode("utf-8"))
+
+
 def do_purge(repo, name, execute: bool, reason: str, confirm: bool = False) -> int:
     repo, target = resolve_case_target(repo, name)       # may raise ScopeError
     if reason == "solved" and not knowledge_recorded(target):
@@ -596,6 +612,8 @@ def do_purge(repo, name, execute: bool, reason: str, confirm: bool = False) -> i
     print_plan(plan, name)
     if not plan.purge:
         print("nothing to purge.")
+        if execute:
+            mark_closed(target, reason)
         return 0
     if not execute:
         print(f"\nDRY RUN: nothing was moved. Re-run with --execute to quarantine the "
@@ -612,6 +630,8 @@ def do_purge(repo, name, execute: bool, reason: str, confirm: bool = False) -> i
         print(f"Expires in 7 days. Undo with: scripts/case_purge.py restore {name} --stamp {stamp}")
     for e in errors:
         print(f"FAILED  {e}", file=sys.stderr)
+    if not errors:
+        mark_closed(target, reason)
     return 4 if errors else 0
 
 
