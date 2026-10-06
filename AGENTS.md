@@ -88,3 +88,6 @@ Full text and the report template: `CASE_POLICY.md`.
     exception in one sentence. The roster is `.codex/agents/`; the assessment order
     is `.agents/skills/attack-resistance-assessment/SKILL.md`. Department output is
     UNVERIFIED until checked against live evidence. Checked by review.
+14. **Commit messages carry no `Co-Authored-By` trailer.** Write the message
+    without one, whatever a tool's default attribution suggests. No machine check;
+    this one is held by hand.
