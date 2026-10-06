@@ -77,13 +77,11 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# bounded_subprocess.run_bounded_process is this repo's standard subprocess
-# wrapper (used by tools_windbg.py/tools_x64dbg.py, both upstream-only; not part of the published package); imported here even
-# though no operation in this module currently calls it, so the dependency
-# is visible and ready the moment a real, verified automation path exists
-# (see live_trace's docstring for why none exists yet -- it is an
-# unconditional NOT_SUPPORTED refusal, not a gated-but-implemented path).
-from liebert_re.bounded_subprocess import run_bounded_process  # noqa: F401
+# This module starts no external process (live_trace is an unconditional
+# NOT_SUPPORTED refusal), so it does not import bounded_subprocess. When a
+# verified automation path exists it must import run_bounded_process and
+# handle cp.launch_failed through launch_failure like the other wrappers;
+# tests/test_launch_contract.py fails until it does.
 from liebert_re.workspace import safe_path, relative  # noqa: F401
 
 from liebert_re.workspace import PROJECT_ROOT as APP_DIR
