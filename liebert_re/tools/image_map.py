@@ -19,9 +19,9 @@ per-target constant appears anywhere in this file. It reads ONE file (the
 dump) with ``pefile`` (an existing project dependency -- no PE parser is
 written here) and does integer arithmetic; it never touches a live process,
 never opens a guest transport, and never executes anything. Host-side static
-analysis of a file, full stop -- the same class of tool as ``tools_native.py``
-(``native_inspect``), not the guest-tiered class of ``tools_unpack.py``/
-``tools_frida.py``.
+analysis of a file, full stop -- the same class of tool as the other static
+readers in this package (e.g. ``liebert_re/tools/binary.py``), not a tool that needs a guest VM:
+this package has no guest layer.
 
 **Why naive ``base + rva`` is wrong, and what this module does about it.**
 
@@ -469,7 +469,7 @@ def image_address_map(
     reported_layout = layout if dump_layout is None else {**layout, "kind": dump_layout, "overridden_from_detected": layout["kind"]}
 
     machine = int(pe.FILE_HEADER.Machine)
-    # Managed (.NET/CLR) detection -- same signal tools_binary.binary_summary
+    # Managed (.NET/CLR) detection -- same signal binary_summary (liebert_re/tools/binary.py)
     # already uses and this codebase already treats as ground truth (COM
     # Descriptor / COR20 data directory, index 14, VirtualAddress != 0):
     # https://learn.microsoft.com/windows/win32/debug/pe-format -- "the

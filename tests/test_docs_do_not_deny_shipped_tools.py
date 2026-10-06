@@ -73,6 +73,11 @@ README_DENIALS = {
 README_ABSENCES = ABSENCES
 
 
+# The claim test_documented_cli_surface_equals_the_live_one reads. Public so that
+# test_docs_counts_match_code.py can prove its count markers never change what this regex matches.
+CLI_CLAIM = re.compile(r"`liebert-re` CLI \((.*?)(\d+) subcommands")
+
+
 def _offences(doc, table):
     text = " ".join(doc.read_text(encoding="utf-8").split())
     defined = tool_families._locally_defined_tool_names()
@@ -139,7 +144,7 @@ class DocsDoNotDenyShippedTools(unittest.TestCase):
         parser = cli._build_parser()
         live = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction)).choices
         text = " ".join(DOC.read_text(encoding="utf-8").split())
-        m = re.search(r"`liebert-re` CLI \((.*?)(\d+) subcommands", text)
+        m = CLI_CLAIM.search(text)
         self.assertIsNotNone(m, "the CLI list in CAPABILITIES_AND_LIMITS.md was not found")
         documented = re.findall(r"`([a-z0-9_-]+)`", m.group(1))
         self.assertEqual(sorted(set(documented)), sorted(live), "documented subcommands differ from the live CLI")

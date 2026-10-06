@@ -171,14 +171,14 @@ hidden feature.
 ## Hard problems, honestly hard
 
 - **Kernel static analysis is a staged roadmap and is NOT implemented.** The `windows-kernel` family in
-  `liebert_re/report/tool_families.py` names 19<!-- count:kernel_family_named --> tools, of which ten are defined in this package (counted from the code): the generic
+  `liebert_re/report/tool_families.py` names a fixed set of tools (the measured counts are stated once, in `docs/CAPABILITIES_AND_LIMITS.md`), of which only some are defined in this package: the generic
   `tool_missing` sentinel, `kernel_triage` (the first slice: static indicators and a `driver_likelihood`
   that is never a proof), five heuristic operations in `tools/binary.py`, `ida_query`, and the
   exception-directory pair `pe_runtime_functions` / `pe_function_extent`. The binary.py operations
   (`driver_major_function_scan`, `rip_relative_iat_scan`, `kernel_callback_registrations`,
   `ioctl_candidate_scan`, `ioctl_control_code_decode`) are byte-pattern scans and a decoder, not parsers:
   they list candidates, `proves_dispatch` is always false, and the decoder only splits control-code
-  integers the caller supplies. `docs/CAPABILITIES_AND_LIMITS.md` carries the full text. The other nine
+  integers the caller supplies. `docs/CAPABILITIES_AND_LIMITS.md` carries the full text. The other
   names in the `windows-kernel` family are roadmap: treat them as planned routing, not as capability.
 
 These are real and known gaps, named so nobody rediscovers them by surprise. They

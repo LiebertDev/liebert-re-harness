@@ -296,7 +296,7 @@ return a named tool-missing status when absent. Function inventory
 
 ### Test coverage
 
-Current: 109<!-- count:test_files --> test files (`tests/test_*.py`); `pytest --collect-only` selects 2082 of 2155 tests, with 73
+Current: the test-file count is stated in one place, `docs/INSTALL.md` (pinned to a measurement by `tests/test_docs_counts_match_code.py`); `pytest --collect-only` selects 2082 of 2155 tests, with 73
 deselected (`heavy`) (counted when this line was last updated; pass and skip counts are not recorded
 here, run `pytest -q` for them). Historical snapshot, not current: an early run on an older checkout
 gave 527 passed, 39 skipped, 157 deselected, from 81<!-- count:historic --> test files, before the IDA wrapper's tests were added. Fixtures are built in code
@@ -311,12 +311,12 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
 ### Kernel-level targets: a first look only
 
 - `report/tool_families.py` names a `windows-kernel` family of 19<!-- count:kernel_family_named --> tools (counted from the code).
-  Ten are defined in this package: the generic `tool_missing` sentinel, `kernel_triage`,
+  10<!-- count:kernel_family_defined --> are defined in this package (also counted from the code, as `published_tools("windows-kernel")`): the generic `tool_missing` sentinel, `kernel_triage`,
   five operations in `tools/binary.py`, described below (byte-pattern scans and a
   disassembly-based candidate lister whose findings never prove what they name, and
   one decoder that splits CTL_CODE integers the caller already has), `ida_query`,
   and the two exception-directory operations `pe_runtime_functions` / `pe_function_extent`
-  (CLI `pdata`). The other nine are names of upstream tools that are not here; they are a roadmap,
+  (CLI `pdata`). The rest are names of upstream tools that are not here; they are a roadmap,
   not capability.
 - `kernel_triage` (`tools/binary.py`) is read-only and reads one PE with
   `pefile`: machine, subsystem, sections (including `INIT` and `PAGE` names),
@@ -480,6 +480,7 @@ x86_64-only stack scan, API Monitor refusals, and the PE directories not covered
 
 ## Maintenance
 
-Counts here are point-in-time (checkout of 2026-10-06). CI's wheel smoke test
-asserts the shipped module count; this document is not part of that check and
-adds no module.
+Counts here are point-in-time (checkout of 2026-10-06). No module count is typed by hand
+in CI: the wheel smoke test measures the shipped modules and compares them with the checkout,
+and `tests/test_docs_counts_match_code.py` pins the documented figure (in `docs/INSTALL.md`)
+to the same measurement. This document adds no module.

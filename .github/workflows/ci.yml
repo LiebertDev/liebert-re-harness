@@ -135,18 +135,18 @@ jobs:
           repo = os.environ["GITHUB_WORKSPACE"]
           assert not any(os.path.abspath(p or ".") == repo for p in sys.path), sys.path
           mods = sorted(m.name for m in pkgutil.walk_packages(liebert_re.__path__, "liebert_re.") if not m.ispkg)
-          # Deliberate count: what the wheel ships cannot change without a
-          # reviewed edit here. 73 = 71 library modules + cli + __main__.
-          # (+1 over 66: liebert_re/tools/capa.py, the capa wrapper.)
-          # (+1 over 67: liebert_re/tools/ida.py, the IDA wrapper. Its IDAPython worker is a
-          # data file under ida_scripts/ and is checked below, not imported.)
-          # (+1 over 68: liebert_re/tools/pe_sieve.py, the pe-sieve wrapper.)
-          # (+1 over 69: liebert_re/dynamic/lab_gate.py, the dynamic-lab gate.)
-          # (+1 over 70: liebert_re/tools/ghidra.py, the Ghidra headless wrapper. Its Java
-          # post-script is a data file under ghidra_scripts/, not a module.)
-          # (+1 over 71: liebert_re/tools/pe_unwind.py, the RUNTIME_FUNCTION (.pdata) reader.)
-          # (+1 over 72: liebert_re/tools/pe_trailing.py, the trailing-data (overlay) reader.)
-          assert len(mods) == 73, (len(mods), mods)
+          # No hand-typed module count lives here. The job measures what the wheel ships and
+          # compares it with what the checkout holds, so a module the wheel drops fails, and
+          # adding a module needs no edit to this file. The count itself is pinned in the docs
+          # by tests/test_docs_counts_match_code.py (docs/INSTALL.md carries the marker).
+          src_root = os.path.join(repo, "liebert_re")
+          src_mods = sorted(
+              "liebert_re." + os.path.relpath(os.path.join(d, f), src_root)[:-3].replace(os.sep, ".")
+              for d, _, files in os.walk(src_root) for f in files
+              if f.endswith(".py") and f != "__init__.py" and "__pycache__" not in d)
+          assert mods == src_mods, (sorted(set(src_mods) ^ set(mods)))
+          assert mods, "no modules found in the installed package"
+          print(f"measured {len(mods)} modules in the wheel, equal to the checkout")
           failed = []
           import importlib.resources as _res
           worker = _res.files("liebert_re.tools").joinpath("ida_scripts/query_program.idapy")

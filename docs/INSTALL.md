@@ -165,8 +165,9 @@ system temp directory is outside the workspace unless you repoint the root, and
 one test file in the upstream tree failed for exactly that reason until it was
 fixed.
 
-Eight modules write their own output *outside* this workspace root on purpose:
-`liebert_re/tools/binary.py` (`pe_resources`), `liebert_re/tools/die.py`, `liebert_re/tools/capa.py`, `liebert_re/tools/ida.py`, `liebert_re/tools/pe_sieve.py`, `liebert_re/tools/yara_x.py`,
+Several modules write their own output *outside* this workspace root on purpose
+(the measured count and the full list are in the README, under the capability table);
+for example `liebert_re/tools/binary.py` (`pe_resources`), `liebert_re/tools/die.py`, `liebert_re/tools/capa.py`, `liebert_re/tools/ida.py`, `liebert_re/tools/pe_sieve.py`, `liebert_re/tools/yara_x.py`,
 `liebert_re/tools/rizin.py` (`binary_patch`, the `rz-bin` reads and the FLIRT runs) and `liebert_re/tools/upx.py` each persist their raw
 engine output under a module-level `dataset/evidence/<tool_name>/` directory
 inside the repository itself, which is git-ignored. The *input* file you pass
