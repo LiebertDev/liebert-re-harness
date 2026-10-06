@@ -462,6 +462,40 @@ def message_findings(rev_ranges: list[list[str]], mod=None) -> list[str]:
     return out
 
 
+def product_rule_state(mod=None) -> tuple[str, str]:
+    """(state, text) for the product-name rule on THIS machine, without raising and without ever
+    printing a registry line (only its path, a count, or a line number).
+
+    States: "active" (entries present), "absent" (no file), "empty" (file present, no entries),
+    "unreadable" (file present, cannot be read), "malformed" (a bad line; message_findings blocks on
+    that), "unknown" (the discipline module could not be loaded). Everything but "active" means no
+    product name was checked in this run; the gate says so, it does not refuse (the registry is
+    operator-private, so a fresh clone could never satisfy a refusal)."""
+    try:
+        mod = mod or _discipline()
+        path = mod._registry_path()
+    except Exception as e:
+        return "unknown", f"product-name rule INACTIVE (could not load the discipline module: {e.__class__.__name__})"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "absent", (f"product-name rule INACTIVE: no private target registry at {path} "
+                          f"(set {mod.TARGETS_ENV} or create it); no commercial product name was checked")
+    except OSError as e:
+        return "unreadable", (f"product-name rule INACTIVE: private target registry at {path} could not be read "
+                              f"({e.__class__.__name__}); no commercial product name was checked")
+    try:
+        entries = mod._parse_registry(text)
+    except ValueError as e:
+        return "malformed", f"product-name rule BROKEN: private target registry at {path} is malformed ({e})"
+    if not entries:
+        return "empty", (f"product-name rule INACTIVE: private target registry at {path} exists but has NO entries "
+                         "(an emptied registry is not the same as none; if it should list targets, restore it); "
+                         "no commercial product name was checked")
+    probes = mod._denylist_probes([(c, n) for c, n, _ in entries])
+    return "active", f"product-name rule active: {len(entries)} target(s), {len(probes)} name probe(s)"
+
+
 def pushed_ranges(stdin_text: str) -> list[list[str]]:
     ranges = []
     for line in stdin_text.splitlines():
@@ -493,7 +527,8 @@ def run_gate(ranges: list[list[str]]) -> int:
 def _run_gate(ranges: list[list[str]]) -> int:
     print("pre-push gate: discipline test + test suite + contract tests on every Python + identity probes "
           "(bypass only with: git push --no-verify)", file=sys.stderr)
-    pytest = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+    # -rs: a skip reason is printed, not just counted. A rule that skips itself must be readable.
+    pytest = [sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider"]
     failed = False
     print("pre-push gate: [1/4] discipline test ...", file=sys.stderr, flush=True)
     cmd = [*pytest, *isolated_basetemp("discipline"), "tests/test_repo_discipline.py"]
@@ -543,6 +578,8 @@ def _run_gate(ranges: list[list[str]]) -> int:
     else:
         print("pre-push gate: [3/4] contract tests: done.", file=sys.stderr)
     print("pre-push gate: [4/4] commit-message identity probes ...", file=sys.stderr, flush=True)
+    rule_state, rule_text = product_rule_state()
+    print(f"pre-push gate: rules: {rule_text}", file=sys.stderr)
     try:
         hits = message_findings(ranges)
     except Exception as e:                           # cannot scan messages => do not wave it through
@@ -555,8 +592,15 @@ def _run_gate(ranges: list[list[str]]) -> int:
         print("  fix: reword/rewrite those commits locally, or --no-verify if you accept the leak.",
               file=sys.stderr)
         failed = True
+    # The LAST line the operator sees names a rule that was off; "ok." is never the whole line then.
+    if rule_state == "active":
+        suffix = f" ({rule_text})"
+    else:
+        suffix = f" BUT {rule_text}"
     if not failed:
-        print("pre-push gate: ok.", file=sys.stderr)
+        print(f"pre-push gate: ok{'.' if rule_state == 'active' else ','}{suffix}", file=sys.stderr)
+    elif rule_state != "active":
+        print(f"pre-push gate: BLOCKED, and note: {rule_text}", file=sys.stderr)
     return 1 if failed else 0
 
 

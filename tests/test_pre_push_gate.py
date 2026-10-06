@@ -16,6 +16,13 @@ _spec = importlib.util.spec_from_file_location("_pre_push_gate", ROOT / "scripts
 gate = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gate)
 
+@pytest.fixture(autouse=True)
+def _no_real_registry(monkeypatch, tmp_path_factory):
+    """Every test in this file sees a registry path that does not exist, so none of them can read the
+    operator's real private target registry. Tests that need another state set the variable again."""
+    monkeypatch.setenv("LIEBERT_RE_TARGETS", str(tmp_path_factory.mktemp("noreg") / "absent-targets.txt"))
+
+
 # Built by concatenation so this file never prints the markers itself.
 FATAL = "Windows fatal " + "exception: access " + "violation"
 
@@ -431,3 +438,93 @@ def test_the_contract_stage_honours_report_mode_only_for_traces(monkeypatch, tmp
 def test_the_flag_is_written_into_no_file():
     for text in (gate.HOOK_TEMPLATE, (gate.ROOT / "pytest.ini").read_text(), (gate.ROOT / ".github" / "workflows" / "ci.yml").read_text()):
         assert gate.FIRSTCHANCE_ENV not in text
+
+
+# ---- the product-name rule must never be silently inactive --------------------------------------
+# The registry holds real names, so tests only ever write placeholder names to a temp file.
+_PLACEHOLDER = "TARGET-01 | Examplecorp Widget; Widgetpro | test category\n"
+
+
+def _gate_with_registry(monkeypatch, capsys, path, content=None):
+    if content is not None:
+        path.write_text(content, encoding="utf-8")
+    monkeypatch.setenv("LIEBERT_RE_TARGETS", str(path))
+    monkeypatch.setattr(gate, "run_pytest", lambda cmd, **kw: (0, []))
+    monkeypatch.setattr(gate, "run_contract_stage", lambda: False)
+    monkeypatch.setattr(gate, "message_findings", lambda ranges: [])
+    rc = gate.run_gate([["HEAD"]])
+    lines = [x for x in capsys.readouterr().err.splitlines() if x.strip()]
+    return rc, lines
+
+
+def test_absent_registry_does_not_block_but_the_last_line_names_the_inactive_rule(monkeypatch, capsys, tmp_path):
+    path = tmp_path / "targets.txt"
+    rc, lines = _gate_with_registry(monkeypatch, capsys, path)
+    assert rc == 0
+    assert lines[-1] != "pre-push gate: ok."
+    assert lines[-1].startswith("pre-push gate: ok,")
+    assert "product-name rule INACTIVE" in lines[-1] and "no private target registry" in lines[-1]
+    assert str(path) in lines[-1]
+    assert any(x.startswith("pre-push gate: rules:") and "INACTIVE" in x for x in lines)
+
+
+def test_empty_registry_is_told_apart_from_an_absent_one(monkeypatch, capsys, tmp_path):
+    path = tmp_path / "targets.txt"
+    rc, lines = _gate_with_registry(monkeypatch, capsys, path, "# only a comment\n\n")
+    assert rc == 0
+    assert "INACTIVE" in lines[-1] and "NO entries" in lines[-1]
+    assert "no private target registry" not in lines[-1]
+    state_empty = gate.product_rule_state()[0]
+    path.unlink()
+    assert (state_empty, gate.product_rule_state()[0]) == ("empty", "absent")
+
+
+def test_malformed_registry_still_blocks_through_the_real_message_scan(monkeypatch, tmp_path):
+    path = tmp_path / "targets.txt"
+    path.write_text("this is not a registry line\n", encoding="utf-8")
+    monkeypatch.setenv("LIEBERT_RE_TARGETS", str(path))
+    assert gate.product_rule_state()[0] == "malformed"
+    with pytest.raises(ValueError):                 # run_gate turns this into a BLOCK (hits)
+        gate.message_findings([["HEAD"]])
+
+
+def test_malformed_registry_blocks_the_gate_and_never_prints_the_line(monkeypatch, capsys, tmp_path):
+    path = tmp_path / "targets.txt"
+    path.write_text("SECRETLINE-not-a-registry-line\n", encoding="utf-8")
+    monkeypatch.setenv("LIEBERT_RE_TARGETS", str(path))
+    monkeypatch.setattr(gate, "run_pytest", lambda cmd, **kw: (0, []))
+    monkeypatch.setattr(gate, "run_contract_stage", lambda: False)
+    assert gate.run_gate([["HEAD"]]) == 1
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err and "could not run the message scan" in err
+    assert "SECRETLINE" not in err
+
+
+def test_populated_registry_is_reported_active_with_probes(monkeypatch, capsys, tmp_path):
+    path = tmp_path / "targets.txt"
+    rc, lines = _gate_with_registry(monkeypatch, capsys, path, _PLACEHOLDER)
+    assert rc == 0
+    assert lines[-1].startswith("pre-push gate: ok.") and "product-name rule active" in lines[-1]
+    assert "INACTIVE" not in "\n".join(lines)
+    state, text = gate.product_rule_state()
+    assert state == "active" and "1 target(s)" in text and "2 name probe(s)" in text
+    assert "Examplecorp" not in "\n".join(lines)
+    assert len(gate._discipline()._denylist_probes()) == 2
+
+
+def test_inactive_rule_is_also_the_last_line_when_the_gate_blocks(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(gate, "run_pytest", lambda cmd, **kw: (1, []))
+    monkeypatch.setattr(gate, "run_contract_stage", lambda: False)
+    monkeypatch.setattr(gate, "message_findings", lambda ranges: [])
+    assert gate.run_gate([["HEAD"]]) == 1
+    last = [x for x in capsys.readouterr().err.splitlines() if x.strip()][-1]
+    assert "BLOCKED" in last and "product-name rule INACTIVE" in last
+
+
+def test_the_gates_own_pytest_runs_print_skip_reasons(monkeypatch):
+    seen = []
+    monkeypatch.setattr(gate, "run_pytest", lambda cmd, **kw: (seen.append(cmd), (0, []))[1])
+    monkeypatch.setattr(gate, "run_contract_stage", lambda: False)
+    monkeypatch.setattr(gate, "message_findings", lambda ranges: [])
+    gate.run_gate([["HEAD"]])
+    assert len(seen) == 2 and all("-rs" in c for c in seen)
