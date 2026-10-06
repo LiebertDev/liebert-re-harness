@@ -40,7 +40,8 @@ harness usually has: `python -m liebert_re capabilities` reports, per routing fa
 are *named* versus actually *published* (locally implemented) in this package. See
 `liebert_re/report/tool_families.py`'s module docstring — `FAMILIES` records routing across a much
 larger private tree this package was extracted from, and most of its names (`ghidra_query`,
-`ida_query`, every `emulate_*` name, and every `kernel_*` name except `kernel_triage`) have no implementation here at all. A zero or low
+every `emulate_*` name, and every `kernel_*` name except `kernel_triage` and
+`kernel_callback_registrations`) have no implementation here at all; `ida_query` does ship. A zero or low
 published count for a family is the real "this install can't do that" signal; `python -m liebert_re
 --help` lists every subcommand actually wired to the CLI.
 

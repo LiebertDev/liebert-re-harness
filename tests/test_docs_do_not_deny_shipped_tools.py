@@ -22,8 +22,8 @@ ioctl_candidate_scan exists. DENIALS, keyed by the tool a sentence is about, can
 ABSENCES is keyed by the tool that FILLS the gap, and its patterns match wording that states a
 gap ("no feeder", "nothing in the package produces its input").
 
-Scope: ``docs/CAPABILITIES_AND_LIMITS.md`` (DENIALS) and ``README.md`` (README_DENIALS). No other
-file is read. README_DENIALS patterns stay inside one table row ([^|]*) so a denial about one
+Scope: ``docs/CAPABILITIES_AND_LIMITS.md`` (DENIALS), ``README.md`` (README_DENIALS) and every
+``.claude/agents/*.md`` agent prompt (AGENT_DENIALS). No other file is read. README_DENIALS patterns stay inside one table row ([^|]*) so a denial about one
 tool cannot be matched against another tool's row.
 
 A tool counts as shipped when ``tool_families._locally_defined_tool_names()`` contains it.
@@ -38,6 +38,7 @@ from liebert_re.report import tool_families
 ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "CAPABILITIES_AND_LIMITS.md"
 README = ROOT / "README.md"
+AGENT_PROMPTS = sorted((ROOT / ".claude" / "agents").glob("*.md"))
 
 _HEADLINE = r"nothing here analyses a kernel-mode binary's dispatch table"
 _NO_MODULE = r"No module parses a driver's dispatch table"
@@ -64,8 +65,27 @@ README_DENIALS = {
     "ghidra_program_facts": (r"`ghidra_status`:[^|]*not wired to the CLI",),
 }
 
+# Agent prompts. A prompt that tells a department a shipped tool is missing sends it down the
+# wrong path, so the same denial shapes are checked per prompt.
+AGENT_DENIALS = {
+    "ida_query": (r"`ida_query`[^;]{0,200}no implementation",),
+    "kernel_callback_registrations": (r"every `kernel_\*` name except `kernel_triage`(?! and `kernel_callback_registrations`)",),
+    "driver_major_function_scan": (r"members are the generic `tool_missing` sentinel and `kernel_triage`",
+                                   r"never a proof; it reads no dispatch table, IOCTL or callback"),
+}
+
 
 README_ABSENCES = ABSENCES
+
+
+def _agent_offences():
+    defined = tool_families._locally_defined_tool_names()
+    found = []
+    for doc in AGENT_PROMPTS:
+        text = " ".join(doc.read_text(encoding="utf-8").split())
+        found += [f"{doc.name} {tool}: {pat!r}" for tool, pats in AGENT_DENIALS.items() if tool in defined
+                  for pat in pats if re.search(pat, text)]
+    return found
 
 
 def _offences(doc, table):
@@ -111,10 +131,24 @@ class DocsDoNotDenyShippedTools(unittest.TestCase):
     def test_readme_does_not_deny_a_defined_tool(self):
         self.assertEqual(_offences(README, README_DENIALS), [], "README.md denies a tool that exists in code")
 
+    def test_agent_prompts_do_not_deny_a_defined_tool(self):
+        self.assertTrue(AGENT_PROMPTS, "no .claude/agents/*.md found; the scan would check nothing")
+        self.assertEqual(_agent_offences(), [], ".claude/agents prompt denies a tool that exists in code")
+
+    def test_agent_denial_patterns_still_match_the_old_wording(self):
+        old = {
+            "ida_query": "`ghidra_query`, `ida_query` and `ilspy` are names in `x.py`'s manifest with no implementation here",
+            "kernel_callback_registrations": "and every `kernel_*` name except `kernel_triage`) have no implementation",
+            "driver_major_function_scan": "members are the generic `tool_missing` sentinel and `kernel_triage` (static; never a proof; it reads no dispatch table, IOCTL or callback)",
+        }
+        for tool, pats in AGENT_DENIALS.items():
+            for pat in pats:
+                self.assertRegex(old[tool], pat)
+
     def test_every_listed_tool_is_defined(self):
         # A renamed or removed tool must not leave a dead row that silently checks nothing.
         defined = tool_families._locally_defined_tool_names()
-        self.assertEqual([t for t in (*DENIALS, *README_DENIALS, *ABSENCES) if t not in defined], [])
+        self.assertEqual([t for t in (*DENIALS, *README_DENIALS, *AGENT_DENIALS, *ABSENCES) if t not in defined], [])
 
 
 if __name__ == "__main__":

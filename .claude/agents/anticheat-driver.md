@@ -15,8 +15,11 @@ Mission: determine whether protection software, anti-cheat, or a kernel-mode dri
 *on paper* — recover dispatch routines and IOCTL handling to assess what a caller can reach and
 whether checks can be defeated. State the ceiling honestly first: this package has no kernel-specific
 analyzer beyond a first look. `windows-kernel` in `liebert_re/report/tool_families.py` is a named routing family whose
-locally-implemented members are the generic `tool_missing` sentinel and `kernel_triage` (static
-indicators and a `driver_likelihood` that is never a proof; it reads no dispatch table, IOCTL or callback) —
+locally-implemented members are the generic `tool_missing` sentinel, `kernel_triage` (static
+indicators and a `driver_likelihood` that is never a proof), `driver_major_function_scan`,
+`kernel_callback_registrations` and `rip_relative_iat_scan` — byte-pattern scans, with no
+disassembler, that never prove dispatch or a call — and `ioctl_control_code_decode`, which only
+splits CTL_CODE integers you already have into their bit fields and reads no file.
 `kernel_security_analyze` and `deep_security_verify` do not exist here. Work this question with the generic
 native toolkit, by hand, instead.
 

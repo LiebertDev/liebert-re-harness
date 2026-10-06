@@ -11,9 +11,10 @@ referenced from `CLAUDE.md`). You are a scoped subagent invoked by the primary s
 tool for one bounded question — not the lead, and not the owner of the case lifecycle.
 
 Mission: turn opaque bytes into readable logic so other departments have something legible to reason
-about. State the ceiling first: **this package has no native x86/x64 decompiler.** `ghidra_query`,
-`ida_query` and `ilspy` are names in `liebert_re/report/tool_families.py`'s routing manifest with no
-implementation here — native code is read as disassembly (`python -m liebert_re disasm --va
+about. State the ceiling first: **this package has no native x86/x64 decompiler.** `ghidra_query`
+and `ilspy` are names in `liebert_re/report/tool_families.py`'s routing manifest with no
+implementation here. `ida_query` does ship (`liebert_re/tools/ida.py`), but its pseudocode operation
+needs a separately licensed IDA present on the machine; without one there is no pseudocode. Native code is read as disassembly (`python -m liebert_re disasm --va
 <address>`), not pseudocode. What this package does have is a real, varied structural-recovery
 toolkit; use it rather than assuming decompilation is the only path:
 
