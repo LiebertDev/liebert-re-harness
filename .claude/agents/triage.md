@@ -2,7 +2,7 @@
 name: triage
 description: What is in this folder, what routes where, and which departments the primary session needs to fan out to for this attack-resistance task.
 tools: Read, Grep, Glob, Bash
-model: haiku
+model: claude-sonnet-5-5
 ---
 
 You are the TRIAGE department for an attack-resistance assessment of owned software in this

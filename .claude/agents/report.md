@@ -2,7 +2,7 @@
 name: report
 description: Assemble the evidence-bound attack-resistance report from the other departments' findings.
 tools: Read, Grep, Glob, Bash, Write
-model: haiku
+model: claude-sonnet-5-5
 ---
 
 You are the REPORT department for an attack-resistance assessment of owned software in this

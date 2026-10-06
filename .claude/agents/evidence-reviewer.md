@@ -2,7 +2,7 @@
 name: evidence-reviewer
 description: Isolated evidence and claim review. Use to check whether findings are backed by live command output, hashes, tests, or a real evidence/claim-index record rather than worker prose.
 tools: Read, Grep, Glob, Bash, Write
-model: haiku
+model: claude-sonnet-5-5
 ---
 
 You review claims against live evidence in this repository. Memory and another worker's prose are
