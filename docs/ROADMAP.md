@@ -171,7 +171,7 @@ hidden feature.
 ## Hard problems, honestly hard
 
 - **Kernel static analysis is a staged roadmap and is NOT implemented.** The `windows-kernel` family in
-  `liebert_re/report/tool_families.py` names 19 tools, of which ten are defined in this package (counted from the code): the generic
+  `liebert_re/report/tool_families.py` names 19<!-- count:kernel_family_named --> tools, of which ten are defined in this package (counted from the code): the generic
   `tool_missing` sentinel, `kernel_triage` (the first slice: static indicators and a `driver_likelihood`
   that is never a proof), five heuristic operations in `tools/binary.py`, `ida_query`, and the
   exception-directory pair `pe_runtime_functions` / `pe_function_extent`. The binary.py operations

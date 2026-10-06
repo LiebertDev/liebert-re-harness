@@ -296,10 +296,10 @@ return a named tool-missing status when absent. Function inventory
 
 ### Test coverage
 
-Current: 106 test files (`tests/test_*.py`); `pytest --collect-only` selects 2082 of 2155 tests, with 73
+Current: 107<!-- count:test_files --> test files (`tests/test_*.py`); `pytest --collect-only` selects 2082 of 2155 tests, with 73
 deselected (`heavy`) (counted when this line was last updated; pass and skip counts are not recorded
 here, run `pytest -q` for them). Historical snapshot, not current: an early run on an older checkout
-gave 527 passed, 39 skipped, 157 deselected, from 81 test files, before the IDA wrapper's tests were added. Fixtures are built in code
+gave 527 passed, 39 skipped, 157 deselected, from 81<!-- count:historic --> test files, before the IDA wrapper's tests were added. Fixtures are built in code
 (`recover/owned_binary_fixtures.py`); no real binaries ship. Real-engine paths
 skip on a clean checkout, so CI does not demonstrate them.
 The IDA wrapper's default-tier tests drive the real wrapper code against a stand-in `idat` that writes
@@ -310,7 +310,7 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
 
 ### Kernel-level targets: a first look only
 
-- `report/tool_families.py` names a `windows-kernel` family of 19 tools (counted from the code).
+- `report/tool_families.py` names a `windows-kernel` family of 19<!-- count:kernel_family_named --> tools (counted from the code).
   Ten are defined in this package: the generic `tool_missing` sentinel, `kernel_triage`,
   five operations in `tools/binary.py`, described below (byte-pattern scans and a
   disassembly-based candidate lister whose findings never prove what they name, and
@@ -460,9 +460,9 @@ sit on disk.
    dependencies alone. No range emulation ships; `recover/vex.py` is an
    instruction-semantics correction layer. It also lists function inventory
    there, but `rizin_functions` needs rizin.
-4. `INSTALL.md` counts: "64 Python modules at the repository root", "47 test
-   files". Actual at that check: 68 modules inside the `liebert_re/` package (CI asserts 68),
-   68 test files (81 when re-counted later with `ls tests/test_*.py`). The "11 standalone challenge-solution scripts in
+4. `INSTALL.md` counts: "64<!-- count:historic --> Python modules at the repository root", "47<!-- count:historic --> test
+   files". Actual at that check: 68<!-- count:historic --> modules inside the `liebert_re/` package (CI asserted 68<!-- count:historic --> then),
+   68<!-- count:historic --> test files (81<!-- count:historic --> when re-counted later with `ls tests/test_*.py`). The "11 standalone challenge-solution scripts in
    `crackme_solutions/`" claim was removed; those scripts are not distributed
    in this package.
 5. `BENCHMARKS.md` lists angr as a real in-process integration. Nothing in the
