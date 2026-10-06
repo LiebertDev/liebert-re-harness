@@ -45,8 +45,17 @@ understands, and only this layout:
 cases/<name>/.liebert-case     marker (JSON); without it the tooling cannot see the case
 cases/<name>/REPORT.md         kept
 cases/<name>/knowledge/...     kept
-cases/<name>/<everything else> scratch; purged on close
+cases/<name>/keep/...          kept
+cases/<name>/**/*.writeup.md   kept (also writeup.md, writeup-*.md, *.knowledge.md)
+cases/<name>/<everything else> scratch; purged on close, whatever its extension
 ```
+
+The rule is an allow-list. On close a regular file survives only if it is on the keep
+list above; everything else is purged, including `.txt`, `.json`, `.csv`, `.html`,
+`.hex`, `.jsonl`, databases, archives, markdown notes and files with no extension.
+There is no list of purgeable extensions to fall behind. Only the case being closed is
+touched; a case that was not named in the close is never read for deletion.
+`REPORT.md` is kept at the case root only.
 
 - **Open:** `python scripts/case_purge.py init <name>` — creates the directory and
   the marker. A `cases/` directory without a marker is invisible to the purge and
@@ -236,8 +245,8 @@ list of names the privacy gate refuses to let into any tracked file.
   is inactive, and `test_product_rule_is_active_or_says_why` SKIPS with the reason
   printed (`pytest -rs`). Shape rules and the operator-identity rules still run. A
   file that exists but is malformed fails the suite, naming only the line number.
-- **Back it up** with the private rule file (section 7). It holds real names: never commit it,
-  never paste its lines anywhere tracked.
+- **Back it up** (section 7). It holds real names: never commit it, never paste its
+  lines anywhere tracked.
 
 ## 7. Where the private files live (restore path)
 
@@ -245,26 +254,14 @@ list of names the privacy gate refuses to let into any tracked file.
 for this policy, and no out-of-tree copy of it is authoritative. Do not keep a
 private master of it; edit it in the repo and commit it.
 
-`CLAUDE.md` stays private: it is gitignored and was never in git history, so
-`git clean -fdx` or a fresh clone deletes the only in-repo copy. Its canonical copy
-is outside the repo, together with the target registry:
+The working rules live in the tracked `AGENTS.md`. The local, gitignored `CLAUDE.md`
+holds the single line `@AGENTS.md` and nothing else, so it cannot drift from the
+tracked rules; a fresh clone or a clean of ignored files deletes it, and recreating it
+is writing that one line. Do not put rules in it. The target registry is the one
+private file left:
 
-- `~/.liebert-re/rules/CLAUDE.md`
 - `~/.liebert-re/targets.txt` (section 6; the registry is stored only there)
 
-**Restore** `CLAUDE.md` (after a clean or a fresh clone), from the repo root:
-
-```
-cp ~/.liebert-re/rules/CLAUDE.md .
-```
-
-**Update** after editing it, same direction reversed:
-
-```
-cp CLAUDE.md ~/.liebert-re/rules/
-```
-
-If the two copies differ, the newer one wins; check with `diff` before overwriting.
 There is no sync tool by design.
 
 ## 8. Annotated analysis data at case close

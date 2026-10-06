@@ -162,42 +162,92 @@ def test_junction_as_case_dir_and_inside_tree_refused(env, tmp_path):
 
 
 # ------------------------------------------------------------ classification
-def test_keep_beats_every_purge_glob():
-    samples = [g.replace("*", "x").replace("[0-9]", "1") for g in cp.PURGE_FILE_GLOBS]
-    assert samples, "cp.PURGE_FILE_GLOBS is empty, so the keep-beats-purge loop below would check nothing"
-    for s in samples:
-        for keepdir in ("knowledge", "keep"):
-            assert cp.classify(f"{keepdir}/{s}") == "keep"
-            assert cp.classify(f"{keepdir}/ida/ghidra/{s}") == "keep"
+KEPT = ["REPORT.md", ".liebert-case", "knowledge/a.md", "knowledge/x.i64", "knowledge/ida/ghidra/a.exe",
+        "keep/anything.exe", "keep/a/b/c.txt", "ida/lessons.writeup.md", "writeup.md", "writeup-1.md",
+        "a/b.knowledge.md", "Knowledge/Upper.TXT"]
+# Everything the old extension list missed, plus ordinary source/notes/markdown: all scratch now.
+SCRATCH = ["a.txt", "notes.txt", "a.json", "a.jsonl", "a.csv", "a.html", "a.hex", "a.db", "a.sqlite",
+           "a.tar.gz", "a.rar", "a.cab", "noext", "Makefile", "a.py", "a.c", "setup.cfg", "sub/config.json",
+           "README.md", "notes.md", "scratch-ideas.md", "samples/a.markdown", "ida/NOTES.MD",
+           "x.dump.md", "ida/a.i64", "m.dmp", "core.123", "t.exe", "run.log", "a.bak", "main.c~",
+           "deep/er/a.bak", "UPPER.PDB", "sub/REPORT.md", "sub/.liebert-case", "REPORT.md.bak",
+           "xknowledge/a.md", "keepsake/a.md", "my_keygen.py", "idea.txt"]
 
 
-def test_keep_wins_even_if_a_careless_pattern_is_added(monkeypatch):
-    monkeypatch.setattr(cp, "PURGE_FILE_GLOBS", cp.PURGE_FILE_GLOBS + ("*", "*.*"))
-    for rel in ("REPORT.md", ".liebert-case", "knowledge/a.md", "knowledge/x.i64",
-                "ida/lessons.writeup.md", "keep/anything.exe"):
-        assert cp.classify(rel) == "keep"
+@pytest.mark.parametrize("rel", KEPT)
+def test_keep_list_survives(rel):
+    assert cp.is_kept(rel) and cp.classify(rel) == "keep"
 
 
-def test_artifact_classes():
-    for rel in ["ida/a.i64", "x.idb", "a.id0", "t.asm", "p.rep/db.gbf", "m.dmp", "core.123",
-                "t.exe", "samples/anything", "run.log", "frida-x.js", "scratch/tmp.txt"]:
-        assert cp.classify(rel) == "purge", rel
-    for rel in ["my_keygen.py", "idea.txt", "README.md", "corefile.md"]:
-        assert cp.classify(rel) == "unclassified", rel
+@pytest.mark.parametrize("rel", SCRATCH)
+def test_everything_not_kept_is_purged(rel):
+    assert not cp.is_kept(rel) and cp.classify(rel) == "purge"
 
 
-def test_markdown_survives_unless_explicit_dump_in_scratch_dir():
-    keep_ish = ["scratch/scratch-ideas.md", "ida/scratch-ideas.md", "scratch-ideas.md",
-                "scratch.md", "ida/notes.md", "samples/README.md", "dumps/analysis.markdown",
-                "ida/NOTES.MD", "decomp/dump.md", "main.decomp.md", "x.dump.md"]
-    for rel in keep_ish:
-        assert cp.classify(rel) != "purge", rel
-    for rel in ["decomp/main.decomp.md", "dumps/proc.dump.md", "ida/f.disasm.md",
-                "traces/run.TRACE.md", "scratch/a.log.md"]:
-        assert cp.classify(rel) == "purge", rel
-    # a dump suffix never beats the keep-list
-    assert cp.classify("knowledge/main.decomp.md") == "keep"
-    assert cp.classify("ida/x.writeup.md") == "keep"
+def test_classify_has_no_third_answer_for_a_regular_file():
+    for rel in KEPT + SCRATCH:
+        assert cp.classify(rel) in ("keep", "purge")
+
+
+def test_real_purge_keeps_only_the_keep_list(env):
+    repo, _ = env
+    case = repo / "cases" / "alpha"
+    for rel in SCRATCH:
+        _w(case / "work" / rel, b"scratch")
+        _w(case / rel, b"scratch")
+    for rel in ("knowledge/z.json", "knowledge/deep/z.bin", "keep/y.txt", "keep/x.bak", "q.writeup.md"):
+        _w(case / rel, b"keepme")
+    rc, _, _ = _run(repo, "purge", "alpha", "--execute", "--yes")
+    assert rc == 0
+    left = set(_snap(case))
+    for rel in SCRATCH:
+        for r in (rel, "work/" + rel):
+            if not cp.is_kept(r):
+                assert r not in left, r
+    for rel in ("knowledge/z.json", "knowledge/deep/z.bin", "keep/y.txt", "keep/x.bak", "q.writeup.md",
+                "REPORT.md", ".liebert-case", "knowledge/technique.md", "ida/lessons.writeup.md"):
+        assert rel in left, rel
+    assert (case / "knowledge" / "z.json").read_bytes() == b"keepme"
+    assert {r for r in left if not cp.is_kept(r)} == set()
+
+
+def test_unmarked_extension_is_not_a_reason_to_keep_a_file(env):
+    """The reported survivor: a .txt analysis log left behind by a solved case."""
+    repo, _ = env
+    case = repo / "cases" / "alpha"
+    _w(case / "ANALYSIS_STEPS.txt", "76 lines of scratch\n")
+    rc, _, _ = _run(repo, "purge", "alpha", "--execute", "--yes")
+    assert rc == 0 and not (case / "ANALYSIS_STEPS.txt").exists()
+
+
+def test_closing_one_case_never_touches_an_active_one(env):
+    """The inverse rule deletes by exclusion, so the dangerous bug is reaching a case
+    nobody closed. beta stays open and holds only files the allow-list would purge."""
+    repo, _ = env
+    beta = repo / "cases" / "beta"
+    for rel in ("notes.txt", "dump.json", "data.csv", "noext", "my_keygen.py", "scratch/a.md",
+                "ida/b2.i64", "REPORT.md", "knowledge/k.txt"):
+        _w(beta / rel, b"active work")
+    before = _snap(beta)
+    assert before and "notes.txt" in before
+    for args in (("purge", "alpha", "--execute", "--yes"),):
+        rc, _, _ = _run(repo, *args)
+        assert rc == 0
+    assert _snap(beta) == before
+    # a dry run on alpha, and a commit-marker close naming alpha, leave beta alone too
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "close\n\ncase: solved alpha")
+    rc, _, _ = _run(repo, "from-commit", "--execute")
+    assert rc == 0
+    assert _snap(beta) == before
+
+
+def test_commit_marker_without_a_name_purges_nothing(env):
+    repo, _ = env
+    before = _snap(repo)
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "x\n\ncase: solved")
+    rc, out, _ = _run(repo, "from-commit", "--execute")
+    assert rc == 0 and "NOTHING purged" in out
+    assert _snap(repo) == before
 
 
 # ------------------------------------------------------------- commit parsing
@@ -242,9 +292,10 @@ def test_purge_quarantines_restores_and_keeps_tree_clean(env):
     assert {"ida/target.i64", "ida/target.id0", "samples/alpha.exe", "dumps/proc.dmp",
             "decomp/main.decomp.c", "decomp/main.decomp.md"} <= gone
     survivors = {"REPORT.md", ".liebert-case", "knowledge/technique.md", "knowledge/ida/type.til",
-                 "ida/lessons.writeup.md", "ida/scratch-ideas.md", "scratch/scratch-ideas.md",
-                 "scratch/notes.md", "my_keygen.py"}
-    assert survivors <= set(after)
+                 "ida/lessons.writeup.md"}
+    assert set(after) == survivors
+    assert {"ida/scratch-ideas.md", "scratch/scratch-ideas.md", "scratch/notes.md",
+            "my_keygen.py"} <= gone
     assert _snap(repo / "cases" / "beta") == other_before
     assert (repo / "docs" / "sample_notes.i64").exists()
     # tree exactly as clean as before; quarantine is outside the repo and invisible to git
@@ -369,75 +420,6 @@ def test_doctor_flags_entries_expiring_soon(env):
     with contextlib.redirect_stdout(out):
         cp.do_doctor(repo, now=now)
     assert "expiring within 2 days: alpha/" in out.getvalue()
-
-
-# ------------------------------------------------- added patterns (item 1)
-NEW_PATTERN_FILES = [
-    "a.pdb", "a.hdmp", "a.cdmp", "a.dump", "a.wer", "a.hprof", "a.etl", "a.pml", "a.pmc",
-    "a.pcap", "a.pcapng", "a.gdt", "a.idc", "a.bak", "a.old", "a.orig", "a.swp", "a.swo",
-    "a.tmp", "main.c~", "x~", "UPPER.PDB", "deep/er/a.bak",
-]
-# Extensions that would delete source, config or notes in a Python repo. Never purgeable.
-NEVER_PURGE = ["a.py", "a.c", "a.cpp", "a.h", "a.json", "a.xml", "a.txt", "notes.txt",
-               "setup.cfg", "a.md", "a.cab", "docs/a.cab", "sub/config.json"]
-
-
-@pytest.mark.parametrize("rel", NEW_PATTERN_FILES)
-def test_new_patterns_are_purgeable_and_keep_still_wins(rel):
-    assert cp.classify(rel) == "purge"
-    for keepdir in ("knowledge", "keep"):
-        assert cp.classify(f"{keepdir}/{rel}") == "keep"
-    assert cp.classify("ida/lessons.writeup.md") == "keep"
-
-
-def test_forbidden_extensions_are_not_in_the_new_pattern_set():
-    for rel in ["a.py", "a.c", "a.cpp", "a.h", "a.json", "a.xml", "a.txt", "notes.txt",
-                "setup.cfg", "a.cab", "docs/a.cab", "sub/config.json"]:
-        assert cp.classify(rel) == "unclassified", rel
-    # markdown rules still win over every new pattern
-    assert cp.classify("scratch/notes.md") != "purge"
-    assert cp.classify("scratch/a.bak.md") != "purge"
-    assert cp.classify("scratch/a.bak.markdown") != "purge"
-
-
-def test_real_purge_removes_new_patterns_and_spares_source_config_notes(env):
-    repo, _ = env
-    case = repo / "cases" / "alpha"
-    for rel in NEW_PATTERN_FILES:
-        _w(case / "work" / rel)
-    for rel in ("a.py", "a.c", "a.h", "a.json", "a.xml", "a.txt", "notes.txt", "setup.cfg"):
-        _w(case / "work" / "src" / rel, b"precious")
-    _w(case / "lonely" / "lonely.cab")                   # .cab with no .wer beside it
-    _w(case / "work" / "wer" / "Report.wer")
-    _w(case / "work" / "wer" / "Report.cab")             # companion: purged
-    _w(case / "knowledge" / "dump.pdb", b"keepme")       # keep-list beats the new pattern
-    _w(case / "keep" / "x.bak", b"keepme")
-    rc, _, _ = _run(repo, "purge", "alpha", "--execute", "--yes")
-    assert rc == 0
-    for rel in NEW_PATTERN_FILES:
-        assert not (case / "work" / rel).exists(), rel
-    assert not (case / "work" / "wer" / "Report.wer").exists()
-    assert not (case / "work" / "wer" / "Report.cab").exists()
-    for rel in ("a.py", "a.c", "a.h", "a.json", "a.xml", "a.txt", "notes.txt", "setup.cfg"):
-        assert (case / "work" / "src" / rel).read_bytes() == b"precious", rel
-    assert (case / "lonely" / "lonely.cab").exists()
-    assert (case / "knowledge" / "dump.pdb").read_bytes() == b"keepme"
-    assert (case / "keep" / "x.bak").read_bytes() == b"keepme"
-    assert (case / "my_keygen.py").exists()
-
-
-def test_cab_companion_only_beside_wer_and_restores(env):
-    repo, _ = env
-    case = repo / "cases" / "alpha"
-    _w(case / "w" / "a.wer")
-    _w(case / "w" / "a.cab", b"c" * 10)
-    _w(case / "other" / "b.cab", b"c" * 10)
-    plan = cp.build_plan(case)
-    assert "w/a.cab" in dict(plan.purge) and "other/b.cab" not in dict(plan.purge)
-    _run(repo, "purge", "alpha", "--execute", "--yes")
-    assert not (case / "w" / "a.cab").exists() and (case / "other" / "b.cab").exists()
-    rc, _, _ = _run(repo, "restore", "alpha")
-    assert rc == 0 and (case / "w" / "a.cab").read_bytes() == b"c" * 10
 
 
 def test_scope_fence_still_refuses_every_malicious_input(env):
