@@ -63,7 +63,12 @@ touched; a case that was not named in the close is never read for deletion.
 - **Close:** put `case: solved <name>` or `case: abandoned <name>` in the commit
   message; the git post-commit hook acts on it
   (`case_purge.py install-hook`, `--check` to verify). `purge <name> --execute` is
-  the manual escape hatch and is a dry run without `--execute`.
+  the manual escape hatch and is a dry run without `--execute`. A manual purge is
+  refused (exit code 3, nothing touched) unless the marker already says `solved` or
+  `abandoned`; an `open` or `active` case, and a marker whose status is missing or
+  unreadable, are refused, because the purge deletes everything outside the keep-list.
+  A commit-marker close is itself the act of closing, so it is allowed while the
+  marker still says `open`; an unreadable or unrecognised status is refused there too.
 - **Reversible for seven days.** A purge *moves* files to
   `<os-temp>/liebert-re-quarantine/<case>/<UTC stamp>/` — never anywhere inside the
   repo. Entries expire after 7 days and are swept on every invocation. `restore

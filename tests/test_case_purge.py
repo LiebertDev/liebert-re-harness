@@ -24,6 +24,7 @@ sys.modules["case_purge"] = cp
 _spec.loader.exec_module(cp)
 
 MARK = '{"liebert_case": 1, "name": "%s", "status": "open"}\n'
+MARK_SOLVED = '{"liebert_case": 1, "name": "%s", "status": "solved"}\n'
 GITIGNORE = ("cases/**\n!cases/*/\n!cases/*/REPORT.md\n!cases/*/knowledge/\n"
              "!cases/*/knowledge/**\n!cases/*/.liebert-case\n")
 
@@ -75,7 +76,7 @@ def env(tmp_path, monkeypatch):
     _w(repo / "liebert_re" / "__init__.py", "# src\n")
     _w(repo / "docs" / "sample_notes.i64", "outside cases; must never be touched\n")
     c = repo / "cases" / "alpha"
-    _w(c / ".liebert-case", MARK % "alpha")
+    _w(c / ".liebert-case", MARK_SOLVED % "alpha")   # a closed case; beta stays open
     _w(c / "REPORT.md", "# report\n")
     _w(c / "knowledge" / "technique.md", "# generalised\n")
     _w(c / "knowledge" / "ida" / "type.til", b"t" * 40)
@@ -487,10 +488,14 @@ def test_solved_accepts_non_empty_knowledge_but_not_empty_report(env):
 
 def test_abandoned_and_manual_purge_do_not_need_a_report(env):
     repo, _ = env
-    for name, reason in (("eps", "abandoned"), ("zeta", "manual")):
-        c = _new_case(repo, name)
-        rc, _, _ = _run(repo, "purge", name, "--execute", "--yes", "--reason", reason)
-        assert rc == 0 and not (c / "ida" / "x.i64").exists(), reason
+    c = _new_case(repo, "eps")
+    rc, _, _ = _run(repo, "purge", "eps", "--execute", "--yes", "--reason", "abandoned")
+    assert rc == 0 and not (c / "ida" / "x.i64").exists()
+    # a manual purge needs the marker to say closed already; no report is needed then
+    z = _new_case(repo, "zeta")
+    (z / ".liebert-case").write_text(MARK_SOLVED % "zeta", encoding="utf-8")
+    rc, _, _ = _run(repo, "purge", "zeta", "--execute", "--yes")
+    assert rc == 0 and not (z / "ida" / "x.i64").exists()
 
 
 # ------------------------------------------------ close writes status to marker
@@ -542,15 +547,76 @@ def test_from_commit_dry_run_leaves_marker_untouched_then_execute_writes(env):
 def test_manual_purge_does_not_change_status(env):
     repo, _ = env
     rc, _, _ = _run(repo, "purge", "alpha", "--execute", "--yes")
-    assert rc == 0 and _meta(repo / "cases" / "alpha")["status"] == "open"
+    assert rc == 0 and _meta(repo / "cases" / "alpha")["status"] == "solved"
 
 
 def test_list_reflects_closed_status(env):
     repo, _ = env
     _, out, _ = _run(repo, "list")
     assert "open" in out
-    _run(repo, "purge", "alpha", "--execute", "--yes", "--reason", "solved")
+    _run(repo, "purge", "beta", "--execute", "--yes", "--reason", "abandoned")
     _, out, _ = _run(repo, "list")
     alpha = [ln for ln in out.splitlines() if ln.startswith("alpha")][0]
     beta = [ln for ln in out.splitlines() if ln.startswith("beta")][0]
-    assert "solved" in alpha and "open" not in alpha and "open" in beta
+    assert "abandoned" in beta and "open" not in beta and "solved" in alpha
+
+
+# ------------------------------------------- an open case is never purged by hand
+def _open_case_with_work(repo, name="gamma"):
+    c = repo / "cases" / name
+    _w(c / ".liebert-case", MARK % name)
+    for rel in ("notes.txt", "data.json", "noext", "ida/g.i64", "scratch/a.md", "REPORT.md"):
+        _w(c / rel, b"live work")
+    return c
+
+
+@pytest.mark.parametrize("status", ["open", "active"])
+def test_manual_purge_of_an_open_case_is_refused_and_touches_nothing(env, status):
+    repo, tmpdir = env
+    c = _open_case_with_work(repo)
+    (c / ".liebert-case").write_text(MARK.replace("open", status) % "gamma", encoding="utf-8")
+    before = _snap(repo)
+    rc, _, err = _run(repo, "purge", "gamma", "--execute", "--yes")
+    assert rc == 3 and status in err and "refusing to purge" in err
+    assert _snap(repo) == before
+    assert not (tmpdir / cp.QUARANTINE_DIRNAME).exists()
+
+
+@pytest.mark.parametrize("marker", ['{"liebert_case": 1, "name": "gamma"}\n',
+                                    '{"liebert_case": 1, "name": "gamma", "status": 7}\n',
+                                    '{"liebert_case": 1, "name": "gamma", "status": "banana"}\n'])
+def test_unreadable_or_unknown_status_is_refused_for_every_reason(env, marker):
+    repo, _ = env
+    c = _open_case_with_work(repo)
+    (c / ".liebert-case").write_text(marker, encoding="utf-8")
+    before = _snap(repo)
+    for reason in ("manual", "solved", "abandoned"):
+        rc, _, err = _run(repo, "purge", "gamma", "--execute", "--yes", "--reason", reason)
+        assert rc == 3 and "refusing to purge" in err, reason
+        assert _snap(repo) == before, reason
+
+
+def test_dry_run_of_an_open_case_still_previews_and_changes_nothing(env):
+    repo, _ = env
+    _open_case_with_work(repo)
+    before = _snap(repo)
+    rc, out, _ = _run(repo, "purge", "gamma")
+    assert rc == 0 and "DRY RUN" in out and _snap(repo) == before
+
+
+def test_solved_case_is_purged_normally(env):
+    repo, _ = env
+    c = repo / "cases" / "alpha"
+    assert _meta(c)["status"] == "solved"
+    rc, _, _ = _run(repo, "purge", "alpha", "--execute", "--yes")
+    assert rc == 0 and not (c / "ida" / "target.i64").exists() and (c / "REPORT.md").exists()
+
+
+def test_commit_marker_close_of_an_open_case_still_works(env):
+    repo, _ = env
+    c = _open_case_with_work(repo)
+    _w(c / "knowledge" / "k.md", b"lesson")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "close" + chr(10) * 2 + "case: solved gamma")
+    rc, _, _ = _run(repo, "from-commit", "--execute")
+    assert rc == 0 and not (c / "notes.txt").exists() and (c / "knowledge" / "k.md").exists()
+    assert _meta(c)["status"] == "solved"

@@ -532,8 +532,50 @@ def mark_closed(target: Path, status: str) -> None:
     path.write_bytes(text.encode("utf-8"))
 
 
+CLOSED_STATUSES = ("solved", "abandoned")
+OPEN_STATUSES = ("open", "active")
+
+
+def case_status(target: Path):
+    """The marker's status string, or None when it cannot be read as one."""
+    try:
+        meta = json.loads((target / MARKER).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    st = meta.get("status") if isinstance(meta, dict) else None
+    return st.strip().lower() if isinstance(st, str) else None
+
+
+def _require_closeable(target: Path, name: str, reason: str) -> None:
+    """Refuse, before anything is planned or moved, to purge a case that is still being
+    worked. The purge deletes everything outside the keep-list, so one call with the
+    wrong name would destroy an open case's working files.
+
+    A commit-marker close (reason solved/abandoned) is itself the act of closing, so the
+    marker still says open at that moment and that is allowed. A manual purge has no such
+    act behind it and needs the marker to already say solved or abandoned. An unreadable
+    or unrecognised status is refused in every case: unknown stays unknown."""
+    st = case_status(target)
+    if st is None:
+        raise ScopeError(f"case {name!r}: status in {MARKER} is missing or unreadable; "
+                         f"refusing to purge, nothing was touched")
+    if reason in CLOSED_STATUSES:
+        if st not in CLOSED_STATUSES + OPEN_STATUSES:
+            raise ScopeError(f"case {name!r}: unrecognised status {st!r} in {MARKER}; "
+                             f"refusing to purge, nothing was touched")
+        return
+    if st not in CLOSED_STATUSES:
+        raise ScopeError(
+            f"case {name!r} is {st!r}, not solved or abandoned; refusing to purge, nothing "
+            f"was touched. Close it with a 'case: solved {name}' or 'case: abandoned {name}' "
+            f"commit line, or run 'purge {name} --reason solved|abandoned' once its report "
+            f"is written.")
+
+
 def do_purge(repo, name, execute: bool, reason: str, confirm: bool = False) -> int:
     repo, target = resolve_case_target(repo, name)       # may raise ScopeError
+    if execute:
+        _require_closeable(target, name, reason)
     if reason == "solved" and not knowledge_recorded(target):
         # 'solved' means the lesson was kept. With no REPORT.md and no knowledge/ the
         # artifacts would be the only record and vanish after the quarantine expires.
