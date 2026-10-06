@@ -537,7 +537,10 @@ def frida_status():
         if exe:
             cli.update(found=True, binary=exe, resolved_by="PATH")
             cp = run_bounded_process([exe, "--version"], timeout_seconds=20, max_output_chars=4096)
-            if cp.timed_out or cp.cancelled:
+            if cp.launch_failed is True:
+                # found but not startable: not "missing", and not "ran and printed nothing"
+                cli.update(runnable=False, launch_failed=True, launch_error=cp.launch_error)
+            elif cp.timed_out or cp.cancelled:
                 timed_out = True
             else:
                 lines = ((cp.stdout or "") + chr(10) + (cp.stderr or "")).strip().splitlines()
@@ -560,6 +563,12 @@ def frida_status():
         if timed_out and not library["found"]:
             return _j({**common, "ok": False, "status": "TIMEOUT", "error": "FRIDA_VERSION_TIMEOUT"})
         if not library["found"] and not cli["runnable"]:
+            if cli.get("launch_failed"):
+                return _j({**common, "ok": False, "status": "TOOL_UNLAUNCHABLE",
+                           "error": "FRIDA_CLI_LAUNCH_FAILED", "launch_error": cli.get("launch_error"),
+                           "detail": "A frida CLI is on PATH but the operating system would not start it "
+                                     "(quarantined, not executable or corrupt); an environment fault, not "
+                                     "a missing tool."})
             if cli["found"]:
                 return _j({**common, "ok": False, "status": "ANALYSIS_LIMITED",
                            "error": "FRIDA_CLI_VERSION_UNREADABLE",

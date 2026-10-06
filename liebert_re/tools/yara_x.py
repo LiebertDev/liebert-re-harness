@@ -57,7 +57,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from liebert_re.bounded_subprocess import run_bounded_process
+from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.workspace import safe_path, relative
 
 try:
@@ -331,6 +331,8 @@ def yara_x_scan(
         if tmp_dir is not None:
             tmp_dir.cleanup()
 
+    if cp.launch_failed is True:
+        return _j(launch_failure(cp, "yara_x_scan", "YARA_X_LAUNCH_FAILED"))
     if cp.cancelled:
         return _j({
             "ok": False, "tool": "yara_x_scan", "status": "CANCELLED",
@@ -460,6 +462,8 @@ def yara_x_status():
                 resolved_by = "PATH"
         cp = run_bounded_process([exe, "--version"], timeout_seconds=_MIN_TIMEOUT_SECONDS,
                                  max_output_chars=4096)
+        if cp.launch_failed is True:
+            return _j({**launch_failure(cp, tool, "YARA_X_LAUNCH_FAILED"), "binary": exe, "resolved_by": resolved_by, "runnable": False})
         if cp.timed_out or cp.cancelled:
             return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "binary": exe,
                        "resolved_by": resolved_by, "runnable": False, "error": "YARA_X_VERSION_TIMEOUT"})

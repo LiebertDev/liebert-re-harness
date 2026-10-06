@@ -22,7 +22,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from liebert_re.bounded_subprocess import run_bounded_process
+from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.workspace import PROJECT_ROOT, safe_path, relative
 
 EVIDENCE = PROJECT_ROOT / "dataset" / "evidence" / "upx_unpacked"
@@ -85,6 +85,8 @@ def upx_unpack(path, timeout_seconds=60, cancellation_token=None):
                 timeout_seconds=timeout_seconds,
                 cancellation_token=cancellation_token,
             )
+            if cp.launch_failed is True:
+                return _j(launch_failure(cp, "upx_unpack", "UPX_LAUNCH_FAILED"))
             if cp.timed_out or cp.cancelled:
                 return _j({
                     "ok": False, "tool": "upx_unpack",
@@ -152,6 +154,8 @@ def upx_status():
             if on_path and _same(exe, on_path):
                 resolved_by = "PATH"
         cp = run_bounded_process([exe, "--version"], timeout_seconds=10, max_output_chars=4096)
+        if cp.launch_failed is True:
+            return _j({**launch_failure(cp, tool, "UPX_LAUNCH_FAILED"), "binary": exe, "resolved_by": resolved_by, "runnable": False})
         if cp.timed_out or cp.cancelled:
             return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "binary": exe,
                        "resolved_by": resolved_by, "runnable": False, "error": "UPX_VERSION_TIMEOUT"})

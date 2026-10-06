@@ -9,7 +9,7 @@ is the real engine; this is a thin, bounded, JSON-normalizing wrapper."""
 from __future__ import annotations
 import json, os, shutil, tempfile
 from pathlib import Path
-from liebert_re.bounded_subprocess import run_bounded_process
+from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.workspace import safe_path, relative
 
 
@@ -49,6 +49,8 @@ def il2cpp_mapper(binary_path, metadata_path, operation="summary", query="", max
             cancellation_token=cancellation_token,
             max_output_chars=200_000,
         )
+        if cp.launch_failed is True:
+            return _j(launch_failure(cp, "il2cpp_mapper", "IL2CPPDUMPER_LAUNCH_FAILED"))
         if cp.cancelled:
             return _j({"ok": False, "tool": "il2cpp_mapper", "error": "IL2CPPDUMPER_CANCELLED_PROCESS_TREE_TERMINATED"})
         if cp.timed_out:
@@ -127,6 +129,8 @@ def il2cpp_status():
         if explicit and any(_same(exe, c) for c in (explicit, shutil.which(explicit) or explicit)):
             resolved_by = "IL2CPPDUMPER_EXE"
         cp = run_bounded_process([exe, "--help"], timeout_seconds=15, max_output_chars=4096)
+        if cp.launch_failed is True:
+            return _j({**launch_failure(cp, tool, "IL2CPPDUMPER_LAUNCH_FAILED"), "binary": exe, "resolved_by": resolved_by, "runnable": False})
         if cp.timed_out or cp.cancelled:
             return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "binary": exe,
                        "resolved_by": resolved_by, "runnable": False, "error": "IL2CPPDUMPER_HELP_TIMEOUT"})

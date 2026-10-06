@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -65,6 +66,40 @@ class BoundedProcessResult:
     output_truncated: bool = False
     stdout_sha256: str | None = None
     stderr_sha256: str | None = None
+    # The executable was found but the OS refused to start it (quarantined,
+    # permission denied, corrupt image). Sibling of ``timed_out`` and friends,
+    # and NOT the same answer as "executable missing" (a caller's own
+    # TOOL_MISSING). ``launch_error`` is a path-free, readable cause.
+    launch_failed: bool = False
+    launch_error: str | None = None
+
+
+# Over-redaction is the safe direction: segments may contain spaces (a profile
+# directory named "First Last"), so a match can swallow a little prose too.
+_PATH_LIKE = re.compile(
+    r"[A-Za-z]:[\/](?:[^\/'\"<>|\r\n]*[\/])*[^\s\/'\"<>|]*"  # drive-letter path
+    r"|\\(?:[^\/'\"<>|\r\n]*[\/])*[^\s\/'\"<>|]*"  # UNC path
+    r"|(?<![\w.])/(?:[^\/'\"<>|\r\n]*/)*[^\s'\"<>|/]*"  # POSIX absolute path
+)
+
+
+def describe_launch_failure(exc: OSError) -> str:
+    """Readable, path-free cause of a failed launch.
+
+    Uses the error number and the OS's own message only; ``exc.filename`` is
+    never included, and any path-looking text left in the message is replaced
+    with ``<PATH>`` (CLAUDE.md rule 9: no operator paths).
+    """
+    winerror = getattr(exc, "winerror", None)
+    name = type(exc).__name__
+    text = _PATH_LIKE.sub("<PATH>", str(exc.strerror or "").strip())
+    if winerror is not None:
+        head = f"{name} WinError {winerror}"
+    elif exc.errno is not None:
+        head = f"{name} errno {exc.errno}"
+    else:
+        head = name
+    return f"{head}: {text}" if text else head
 
 
 def _process_tree_rss_bytes(pid: int) -> int | None:
@@ -442,22 +477,28 @@ def run_bounded_process(
     if max_memory_bytes is not None and not _memory_monitor_usable():
         return BoundedProcessResult(None, "", "", resource_limit_unavailable=True)
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-    process = subprocess.Popen(
-        list(command),
-        cwd=str(cwd) if cwd is not None else None,
-        env=dict(environment) if environment is not None else None,
-        stdin=subprocess.DEVNULL,  # never inherit the caller's stdin: a non-interactive
-        # CLI tool that unexpectedly probes for piped input (e.g. Codex CLI's
-        # exec subcommand) must see immediate EOF, not block waiting on a
-        # parent stdin that may never close.
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=creationflags,
-        start_new_session=os.name != "nt",
-    )
+    try:
+        process = subprocess.Popen(
+            list(command),
+            cwd=str(cwd) if cwd is not None else None,
+            env=dict(environment) if environment is not None else None,
+            stdin=subprocess.DEVNULL,  # never inherit the caller's stdin: a non-interactive
+            # CLI tool that unexpectedly probes for piped input (e.g. Codex CLI's
+            # exec subcommand) must see immediate EOF, not block waiting on a
+            # parent stdin that may never close.
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=creationflags,
+            start_new_session=os.name != "nt",
+        )
+    except OSError as exc:  # file present but the OS would not start it
+        return BoundedProcessResult(
+            None, "", "", launch_failed=True, launch_error=describe_launch_failure(exc),
+        )
+
     _register_active(process)
     # Continuously-refreshed descendant snapshot -- see
     # `_snapshot_descendant_pids`'s docstring for why this must be captured
@@ -536,3 +577,30 @@ def run_bounded_process(
             )
         except subprocess.TimeoutExpired:
             continue
+
+
+def launch_failure(result: BoundedProcessResult, tool: str | None, error: str) -> dict[str, Any]:
+    """The wrapper-facing answer for ``result.launch_failed``.
+
+    Status ``TOOL_UNLAUNCHABLE`` is deliberately not ``TOOL_MISSING``: the
+    executable exists, the OS would not start it. ``launch_error`` carries the
+    path-free cause (see ``describe_launch_failure``). Wrappers test
+    ``result.launch_failed is True`` so a duck-typed fake without the field is
+    never read as a failed launch. ``tool`` is omitted when
+    None so a caller can merge this over a dict that already names the tool.
+    """
+    body: dict[str, Any] = {"ok": False}
+    if tool is not None:
+        body["tool"] = tool
+    body.update({
+        "status": "TOOL_UNLAUNCHABLE",
+        "error": error,
+        "launch_error": result.launch_error,
+        "detail": (
+            "The executable was found but the operating system would not start it, so nothing was "
+            "analysed. This is an environment fault, not a finding about the input and not a missing "
+            "tool: check whether the file was quarantined by security software, lost its execute "
+            "permission, or is corrupt, then reinstall or restore it."
+        ),
+    })
+    return body

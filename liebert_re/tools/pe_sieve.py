@@ -47,7 +47,7 @@ import re
 import shutil
 import uuid
 
-from liebert_re.bounded_subprocess import run_bounded_process
+from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.dynamic.lab_gate import LabGate
 
 try:
@@ -364,6 +364,8 @@ class _PeSieve:
         cp = run_bounded_process(argv, timeout_seconds=timeout_seconds, cancellation_token=cancellation_token,
                                  environment=env, max_output_chars=_MAX_OUTPUT_CHARS,
                                  max_memory_bytes=_MAX_SCANNER_MEMORY_BYTES)
+        if cp.launch_failed is True:
+            return _j({**base, **launch_failure(cp, None, "PE_SIEVE_LAUNCH_FAILED")})
         if cp.resource_limit_unavailable:
             return _j({**base, "ok": False, "status": "ANALYSIS_LIMITED", "error": "PE_SIEVE_RESOURCE_LIMIT_UNAVAILABLE",
                        "detail": "The memory limit could not be enforced on this host, so nothing was started."})
@@ -459,6 +461,8 @@ def pe_sieve_status():
         cp = run_bounded_process(argv, timeout_seconds=_MIN_TIMEOUT_SECONDS,
                                  environment={**os.environ, "MSYS_NO_PATHCONV": "1", "MSYS2_ARG_CONV_EXCL": "*"},
                                  max_output_chars=65536)
+        if cp.launch_failed is True:
+            return _j({**launch_failure(cp, tool, "PE_SIEVE_LAUNCH_FAILED"), "binary": exe})
         if cp.timed_out or cp.cancelled:
             return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "binary": exe,
                        "error": "PE_SIEVE_VERSION_TIMEOUT"})

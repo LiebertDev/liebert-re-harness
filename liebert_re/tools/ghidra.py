@@ -360,12 +360,11 @@ def _probe_java():
     exe, via = _java_executable()
     if not exe:
         return {"found": False, "major": None, "resolved_by": None, "version_line": None}
-    try:
-        cp = run_bounded_process([exe, "-version"], timeout_seconds=_JAVA_PROBE_TIMEOUT_SECONDS,
+    cp = run_bounded_process([exe, "-version"], timeout_seconds=_JAVA_PROBE_TIMEOUT_SECONDS,
                                  max_output_chars=4096)
-    except OSError as exc:
+    if cp.launch_failed is True:
         return {"found": True, "major": None, "resolved_by": via, "version_line": None,
-                "error": f"JAVA_LAUNCH_FAILED: {type(exc).__name__}"}
+                "error": f"JAVA_LAUNCH_FAILED: {cp.launch_error}"}
     if cp.timed_out:
         return {"found": True, "major": None, "resolved_by": via, "version_line": None,
                 "error": "JAVA_VERSION_PROBE_TIMEOUT"}
@@ -655,10 +654,14 @@ def _facts_in_work(tool, selection, p, before, timeout, analysis_timeout, work, 
     try:
         cp = run_bounded_process(argv, timeout_seconds=timeout, cancellation_token=cancellation_token,
                                  max_output_chars=_MAX_OUTPUT_CHARS)
-    except OSError as exc:
+    except OSError as exc:  # defensive: the runner reports a failed launch itself (below)
         return fail("ENVIRONMENT_ERROR", "GHIDRA_LAUNCH_FAILED",
                     detail=f"analyzeHeadless was found but could not be started ({type(exc).__name__}).",
                     launcher_executed=False)
+    if cp.launch_failed is True:
+        return fail("ENVIRONMENT_ERROR", "GHIDRA_LAUNCH_FAILED",
+                    detail=f"analyzeHeadless was found but could not be started ({cp.launch_error}).",
+                    launch_error=cp.launch_error, launcher_executed=False)
     log = (cp.stdout or "") + "\n" + (cp.stderr or "")
     invocation = {"timeout_seconds": timeout, "analysis_timeout_seconds": analysis_timeout}
     if cp.cancelled or cp.timed_out:

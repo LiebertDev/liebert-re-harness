@@ -6,7 +6,7 @@ Java source, mirroring dotnet_inspect's structural-metadata/ILSpy-decompile spli
 from __future__ import annotations
 import json,os,re,shutil,struct,tempfile
 from pathlib import Path
-from liebert_re.bounded_subprocess import run_bounded_process
+from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.workspace import safe_path,relative
 
 def _j(x):return json.dumps(x,ensure_ascii=False,indent=2,default=str)
@@ -138,6 +138,8 @@ def dex_decompiler(path,operation='summary',class_name='',max_items=300,max_char
         if not exe:return _j({**base,'ok':False,'error':'JADX_TOOL_MISSING'})
         with tempfile.TemporaryDirectory(prefix='jadx_out_') as tmp:
             cp=run_bounded_process([exe,'-d',tmp,str(p)],timeout_seconds=180,cancellation_token=cancellation_token,max_output_chars=2_000_000)
+            if cp.launch_failed is True:
+                return _j({**base, **launch_failure(cp, None, 'JADX_LAUNCH_FAILED')})
             if cp.cancelled:return _j({**base,'ok':False,'error':'JADX_CANCELLED_PROCESS_TREE_TERMINATED'})
             if cp.timed_out:return _j({**base,'ok':False,'error':'JADX_TIMEOUT_PROCESS_TREE_TERMINATED'})
             hit,found_pkgs=_find_decompiled(Path(tmp),rel)
@@ -191,6 +193,8 @@ def dex_status():
             if on_path and _same(exe, on_path):
                 resolved_by = "PATH"
         cp = run_bounded_process([exe, "--version"], timeout_seconds=30, max_output_chars=8192)
+        if cp.launch_failed is True:
+            return _j({**launch_failure(cp, tool, "JADX_LAUNCH_FAILED"), "binary": exe, "resolved_by": resolved_by, "runnable": False})
         if cp.timed_out or cp.cancelled:
             return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "binary": exe,
                        "resolved_by": resolved_by, "runnable": False, "error": "JADX_VERSION_TIMEOUT"})

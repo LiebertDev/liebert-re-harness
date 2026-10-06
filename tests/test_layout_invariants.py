@@ -280,7 +280,15 @@ def test_published_tool_name_set_is_unchanged():
     # _parse_table, _pdata, _public. The module's other helpers share names with existing
     # definitions, and the set is deduplicated by name, so they add nothing.
     # Digest recomputed from the source.
-    assert digest == "7cc5d176d5bb20e843b31f3e004dcae6c1e26298478d2434c019591df3b49e8c"
+    # Updated again: 787 -> 789 (measured against a git archive of the previous commit).
+    # None removed. Two private top-level helpers added in liebert_re/bounded_subprocess.py:
+    # describe_launch_failure and launch_failure. They exist because an executable that is
+    # present but cannot be started (a quarantined binary, a permission denial, a corrupt
+    # image) escaped Popen as a raw OSError, and -- worse -- a naive fix would have let
+    # returncode=None read as success, so capa_status would have answered OK with a null
+    # version. TOOL_UNLAUNCHABLE is now a distinct code from TOOL_MISSING across all
+    # thirteen callers of run_bounded_process. Digest recomputed from the source.
+    assert digest == "c1993bdf118ec3051a27ea665de09dbec80dc3d575bc285fc88a864dc44c7f92"
 
 
 def test_the_imported_package_is_this_checkout():

@@ -48,7 +48,7 @@ import shutil
 import uuid
 from pathlib import Path
 
-from liebert_re.bounded_subprocess import run_bounded_process
+from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.workspace import safe_path, relative
 
 try:
@@ -174,6 +174,8 @@ def _run(exe, argv, tool, timeout_seconds, cancellation_token):
         cancellation_token=cancellation_token,
         max_output_chars=_MAX_OUTPUT_CHARS,
     )
+    if cp.launch_failed is True:
+        return None, _j(launch_failure(cp, tool, "DIE_LAUNCH_FAILED"))
     if cp.cancelled:
         return None, _j({
             "ok": False, "tool": tool, "status": "CANCELLED",

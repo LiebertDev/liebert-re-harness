@@ -49,7 +49,7 @@ import uuid
 import zlib
 from pathlib import Path
 
-from liebert_re.bounded_subprocess import run_bounded_process
+from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.recover.pe_address import AddressForm, normalize_address, resolve_address_form
 from liebert_re.workspace import safe_path, relative
 
@@ -295,6 +295,8 @@ def _pdj(exe: str, path: str, resolved: dict, count: int, timeout_seconds, cance
     va = resolved["va"]
     cmd = [exe, "-q", "-a", resolved["rizin_arch"], "-b", str(resolved["bits"]), "-c", f"pdj {count} @ {va}", str(path)]
     cp = run_bounded_process(cmd, timeout_seconds=timeout_seconds, cancellation_token=cancellation_token, max_output_chars=_MAX_OUTPUT_CHARS)
+    if cp.launch_failed is True:
+        return None, launch_failure(cp, None, "RIZIN_LAUNCH_FAILED")
     if cp.cancelled:
         return None, {"ok": False, "status": "CANCELLED", "error": "RIZIN_CANCELLED_PROCESS_TREE_TERMINATED"}
     if cp.timed_out:
@@ -438,6 +440,8 @@ def _rz_asm_encode(exe_asm: str, resolved: dict, va: str, line: str, timeout_sec
     not a file open). Returns ``(bytes, None)`` or ``(None, fail_dict)``."""
     cmd = [exe_asm, "-a", resolved["rizin_arch"], "-b", str(resolved["bits"]), "-o", va, line]
     cp = run_bounded_process(cmd, timeout_seconds=timeout_seconds, cancellation_token=cancellation_token, max_output_chars=_MAX_OUTPUT_CHARS)
+    if cp.launch_failed is True:
+        return None, launch_failure(cp, None, "RZ_ASM_LAUNCH_FAILED")
     if cp.cancelled:
         return None, {"ok": False, "status": "CANCELLED", "error": "RZ_ASM_CANCELLED_PROCESS_TREE_TERMINATED"}
     if cp.timed_out:
@@ -460,6 +464,8 @@ def _rz_asm_disasm(exe_asm: str, resolved: dict, va: str, data: bytes, timeout_s
     decoded instruction (``["mnemonic operands", ...]``) or a fail dict."""
     cmd = [exe_asm, "-a", resolved["rizin_arch"], "-b", str(resolved["bits"]), "-o", va, "-d", data.hex()]
     cp = run_bounded_process(cmd, timeout_seconds=timeout_seconds, cancellation_token=cancellation_token, max_output_chars=_MAX_OUTPUT_CHARS)
+    if cp.launch_failed is True:
+        return None, launch_failure(cp, None, "RZ_ASM_LAUNCH_FAILED")
     if cp.cancelled:
         return None, {"ok": False, "status": "CANCELLED", "error": "RZ_ASM_CANCELLED_PROCESS_TREE_TERMINATED"}
     if cp.timed_out:
@@ -1676,6 +1682,8 @@ def rizin_functions(
         cancellation_token=cancellation_token,
         max_output_chars=_MAX_OUTPUT_CHARS,
     )
+    if cp.launch_failed is True:
+        return _j(launch_failure(cp, "rizin_functions", "RIZIN_LAUNCH_FAILED"))
     elapsed = time.monotonic() - started
 
     if cp.cancelled:
@@ -1932,6 +1940,8 @@ class _RzBin:
             elapsed = time.monotonic() - started
         except Exception as exc:  # noqa: BLE001
             return _RzBin.env_failure(tool, exc, "RZ_BIN_COULD_NOT_START")
+        if cp.launch_failed is True:
+            return _j(launch_failure(cp, tool, "RZ_BIN_LAUNCH_FAILED"))
         if cp.cancelled:
             return _j({"ok": False, "tool": tool, "status": "CANCELLED",
                        "error": "RZ_BIN_CANCELLED_PROCESS_TREE_TERMINATED"})
@@ -2132,6 +2142,8 @@ def rz_bin_status() -> str:
         cp = run_bounded_process([exe, "-v"], timeout_seconds=_MIN_TIMEOUT_SECONDS, max_output_chars=4096)
     except Exception as exc:  # noqa: BLE001
         return _RzBin.env_failure(tool, exc, "RZ_BIN_COULD_NOT_START")
+    if cp.launch_failed is True:
+        return _j(launch_failure(cp, tool, "RZ_BIN_LAUNCH_FAILED"))
     if cp.timed_out:
         return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "error": "RZ_BIN_VERSION_TIMEOUT"})
     lines = ((cp.stdout or "") + (cp.stderr or "")).strip().splitlines()
@@ -2226,6 +2238,8 @@ class _RzFlirt:
             elapsed = time.monotonic() - started
         except Exception as exc:  # noqa: BLE001 - the contract is a JSON string, never an exception
             return None, 0.0, _RzFlirt.env_failure(tool, exc, "RIZIN_FLIRT_COULD_NOT_START")
+        if cp.launch_failed is True:
+            return None, 0.0, _j(launch_failure(cp, tool, "RIZIN_FLIRT_LAUNCH_FAILED"))
         if cp.cancelled:
             return None, 0.0, _j({"ok": False, "tool": tool, "status": "CANCELLED",
                                   "error": "RIZIN_FLIRT_CANCELLED_PROCESS_TREE_TERMINATED"})

@@ -940,8 +940,11 @@ def _launch(exe, work, job, *, mode, target, timeout_seconds, cancellation_token
             command, timeout_seconds=timeout_seconds, cancellation_token=cancellation_token,
             cwd=work, environment=_job_environment(job_path), max_output_chars=_MAX_OUTPUT_CHARS,
         )
-    except OSError as exc:  # the file exists but the OS would not start it (not executable, denied, ...)
+    except OSError as exc:  # defensive: the runner reports a failed launch itself (below)
         raise _EnvironmentFailure("IDA_LAUNCH_FAILED", exc) from exc
+    if cp.launch_failed is True:  # the file exists but the OS would not start it (not executable, denied, ...)
+        # The runner already reduced the OSError to a path-free cause; carry it as the strerror.
+        raise _EnvironmentFailure("IDA_LAUNCH_FAILED", OSError(None, cp.launch_error))
     return cp, command
 
 

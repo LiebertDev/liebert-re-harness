@@ -1,5 +1,5 @@
 import hashlib, json, math, os, re
-from liebert_re.bounded_subprocess import run_bounded_process
+from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.workspace import safe_path, relative, skipped, _limit_marker
 
 try:
@@ -568,6 +568,8 @@ def authenticode_signature(path,cancellation_token=None):
         ["powershell.exe","-NoProfile","-NonInteractive","-Command",ps],
         timeout_seconds=30,cancellation_token=cancellation_token,
     )
+    if cp.launch_failed is True:
+        return json.dumps(launch_failure(cp, "authenticode_signature", "AUTHENTICODE_LAUNCH_FAILED"))
     if cp.cancelled:return json.dumps({"ok":False,"status":"CANCELLED","error":"TOOL_CALL_CANCELLED","process_tree_terminated":cp.process_tree_terminated})
     if cp.timed_out:return json.dumps({"ok":False,"status":"TIMEOUT","error":"PROCESS_TIMEOUT","process_tree_terminated":cp.process_tree_terminated})
     return cp.stdout.strip() if cp.returncode==0 else cp.stderr.strip()

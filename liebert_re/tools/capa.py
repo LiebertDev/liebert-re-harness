@@ -48,7 +48,7 @@ import shutil
 import uuid
 from pathlib import Path
 
-from liebert_re.bounded_subprocess import run_bounded_process
+from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.workspace import safe_path, relative
 
 try:
@@ -277,6 +277,8 @@ def capa_analyze(path, backend=None, file_format=None, os_name=None, rules=None,
         cancellation_token=cancellation_token,
         max_output_chars=_MAX_OUTPUT_CHARS,
     )
+    if cp.launch_failed is True:
+        return _j(launch_failure(cp, tool, "CAPA_LAUNCH_FAILED"))
     if cp.cancelled:
         return _j({
             "ok": False, "tool": tool, "status": "CANCELLED",
@@ -389,6 +391,8 @@ def capa_status():
         return _tool_missing(tool)
     cp = run_bounded_process([exe, "--version"], timeout_seconds=_MIN_TIMEOUT_SECONDS,
                              max_output_chars=4096)
+    if cp.launch_failed is True:
+        return _j(launch_failure(cp, tool, "CAPA_LAUNCH_FAILED"))
     if cp.timed_out:
         return _j({"ok": False, "tool": tool, "status": "TIMEOUT", "error": "CAPA_VERSION_TIMEOUT"})
     version = ((cp.stdout or "") + (cp.stderr or "")).strip().splitlines()

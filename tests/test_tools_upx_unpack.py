@@ -13,7 +13,7 @@ PAYLOAD = b"MZ-packed-input-bytes"
 
 def _result(returncode=0, timed_out=False):
     return types.SimpleNamespace(returncode=returncode, timed_out=timed_out, cancelled=False,
-                                 stdout="", stderr="")
+                                 stdout="", stderr="", launch_failed=False)
 
 
 @pytest.fixture
