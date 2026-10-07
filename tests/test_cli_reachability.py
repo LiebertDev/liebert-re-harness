@@ -42,15 +42,16 @@ def test_describe_answers_without_importing_the_tool_module(name, capsys):
             sys.modules[module] = stashed
 
 
-def test_every_published_tool_is_reached_by_at_least_one_route():
-    published = published_set()
-    direct = directly_dispatched()
-    declared = set(python_only_declarations())
-    generic = published - declared
-    unreached = published - (direct | declared | generic)
-    assert not unreached, f"published but reachable by no route: {sorted(unreached)}"
-    assert direct <= published and declared <= published
-    assert published, "no published tool found; the scan itself is broken"
+def test_tool_list_marks_exactly_the_declared_tools_as_python_only(capsys):
+    # The generic route is "published minus declared"; `tool list` is what a user sees, so it must agree:
+    # a python_only reason on every declared tool and on no other, and every published tool listed.
+    assert published_set(), "no published tool found; the scan itself is broken"
+    assert cli.main(["tool", "list"]) == 0
+    rows = {row["name"]: row["python_only"] for row in json.loads(capsys.readouterr().out)["tools"]}
+    assert set(rows) == published_set()
+    declared = python_only_declarations()
+    assert {n for n, reason in rows.items() if reason} == set(declared)
+    assert all(rows[n] is None for n in set(rows) - set(declared))
 
 
 def test_every_generic_route_tool_really_runs_through_tool_run():
