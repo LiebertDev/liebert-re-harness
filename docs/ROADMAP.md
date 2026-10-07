@@ -1,7 +1,7 @@
 # Roadmap and known gaps
 
-This project is not under active development right now. This document exists so
-that someone who wants to pick it back up knows where to start, what is genuinely
+This project is under active development (see `git log`). This document exists so
+that someone who wants to contribute knows where to start, what is genuinely
 missing, and what has already been tried and abandoned as too hard for a casual
 contribution. It is a map, not a promise — nobody is committed to working through
 it on a schedule.

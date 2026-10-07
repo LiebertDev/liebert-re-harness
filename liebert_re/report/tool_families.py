@@ -126,6 +126,34 @@ FAMILIES = {
 }
 
 
+_DEF_PATTERN = re.compile(r"^(?:async )?def ([A-Za-z_][A-Za-z0-9_]*)\(", re.MULTILINE)
+
+
+def _definitions_by_name(package_dir: Path) -> dict[str, list[tuple[str, Path]]]:
+    """``{function name: [(module path, source file), ...]}`` for ``package_dir``.
+
+    Scans source text for ``def <name>(`` at column 0 in every ``.py`` file
+    under ``package_dir`` (excluding any file named like this module and
+    ``test_*`` files). A name defined in several files lists each of them.
+    The module path is relative to ``package_dir.parent``.
+    """
+    found: dict[str, list[tuple[str, Path]]] = {}
+    for path in sorted(package_dir.rglob("*.py")):
+        if path.name == Path(__file__).name or path.stem.startswith("test_"):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        parts = path.relative_to(package_dir.parent).with_suffix("").parts
+        module = ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
+        for name in _DEF_PATTERN.findall(text):
+            entries = found.setdefault(name, [])
+            if all(existing != path for _, existing in entries):
+                entries.append((module, path))
+    return found
+
+
 @functools.lru_cache(maxsize=1)
 def _locally_defined_tool_names() -> frozenset[str]:
     """Every top-level function this package's own ``.py`` files define.
@@ -140,18 +168,8 @@ def _locally_defined_tool_names() -> frozenset[str]:
     this project tried that: a hand-maintained tuple silently stopped
     tracking FAMILIES and 27 registered tools went unreachable for months).
     """
-    names: set[str] = set()
-    pattern = re.compile(r"^(?:async )?def ([A-Za-z_][A-Za-z0-9_]*)\(", re.MULTILINE)
     package_dir = Path(__file__).resolve().parent.parent
-    for path in sorted(package_dir.rglob("*.py")):
-        if path.name == Path(__file__).name or path.stem.startswith("test_"):
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        names.update(pattern.findall(text))
-    return frozenset(names)
+    return frozenset(_definitions_by_name(package_dir))
 
 
 def published_tools(family: str) -> frozenset[str]:
@@ -172,6 +190,73 @@ def published_family_report() -> dict[str, tuple[int, int]]:
     published package can actually reach, versus how much it merely names.
     """
     return {name: (len(tools), len(published_tools(name))) for name, tools in FAMILIES.items()}
+
+
+def _published_definitions(package_dir: Path | None) -> dict[str, tuple[str, Path]]:
+    """Published tool name -> its single defining (module, file); ``ValueError`` on a clash."""
+    root = Path(__file__).resolve().parent.parent if package_dir is None else Path(package_dir)
+    named = set().union(*FAMILIES.values())
+    result: dict[str, tuple[str, Path]] = {}
+    for name, entries in sorted(_definitions_by_name(root).items()):
+        if name not in named:
+            continue
+        if len(entries) > 1:
+            raise ValueError(
+                f"tool {name!r} is defined in more than one module: "
+                + ", ".join(sorted(module for module, _ in entries))
+            )
+        result[name] = entries[0]
+    return result
+
+
+def tool_modules(package_dir: Path | None = None) -> dict[str, str]:
+    """``{published tool name: dotted module path that defines it}``.
+
+    Same ground truth as :func:`published_tools` (source scan, no imports),
+    over the union of every family. A name defined in more than one module
+    raises ``ValueError`` naming the tool and the modules, never picks one.
+    ``package_dir`` is for tests; the default is this package.
+    """
+    return {name: module for name, (module, _) in _published_definitions(package_dir).items()}
+
+
+_PYTHON_ONLY_LINE = re.compile(r"^\s*CLI:\s*python-only(?![\w-])(?:\s*:\s*(.*?))?\s*$")
+
+
+def python_only_declarations(package_dir: Path | None = None) -> dict[str, str]:
+    """``{published tool name: reason}`` for tools declared python-only.
+
+    A tool declares it with one docstring line ``CLI: python-only: <reason>``.
+    The docstring is read with ``ast`` (the module is never imported, so
+    optional dependencies are not loaded). A declaration with an empty
+    reason, or more than one declaration in one docstring, raises
+    ``ValueError``; a tool with no such line is simply absent.
+    ``package_dir`` is for tests; the default is this package.
+    """
+    import ast
+
+    declared: dict[str, str] = {}
+    for name, (module, path) in _published_definitions(package_dir).items():
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8-sig", errors="ignore"), filename=str(path))
+        except SyntaxError as exc:
+            raise ValueError(f"cannot parse {module} to read the docstring of {name!r}: {exc}") from exc
+        node = next(
+            (n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name),
+            None,
+        )
+        if node is None:
+            continue
+        lines = [m for m in map(_PYTHON_ONLY_LINE.match, (ast.get_docstring(node) or "").splitlines()) if m]
+        if not lines:
+            continue
+        if len(lines) > 1:
+            raise ValueError(f"tool {name!r} in {module} declares 'CLI: python-only' more than once")
+        reason = (lines[0].group(1) or "").strip()
+        if not reason:
+            raise ValueError(f"tool {name!r} in {module} declares 'CLI: python-only' with an empty reason")
+        declared[name] = reason
+    return declared
 
 
 BASE_FAMILIES = ("workspace", "identity", "source")
