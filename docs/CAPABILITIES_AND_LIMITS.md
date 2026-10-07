@@ -177,6 +177,34 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
   content), the session that answers a question never runs longer than 300 s. A timed-out analysis
   is discarded, not half-cached, and is reported as `TIMEOUT`, never as "nothing found". A listing
   cut short by a walk ceiling or by `max_chars` is `PARTIAL` and names the ceiling and its value.
+- `ida_script` (CLI `idascript --script-file F`, also `tool run ida_script`): the one operation that runs code
+  this package did not write. The caller's IDAPython runs once, in an idalib session, on a COPY of the
+  cached database; the answer is the JSON value the script leaves in the variable `result`, labelled
+  `result_kind: SCRIPT_REPORTED` (the script's claim). **What it verifies:** the input hash, that this
+  script text ran to completion inside IDA on this input, that the session was closed without saving, and
+  that the cached database file is byte-identical afterwards (hashed before and after; a change is
+  `CACHE_VIOLATION`, the slot is dropped and there is no result). **What it does NOT enforce, and says so in
+  every answer (`NOT_ENFORCED`): child processes, the network, the file system; the environment is
+  inherited. It is not a sandbox.** An AST accident guard refuses the usual mistakes before anything starts
+  (imports outside a short allow-list, `open`/`exec`/`eval`/`getattr`, attributes starting with `_`,
+  `save_database` / `open_database` / `close_database`, debugger starts, file-writing and IDC-evaluating
+  calls, `ida_dbg` so the sample is never run), but it is syntactic: `import json` then `json.codecs.open(...)`
+  gets past it, and the test suite pins that gap on purpose. Closing it takes a different mechanism (a guest,
+  a job object), not a longer list. Gates: the key `LIEBERT_RE_IDA_SCRIPT=authorized` (off by default:
+  `AUTHORIZATION_REQUIRED`, nothing started), and the idalib backend (`backend="idat"` or an unconfigured
+  idalib is `UNSUPPORTED`; idat opens the cache slot itself, so there is no idat path). Bounds: script
+  session timeout 5-300 s (default 120; the process tree is killed, the cache slot is kept), memory polled
+  against the process tree's resident size (default 4 GiB; a host that cannot measure it is
+  `RESOURCE_LIMIT_UNAVAILABLE`, fail closed), stdout and stderr into a bounded buffer (never read as the
+  result), `max_result_chars` for the value, `max_chars` for the response. A result that does not fit is
+  withheld (`PARTIAL`, `script_result_withheld`), never cut. The full record (script text, worker result,
+  stdout tail, signals) goes to `dataset/evidence/ida_script/`; if it cannot be written the result is withheld
+  (`EVIDENCE_WRITE_FAILED`). Measured once, on one stock Windows PE with 501 functions on this machine: a
+  function-count script returned 501, the same as `list_functions`; a script that renamed a function saw its own
+  change and left the cached database's hash unchanged; a decompiler visitor script counted call expressions;
+  a script with `import os` was refused before IDA started; one script call took about 2 s wall, about 1 s of it
+  the session. Not done: running the script in a guest (a later slice), keeping scripts for public crackmes as
+  knowledge, any allow-list of IDA APIs beyond the names the guard refuses.
 - `ida_microcode_cfg` (CLI `idamicrocode`): one function's microcode as a control-flow graph (blocks,
   predecessors, successors, instructions; every address in the shared five-field address form) at any
   of the eight maturity levels, read in the same temporary session as a question. **Raw by default.**
@@ -318,9 +346,9 @@ return a named tool-missing status when absent. Function inventory
 - Workspace path sandbox, bounded subprocess with process-tree teardown, and a
   `liebert-re` CLI (`identify`, `probe`, `pe`, `disasm`, `packer`, `die`, `rzbin`, `flirt`, `flirtinventory`,
   `sieve`, `labgate`, `labregister`, `sievestatus`, `rzbinstatus`, `diestatus`, `yarastatus`, `upxstatus`,
-  `il2cppstatus`, `dexstatus`, `jvmstatus`, `capa`, `capastatus`, `ida`, `idamicrocode`, `idastatus`, `idaannotations`,
+  `il2cppstatus`, `dexstatus`, `jvmstatus`, `capa`, `capastatus`, `ida`, `idascript`, `idamicrocode`, `idastatus`, `idaannotations`,
   `kerneltriage`, `kerneldispatch`, `kerneliat`, `kernelcallbacks`, `ioctldecode`, `ghidrastatus`, `ghidrafacts`, `ghidradecompile`, `unpack`,
-  `scan`, `minidump`, `pdata`, `trailing`, `tool`, `capabilities`; 41 subcommands, from `cli.py`):
+  `scan`, `minidump`, `pdata`, `trailing`, `tool`, `capabilities`; 42 subcommands, from `cli.py`):
   `workspace.py`, `bounded_subprocess.py`, `cli.py`.
 
 ### Dynamic and emulation

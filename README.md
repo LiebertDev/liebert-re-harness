@@ -142,7 +142,7 @@ import is the exact failure this project is organised against:
   script that needed it (the mutated-crackme-5 serial solver) is not
   distributed in this public package; it is documentation-only.
 - **Ghidra cross-references, and normalisation of answers across engines.** Not here (a Ghidra wrapper for status, program facts and decompilation of selected functions *is* here, see the engine table). An IDA
-  wrapper *is* here (`ida_query`, `ida_microcode_cfg`, `ida_type_member_offset`, `ida_patch_plan` (a plan only), `ida_annotations`, `ida_status`, and a write path: `ida_rename_plan` / `ida_set_comments_plan` then `ida_annotations_apply`, with `ida_annotations_purge`); the
+  wrapper *is* here (`ida_query`, `ida_script` (caller-written IDAPython on a discarded database copy: idalib only, off unless `LIEBERT_RE_IDA_SCRIPT=authorized`, and **not a sandbox**), `ida_microcode_cfg`, `ida_type_member_offset`, `ida_patch_plan` (a plan only), `ida_annotations`, `ida_status`, and a write path: `ida_rename_plan` / `ida_set_comments_plan` then `ida_annotations_apply`, with `ida_annotations_purge`); the
   decompiler-comment operation is not. `docs/INSTALL.md` is the authority on which
   engines this package can actually drive.
 - **Function discovery and engine cross-check.** The exception directory is read
@@ -461,7 +461,7 @@ that starts with a status code (`ANALYSIS_LIMITED`-class codes such as `IMPORT_D
 with `EMPTY_RESULT: ` is `ok: true` with `empty: true`; failure in unprefixed prose is still not told
 apart from an answer. `authenticode_signature` answers in JSON (`signature_status`, `signer`, `issuer`, `raw`).
 
-53<!-- count:cli_direct_commands --> published tools also have a dedicated subcommand (`cli.py` names
+54<!-- count:cli_direct_commands --> published tools also have a dedicated subcommand (`cli.py` names
 them by string literal). `tool run` reaches the rest, except the tools that write to disk or need a
 live Python object: 9<!-- count:cli_python_only --> tools declare `CLI: python-only: <reason>` in their
 docstring, and `tool run` answers those as unsupported and prints the reason. The reason lives in the

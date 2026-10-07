@@ -23,6 +23,18 @@ Job file (JSON)::
      "max_result_bytes": 16777216,
      "operations": [{"operation": "...", "query": "...", "max_results": 200, "offset": 0}, ...]}
 
+* ``script`` (``ida_script``): open ``database_name`` (a COPY, as in ``copy``) and run ONE caller-written
+  IDAPython script in it, with these extra job fields: ``script_path`` (the script text, UTF-8, in the
+  work directory), ``script_sha256`` (the worker re-hashes the file and refuses on a mismatch),
+  ``input_sha256``, ``max_result_chars``, ``max_stdout_chars``. ``operations`` and ``ops_path`` are not
+  used. The script's stdout and stderr go to a bounded buffer (never to the real stdout); its answer is
+  the variable ``result`` it leaves behind, which must be JSON and at most ``max_result_chars``
+  characters. The outcome is the result file's ``script`` object: ``{"status": "OK" | "NO_RESULT" |
+  "NOT_JSON" | "TOO_LARGE" | "EXCEPTION" | "SYNTAX_ERROR" | "HASH_MISMATCH" | "UNREADABLE", ...}`` and
+  never anything parsed from stdout. The mode shares the single ``open_database`` and the
+  ``close_database(False)`` ``finally`` of the other modes: whatever the script did to the open database
+  is discarded. This is an accident guard, not a sandbox: nothing here restricts what the script can do
+  on the host.
 * ``copy``: open ``database_name`` (a COPY of the cached database, made by the wrapper; the cached
   file itself is never opened) without auto-analysis.
 * ``create``: analyse ``input`` into ``database_name`` (``-o``), wait for auto-analysis to settle,
@@ -50,7 +62,9 @@ import idapro  # noqa: E402 - first import of the IDA stack, on purpose
 
 SCHEMA = 1
 _DEFAULT_MAX_RESULT_BYTES = 16 * 1024 * 1024
-_MODES = ("create", "copy")
+_MODES = ("create", "copy", "script")
+_DEFAULT_MAX_RESULT_CHARS = 60000
+_DEFAULT_MAX_STDOUT_CHARS = 16384
 
 
 def _read_job(path):
@@ -61,7 +75,10 @@ def _read_job(path):
         return None, "JOB_UNREADABLE: %s: %s" % (type(exc).__name__, exc)
     if not isinstance(job, dict) or not job.get("output") or job.get("mode") not in _MODES:
         return None, "JOB_MALFORMED"
-    if not isinstance(job.get("operations"), list) or not job.get("ops_path"):
+    if job["mode"] == "script":
+        if not job.get("script_path") or not isinstance(job.get("script_sha256"), str):
+            return None, "JOB_MALFORMED"
+    elif not isinstance(job.get("operations"), list) or not job.get("ops_path"):
         return None, "JOB_MALFORMED"
     if job["mode"] == "create" and not job.get("input"):
         return None, "JOB_MALFORMED"
@@ -111,11 +128,114 @@ def _write_result(path, envelope, max_bytes):
     os.replace(temporary, path)
 
 
+class _Capture(object):
+    """The script's stdout and stderr: a bounded buffer that keeps the LAST ``limit`` characters and counts
+    everything written, so a script that prints a lot cannot grow memory or reach the real stdout."""
+
+    def __init__(self, limit):
+        self.limit = max(0, int(limit))
+        self.parts = []
+        self.kept = 0
+        self.total = 0
+
+    def write(self, text):
+        text = text if isinstance(text, str) else str(text)
+        self.total += len(text)
+        self.parts.append(text)
+        self.kept += len(text)
+        if self.kept > 2 * self.limit + 4096:
+            joined = "".join(self.parts)[-self.limit:] if self.limit else ""
+            self.parts, self.kept = [joined], len(joined)
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+    def tail(self):
+        joined = "".join(self.parts)
+        return joined[-self.limit:] if self.limit else ""
+
+
+def _script_outcome(job):
+    """Run the caller's script in the open database. Returns the ``script`` object for the result file.
+    Nothing here can raise: every ending is a status."""
+    import hashlib
+    out = {"status": None, "compiled_by": "ida_python", "auto_wait": None}
+    limit_result = int(job.get("max_result_chars") or _DEFAULT_MAX_RESULT_CHARS)
+    capture = _Capture(job.get("max_stdout_chars") or _DEFAULT_MAX_STDOUT_CHARS)
+
+    def finish(status, **fields):
+        out["status"] = status
+        out.update(fields)
+        out["stdout_tail"] = capture.tail()
+        out["stdout_chars"] = capture.total
+        out["stdout_truncated"] = capture.total > len(out["stdout_tail"])
+        return out
+
+    try:
+        with open(str(job["script_path"]), "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return finish("UNREADABLE", error="%s: %s" % (type(exc).__name__, exc))
+    digest = hashlib.sha256(raw).hexdigest()
+    out["script_sha256_seen"] = digest
+    if digest != job["script_sha256"]:
+        return finish("HASH_MISMATCH", expected_sha256=job["script_sha256"])
+    try:
+        code = compile(raw.decode("utf-8"), "<liebert_script>", "exec", dont_inherit=True)
+    except (SyntaxError, ValueError, UnicodeDecodeError) as exc:
+        return finish("SYNTAX_ERROR", error="%s: %s" % (type(exc).__name__, exc), line=getattr(exc, "lineno", None))
+    try:
+        import ida_auto
+        ida_auto.auto_wait()
+        out["auto_wait"] = True
+    except Exception as exc:  # noqa: BLE001 - recorded, not hidden; the script still runs on what is open
+        out["auto_wait"] = False
+        out["auto_wait_error"] = "%s: %s" % (type(exc).__name__, exc)
+    # What the database itself says its input was, read BEFORE the script runs (the wrapper compares it).
+    out["engine_input_sha256"] = out["engine_input_md5"] = None
+    try:
+        import ida_nalt
+        for key, reader in (("engine_input_sha256", ida_nalt.retrieve_input_file_sha256),
+                            ("engine_input_md5", ida_nalt.retrieve_input_file_md5)):
+            value = reader()
+            out[key] = bytes(value).hex() if isinstance(value, (bytes, bytearray)) else (str(value) if value else None)
+    except Exception:  # noqa: BLE001 - unreadable stays None; the wrapper reports provenance UNVERIFIABLE
+        pass
+    namespace = {"__name__": "__liebert_script__",
+                 "LIEBERT_CONTEXT": {"input_sha256": job.get("input_sha256"), "max_result_chars": limit_result}}
+    real_out, real_err = sys.stdout, sys.stderr
+    sys.stdout = sys.stderr = capture
+    failure = None
+    try:
+        exec(code, namespace)
+    except BaseException as exc:  # noqa: BLE001 - SystemExit and KeyboardInterrupt included: the session must still close
+        failure = {"type": type(exc).__name__, "message": str(exc)[:2000], "traceback": traceback.format_exc()[-6000:]}
+    finally:
+        sys.stdout, sys.stderr = real_out, real_err
+    if failure is not None:
+        return finish("EXCEPTION", exception=failure)
+    if "result" not in namespace:
+        return finish("NO_RESULT")
+    value = namespace["result"]
+    try:
+        text = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    except Exception as exc:  # noqa: BLE001
+        return finish("NOT_JSON", result_type=type(value).__name__, error="%s: %s" % (type(exc).__name__, str(exc)[:300]))
+    if len(text) > limit_result:
+        return finish("TOO_LARGE", result_chars=len(text), max_result_chars=limit_result, result_type=type(value).__name__)
+    return finish("OK", result=json.loads(text), result_chars=len(text), result_type=type(value).__name__)
+
+
 def run(job):
     """One session: open, (create: settle and save), operations, close without saving. Returns the
     result envelope and the process exit code."""
     mode = job["mode"]
     creating = mode == "create"
+    scripting = mode == "script"
     envelope = {
         "ok": True, "schema": SCHEMA, "backend": "idalib", "mode": mode, "results": [],
         "database_opened": False, "database_saved_before_queries": None,
@@ -138,6 +258,9 @@ def run(job):
             return envelope, 0
         opened = True
         envelope["database_opened"] = True
+        if scripting:
+            envelope["script"] = _script_outcome(job)
+            return envelope, 0
         ops = _load_ops(str(job["ops_path"]))
         if creating:
             ops._settled_function_count()  # auto-analysis settled before the pristine save

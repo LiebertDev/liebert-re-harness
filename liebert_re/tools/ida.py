@@ -125,7 +125,17 @@ before the pointer is published. Concurrent writers are blocked, not merged (`co
 answer). The write worker is its own data file, `ida_scripts/annotate_write.idapy`, and the only one that
 contains write calls.
 
-Scope of this module: `ida_query`, `ida_microcode_cfg`, `ida_type_member_offset`, `ida_patch_plan`
+**Caller-written IDAPython (`ida_script`).** The one operation that runs code this package did not write. It is
+gated (`LIEBERT_RE_IDA_SCRIPT=authorized`, off by default), idalib-only (it opens a COPY of the cached database,
+never the slot; `backend="idat"` is UNSUPPORTED), and it is NOT a sandbox: an AST accident guard refuses the
+usual mistakes (`os`, `open`, `save_database`, a debugger start) before anything starts, but the script runs with
+the operator's rights and the child inherits the environment, the network and the file system. Every answer says
+`NOT_ENFORCED` for those, labels the script's `result` as `SCRIPT_REPORTED` (the script's claim, not a measurement),
+and keeps the full record under `dataset/evidence/ida_script/`; if that record cannot be written the result is
+withheld. The worker is a mode (`script`) of `ida_scripts/idalib_worker.idapy`, so the one `open_database` and the
+`close_database(False)` stay the only ones in the project.
+
+Scope of this module: `ida_query`, `ida_script` (gated, see above), `ida_microcode_cfg`, `ida_type_member_offset`, `ida_patch_plan`
 and `ida_annotations` (none of them writes the input or persists anything), `ida_rename_plan` and
 `ida_set_comments_plan` and `ida_annotations_apply` (the one persistent write path: it applies a rename plan or a
 comments plan), `ida_annotations_purge`
@@ -133,6 +143,7 @@ comments plan), `ida_annotations_purge`
 """
 from __future__ import annotations
 
+import ast
 import collections
 import datetime
 import getpass
@@ -167,6 +178,7 @@ EVIDENCE_PATCH_PLAN = APP_DIR / "dataset" / "evidence" / "ida_patch_plan"
 EVIDENCE_ANNOTATIONS = APP_DIR / "dataset" / "evidence" / "ida_annotations"
 EVIDENCE_RENAME_PLAN = APP_DIR / "dataset" / "evidence" / "ida_rename_plan"
 EVIDENCE_ANNOTATE_APPLY = APP_DIR / "dataset" / "evidence" / "ida_annotations_apply"
+EVIDENCE_SCRIPT = APP_DIR / "dataset" / "evidence" / "ida_script"      # created on first use; tests patch this name
 # Annotated data has its OWN root, a sibling of the cache and never inside it: the cache evicts, rebuilds
 # and deletes whole slots, and a person's annotations are not re-derivable. Created lazily. Tests patch this name.
 ANNOTATED_ROOT = APP_DIR / "dataset" / "ida_annotated"
@@ -1665,7 +1677,10 @@ def _locked_call(tool, exe, p, invocation, max_chars, cancellation_token, profil
             "detail": "Another process is analysing this exact file; retry when it finishes.",
         })
     try:
-        run = _query_locked_idalib if (profile or {}).get("backend") == "idalib" else _query_locked
+        if (profile or {}).get("script"):
+            run = _script_locked
+        else:
+            run = _query_locked_idalib if (profile or {}).get("backend") == "idalib" else _query_locked
         outcome = run(exe, p, sha256, md5, slot, invocation, max_chars, cancellation_token, profile)
         if isinstance(outcome, dict) and outcome.get("ok") is True:
             outcome_evict = _enforce_cache_budget(slot)
@@ -2604,10 +2619,13 @@ def _tag_backend(text, info):
     return _j(body)
 
 
-def _write_idalib_files(work, job):
-    """The worker, the shared operations file and the job, in the scratch directory (BOM-free, LF)."""
+def _write_idalib_files(work, job, *, with_ops=True):
+    """The worker, the shared operations file and the job, in the scratch directory (BOM-free, LF).
+    `with_ops=False` (a script session) leaves the operations file out: that mode does not run it."""
     try:
-        sources = ((_IDALIB_JOB_SCRIPT, _IDALIB_WORKER_SOURCE.read_bytes()), (_IDALIB_OPS_NAME, _WORKER_SOURCE.read_bytes()))
+        sources = [(_IDALIB_JOB_SCRIPT, _IDALIB_WORKER_SOURCE.read_bytes())]
+        if with_ops:
+            sources.append((_IDALIB_OPS_NAME, _WORKER_SOURCE.read_bytes()))
     except OSError as exc:
         raise _EnvironmentFailure("IDA_WORKER_UNREADABLE", exc) from exc
     try:
@@ -2620,15 +2638,17 @@ def _write_idalib_files(work, job):
         raise _EnvironmentFailure("IDA_LAUNCH_FAILED", exc) from exc
 
 
-def _launch_idalib(python, work, job, *, timeout_seconds, cancellation_token):
+def _launch_idalib(python, work, job, *, timeout_seconds, cancellation_token, max_memory_bytes=None):
     """Run the idalib worker once in `work`. `-I` keeps the interpreter from reading PYTHON* variables, the
-    user site or the working directory's modules; `-X utf8` fixes the encoding of the (ignored) console output."""
-    _write_idalib_files(work, job)
+    user site or the working directory's modules; `-X utf8` fixes the encoding of the (ignored) console output.
+    `max_memory_bytes` (a script session only) is polled against the process tree's resident size."""
+    _write_idalib_files(work, job, with_ops=job.get("mode") != "script")
     command = [str(python), "-I", "-X", "utf8", _IDALIB_JOB_SCRIPT, _IDALIB_JOB_NAME]
+    limits = {} if max_memory_bytes is None else {"max_memory_bytes": max_memory_bytes}
     try:
         cp = run_bounded_process(
             command, timeout_seconds=timeout_seconds, cancellation_token=cancellation_token, cwd=work,
-            environment=dict(os.environ), max_output_chars=_IDALIB_MAX_OUTPUT_CHARS,
+            environment=dict(os.environ), max_output_chars=_IDALIB_MAX_OUTPUT_CHARS, **limits,
         )
     except OSError as exc:
         raise _EnvironmentFailure("IDA_LAUNCH_FAILED", exc) from exc
@@ -2698,7 +2718,7 @@ def _verdict_idalib(cp, work, *, creating, operations):
                    "open_rc": (envelope or {}).get("open_rc"),
                    "database_saved_before_queries": (envelope or {}).get("database_saved_before_queries")},
     }
-    first = results[0] if operation_matches else None
+    first = results[0] if operation_matches and results else None     # a script session answers no operation
     if too_large:
         return None, None, "IDALIB_RESULT_TOO_LARGE", {**signals, "result_limit_bytes": _IDALIB_MAX_RESULT_BYTES}
     if parse_error:
@@ -2882,6 +2902,556 @@ def _query_locked_idalib(engine_exe, p, sha256, md5, slot, invocation, max_chars
     finally:
         if not (slot / _DB_NAME).exists() and not scratch_kept:
             shutil.rmtree(slot, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# ida_script: caller-written IDAPython on a discarded copy of the database (idalib backend only)
+# --------------------------------------------------------------------------
+#
+# What this is: the caller (a model or a person) hands over IDAPython source; it runs inside an idalib worker
+# on a COPY of the cached database and the answer is the JSON value the script leaves in `result`.
+# What it is NOT: a sandbox. The script runs with the operator's rights, inheriting the environment, the
+# network and the file system. The accident guard below refuses the mistakes a model makes by accident (an
+# `os` import, a `save_database` call, an `open`); it does not stop a determined script, and every answer
+# says so (`guard.kind`, `execution.*: NOT_ENFORCED`). The key (`LIEBERT_RE_IDA_SCRIPT=authorized`) is the
+# operator's decision to allow that, made per machine.
+#
+# Why idalib only: the idalib backend already opens a COPY of the cached database (never the slot) and
+# measures the slot before and after. idat opens the slot itself and relies on a flag a script could clear,
+# so `ida_script` has no idat path at all.
+#
+# Why a mode of the idalib worker and not a second worker file: the worker has exactly one
+# `open_database` and one `close_database(False)` in a `finally`, pinned by a test. A second worker file
+# would be a second place to get that wrong, and a second open in one process silently SAVES the first
+# database (measured).
+#
+# Session: first analysis (only when the slot is absent), in its own `summary` session that promotes the
+# pristine database; then the script session: hash the slot, copy it into a scratch directory, hash the
+# copy, run the worker on the copy, hash the slot again. A changed slot is CACHE_VIOLATION (slot dropped,
+# no result); a timeout or cancellation does not cost the slot (it was never open).
+
+SCRIPT_GATE_ENV = "LIEBERT_RE_IDA_SCRIPT"
+SCRIPT_GATE_VALUE = "authorized"
+_DEFAULT_SCRIPT_TIMEOUT_SECONDS = 120
+_MIN_SCRIPT_TIMEOUT_SECONDS = 5
+_MAX_SCRIPT_TIMEOUT_SECONDS = 300
+_SCRIPT_MAX_BYTES = 64 * 1024
+_SCRIPT_DEFAULT_MEMORY_BYTES = 4 * 1024 ** 3
+_SCRIPT_MIN_MEMORY_BYTES = 512 * 1024 ** 2
+_SCRIPT_MAX_MEMORY_BYTES = 64 * 1024 ** 3
+_SCRIPT_FILE_NAME = "script.py"
+_SCRIPT_MIN_RESPONSE_CHARS = 8000
+_SCRIPT_GUARD = {"kind": "ACCIDENT_GUARD_NOT_A_SANDBOX", "version": 1}
+_SCRIPT_NOT_A_SANDBOX = (
+    "This guard refuses the mistakes a model makes by accident. It is not a sandbox: a script can still reach the "
+    "host in ways it does not look for, and the process inherits the environment, the network and the file system."
+)
+
+# Modules a script may not import. Anything not in the allow-list below is also refused (IMPORT_NOT_ALLOWED);
+# this list only gives the common ones a clearer name.
+_GUARD_FORBIDDEN_MODULES = frozenset({
+    "os", "sys", "subprocess", "socket", "shutil", "pathlib", "ctypes", "importlib", "builtins", "urllib", "http",
+    "multiprocessing", "threading", "asyncio", "ida_dbg", "ida_idd", "ida_fpro", "ida_expr", "ida_registry", "idapro",
+})
+_GUARD_ALLOWED_STDLIB = frozenset({
+    "re", "struct", "math", "collections", "itertools", "functools", "hashlib", "binascii", "json", "bisect",
+    "heapq", "array", "typing", "string", "operator", "enum",
+})
+_GUARD_ALLOWED_IDA = frozenset({"idaapi", "idc", "idautils"})        # plus every `ida_*` module not forbidden above
+# Builtins a script may not use by name.
+_GUARD_FORBIDDEN_BUILTINS = frozenset({
+    "open", "exec", "eval", "compile", "__import__", "getattr", "setattr", "delattr", "globals", "vars", "locals",
+    "input", "breakpoint", "help",
+})
+# IDA API names that start a debugger (the sample would run on the host), load or run code, write files,
+# evaluate IDC, or save / reopen the database (`open_database` / `close_database` / `save_database` / `idapro`:
+# a second open in one process silently saves and closes the first database, measured). Matched as attribute
+# names and as used or imported names.
+_GUARD_FORBIDDEN_API = frozenset({
+    "idapro", "open_database", "close_database", "save_database", "save_database_ex", "gen_file", "gen_exe_file",
+    "GenerateFile", "savefile", "loadfile", "fopen", "qfopen", "start_process", "attach_process", "detach_process",
+    "exit_process", "run_to", "continue_process", "suspend_process", "load_debugger", "load_plugin", "run_plugin",
+    "load_and_run_plugin", "IDAPython_ExecScript", "exec_system_script", "exec_idc_script",
+})
+_GUARD_FORBIDDEN_API_PREFIXES = ("eval_idc", "gen_", "dbg_")
+# The two underscore attributes ordinary IDAPython needs: `ida_hexrays.ctree_visitor_t.__init__(self, flags)` is the
+# canonical way to start a visitor, and `__name__` is harmless. Every other attribute starting with `_` is refused
+# (`__class__`, `__dict__`, `__globals__`, `__subclasses__`, ... are how a script walks out of its namespace).
+_GUARD_ALLOWED_DUNDER_ATTRIBUTES = frozenset({"__init__", "__name__"})
+_GUARD_MAX_FINDINGS = 40
+
+
+def _guard_module_rule(name):
+    top = str(name).split(".")[0]
+    if top in _GUARD_FORBIDDEN_MODULES:
+        return "FORBIDDEN_IMPORT"
+    if top in _GUARD_ALLOWED_STDLIB or top in _GUARD_ALLOWED_IDA or top.startswith("ida_"):
+        return None
+    return "IMPORT_NOT_ALLOWED"
+
+
+def _guard_api_forbidden(name):
+    return name in _GUARD_FORBIDDEN_API or name.startswith(_GUARD_FORBIDDEN_API_PREFIXES)
+
+
+def _script_guard_findings(tree):
+    """The accident guard over a parsed script. Returns `(findings, total)`: findings is a list of
+    `{"rule", "name", "line", "column"}` (at most `_GUARD_MAX_FINDINGS`), total the number found; an empty list
+    means nothing was refused. A syntactic check on names: it cannot see a name built at run time."""
+    found = []
+
+    def add(rule, name, node):
+        found.append({"rule": rule, "name": str(name)[:80], "line": getattr(node, "lineno", None),
+                      "column": getattr(node, "col_offset", None)})
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                rule = _guard_module_rule(alias.name)
+                if rule:
+                    add(rule, alias.name, node)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                add("RELATIVE_IMPORT", "." * node.level + (node.module or ""), node)
+                continue
+            rule = _guard_module_rule(node.module or "")
+            if rule:
+                add(rule, node.module or "", node)
+            for alias in node.names:
+                if alias.name in _GUARD_FORBIDDEN_MODULES or _guard_api_forbidden(alias.name) \
+                        or alias.name in _GUARD_FORBIDDEN_BUILTINS or alias.name.startswith("_"):
+                    add("FORBIDDEN_IMPORTED_NAME", alias.name, node)
+        elif isinstance(node, ast.Name):
+            if node.id in _GUARD_FORBIDDEN_BUILTINS or _guard_api_forbidden(node.id):
+                add("FORBIDDEN_NAME", node.id, node)
+            elif node.id.startswith("__") and node.id != "__name__":
+                add("DUNDER_NAME", node.id, node)
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("_") and node.attr not in _GUARD_ALLOWED_DUNDER_ATTRIBUTES:
+                add("PRIVATE_ATTRIBUTE", node.attr, node)
+            elif node.attr in _GUARD_FORBIDDEN_MODULES or _guard_api_forbidden(node.attr):
+                add("FORBIDDEN_ATTRIBUTE", node.attr, node)
+    found.sort(key=lambda f: (f["line"] or 0, f["column"] or 0, f["rule"]))
+    unique, seen = [], set()
+    for item in found:
+        key = (item["rule"], item["name"], item["line"], item["column"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique[:_GUARD_MAX_FINDINGS], len(unique)
+
+
+def _script_refusal(error, status="ANALYSIS_LIMITED", **fields):
+    body = {"ok": False, "tool": "ida_script", "status": status, "error": error}
+    body.update(fields)
+    return body
+
+
+def _script_precheck(script):
+    """Every check that needs no IDA. Returns `(checked_script, None)` or `(None, refusal_body)`.
+
+    The order: type / size / encoding, then Python syntax (`compiled_by: harness_python`; the worker compiles
+    again with IDA's own interpreter), then the accident guard."""
+    if not isinstance(script, str) or not script.strip():
+        return None, _script_refusal("SCRIPT_INVALID", reason="SCRIPT_EMPTY",
+                                     detail="`script` must be a non-empty string of IDAPython source. Nothing was started.")
+    try:
+        raw = script.encode("utf-8")
+    except UnicodeEncodeError:
+        return None, _script_refusal("SCRIPT_INVALID", reason="SCRIPT_NOT_UTF8",
+                                     detail="The script cannot be encoded as UTF-8. Nothing was started.")
+    if len(raw) > _SCRIPT_MAX_BYTES:
+        return None, _script_refusal("SCRIPT_INVALID", reason="SCRIPT_TOO_LARGE", bytes=len(raw),
+                                     limit_bytes=_SCRIPT_MAX_BYTES, detail="The script is larger than the limit. Nothing was started.")
+    if "\x00" in script:
+        return None, _script_refusal("SCRIPT_INVALID", reason="SCRIPT_CONTAINS_NUL",
+                                     detail="The script contains a NUL character. Nothing was started.")
+    try:
+        tree = ast.parse(script, filename="<liebert_script>")
+        compile(tree, "<liebert_script>", "exec", dont_inherit=True)
+    except SyntaxError as exc:
+        return None, _script_refusal("SCRIPT_SYNTAX_ERROR", compiled_by="harness_python", line=exc.lineno,
+                                     offset=exc.offset, message=_redact(str(exc.msg))[:300],
+                                     detail="Nothing was started.")
+    except (ValueError, RecursionError, MemoryError) as exc:
+        return None, _script_refusal("SCRIPT_SYNTAX_ERROR", compiled_by="harness_python",
+                                     message=type(exc).__name__, detail="Nothing was started.")
+    findings, total = _script_guard_findings(tree)
+    if findings:
+        return None, _script_refusal(
+            "SCRIPT_GUARD_REFUSED", findings=findings, finding_count=total, guard=dict(_SCRIPT_GUARD),
+            detail=f"The script uses something the accident guard refuses. Nothing was started. {_SCRIPT_NOT_A_SANDBOX}")
+    return {
+        "raw": raw, "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+        "lines": script.count("\n") + (0 if script.endswith("\n") else 1),
+    }, None
+
+
+def _script_summary(script):
+    return {"sha256": script["sha256"], "bytes": script["bytes"], "lines": script["lines"], "guard": dict(_SCRIPT_GUARD)}
+
+
+def _redact_value(value, *, target=None):
+    """`_redact` over every string of a JSON value (keys are left alone). Returns `(value, changed)`."""
+    changed = False
+
+    def walk(item):
+        nonlocal changed
+        if isinstance(item, str):
+            clean = _redact(item, target=target)
+            changed = changed or clean != item
+            return clean
+        if isinstance(item, list):
+            return [walk(x) for x in item]
+        if isinstance(item, dict):
+            return {k: walk(v) for k, v in item.items()}
+        return item
+    return walk(value), changed
+
+
+def ida_script(path, script, *, timeout_seconds=_DEFAULT_SCRIPT_TIMEOUT_SECONDS, max_result_chars=60000,
+               max_stdout_chars=16384, max_memory_bytes=_SCRIPT_DEFAULT_MEMORY_BYTES, max_chars=60000,
+               backend="auto", cancellation_token=None):
+    """Run caller-written IDAPython against `path` in an idalib session on a DISCARDED COPY of its cached
+    database, and return the JSON value the script left in the variable `result`.
+
+    **Not a sandbox.** The script runs with your rights; the child process inherits the environment, the
+    network and the file system, and none of that is restricted (every answer says `NOT_ENFORCED`). An
+    accident guard refuses the usual mistakes before anything starts (imports outside `re struct math
+    collections itertools functools hashlib binascii json bisect heapq array typing string operator enum` and
+    `ida_* / idaapi / idc / idautils`; `open exec eval compile getattr setattr globals vars __import__`;
+    attributes starting with `_`; `idapro`, `open_database`, `close_database`, `save_database`; debugger,
+    file-writing and IDC-evaluating IDA calls; `ida_dbg` so the sample is never run). It is a syntactic check
+    and can be evaded; it is a guard against accidents, not against a script written to get out.
+
+    **Gate.** Off unless the environment variable `LIEBERT_RE_IDA_SCRIPT` is exactly `authorized` in the
+    environment this process was started from (`AUTHORIZATION_REQUIRED`, nothing started, otherwise).
+
+    **Backend.** idalib only: the interpreter named by `LIEBERT_RE_IDALIB_PYTHON`. `backend="idat"`, or an
+    idalib that is not configured or does not import, is `UNSUPPORTED` and nothing starts. The cached
+    database is never opened: a copy is, and the cache slot's hash is taken before and after (`CACHE_VIOLATION`,
+    slot dropped, no result, if it moved). A first call on a file also pays for the analysis in an earlier,
+    separate session (the `summary` session of `ida_query`).
+
+    **The script.** UTF-8 text of at most 64 KiB, run once with `exec`. Its answer is the variable `result`,
+    which must be JSON (`NaN` is not). `LIEBERT_CONTEXT` (a dict: `input_sha256`, `max_result_chars`) is in
+    scope. stdout and stderr are captured into a buffer of `max_stdout_chars` (the tail is returned); a
+    result is never read from stdout. Whatever the script does to the open database stays in the copy, which
+    is closed without saving; the answer is the state the script saw.
+
+    **Limits.** `timeout_seconds` (5..300, default 120) bounds the script session (the process tree is
+    killed; the slot is kept). `max_memory_bytes` (512 MiB..64 GiB, default 4 GiB) is polled against the
+    process tree's resident size; a host that cannot measure it is `RESOURCE_LIMIT_UNAVAILABLE` (fail closed).
+    `max_result_chars` bounds the script's `result` (larger: `PARTIAL`, `script_result_withheld`); `max_chars`
+    bounds the whole response and is never met by cutting the result: a result that does not fit is withheld
+    (`PARTIAL`, `TOO_LARGE_FOR_MAX_CHARS`; the evidence file holds it).
+
+    **Status vocabulary.** OK, PARTIAL (a result withheld because of a size limit; says which),
+    AUTHORIZATION_REQUIRED, UNSUPPORTED, TOOL_MISSING, PATH_REFUSED, NOT_FOUND, TIMEOUT
+    (`timed_out_stage: "script"`), CANCELLED, MEMORY_LIMIT, RESOURCE_LIMIT_UNAVAILABLE, CACHE_VIOLATION,
+    RESULT_PARSE_FAILED, ANALYSIS_LIMITED with `error` one of SCRIPT_INVALID, SCRIPT_SYNTAX_ERROR,
+    SCRIPT_GUARD_REFUSED, SCRIPT_EXCEPTION (redacted traceback and stdout tail), SCRIPT_NO_RESULT,
+    SCRIPT_RESULT_NOT_JSON, SCRIPT_HASH_MISMATCH, SCRIPT_COPY_MISMATCH, DATABASE_CHANGES_NOT_DISCARDED,
+    EVIDENCE_WRITE_FAILED (the result is withheld when the evidence record cannot be written) and the
+    environment errors of `ida_query`.
+
+    **What the answer claims.** `result_kind: "SCRIPT_REPORTED"`: the harness verified the input hash, that
+    this script text ran to completion inside IDA on this input, and that the cached database was unchanged.
+    `script_result` is the script's claim; the harness did not verify its content. The full record (script
+    text, worker result, stdout tail, signals) is saved under `dataset/evidence/ida_script/`.
+
+    No script is stored in this repository for any real product; examples in docs use code-built fixtures.
+    """
+    tool = "ida_script"
+    if os.environ.get(SCRIPT_GATE_ENV, "").strip() != SCRIPT_GATE_VALUE:
+        return _j({
+            "ok": False, "tool": tool, "status": "AUTHORIZATION_REQUIRED", "error": "SCRIPT_GATE_CLOSED",
+            "required_environment": f"{SCRIPT_GATE_ENV}={SCRIPT_GATE_VALUE}",
+            "detail": ("Running caller-written IDAPython is off by default. The operator opens it for this machine by "
+                       f"setting {SCRIPT_GATE_ENV}={SCRIPT_GATE_VALUE} in the environment the harness is started from. "
+                       "Nothing was started and nothing was read."),
+        })
+    if backend not in _BACKENDS:
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "UNKNOWN_BACKEND",
+                   "given": str(backend), "accepted": list(_BACKENDS)})
+    unsupported = {
+        "ok": False, "tool": tool, "status": "UNSUPPORTED", "error": "IDALIB_BACKEND_REQUIRED",
+        "reason": f"requires the idalib copy-on-open backend (set {IDALIB_PYTHON_ENV})",
+        "detail": ("ida_script runs only where a COPY of the cached database is opened and the cache slot is measured "
+                   "before and after, which is the idalib backend. It has no idat path. Nothing was started."),
+    }
+    if backend == "idat":
+        return _j(unsupported)
+    checked, refusal = _script_precheck(script)
+    if refusal:
+        return _j(refusal)
+    p, fail = _checked_path(path, tool, echo_path=False)
+    if fail:
+        return fail
+    if p.suffix.lower() in _DATABASE_SUFFIXES:
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "DATABASE_INPUT_NOT_SUPPORTED",
+                   "detail": "An existing IDA database is not accepted as input; pass the original binary (see ida_query)."})
+    if not _IDALIB_WORKER_SOURCE.is_file():
+        return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "IDA_WORKER_MISSING",
+                   "detail": "The packaged idalib worker is absent from this install (a packaging defect, not an IDA problem)."})
+    choice = _choose_backend("idalib")
+    if choice["failure"] is not None:
+        public = choice["failure"].get("idalib")
+        unsupported["idalib"] = public
+        if public and public.get("status") not in (None, "NOT_CONFIGURED"):
+            unsupported["reason"] = (f"requires the idalib copy-on-open backend; the interpreter named by "
+                                     f"{IDALIB_PYTHON_ENV} is not usable ({public.get('status')})")
+        return _j(unsupported)
+    from liebert_re.bounded_subprocess import _memory_monitor_usable
+    if not _memory_monitor_usable():
+        return _j({"ok": False, "tool": tool, "status": "RESOURCE_LIMIT_UNAVAILABLE", "error": "MEMORY_MONITOR_UNUSABLE",
+                   "detail": ("This host cannot measure process memory (psutil), so the memory limit could not be "
+                              "enforced. Nothing was started; the call fails closed.")})
+    info = dict(choice["info"], requested=str(backend))
+    timeout_seconds = _clamp(timeout_seconds, _MIN_SCRIPT_TIMEOUT_SECONDS, _MAX_SCRIPT_TIMEOUT_SECONDS,
+                             _DEFAULT_SCRIPT_TIMEOUT_SECONDS)
+    max_result_chars = _clamp(max_result_chars, 100, _MAX_RESPONSE_CHARS, 60000)
+    max_stdout_chars = _clamp(max_stdout_chars, 0, 65536, 16384)
+    max_memory_bytes = _clamp(max_memory_bytes, _SCRIPT_MIN_MEMORY_BYTES, _SCRIPT_MAX_MEMORY_BYTES,
+                              _SCRIPT_DEFAULT_MEMORY_BYTES)
+    max_chars = _clamp(max_chars, _SCRIPT_MIN_RESPONSE_CHARS, _MAX_RESPONSE_CHARS, 60000)
+    invocation = {"timeout_seconds": timeout_seconds, "max_result_chars": max_result_chars,
+                  "max_stdout_chars": max_stdout_chars, "max_memory_bytes": max_memory_bytes, "max_chars": max_chars}
+    profile = {"backend": "idalib", "python": choice["python"], "script": checked, "backend_info": info}
+    return _locked_call(tool, choice["engine_exe"], p, invocation, max_chars, cancellation_token, profile)
+
+
+def _script_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation_token, profile):
+    """`ida_script` under the slot lock: make sure the pristine database exists, then run the script session."""
+    tool = "ida_script"
+    summary = _script_summary(profile["script"])
+    slot.mkdir(parents=True, exist_ok=True)
+    for stale in slot.glob("work-*"):       # under the lock, any scratch directory here is an abandoned attempt
+        shutil.rmtree(stale, ignore_errors=True)
+    cache_state = "HIT"
+    if (slot / _DB_NAME).exists() and not _slot_is_healthy(slot):
+        _evict_slot(slot)
+        slot.mkdir(parents=True, exist_ok=True)
+        cache_state = "REBUILT"
+    elif not (slot / _DB_NAME).exists():
+        cache_state = "CREATED"
+    scratch_kept = False
+    try:
+        if cache_state != "HIT":
+            try:
+                _run_idalib_session(
+                    profile["python"], p, sha256, md5, slot, creating=True,
+                    invocation={"operation": "summary", "query": "", "max_results": 1, "offset": 0,
+                                "timeout_seconds": _MAX_CREATE_TIMEOUT_SECONDS},
+                    cancellation_token=cancellation_token)
+            except _StageFailure as failure:
+                failure.body.update(tool=tool, invocation=invocation, script=summary, failed_stage="first_analysis",
+                                    backend=profile["backend_info"], database_cache=cache_state)
+                raise
+        return _run_script_session(p, sha256, md5, slot, invocation, max_chars, cancellation_token, profile,
+                                   cache_state, summary)
+    except _StageFailure as failure:
+        scratch_kept = "scratch_retained" in failure.body
+        return failure.body
+    finally:
+        if not (slot / _DB_NAME).exists() and not scratch_kept:
+            shutil.rmtree(slot, ignore_errors=True)
+
+
+def _script_evidence(p, sha256, profile, job, envelope, signals, body):
+    """The full record of one script run, written whatever the outcome. Returns `(name, error)`."""
+    worker, _changed = _redact_value(envelope, target=p) if isinstance(envelope, dict) else (envelope, False)
+    record = {
+        "schema": 1, "tool": "ida_script", "target_sha256": sha256,
+        "script": {"sha256": profile["script"]["sha256"], "text": profile["script"]["raw"].decode("utf-8")},
+        "job": {k: v for k, v in job.items() if k not in ("output", "script_path", "ops_path")},
+        "worker_result": worker, "signals": signals, "response": body,
+    }
+    return _write_evidence(p, "script", record, directory=EVIDENCE_SCRIPT, stem=sha256[:16])
+
+
+def _run_script_session(p, sha256, md5, slot, invocation, max_chars, cancellation_token, profile, cache_state, summary):
+    """One idalib worker process running the script on a scratch copy of the slot database. Returns the finished
+    response dict (every ending is a response) or raises `_StageFailure` for an environment error."""
+    tool = "ida_script"
+    script = profile["script"]
+    work = slot / f"work-{uuid.uuid4().hex[:8]}"
+    work.mkdir()
+    job = {
+        "schema": 1, "mode": "script", "output": str(work / _IDALIB_RESULT_NAME), "database_name": _DB_NAME,
+        "log_name": _LOG_NAME, "max_result_bytes": _IDALIB_MAX_RESULT_BYTES,
+        "script_path": str(work / _SCRIPT_FILE_NAME), "script_sha256": script["sha256"], "input_sha256": sha256,
+        "max_result_chars": invocation["max_result_chars"], "max_stdout_chars": invocation["max_stdout_chars"],
+    }
+    keep_work = False
+    try:
+        base = {"tool": tool, "target_sha256": sha256, "invocation": invocation, "script": summary,
+                "backend": profile["backend_info"], "database_cache": cache_state}
+        execution = {
+            "session": "open_of_scratch_copy", "backend": "idalib", "copy_discarded": None,
+            "slot_database_integrity": None, "elapsed_seconds": None,
+            "timeout_seconds": invocation["timeout_seconds"], "memory_limit_bytes": invocation["max_memory_bytes"],
+            "memory_limit": "POLLED_PROCESS_TREE_RESIDENT_SIZE", "child_processes": "NOT_ENFORCED",
+            "network": "NOT_ENFORCED", "filesystem": "NOT_ENFORCED", "environment": "INHERITED",
+        }
+        context = {"envelope": None, "signals": None}
+
+        def respond(body):
+            """Finish a refusal or failure: its evidence record is written best effort, and a failed run's scratch
+            directory is kept only when the operator asked for that."""
+            nonlocal keep_work
+            if _keep_failed_scratch() and work.is_dir():
+                keep_work = True
+                body["scratch_retained"] = _retained_scratch(work, _cache_root(), "<CACHE>")
+            name, error = _script_evidence(p, sha256, profile, job, context["envelope"], context["signals"], body)
+            body["internal_evidence_name"] = name
+            body["evidence_write_error"] = error
+            return body
+
+        def refuse(status, error, **extra):
+            return respond({"ok": False, "status": status, "error": error, **base, "execution": execution, **extra})
+
+        (work / _SCRIPT_FILE_NAME).write_bytes(script["raw"])
+        try:
+            before = _sha256_md5(slot / _DB_NAME)[0]
+            shutil.copyfile(slot / _DB_NAME, work / _DB_NAME)
+            copy_hash = _sha256_md5(work / _DB_NAME)[0]
+        except OSError as exc:
+            raise _StageFailure(_EnvironmentFailure("IDA_DATABASE_UNREADABLE", exc).body(
+                tool, invocation=invocation, target_sha256=sha256)) from exc
+        if copy_hash != before:
+            return refuse("ANALYSIS_LIMITED", "SCRIPT_COPY_MISMATCH", database_sha256_slot=before,
+                          database_sha256_copy=copy_hash,
+                          detail="The scratch copy of the cached database differs from the original; nothing was run.")
+        execution["scratch_copy_sha256"] = copy_hash
+        started = time.monotonic()
+        try:
+            cp, _command = _launch_idalib(
+                profile["python"], work, job, timeout_seconds=invocation["timeout_seconds"],
+                cancellation_token=cancellation_token, max_memory_bytes=invocation["max_memory_bytes"])
+        except _EnvironmentFailure as failure:
+            raise _StageFailure(failure.body(tool, invocation=invocation, target_sha256=sha256)) from failure
+        execution["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        try:
+            after = _sha256_md5(slot / _DB_NAME)[0]
+        except OSError:
+            after = None
+        integrity = {"database_sha256_before": before, "database_sha256_after": after, "unchanged": after == before,
+                     "opened": "a copy in the scratch directory"}
+        execution["slot_database_integrity"] = integrity
+        if after != before:
+            _evict_slot(slot)
+            return refuse("CACHE_VIOLATION", "SCRIPT_CACHE_VIOLATION",
+                          detail=("The cached database file differed after the session (or could not be read again), "
+                                  "although only a copy of it was opened. The cache slot was deleted and no result is "
+                                  "returned; the next call analyses the input again."))
+        if getattr(cp, "resource_limit_unavailable", False):
+            return refuse("RESOURCE_LIMIT_UNAVAILABLE", "MEMORY_MONITOR_UNUSABLE",
+                          detail="The memory limit could not be enforced on this host; the process tree was stopped.")
+        if getattr(cp, "memory_exceeded", False):
+            return refuse("MEMORY_LIMIT", "SCRIPT_MEMORY_LIMIT_EXCEEDED_PROCESS_TREE_TERMINATED",
+                          memory_limit_bytes=invocation["max_memory_bytes"],
+                          detail="The script session exceeded its memory limit and its process tree was terminated. No result.")
+        if cp.cancelled:
+            return refuse("CANCELLED", "SCRIPT_CANCELLED_PROCESS_TREE_TERMINATED")
+        if cp.timed_out:
+            return refuse("TIMEOUT", "SCRIPT_TIMEOUT_PROCESS_TREE_TERMINATED", timeout_seconds=invocation["timeout_seconds"],
+                          timed_out_stage="script",
+                          detail=("The script session did not finish and its process tree was terminated. The cache slot "
+                                  "was kept (only a copy was open). Do not read a timeout as 'nothing found'."))
+        envelope, _first, error, signals = _verdict_idalib(cp, work, creating=False, operations=[])
+        signals["elapsed_seconds"] = execution["elapsed_seconds"]
+        signals["database_integrity"] = integrity
+        context.update(envelope=envelope, signals=signals)
+        execution["copy_discarded"] = signals.get("database_closed_without_save") is True
+        if error:
+            extra = {"signals": signals}
+            if isinstance(envelope, dict) and envelope.get("error"):
+                extra["worker_error"] = envelope.get("error")
+                if envelope.get("traceback"):
+                    extra["worker_traceback"] = _redact(str(envelope["traceback"]), work=work, target=p)[-2000:]
+            failure = _failure_response(tool, "RESULT_PARSE_FAILED" if error == "RESULT_PARSE_FAILED" else "ANALYSIS_LIMITED",
+                                        error, operation="script", signals=signals, cp=cp, work=work, target=p, extra=extra)
+            failure.update(base)
+            failure["execution"] = execution
+            return respond(failure)
+        outcome = envelope.get("script") if isinstance(envelope, dict) else None
+        if not isinstance(outcome, dict):
+            return refuse("ANALYSIS_LIMITED", "SCRIPT_OUTCOME_MISSING", signals=signals,
+                          detail="The worker finished without reporting what the script did.")
+        provenance = _provenance(sha256, md5, outcome)
+        if provenance["status"] == "MISMATCH":
+            _evict_slot(slot)
+            return refuse("ANALYSIS_LIMITED", "IDA_INPUT_HASH_MISMATCH", provenance=provenance, signals=signals,
+                          detail=("The database's recorded input is not the file that was hashed; the slot was dropped and "
+                                  "no result is returned."))
+        status = outcome.get("status")
+        tail, _ = _redact_value(str(outcome.get("stdout_tail") or ""), target=p)
+        stdout = {"stdout_tail": tail, "stdout_chars": outcome.get("stdout_chars"),
+                  "stdout_truncated": outcome.get("stdout_truncated")}
+        common = {"signals": signals, "provenance": provenance, **stdout}
+        if status == "HASH_MISMATCH":
+            return refuse("ANALYSIS_LIMITED", "SCRIPT_HASH_MISMATCH", **common,
+                          detail="The script file the worker read is not the text that was submitted; it was not run.")
+        if status == "UNREADABLE":
+            return refuse("ANALYSIS_LIMITED", "SCRIPT_UNREADABLE", **common)
+        if status == "SYNTAX_ERROR":
+            return refuse("ANALYSIS_LIMITED", "SCRIPT_SYNTAX_ERROR", compiled_by="ida_python", line=outcome.get("line"),
+                          message=_redact(str(outcome.get("error") or ""), work=work, target=p)[:300], **common)
+        if status == "EXCEPTION":
+            exc = outcome.get("exception") if isinstance(outcome.get("exception"), dict) else {}
+            return refuse("ANALYSIS_LIMITED", "SCRIPT_EXCEPTION", **common, exception={
+                "type": str(exc.get("type"))[:120],
+                "message": _redact(str(exc.get("message") or ""), work=work, target=p)[:2000],
+                "traceback": _redact(str(exc.get("traceback") or ""), work=work, target=p)[-6000:]},
+                detail=("The script raised. The database copy was discarded. No result. stdout_tail holds what it printed "
+                        "before failing."))
+        if status == "NO_RESULT":
+            return refuse("ANALYSIS_LIMITED", "SCRIPT_NO_RESULT", **common,
+                          detail="The script finished without setting `result`. stdout never substitutes for it.")
+        if status == "NOT_JSON":
+            return refuse("ANALYSIS_LIMITED", "SCRIPT_RESULT_NOT_JSON", result_type=str(outcome.get("result_type"))[:80],
+                          message=_redact(str(outcome.get("error") or ""))[:300], **common,
+                          detail="`result` is not a JSON value (NaN and infinity are not JSON either).")
+        if status not in ("OK", "TOO_LARGE"):
+            return refuse("ANALYSIS_LIMITED", "SCRIPT_OUTCOME_UNRECOGNISED", status_seen=str(status)[:80], **common)
+        body = {
+            "ok": True, "status": "OK", **base, "provenance": provenance, "signals": signals, "execution": execution,
+            "result_kind": "SCRIPT_REPORTED", **stdout,
+            "claim_basis": (
+                "Harness verified: the input hash, that this script text completed inside IDA on this input, and that the "
+                "cached database was unchanged. script_result is the script's claim; the harness did not verify its "
+                "content. The script may have modified the database inside the session (the copy was discarded); the "
+                "result reflects that state."),
+            "note": "Not a sandbox. " + _SCRIPT_NOT_A_SANDBOX,
+        }
+        if status == "TOO_LARGE":
+            body.update(status="PARTIAL", script_result_withheld="TOO_LARGE_FOR_MAX_RESULT_CHARS",
+                        script_result_chars=outcome.get("result_chars"), max_result_chars=invocation["max_result_chars"],
+                        limitations=["the script's result is larger than max_result_chars and was not returned (never truncated)"])
+        else:
+            value, changed = _redact_value(outcome.get("result"), target=p)
+            body.update(script_result=value, script_result_redacted=changed, script_result_chars=outcome.get("result_chars"))
+        name, error = _script_evidence(p, sha256, profile, job, envelope, signals, body)
+        if error and status == "OK":
+            # The record is the audit trail of a run that cannot be undone; without it the result is withheld.
+            return {"ok": False, "status": "ANALYSIS_LIMITED", "error": "EVIDENCE_WRITE_FAILED", **base,
+                    "execution": execution, "evidence_write_error": error, "result_withheld": True,
+                    "detail": ("The script ran to completion, but its evidence record could not be written, so its "
+                               "result is withheld. Fix the evidence directory and run it again.")}
+        body["internal_evidence_name"] = name
+        body["evidence_write_error"] = error
+        if len(_j(body)) > max_chars and "script_result" in body:
+            body.pop("script_result")
+            body.update(status="PARTIAL", script_result_withheld="TOO_LARGE_FOR_MAX_CHARS",
+                        limitations=[f"the result does not fit max_chars={max_chars} and was not returned (never truncated); "
+                                     "the evidence file holds the full record"])
+            if len(_j(body)) > max_chars:
+                body["stdout_tail"], body["stdout_tail_withheld"] = "", True
+        return body
+    finally:
+        if not keep_work:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------

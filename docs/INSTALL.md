@@ -5,7 +5,7 @@
 Only what you need to run and develop the analysis code. Concretely:
 
 - **74<!-- count:modules --> Python modules** in the `liebert_re/` package — the analysis code itself.
-- **116<!-- count:test_files --> test files** in `tests/` (`tests/test_*.py`), plus `conftest.py` and an empty `__init__.py`
+- **117<!-- count:test_files --> test files** in `tests/` (`tests/test_*.py`), plus `conftest.py` and an empty `__init__.py`
   (the latter is required so the flat top-level modules resolve on `sys.path`).
 - No challenge-solution scripts: they are not distributed in this public package (see [SOLVED_INDEX.md](../SOLVED_INDEX.md) for the record of what was solved).
 - Documentation, licence, CI configuration, and issue templates.
@@ -235,6 +235,32 @@ never opened in place**: a copy is opened in a scratch directory and the cache f
 and after (`CACHE_VIOLATION` if it moved). A timed-out or cancelled session therefore does not cost the
 cache slot. The result comes back through a JSON file, never from the worker's stdout (IDA plugins print
 banners and warnings there).
+
+### Caller-written IDAPython: `ida_script` (gated, idalib only, not a sandbox)
+
+`ida_script` (CLI `idascript`, also `tool run ida_script`) runs IDAPython that the caller supplies, once, on a
+discarded copy of the cached database, and returns the JSON value the script leaves in the variable `result`.
+It needs two things, and without either nothing starts:
+
+1. **The key.** `LIEBERT_RE_IDA_SCRIPT=authorized` in the environment the harness is started from. It is off by
+   default (`AUTHORIZATION_REQUIRED`). Setting it is your decision that scripts written by someone else (a
+   model, for instance) may run on this machine:
+
+   ```powershell
+   $env:LIEBERT_RE_IDA_SCRIPT = "authorized"
+   python -m liebert_re idascript .\sample.bin --script-file .\count_functions.py
+   ```
+
+2. **idalib** (the previous section): `LIEBERT_RE_IDALIB_PYTHON` must name an interpreter in which
+   `import idapro` works. `--backend idat`, or an unconfigured or broken idalib, is `UNSUPPORTED`: the idalib
+   backend is the one that opens a copy and measures the cache before and after.
+
+The script, in full: `import idautils` / `result = len(list(idautils.Functions()))`. Stdout is captured, never
+read as the result. **This is not a sandbox.** The script runs with your rights; the child process inherits your
+environment, the network and the file system, and every answer says `NOT_ENFORCED` for those. A syntactic guard
+refuses the usual accidents (see `docs/CAPABILITIES_AND_LIMITS.md` for the list and the documented gap); a script
+written to get out can. Do not run scripts you would not run as yourself. Records of every run, including the
+script text, are written under `dataset/evidence/ida_script/` (not tracked by git).
 
 ## The heavy test tier
 
