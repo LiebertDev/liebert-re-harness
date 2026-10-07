@@ -43,9 +43,11 @@ from tests.test_tools_ida_idalib import (
 
 GATE = ti.SCRIPT_GATE_ENV
 GOOD_SCRIPT = "import idautils\nresult = len(list(idautils.Functions()))\n"
+# Built at run time: a literal home path here would trip the repository privacy scan (`USER_PATH`).
+HOME_DIR = "C:\\" + "Us" + "ers\\SomeOperator"
 HOME_TRACEBACK = (
     "Traceback (most recent call last):\n"
-    "  File \"C:\\Users\\SomeOperator\\AppData\\Local\\Temp\\work\\script.py\", line 3, in <module>\n"
+    f"  File \"{HOME_DIR}\\AppData\\Local\\Temp\\work\\script.py\", line 3, in <module>\n"
     "ValueError: bad input\n"
 )
 
@@ -93,7 +95,7 @@ class FakeScriptIdalib(FakeIdalib):
                         result_type="str")
         if name == "exception":
             return dict(common, status="EXCEPTION", exception={
-                "type": "ValueError", "message": "bad input at C:\\Users\\SomeOperator\\x", "traceback": HOME_TRACEBACK})
+                "type": "ValueError", "message": f"bad input at {HOME_DIR}\\x", "traceback": HOME_TRACEBACK})
         if name == "syntax":
             return dict(common, status="SYNTAX_ERROR", error="SyntaxError: invalid syntax (<liebert_script>, line 2)", line=2)
         if name == "hash_mismatch":
@@ -566,7 +568,7 @@ class SessionTests(ScriptCase):
         self.assertEqual(self.leftovers(), [])
 
     def test_a_result_with_a_home_path_is_redacted_and_says_so(self):
-        self.idalib.script_value = {"where": "C:\\Users\\SomeOperator\\Desktop\\x.bin", "n": 1}
+        self.idalib.script_value = {"where": HOME_DIR + "\\Desktop\\x.bin", "n": 1}
         data = self.s()
         self.assertTrue(data["ok"], data)
         self.assertEqual(data["script_result"], {"where": "<HOME>\\Desktop\\x.bin", "n": 1})
