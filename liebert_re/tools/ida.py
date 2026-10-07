@@ -3034,6 +3034,8 @@ def ida_annotations_apply(path, plan=None, allow_partial=False, timeout_seconds=
     Status vocabulary: OK, PARTIAL_FAILURE, ALL_FAILED, ABORTED_ATOMIC, PRECONDITION_FAILED, VERIFICATION_FAILED,
     ANNOTATED_PROMOTION_BLOCKED, JOURNAL_UNWRITABLE, TOOL_MISSING, PATH_REFUSED, NOT_FOUND, TIMEOUT, CANCELLED,
     ANALYSIS_LIMITED, RESULT_PARSE_FAILED, INVALID_PLAN. Refusals say `fixable`.
+
+    CLI: python-only: writes a new annotation version into the IDA scope store; the generic path never writes
     """
     tool = "ida_annotations_apply"
     if isinstance(plan, str):
@@ -3555,6 +3557,8 @@ def ida_annotations_purge(path, label=None, targets=None, confirm_token=None, ca
     Every deletion is journalled (`purge_prepared`, synced, before the first delete; `purge_committed` after).
     Statuses: REPORT_ONLY, OK, PARTIAL_FAILURE, STALE_CONFIRMATION, JOURNAL_UNWRITABLE, ANALYSIS_LIMITED
     (named error, `fixable`), PATH_REFUSED, NOT_FOUND, READ_FAILED.
+
+    CLI: python-only: deletes annotation versions on confirmation; the generic path never deletes
     """
     tool = "ida_annotations_purge"
     if not _valid_label(label):

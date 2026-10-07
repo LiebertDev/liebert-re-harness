@@ -598,6 +598,10 @@ class WorkspaceIndex:
 
 
 def workspace_index(operation="status", path=".", query="", max_files=MAX_FILES_DEFAULT, max_results=50):
+    """Top-level workspace-index dispatcher; returns JSON text.
+
+    CLI: python-only: 'build' and 'refresh' write the workspace index database; the generic path never writes state
+    """
     index = WorkspaceIndex(path)
     if operation in {"build", "refresh"}:
         result = index.refresh(max_files=max_files)

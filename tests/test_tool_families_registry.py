@@ -68,8 +68,15 @@ def test_tool_modules_ignores_unpublished_names(tmp_path):
     assert tf.tool_modules(package) == {}
 
 
-def test_python_only_declarations_is_empty_for_this_slice():
-    assert tf.python_only_declarations() == {}
+def test_python_only_declarations_are_the_write_capable_tools_and_the_sentinel():
+    # Names, not a count: each of these writes or deletes state, or is the tool_missing sentinel. Adding to
+    # this set is a decision to keep a tool off the generic `tool run` path.
+    declared = tf.python_only_declarations()
+    assert set(declared) == {
+        "asar_inspect", "binary_patch", "claim_index", "evidence_index", "ida_annotations_apply",
+        "ida_annotations_purge", "rizin_patch_apply", "tool_missing", "workspace_index",
+    }
+    assert all(reason.strip() for reason in declared.values())
 
 
 def test_python_only_declaration_parsing(tmp_path):

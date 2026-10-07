@@ -269,7 +269,7 @@ return a named tool-missing status when absent. Function inventory
   `sieve`, `labgate`, `labregister`, `sievestatus`, `rzbinstatus`, `diestatus`, `yarastatus`, `upxstatus`,
   `il2cppstatus`, `dexstatus`, `jvmstatus`, `capa`, `capastatus`, `ida`, `idamicrocode`, `idastatus`, `idaannotations`,
   `kerneltriage`, `kerneldispatch`, `kerneliat`, `kernelcallbacks`, `ioctldecode`, `ghidrastatus`, `ghidrafacts`, `unpack`,
-  `scan`, `minidump`, `pdata`, `trailing`, `capabilities`; 39 subcommands, from `cli.py`):
+  `scan`, `minidump`, `pdata`, `trailing`, `tool`, `capabilities`; 40 subcommands, from `cli.py`):
   `workspace.py`, `bounded_subprocess.py`, `cli.py`.
 
 ### Dynamic and emulation

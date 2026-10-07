@@ -806,4 +806,8 @@ def _wasm_instructions(data,p,code_range,imports,max_items):
 
 _MISSING={'dex_decompiler':['JADX','androguard'],'android_resources':['apktool','aapt2'],'pcap_analyzer':['tshark','Wireshark'],'minidump_analyzer':['WinDbg','cdb'],'pdb_symbols':['LLVM PDB tools','DIA SDK'],'wasm_analyzer':['WABT','wasmparser'],'unreal_assets':['FModel-compatible tooling'],'unity_assets':['AssetRipper','UnityPy'],'asar_parser':['ASAR tooling'],'rar_7z':['7-Zip','libarchive']}
 def tool_missing(target,required_capability,reason='Required specialist analyzer is not registered'):
+    """Sentinel result for a capability this install does not have; reads and writes nothing.
+
+    CLI: python-only: sentinel other tools return in place of an answer, not an analysis to run
+    """
     key=required_capability.lower().replace(' ','_'); return _json({'ok':True,'status':'TOOL_MISSING','target':target,'required_capability':required_capability,'reason':reason,'known_candidates':_MISSING.get(key,[]),'installation_performed':False})

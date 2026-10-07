@@ -752,6 +752,8 @@ def rizin_patch_apply(path, file_offset, patched_bytes: str, output_path=None, e
     INVALID_PATCH_BYTES, INVALID_EXPECTED_BYTES, EXPECTED_BYTES_MISMATCH,
     OUTPUT_PATH_EQUALS_INPUT, READ_FAILED, WRITE_FAILED,
     WRITE_VERIFICATION_FAILED.
+
+    CLI: python-only: writes a patched copy of a binary to disk; the generic path never writes files
     """
     try:
         p = safe_path(path)
@@ -1348,6 +1350,8 @@ def binary_patch(path, operation="apply", patches=None, dry_run=True, backup=Tru
     BACKUP_NOT_FOUND, RESTORE_HASH_MISMATCH, UNKNOWN_OPERATION,
     CRC_FIX_WINDOW_MUST_BE_4_BYTES, UNSUPPORTED_CRC_VARIANT, TARGET_CRC_REQUIRED,
     INVALID_TARGET_CRC, CRC_FIX_UNSOLVABLE, CRC_FIX_VERIFICATION_FAILED.
+
+    CLI: python-only: patches binaries on disk (apply, backup, restore); the generic path never writes files
     """
     op = str(operation or "apply").strip().lower()
     if op not in ("apply", "restore"):

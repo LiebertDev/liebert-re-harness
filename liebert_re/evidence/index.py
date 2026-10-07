@@ -1171,6 +1171,10 @@ def _evidence_uid_for_path(path, root=None):
 
 def evidence_index(operation="status", root=None, target="", tool="", query="", record_id=None, path="",
                     limit=20, offset=0, max_files=300_000, db_path=None, kind="", value="", strict=False):
+    """Top-level evidence-index dispatcher; returns JSON text.
+
+    CLI: python-only: 'build' and 'refresh' write the evidence index database; the generic path never writes state
+    """
     index = EvidenceIndex(root, db_path=db_path)
     if operation in {"build", "refresh"}:
         result = index.refresh(max_files=max_files)
