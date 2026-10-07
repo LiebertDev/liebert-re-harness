@@ -231,10 +231,10 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
   `signals.log_network_text_found` is a scan of log text for listed markers; a lookup that writes none of them
   is not seen, and the answer states that limit.
 
-### Ghidra (headless, slice 1: status and program facts)
+### Ghidra (headless: status, program facts and decompilation of selected functions)
 
-- `tools/ghidra.py`: `ghidra_status` and `ghidra_program_facts`, driving Ghidra's own `support/analyzeHeadless`.
-  CLI: `ghidrastatus` and `ghidrafacts`.
+- `tools/ghidra.py`: `ghidra_status`, `ghidra_program_facts` and `ghidra_decompile`, driving Ghidra's own
+  `support/analyzeHeadless`. CLI: `ghidrastatus`, `ghidrafacts` and `ghidradecompile`.
 - `ghidra_status` discovers the install (`GHIDRA_INSTALL_DIR`, `GHIDRA_HOME`, `PATH`, then known locations) and
   reports the version, the Java the install needs and the Java found. It does NOT launch Ghidra
   (`launcher_verified: false`): `OK` means files present and Java new enough, not that a run will succeed.
@@ -243,6 +243,17 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
   (what analysis found in the time bound, not a complete inventory) and imported library names. A fact the
   script could not read is `null` and named, never guessed. The source file's SHA-256 is compared before and
   after; a changed source is refused (`SOURCE_MODIFIED`).
+- `ghidra_decompile` runs the same import and default analysis, then decompiles at most 16 functions you name
+  (an address written `0x...` or an integer, or a function name; a string not written `0x...` is always a name)
+  with Ghidra's own decompiler, read-only: no transaction is opened and nothing is saved. Each request gets
+  one entry: `address`, `name`, `signature`, `decompiled_signature`, `c_code`, `decompile_completed`, `warnings`
+  and `error`. A function that is not found, whose name is shared by several functions
+  (`AMBIGUOUS_FUNCTION_NAME`, with their addresses), that times out per function (default 30 s) or fails to
+  decompile has `c_code: null` and the reason; the call is `OK` only when every function decompiled, `PARTIAL`
+  when some did and `ANALYSIS_LIMITED` when none did. A `warnings` entry such as `halt_baddata` means Ghidra
+  met bytes it could not decode: that C is not evidence of what the code does. The C is Ghidra's inference,
+  not source. Every call pays the import and analysis again (about two minutes for a system executable
+  measured on one machine), so ask for the functions you need in one call.
 - **Exit code 0 is not success.** Measured: when the post-script fails, `analyzeHeadless` still exits 0. The
   wrapper scans the log for failure markers and requires the result file to exist, parse and carry the
   script's completion flag; anything less is `ANALYSIS_LIMITED`.
@@ -251,7 +262,8 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
 - Each run has its own temporary project (Ghidra locks per project), placed outside the checkout because Ghidra
   refuses a project path with a dot-prefixed element.
 - Why it was added: it is free and runs in CI (an IDA licence does not), and "answer the same question two
-  ways" in the assessment order needs a second engine. Not here: decompilation, cross-references, writes.
+  ways" in the assessment order needs a second engine. Not here: cross-references, writes, a decompile of
+  every function, a persistent project that skips re-analysis.
 
 ### External-engine wrappers actually present
 
@@ -274,8 +286,8 @@ return a named tool-missing status when absent. Function inventory
   `liebert-re` CLI (`identify`, `probe`, `pe`, `disasm`, `packer`, `die`, `rzbin`, `flirt`, `flirtinventory`,
   `sieve`, `labgate`, `labregister`, `sievestatus`, `rzbinstatus`, `diestatus`, `yarastatus`, `upxstatus`,
   `il2cppstatus`, `dexstatus`, `jvmstatus`, `capa`, `capastatus`, `ida`, `idamicrocode`, `idastatus`, `idaannotations`,
-  `kerneltriage`, `kerneldispatch`, `kerneliat`, `kernelcallbacks`, `ioctldecode`, `ghidrastatus`, `ghidrafacts`, `unpack`,
-  `scan`, `minidump`, `pdata`, `trailing`, `tool`, `capabilities`; 40 subcommands, from `cli.py`):
+  `kerneltriage`, `kerneldispatch`, `kerneliat`, `kernelcallbacks`, `ioctldecode`, `ghidrastatus`, `ghidrafacts`, `ghidradecompile`, `unpack`,
+  `scan`, `minidump`, `pdata`, `trailing`, `tool`, `capabilities`; 41 subcommands, from `cli.py`):
   `workspace.py`, `bounded_subprocess.py`, `cli.py`.
 
 ### Dynamic and emulation
@@ -418,8 +430,9 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
   formats. Only `MDMP`-format dumps are read.
 - No decompiler and no cross-reference engine of its own. With a licensed IDA Pro 9.x on the
   machine, `ida_query` supplies decompiled pseudocode and cross-references from IDA's analysis of
-  the real bytes (read-only, symbol-server lookups off); without IDA there is neither, and the Ghidra
-  wrapper does not decompile or cross-reference (facts only). `recover/native_xref.py` resolves only over an IR the caller supplies.
+  the real bytes (read-only, symbol-server lookups off); without IDA there are no IDA answers. The Ghidra wrapper
+  decompiles selected functions (`ghidra_decompile`, at most 16 per call) but has no cross-reference
+  query. `recover/native_xref.py` resolves only over an IR the caller supplies.
 - The kernel operations above were measured on real drivers only in a
   measurement session, with no corpus kept in the repository; the test suite
   uses synthetic fixtures, including one in

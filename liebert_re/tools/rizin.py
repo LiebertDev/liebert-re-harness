@@ -1,5 +1,5 @@
-"""rizin headless static-analysis adapter -- a third, independent decompiler
-engine alongside IDA (tools_ida.py (upstream-only; not part of the published package)) and Ghidra (tools_decompiler.py (upstream-only; not part of the published package)).
+"""rizin headless static-analysis adapter -- a third, independent analysis
+engine (function discovery and disassembly; it does not decompile) alongside IDA (tools_ida.py (upstream-only; not part of the published package)) and Ghidra (tools_decompiler.py (upstream-only; not part of the published package)).
 
 Why this exists: on a real packed corpus binary
 (benchmarks/windows_native_ladder/corpus/tier2/decryption_key1/elevenpack.exe)

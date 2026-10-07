@@ -244,3 +244,11 @@ _entropy. It exists because a real target was 65% trailing data that nothing in
 this package could see, and that tail was the reason a disassembler returned
 named functions. Its other helpers share names that already existed, and the set
 is deduplicated by name, so they add nothing. Digest recomputed from the source.
+Updated again: the published tool set gained ghidra_decompile (liebert_re/tools/ghidra.py), the
+read-only decompilation of at most 16 functions chosen by address or name through Ghidra's own
+decompiler, reached from the CLI as `ghidradecompile`. It was already a FAMILIES["native"] name with no
+implementation here; it needs more than a path, so it was taken out of the path-only tier
+(NATIVE_PATH_ONLY_TOOLS) and sits in the coordinate-requiring one. Public names: one
+(ghidra_decompile). The module's private helpers are not part of the pin. The Java script it drives
+(ghidra_scripts/DecompileFunctions.java) is a data file and adds no names. No new Python module.
+Digest recomputed from the source.

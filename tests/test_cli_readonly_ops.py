@@ -1,4 +1,4 @@
-"""CLI wiring for four read-only operations: kerneltriage, ghidrastatus, ghidrafacts, idaannotations.
+"""CLI wiring for five read-only operations: kerneltriage, ghidrastatus, ghidrafacts, ghidradecompile, idaannotations.
 
 Same contract as the existing ``ida`` commands: JSON on stdout, a ``command`` key added, refusals
 visible as the module's own status/error and exit code 3 where the CLI maps them so. Nothing here
@@ -22,7 +22,7 @@ from liebert_re.recover.owned_binary_fixtures import build_owned_pe_sections
 from liebert_re.tools import ghidra
 
 REPO_ROOT = Path(tools_workspace.WORKSPACE_ROOT)
-COMMANDS = ("kerneltriage", "ghidrastatus", "ghidrafacts", "idaannotations")
+COMMANDS = ("kerneltriage", "ghidrastatus", "ghidrafacts", "ghidradecompile", "idaannotations")
 _TMP = None
 ROOT = Path()
 
@@ -127,6 +127,48 @@ class GhidraFactsCliTests(unittest.TestCase):
                 code, body = run("ghidrafacts", str(sample))
             self.assertEqual(body["status"], status)
             self.assertNotEqual(code, 0)
+
+
+class GhidraDecompileCliTests(unittest.TestCase):
+    def test_functions_and_timeouts_are_passed_through(self):
+        sample = ROOT / "d.exe"
+        sample.write_bytes(b"MZ")
+        canned = json.dumps({"ok": True, "tool": "ghidra_decompile", "status": "OK", "source_unchanged": True,
+                             "functions": []})
+        with mock.patch.object(ghidra, "ghidra_decompile", return_value=canned) as fn:
+            code, body = run("ghidradecompile", str(sample), "--function", "0x1000", "main",
+                             "--function-timeout", "12", "--timeout", "99")
+        self.assertEqual(code, 0)
+        self.assertEqual((body["command"], body["tool"]), ("ghidradecompile", "ghidra_decompile"))
+        self.assertEqual(fn.call_args.args[1], ["0x1000", "main"])
+        self.assertEqual(fn.call_args.kwargs, {"per_function_timeout_seconds": 12, "timeout_seconds": 99})
+
+    def test_defaults_leave_the_whole_run_bound_to_the_module(self):
+        sample = ROOT / "e.exe"
+        sample.write_bytes(b"MZ")
+        canned = json.dumps({"ok": True, "tool": "ghidra_decompile", "status": "OK"})
+        with mock.patch.object(ghidra, "ghidra_decompile", return_value=canned) as fn:
+            run("ghidradecompile", str(sample), "--function", "main")
+        self.assertEqual(fn.call_args.kwargs, {"per_function_timeout_seconds": 30, "timeout_seconds": None})
+
+    def test_missing_file_is_a_visible_refusal(self):
+        code, body = run("ghidradecompile", str(ROOT / "absent.exe"), "--function", "main")
+        self.assertEqual((code, body["status"], body["error"]), (3, "PATH_REFUSED", "FILE_NOT_FOUND"))
+
+    def test_a_request_the_module_refuses_is_a_usage_exit_not_a_run(self):
+        sample = ROOT / "f.exe"
+        sample.write_bytes(b"MZ")
+        code, body = run("ghidradecompile", str(sample), "--function", *["0x1"] * 17)
+        self.assertEqual((code, body["status"], body["error"]), (2, "TOOL_USAGE", "TOO_MANY_FUNCTIONS"))
+
+    def test_partial_and_limited_answers_are_not_swallowed(self):
+        sample = ROOT / "g2.exe"
+        sample.write_bytes(b"MZ")
+        for status, ok, expected_code in (("PARTIAL", True, 0), ("ANALYSIS_LIMITED", False, 3)):
+            canned = json.dumps({"ok": ok, "tool": "ghidra_decompile", "status": status})
+            with mock.patch.object(ghidra, "ghidra_decompile", return_value=canned):
+                code, body = run("ghidradecompile", str(sample), "--function", "main")
+            self.assertEqual((code, body["status"]), (expected_code, status))
 
 
 class IdaAnnotationsCliTests(unittest.TestCase):
