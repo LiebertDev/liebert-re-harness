@@ -1,9 +1,9 @@
-"""Canonical evidence-guard checks live in claim_guard, not teacher.py.
+"""Canonical evidence-guard checks live in claim_guard, not in an upstream orchestration file.
 
-Ported from the upstream development repo: one test method,
-``test_teacher_has_no_unreachable_evidence_guard_body``, was removed here
-because it read ``teacher.py``'s source text directly off disk to assert a
-structural property of that file -- ``teacher.py`` is an upstream,
+Ported from the upstream development repo: one test method, which checked
+an upstream orchestration file's source layout, was removed here
+because it read that file's source text directly off disk to assert a
+structural property of it -- that file is an upstream,
 project-specific orchestration file that is not part of this package, so the
 assertion has no target here. Every other test in this file exercises
 ``claim_guard`` itself and is unaffected.

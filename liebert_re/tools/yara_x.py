@@ -280,7 +280,7 @@ def yara_x_scan(
     tmp_dir = None
     try:
         if rules_text:
-            tmp_dir = tempfile.TemporaryDirectory(prefix="teacher_yarax_rule_")
+            tmp_dir = tempfile.TemporaryDirectory(prefix="liebert_yarax_rule_")
             rule_file = Path(tmp_dir.name) / "inline_rules.yar"
             rule_file.write_text(rules_text, encoding="utf-8")
             rules_arg = str(rule_file)

@@ -42,7 +42,7 @@ def il2cpp_mapper(binary_path, metadata_path, operation="summary", query="", max
     exe = _il2cppdumper()
     if not exe:
         return _j({"ok": False, "tool": "il2cpp_mapper", "error": "IL2CPPDUMPER_TOOL_MISSING"})
-    with tempfile.TemporaryDirectory(prefix="teacher_il2cpp_") as td:
+    with tempfile.TemporaryDirectory(prefix="liebert_il2cpp_") as td:
         cp = run_bounded_process(
             [exe, str(bp), str(mp), td],
             timeout_seconds=180,

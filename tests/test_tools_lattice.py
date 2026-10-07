@@ -89,7 +89,7 @@ class ToolsLatticeMpmathFailClosedTests(unittest.TestCase):
     """When the optional 'mpmath' backend is absent, the mpmath-dependent
     operations must fail closed with a structured TOOL_MISSING result rather
     than raising (which, because tools_lattice is eager-imported at
-    teacher.py startup, would otherwise crash the whole harness). The
+    harness startup, would otherwise crash the whole harness). The
     exact-Fraction 'is_reduced' operation must keep working. mpmath is
     installed in this environment, so absence is simulated by patching the
     _HAVE_MPMATH flag both modules read."""

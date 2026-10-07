@@ -1,7 +1,7 @@
-"""Ported from the upstream development repo: one test method,
-``test_teacher_schema_exposes_config_schema_operation``, was removed here
-because it read ``teacher.py``'s source text directly off disk to assert
-that a tool declaration line exists in it -- ``teacher.py`` is an upstream,
+"""Ported from the upstream development repo: one test method, which checked
+an upstream orchestration file's tool declaration, was removed here
+because it read that file's source text directly off disk to assert
+that a tool declaration line exists in it -- that file is an upstream,
 project-specific orchestration file that is not part of this package, so
 the assertion has no target here. Every other test in this file exercises
 ``tools_formats.structured_inspect`` itself and is unaffected.
