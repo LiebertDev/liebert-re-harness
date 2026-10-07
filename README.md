@@ -143,7 +143,7 @@ import is the exact failure this project is organised against:
   distributed in this public package; it is documentation-only.
 - **Ghidra cross-references, and normalisation of answers across engines.** Not here (a Ghidra wrapper for status, program facts and decompilation of selected functions *is* here, see the engine table). An IDA
   wrapper *is* here (`ida_query`, `ida_microcode_cfg`, `ida_type_member_offset`, `ida_patch_plan` (a plan only), `ida_annotations`, `ida_status`, and a write path: `ida_rename_plan` / `ida_set_comments_plan` then `ida_annotations_apply`, with `ida_annotations_purge`); the
-  disassembly-listing operation is not. `docs/INSTALL.md` is the authority on which
+  decompiler-comment operation is not. `docs/INSTALL.md` is the authority on which
   engines this package can actually drive.
 - **Function discovery and engine cross-check.** The exception directory is read
   for x64 PEs (`pe_runtime_functions`, `pe_function_extent`, CLI `pdata`;

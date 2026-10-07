@@ -79,7 +79,9 @@ _TEXT_SHAPES = {
 # file imports each tool lazily; tests/test_tools_ida.py pins the two lists equal.
 _IDA_OPERATIONS = ("summary", "list_functions", "segments", "function_at_address",
                    "decompile_function", "xrefs_to", "imports_exports", "strings",
-                   "read_bytes", "xrefs_from", "callers_of_import")
+                   "read_bytes", "xrefs_from", "callers_of_import",
+                   "disasm_range", "basic_blocks", "callgraph", "stack_frame", "local_variables",
+                   "find_bytes", "find_immediate", "list_structs", "get_struct", "flirt_signatures")
 # The microcode maturity levels ida_microcode_cfg accepts (same lazy-import reason; pinned by the same test file).
 _IDA_MATURITIES = ("MMAT_GENERATED", "MMAT_PREOPTIMIZED", "MMAT_LOCOPT", "MMAT_CALLS",
                    "MMAT_GLBOPT1", "MMAT_GLBOPT2", "MMAT_GLBOPT3", "MMAT_LVARS")
@@ -784,9 +786,9 @@ def _build_parser():
     add("capastatus", _capa_status, "report whether capa is reachable, from where, its version and which backends it accepts", path=False)
     # IDA is licensed and headless here. The first look at a file pays for IDA's own analysis (the database is
     # cached by the file's SHA-256 under dataset/ida_cache/, size-capped), later calls reuse it.
-    sp = add("ida", _ida, "query a binary through headless IDA Pro: functions, segments, imports, strings, xrefs, decompiled code")
+    sp = add("ida", _ida, "query a binary through headless IDA Pro: functions, segments, imports, strings, xrefs, decompiled code, disassembly ranges, basic blocks, call graph, stack frame, local variables, byte and immediate search, structs, FLIRT signatures")
     sp.add_argument("--operation", default="summary", choices=_IDA_OPERATIONS, help="what to ask (default: summary)")
-    sp.add_argument("--query", default="", metavar="TEXT", help="a symbol name or virtual address (function_at_address, decompile_function, xrefs_to, xrefs_from), an import name (callers_of_import), a text filter (strings), or ADDRESS SIZE / JSON {\"address\",\"size\"} (read_bytes, size 1-4096)")
+    sp.add_argument("--query", default="", metavar="TEXT", help="a symbol name or virtual address (function_at_address, decompile_function, xrefs_to, xrefs_from, basic_blocks, callgraph, stack_frame, local_variables), an import name (callers_of_import), a text filter (strings, list_structs), a type name (get_struct), ADDRESS SIZE / JSON {\"address\",\"size\"} (read_bytes, size 1-4096), ADDRESS COUNT / JSON {\"address\",\"count\"|\"end\"} (disasm_range, count 1-2000), a byte pattern such as \"48 8B ?? 05\" (find_bytes), a number (find_immediate); find_bytes and find_immediate also take JSON with start/end/segment, callgraph JSON {\"function\",\"depth\",\"max_nodes\"}")
     sp.add_argument("--max-results", type=int, default=200, help="1-1000")
     sp.add_argument("--offset", type=int, default=0, help="page offset for the listing operations")
     sp.add_argument("--max-chars", type=int, default=60000, help="bound on the JSON response")

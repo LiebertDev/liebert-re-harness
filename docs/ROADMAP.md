@@ -83,7 +83,9 @@ hidden feature.
   ships (`liebert_re/tools/ida.py`: `ida_query`, `ida_status`; summary, function list,
   segments, function-at-address, Hex-Rays pseudocode, cross-references to and from an
   address or name, import callers, byte reads, imports/exports,
-  strings; database cache keyed by input hash and size-capped; PDB downloads off). It
+  strings, and the read-only listings `disasm_range`, `basic_blocks`, `callgraph`, `stack_frame`,
+  `local_variables`, `find_bytes`, `find_immediate`, `list_structs` / `get_struct` and
+  `flirt_signatures`; database cache keyed by input hash and size-capped; PDB downloads off). It
   needs a licensed IDA Pro 9.x, so CI cannot exercise it: the default tier tests the
   wrapper against a stand-in `idat`, and one `heavy` class runs the real thing locally.
   Also shipped: `ida_type_member_offset`, `ida_patch_plan` (a plan, checked by hashing the
@@ -94,8 +96,11 @@ hidden feature.
   `regular` and `repeatable` comments. **What is left of round 2 is the CLI binding.**
   `case_purge` integration is not done: the annotated purge does not read case state today, so a case
   becoming `solved` or `abandoned` does not trigger it.
-  **Still open:** `ida_disasm_listing` (read-only, next
-  round), Ghidra cross-references (`ghidra_status`, `ghidra_program_facts` and
+  **The IDA disassembly listing is done** as `ida --operation disasm_range` (a bounded range of
+  the database; an `undefined` or `data` item is listed as such and never disassembled), not as a
+  separate `ida_disasm_listing` tool. What the listings do not do: resolve an indirect call
+  (`callgraph` only counts them), apply or plan a FLIRT signature, search for a constant in any
+  encoding but the one IDA decoded. **Still open:** Ghidra cross-references (`ghidra_status`, `ghidra_program_facts` and
   `ghidra_decompile`, the read-only decompile of up to 16 selected functions, have landed),
   and normalising answers across engines. `ida_query` also has a second backend, idalib
   (`backend="idalib"` or `auto`, `LIEBERT_RE_IDALIB_PYTHON`), for the same read-only questions; the other IDA tools stay on idat.

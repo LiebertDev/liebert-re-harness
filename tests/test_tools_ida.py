@@ -993,6 +993,11 @@ class WorkerFileTests(IdaCase):
             self.assertNotIn(api, source, api)
 
 
+# A query each operation accepts (the default `start` is a symbol name, which the operations below it would refuse).
+_VALID_QUERY = {"read_bytes": "0x1000 8", "disasm_range": "0x1000 8", "find_bytes": "48 8B ?? 05",
+                "find_immediate": "0x5A827999", "list_structs": "", "flirt_signatures": ""}
+
+
 def _load_worker():
     """The worker executed against stub `ida_*` modules (it is only ever run
     inside idat, so this is the one way to test its logic without IDA)."""
@@ -1614,7 +1619,7 @@ class StricterVerdictTests(IdaCase):
         for operation in ti._ALLOWED_OPERATIONS:
             for state in ("CREATED", "HIT"):
                 with self.subTest(operation=operation, state=state):
-                    data = self.q(operation, "0x1000 8" if operation == "read_bytes" else "start")
+                    data = self.q(operation, _VALID_QUERY.get(operation, "start"))
                     self.assertTrue(data["ok"], data)
                     self.assertEqual(data["status"], "OK")
                     self.assertEqual(data["operation"], operation)
@@ -2245,6 +2250,33 @@ class IdaRealInstallTests(unittest.TestCase):
         self.assertEqual([(x["to"], x["kind"], x["is_call"]) for x in out["items"]], [("0x140001000", "code", True)])
         missing = self.q("callers_of_import", "CreateFileW")
         self.assertEqual(missing["error"], "IMPORT_NOT_FOUND", missing)
+
+    def test_the_read_only_listings_on_the_synthetic_function(self):
+        """The ten listing operations against the real engine, on the 8-byte function plus its caller."""
+        rows = self.q("disasm_range", "0x140001000 5")
+        self.assertTrue(rows["ok"], rows)
+        self.assertEqual([r["mnemonic"] for r in rows["items"]], ["push", "mov", "xor", "pop", "retn"])
+        self.assertEqual(rows["items"][0]["bytes_hex"], "55")
+        self.assertEqual(self.q("disasm_range", "0x10 4")["error"], "ADDRESS_NOT_MAPPED")
+        blocks = self.q("basic_blocks", "start")
+        self.assertTrue(blocks["ok"], blocks)
+        self.assertEqual([(b["start"], b["type"], b["successor_count"]) for b in blocks["items"]], [("0x140001000", "return", 0)])
+        graph = self.q("callgraph", "start")
+        self.assertTrue(graph["ok"], graph)
+        self.assertEqual((graph["root"], graph["node_count"], graph["indirect_call_total"]), ("0x140001000", 1, 0))
+        frame = self.q("stack_frame", "start")
+        self.assertIn(frame.get("error", "OK"), ("OK", "NO_STACK_FRAME"), frame)
+        variables = self.q("local_variables", "start")
+        self.assertTrue(variables["ok"] or variables["error"].startswith("HEXRAYS_"), variables)
+        found = self.q("find_bytes", "55 48 89 E5")
+        self.assertEqual([(m["address"], m["function"]["name"]) for m in found["items"]], [("0x140001000", "start")], found)
+        self.assertEqual(self.q("find_bytes", "DE AD BE EF 01 02")["items"], [])
+        self.assertTrue(self.q("find_immediate", "0x5A827999")["ok"])
+        self.assertTrue(self.q("list_structs")["ok"])
+        self.assertEqual(self.q("get_struct", "NoSuchTypeAnywhere")["error"], "TYPE_NOT_FOUND")
+        signatures = self.q("flirt_signatures")
+        self.assertTrue(signatures["ok"], signatures)
+        self.assertEqual(signatures["signature_count"], len(signatures["items"]))
 
     def test_a_decompile_does_not_change_the_cached_database(self):
         self.q("summary")

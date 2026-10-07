@@ -315,9 +315,23 @@ _ALLOWED_OPERATIONS = (
     "summary", "list_functions", "segments", "function_at_address",
     "decompile_function", "xrefs_to", "imports_exports", "strings",
     "read_bytes", "xrefs_from", "callers_of_import",
+    "disasm_range", "basic_blocks", "callgraph", "stack_frame", "local_variables",
+    "find_bytes", "find_immediate", "list_structs", "get_struct", "flirt_signatures",
 )
 # `read_bytes` takes 1..this many bytes; the worker enforces the same window.
 _READ_BYTES_MAX_SIZE = 4096
+# The bounds of the listing operations added after `read_bytes`; the worker enforces the same ones.
+_U64 = 0xFFFFFFFFFFFFFFFF
+_DISASM_MAX_ROWS = 2000
+_CALLGRAPH_MAX_DEPTH = 4
+_CALLGRAPH_MAX_NODES = 500
+_CALLGRAPH_DEFAULT_DEPTH = 2
+_CALLGRAPH_DEFAULT_NODES = 100
+_PATTERN_MAX_TOKENS = 256
+_FUNCTION_QUERY_MAX = 512
+_TYPE_NAME_QUERY_MAX = 256
+_SEGMENT_NAME_MAX = 64
+_FUNCTION_QUERY_OPERATIONS = ("basic_blocks", "stack_frame", "local_variables")
 _DATABASE_SUFFIXES = {".i64", ".idb", ".id0", ".id1", ".id2", ".nam", ".til"}
 _LOOSE_COMPONENTS = (".id0", ".id1", ".id2", ".nam", ".til")
 
@@ -349,7 +363,9 @@ _WORKER_BOOKKEEPING = {"ok", "tool", "script_completed", "engine_input_sha256", 
 # Operations whose `offset` indexes the result sequence, so a response that
 # had to be trimmed can report where to resume.
 _PAGED_OPERATIONS = {"list_functions", "segments", "xrefs_to", "imports_exports", "strings",
-                     "xrefs_from", "callers_of_import"}
+                     "xrefs_from", "callers_of_import", "disasm_range", "basic_blocks", "callgraph", "stack_frame",
+                     "local_variables", "find_bytes", "find_immediate", "list_structs", "get_struct",
+                     "flirt_signatures"}
 
 
 def _read_bytes_request_problem(query):
@@ -383,6 +399,187 @@ def _read_bytes_request_problem(query):
     if count is None or not 1 <= count <= _READ_BYTES_MAX_SIZE:
         return "INVALID_SIZE"
     return None
+
+
+def _to_int(value):
+    """An int from a JSON number or a numeric string (decimal or 0x hex); never from a bool or a float."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip(), 0)
+        except ValueError:
+            return None
+    return None
+
+
+def _json_fields(text, allowed):
+    """The dict when `text` is a JSON object whose keys are all in `allowed`, else None."""
+    try:
+        request = json.loads(text)
+    except Exception:  # noqa: BLE001
+        return None
+    return request if isinstance(request, dict) and set(request) <= set(allowed) else None
+
+
+def _address_ok(value):
+    ea = _to_int(value)
+    return ea is not None and 0 <= ea < _U64
+
+
+def _range_fields_problem(fields):
+    """The error code for the optional start / end / segment fields of a find_* request, or None."""
+    start, end, segment = fields.get("start"), fields.get("end"), fields.get("segment")
+    if segment is not None:
+        if not isinstance(segment, str) or not segment.strip() or len(segment) > _SEGMENT_NAME_MAX \
+                or start is not None or end is not None:
+            return "INVALID_RANGE"
+        return None
+    low = high = None
+    if start is not None:
+        if not _address_ok(start):
+            return "INVALID_ADDRESS"
+        low = _to_int(start)
+    if end is not None:
+        high = _to_int(end)
+        if high is None or not 0 < high <= _U64:
+            return "INVALID_ADDRESS"
+    if low is not None and high is not None and high <= low:
+        return "INVALID_RANGE"
+    return None
+
+
+def _disasm_range_request_problem(query):
+    text = (query or "").strip()
+    bad = "INVALID_DISASM_RANGE_REQUEST"
+    if text.startswith("{"):
+        fields = _json_fields(text, ("address", "count", "end"))
+        if fields is None:
+            return bad
+        address, count, end = fields.get("address"), fields.get("count"), fields.get("end")
+    else:
+        parts = text.replace(",", " ").split()
+        if len(parts) != 2:
+            return bad
+        address, count, end = parts[0], parts[1], None
+    if address is None or (count is None) == (end is None):
+        return bad
+    if not _address_ok(address):
+        return "INVALID_ADDRESS"
+    if count is not None:
+        number = _to_int(count)
+        return None if number is not None and 1 <= number <= _DISASM_MAX_ROWS else "INVALID_COUNT"
+    stop = _to_int(end)
+    return None if stop is not None and _to_int(address) < stop <= _U64 else "INVALID_END_ADDRESS"
+
+
+def _function_query_problem(query):
+    text = (query or "").strip()
+    return None if text and len(text) <= _FUNCTION_QUERY_MAX else "FUNCTION_REQUIRED"
+
+
+def _callgraph_request_problem(query):
+    text = (query or "").strip()
+    depth, nodes = _CALLGRAPH_DEFAULT_DEPTH, _CALLGRAPH_DEFAULT_NODES
+    if text.startswith("{"):
+        fields = _json_fields(text, ("function", "depth", "max_nodes"))
+        if fields is None or not isinstance(fields.get("function"), str):
+            return "INVALID_CALLGRAPH_REQUEST"
+        function = fields["function"].strip()
+        if "depth" in fields:
+            depth = _to_int(fields["depth"])
+        if "max_nodes" in fields:
+            nodes = _to_int(fields["max_nodes"])
+    else:
+        function = text
+    if _function_query_problem(function):
+        return "FUNCTION_REQUIRED"
+    if depth is None or not 1 <= depth <= _CALLGRAPH_MAX_DEPTH:
+        return "INVALID_DEPTH"
+    if nodes is None or not 1 <= nodes <= _CALLGRAPH_MAX_NODES:
+        return "INVALID_MAX_NODES"
+    return None
+
+
+def _find_bytes_request_problem(query):
+    text = (query or "").strip()
+    fields = {}
+    if text.startswith("{"):
+        fields = _json_fields(text, ("pattern", "start", "end", "segment"))
+        if fields is None or not isinstance(fields.get("pattern"), str):
+            return "INVALID_FIND_BYTES_REQUEST"
+        pattern = fields["pattern"]
+    else:
+        pattern = text
+    tokens = pattern.split()
+    if not 1 <= len(tokens) <= _PATTERN_MAX_TOKENS:
+        return "INVALID_PATTERN"
+    for token in tokens:
+        if token not in ("?", "??") and (len(token) != 2 or any(c not in "0123456789abcdefABCDEF" for c in token)):
+            return "INVALID_PATTERN"
+    if all(token in ("?", "??") for token in tokens):
+        return "INVALID_PATTERN"
+    return _range_fields_problem(fields)
+
+
+def _find_immediate_request_problem(query):
+    text = (query or "").strip()
+    fields = {}
+    if text.startswith("{"):
+        fields = _json_fields(text, ("value", "start", "end", "segment"))
+        if fields is None or "value" not in fields:
+            return "INVALID_FIND_IMMEDIATE_REQUEST"
+        raw = fields["value"]
+    else:
+        raw = text
+    value = _to_int(raw)
+    if value is None or not 0 <= value <= _U64:
+        return "INVALID_VALUE"
+    return _range_fields_problem(fields)
+
+
+def _printable_name_problem(query, required, error):
+    text = (query or "").strip()
+    if (required and not text) or len(text) > _TYPE_NAME_QUERY_MAX or not text.isprintable():
+        return error
+    return None
+
+
+# what the caller should have sent, for the refusal's `detail` (nothing was started)
+_QUERY_FORMS = {
+    "disasm_range": "JSON {\"address\": \"0x...\", \"count\": N} or {\"address\": \"0x...\", \"end\": \"0x...\"}, "
+                    f"or the text \"0x... N\", with 1 <= N <= {_DISASM_MAX_ROWS}",
+    "callgraph": "a function name or address, or JSON {\"function\": ..., \"depth\": "
+                 f"1-{_CALLGRAPH_MAX_DEPTH}, \"max_nodes\": 1-{_CALLGRAPH_MAX_NODES}}}",
+    "find_bytes": "a pattern of hex bytes with ? / ?? wildcards and at least one concrete byte "
+                  f"(at most {_PATTERN_MAX_TOKENS} tokens), or JSON {{\"pattern\", \"start\"?, \"end\"?, \"segment\"?}}",
+    "find_immediate": "a number 0 .. 2**64-1 (decimal or 0x hex), or JSON {\"value\", \"start\"?, \"end\"?, \"segment\"?}",
+    "get_struct": f"a type name of at most {_TYPE_NAME_QUERY_MAX} printable characters",
+    "list_structs": f"an optional name filter of at most {_TYPE_NAME_QUERY_MAX} printable characters",
+    "flirt_signatures": "empty (this operation takes no query)",
+    **{name: f"a function name or address (1..{_FUNCTION_QUERY_MAX} characters)" for name in _FUNCTION_QUERY_OPERATIONS},
+}
+
+_QUERY_CHECKS = {
+    "disasm_range": _disasm_range_request_problem,
+    "callgraph": _callgraph_request_problem,
+    "find_bytes": _find_bytes_request_problem,
+    "find_immediate": _find_immediate_request_problem,
+    "get_struct": lambda q: _printable_name_problem(q, True, "INVALID_TYPE_NAME"),
+    "list_structs": lambda q: _printable_name_problem(q, False, "INVALID_FILTER"),
+    "flirt_signatures": lambda q: "UNEXPECTED_QUERY" if (q or "").strip() else None,
+    **{name: _function_query_problem for name in _FUNCTION_QUERY_OPERATIONS},
+}
+
+
+def _query_request_problem(operation, query):
+    """The error code the worker would give for a malformed `query` of a listing operation added after
+    `read_bytes`, or None. Same grammar as the worker's request readers; checked here too so a bad request
+    never starts IDA."""
+    check = _QUERY_CHECKS.get(operation)
+    return check(query) if check else None
 
 
 # --------------------------------------------------------------------------
@@ -1162,7 +1359,8 @@ def _fit(body, max_chars):
             body["decompiled"] = text[:keep]
             trimmed = True
             rendered = _j(body)
-    list_keys = [k for k in ("items", "exports", "loaded_ranges", "unloaded_ranges") if isinstance(body.get(k), list)]
+    list_keys = [k for k in ("items", "nodes", "exports", "loaded_ranges", "unloaded_ranges")
+                 if isinstance(body.get(k), list)]
     while len(rendered) > max_chars and any(body.get(k) for k in list_keys):
         for key in list_keys:
             if body.get(key):
@@ -1198,6 +1396,11 @@ def _success_response(tool, p, sha256, md5, operation, data, *, cache_state, sig
         limitations.append(
             f"the microcode listing was cut at {body.get('instructions_returned')} of "
             f"{body.get('instruction_count')} instructions (max_results); block edges are complete"
+        )
+    if body.get("nodes_truncated"):
+        limitations.append(
+            f"the call graph reached its node cap of {body.get('max_nodes')}: {body.get('dropped_node_count')} "
+            "further functions were not added and the edges to them are not listed"
         )
     head = {
         "ok": True, "tool": tool, "status": "OK",
@@ -1307,6 +1510,34 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
     * `imports_exports`     IDA's own import resolution plus entry points.
     * `strings`             IDA's string list; a non-empty `query` filters
                             case-insensitively on the decoded text.
+    * `disasm_range`        `query` is JSON `{"address": "0x...", "count": N}` (N <= 2000), `{"address",
+                            "end"}` or the text "0x... N". Rows say what each item is: `instruction`
+                            (mnemonic and operands, no comments), `data`, `undefined` (never
+                            disassembled) or `inside_item`; the walk stops at the end of the mapped
+                            segments (`stop_reason`).
+    * `basic_blocks`        `query` is a function name or address. IDA's flow chart: start, end, type
+                            and successor / predecessor starts of every block.
+    * `callgraph`           `query` is a function name or address, or JSON `{"function", "depth" (1-4),
+                            "max_nodes" (1-500)}`. Nodes (address, name, import or not) and edges
+                            (`items`, paged); calls through a register or a non-import memory operand
+                            are counted per node (`indirect_call_count`), never resolved.
+    * `stack_frame`         `query` is a function name or address. Frame sizes, IDA's landmark offsets
+                            and the members with offset, size, type and region (local, saved
+                            registers, return address, argument); no frame is `NO_STACK_FRAME`.
+    * `local_variables`     same `query`. The decompiler's variable list (name, type, argument or
+                            not, location); no decompiler or a failed decompile is an error.
+    * `find_bytes`          `query` is a pattern ("48 8B ?? 05": hex bytes and ? / ?? wildcards) or
+                            JSON `{"pattern", "start"?, "end"?, "segment"?}`. Matches in address
+                            order with the function containing each; `max_results` caps the matches.
+    * `find_immediate`      `query` is a number (0 .. 2**64-1) or JSON `{"value", "start"?, "end"?,
+                            "segment"?}`. Instructions with that immediate operand, by IDA's own
+                            immediate search; the same constant written negated or sign-extended is
+                            a different number and is not found.
+    * `list_structs`        a non-empty `query` filters the local type library's struct and union
+                            names; size and member count each.
+    * `get_struct`          `query` is a type name. Members with offset, size and type text.
+    * `flirt_signatures`    no `query`. The FLIRT signature list with each signature's state and
+                            matched-function count (listing only; nothing is applied).
 
     `max_results` is clamped to 1..1000; `offset` pages the operations that
     list; `next_offset` is null once the end is reached. `timeout_seconds` is
@@ -1371,6 +1602,12 @@ def _ida_query(path, operation, query, max_results, offset, timeout_seconds, max
                     f"text \"0x... N\", with 1 <= size <= {_READ_BYTES_MAX_SIZE}. Nothing was started."
                 ),
             })
+    problem = _query_request_problem(operation, query)
+    if problem:
+        return _j({
+            "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": problem, "path": relative(p),
+            "detail": f"`query` for {operation} must be {_QUERY_FORMS[operation]}. Nothing was started.",
+        })
     if p.suffix.lower() in _DATABASE_SUFFIXES:
         return _j({
             "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "DATABASE_INPUT_NOT_SUPPORTED",
