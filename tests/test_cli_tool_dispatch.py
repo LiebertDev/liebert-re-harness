@@ -228,3 +228,140 @@ def test_plain_text_from_a_str_tool_is_enveloped_and_bytes_are_decoded_or_refuse
 def test_no_per_tool_text_shape_remains_for_tool_run():
     assert cli._shape(cli._build_parser().parse_args(["tool", "run", "binary_strings"])) is None
     assert "binary_strings" not in cli._TEXT_SHAPES
+
+
+# ---- text tools: failure lines carry a recognised status prefix; empty results are distinguishable ----
+
+def _corrupt_import_pe(path):
+    import struct
+
+    from liebert_re.recover.owned_binary_fixtures import build_owned_pe_with_rsds
+    build_owned_pe_with_rsds(path)
+    data = bytearray(path.read_bytes())
+    struct.pack_into("<II", data, 88 + 112 + 8, 0x90000000, 40)  # import data directory -> outside the image
+    path.write_bytes(bytes(data))
+
+
+def test_text_tool_failure_through_the_envelope_is_ok_false_with_a_status(capsys, workspace):
+    _corrupt_import_pe(workspace / "bad.exe")
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "pe_imports",
+                    "--args", json.dumps({"path": str(workspace / "bad.exe")}))
+    assert out["tool"] == "pe_imports" and out["ok"] is False and out["status"] == "ANALYSIS_LIMITED"
+    assert out["text"].startswith("IMPORT_DIRECTORY_UNREADABLE") and "empty" not in out
+    assert code == 3
+
+
+def test_empty_text_result_through_the_envelope_is_ok_true_and_marked_empty(capsys, workspace):
+    (workspace / "blob.bin").write_bytes(b"\x00\x01needle-string-here\x00")
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "binary_strings",
+                    "--args", json.dumps({"path": str(workspace / "blob.bin"), "contains": "absent-needle"}))
+    assert code == 0 and out["ok"] is True and out["status"] == "OK" and out["empty"] is True
+    assert out["text"] == "EMPTY_RESULT: No strings found." and out["classified"] is False
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "binary_strings",
+                    "--args", json.dumps({"path": str(workspace / "blob.bin"), "contains": "needle"}))
+    assert code == 0 and out["ok"] is True and "empty" not in out  # a real listing is not marked empty
+
+
+def test_empty_prefix_and_failure_codes_are_pinned_between_cli_and_tools():
+    from liebert_re.tools import binary
+    assert cli._TEXT_EMPTY_PREFIX == binary.EMPTY_RESULT_PREFIX
+    assert binary.DOTNET_METADATA_UNREADABLE in cli._TEXT_LIMITED_PREFIXES
+    assert binary.DISASSEMBLY_FAILED in cli._TEXT_LIMITED_PREFIXES
+    assert binary.IMPORT_DIRECTORY_UNREADABLE in cli._TEXT_LIMITED_PREFIXES
+    assert binary.EXPORT_DIRECTORY_UNREADABLE in cli._TEXT_LIMITED_PREFIXES
+
+
+def test_every_empty_sentence_of_the_text_tools_carries_the_prefix(workspace, monkeypatch):
+    import sys
+    import types
+
+    from liebert_re.recover.owned_binary_fixtures import build_owned_pe_with_rsds
+    from liebert_re.tools import binary
+    root = workspace
+    monkeypatch.setattr(binary, "safe_path", lambda p: Path(p))
+    monkeypatch.setattr(binary, "relative", lambda p: str(p))
+    (root / "plain.bin").write_bytes(b"\x00" * 16)
+    assert binary.binary_strings(str(root / "plain.bin")) == "EMPTY_RESULT: No strings found."
+    assert binary.find_binaries(str(root)) == "EMPTY_RESULT: No binary found."
+    assert binary.search_binary_bytes(str(root / "plain.bin"), "AA BB") == "EMPTY_RESULT: No matches."
+    build_owned_pe_with_rsds(root / "x.exe")
+    assert binary.pe_imports(str(root / "x.exe")) == "EMPTY_RESULT: No import table."
+    assert binary.pe_exports(str(root / "x.exe")) == "EMPTY_RESULT: No export table."
+    assert binary.dotnet_metadata(str(root / "x.exe")) == "EMPTY_RESULT: No CLR/.NET header present."
+    # a CLR header whose TypeDef table is empty, and one whose metadata cannot be read (fake dnfile, no real assembly)
+    monkeypatch.setattr(binary, "_pe", lambda p: types.SimpleNamespace(OPTIONAL_HEADER=types.SimpleNamespace(
+        DATA_DIRECTORY=[types.SimpleNamespace(VirtualAddress=1)] * 15)))
+    fake = types.ModuleType("dnfile")
+    fake.dnPE = lambda p: types.SimpleNamespace(net=types.SimpleNamespace(
+        mdtables=types.SimpleNamespace(TypeDef=types.SimpleNamespace(rows=[]))))
+    monkeypatch.setitem(sys.modules, "dnfile", fake)
+    assert binary.dotnet_metadata(str(root / "x.exe")) == "EMPTY_RESULT: .NET assembly parsed, but TypeDef table is empty."
+    fake.dnPE = lambda p: types.SimpleNamespace(net=types.SimpleNamespace(mdtables=None))
+    out = binary.dotnet_metadata(str(root / "x.exe"))
+    assert out.startswith("DOTNET_METADATA_UNREADABLE: .NET metadata incomplete or failed: ")
+    assert cli._decode(out, None, "dotnet_metadata")["status"] == "ANALYSIS_LIMITED"
+
+
+def test_disassembly_with_nothing_decoded_is_a_limited_failure_not_an_empty_answer(monkeypatch):
+    from liebert_re.tools import binary
+    monkeypatch.setattr(binary, "_dpe_open", lambda *a, **k: (
+        {"md": None, "data": b"", "start_offset": 0, "base": 0}, None))
+    out = binary.disassemble_pe("x")
+    assert out == "DISASSEMBLY_FAILED: No instruction could be decoded."
+    body = cli._decode(out, cli._TEXT_SHAPES["disasm"])
+    assert body["ok"] is False and body["status"] == "ANALYSIS_LIMITED" and "empty" not in body
+
+
+def test_direct_commands_mark_an_empty_listing_too():
+    body = cli._decode("EMPTY_RESULT: No import table.", cli._TEXT_SHAPES["imports"])
+    assert body["ok"] is True and body["empty"] is True and body["status"] == "OK"
+    assert cli._decode("EMPTY_RESULT: No export table.", cli._TEXT_SHAPES["exports"])["empty"] is True
+    assert cli._decode("No import table.", cli._TEXT_SHAPES["imports"])["error"] == "UNCLASSIFIED_OUTPUT"
+
+
+# ---- authenticode_signature: JSON on success and on failure, parsed from the PowerShell stdout ----
+
+_PS_OK = json.dumps({"Status": "Valid", "StatusMessage": "Signature verified.", "SignerSubject": "CN=Example Signer",
+                     "Issuer": "CN=Example CA", "Thumbprint": "AB" * 20, "TimestamperSubject": None})
+
+
+def _fake_powershell(monkeypatch, *, stdout="", stderr="", returncode=0):
+    import types
+
+    from liebert_re.tools import binary
+    monkeypatch.setattr(binary, "os", types.SimpleNamespace(name="nt"))  # only os.name is read on this path
+    monkeypatch.setattr(binary, "run_bounded_process", lambda *a, **k: types.SimpleNamespace(
+        launch_failed=False, cancelled=False, timed_out=False, stdout=stdout, stderr=stderr, returncode=returncode))
+
+
+def _signature(capsys, workspace, monkeypatch, **fake):
+    (workspace / "s.exe").write_bytes(b"MZ")
+    _fake_powershell(monkeypatch, **fake)
+    return run(capsys, "--workspace", str(workspace), "tool", "run", "authenticode_signature",
+               "--args", json.dumps({"path": str(workspace / "s.exe")}))
+
+
+def test_authenticode_success_is_json_with_unknown_fields_as_none(capsys, workspace, monkeypatch):
+    code, out = _signature(capsys, workspace, monkeypatch, stdout=_PS_OK + "\n")
+    assert code == 0 and out["ok"] is True and out["status"] == "OK" and out["signature_status"] == "Valid"
+    assert out["signer"] == "CN=Example Signer" and out["issuer"] == "CN=Example CA"
+    assert out["timestamper"] is None and out["raw"] == _PS_OK and "text" not in out
+    partial = json.dumps({"Status": "NotSigned", "StatusMessage": "The file is not digitally signed."})
+    code, out = _signature(capsys, workspace, monkeypatch, stdout=partial)
+    assert code == 0 and out["signature_status"] == "NotSigned"
+    assert out["signer"] is None and out["issuer"] is None and out["thumbprint"] is None and out["timestamper"] is None
+
+
+def test_authenticode_unparseable_output_and_command_failure_are_json_failures(capsys, workspace, monkeypatch):
+    code, out = _signature(capsys, workspace, monkeypatch, stdout="Status : Valid")
+    assert code == 3 and out["ok"] is False and out["status"] == "ANALYSIS_LIMITED"
+    assert out["error"] == "AUTHENTICODE_OUTPUT_UNPARSEABLE" and out["raw"] == "Status : Valid"
+    code, out = _signature(capsys, workspace, monkeypatch, stderr="boom\n", returncode=1)
+    assert code == 3 and out["ok"] is False and out["error"] == "AUTHENTICODE_COMMAND_FAILED" and out["stderr"] == "boom"
+
+
+def test_authenticode_direct_command_returns_the_same_json(capsys, workspace, monkeypatch):
+    (workspace / "s.exe").write_bytes(b"MZ")
+    _fake_powershell(monkeypatch, stdout=_PS_OK)
+    code, out = run(capsys, "--workspace", str(workspace), "pe", str(workspace / "s.exe"), "--signature")
+    assert code == 0 and out["command"] == "pe" and out["signature_status"] == "Valid" and out["ok"] is True
