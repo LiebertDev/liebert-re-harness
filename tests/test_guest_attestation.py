@@ -50,6 +50,7 @@ def _measurement(**overrides):
         "switches": {"ok": True, "error": None, "items": [
             {"id": SWITCH_ID, "name": "lab-private", "switch_type": "Private"}]},
         "switch_peers": {"ok": True, "error": None, "items": []},
+        "host_adapters": {"ok": True, "error": None, "items": []},
         "integration_services": {"ok": True, "error": None, "items": [
             {"id_suffix": GUEST_SERVICE_SUFFIX, "enabled": False},
             {"id_suffix": "9F3B1C00-0000-4000-8000-000000000000", "enabled": True}]},
@@ -57,6 +58,9 @@ def _measurement(**overrides):
         "guest": {"ok": True, "error": None, "vm_id_from_kvp": VM_ID, "os_build": "26100",
                   "vbs_status": 0, "security_services_running": []},
     }
+    for section in m.values():
+        if isinstance(section, dict):
+            section["error_category"] = None
     m.update(overrides)
     return m
 
@@ -116,7 +120,7 @@ def test_fully_isolated_verifies_all_three():
     assert _status(result) == {n: "VERIFIED" for n in ALL}
     assert result["isolation_verified"] is True
     assert result["isolation_basis"] == "observed"
-    assert result["schema_version"] == "liebert-re.guest-measurement/1"
+    assert result["schema_version"] == "liebert-re.guest-measurement/2"
     assert result["isolation_asserted_by_operator"] is False
     assert result["informational"]["guest_hvci_running"] is False
     for cap in result["capabilities"].values():
@@ -221,7 +225,8 @@ _MISSING_FIELDS = [
     ("switches", ("network_control",)), ("switches.items.0.id", ("network_control",)),
     ("switches.items.0.name", ("network_control",)),
     ("switches.items.0.switch_type", ("network_control",)), ("switch_peers", ("network_control",)),
-    ("switch_peers.items", ("network_control",)),
+    ("switch_peers.items", ("network_control",)), ("host_adapters", ("network_control",)),
+    ("host_adapters.items", ("network_control",)),
 ]
 
 
@@ -354,7 +359,7 @@ def test_peer_vm_on_private_switch_is_unknown():
 
 
 def test_wrong_schema_is_unknown():
-    for schema in ("liebert-re.guest-measurement/2", "", None, 1, ["liebert-re.guest-measurement/1"]):
+    for schema in ("liebert-re.guest-measurement/3", "", None, 1, ["liebert-re.guest-measurement/2"]):
         result = _evaluate(_measurement(schema_version=schema))
         assert set(_status(result).values()) == {"UNKNOWN"}, schema
         assert all(c["reasons"] == ["SCHEMA_MISMATCH"] for c in result["capabilities"].values())
@@ -464,3 +469,111 @@ def test_schema_fields_describe_the_fixture():
     for section, fields in GuestAttestation.SCHEMA_ITEM_FIELDS.items():
         for item in m[section]["items"]:
             assert set(fields) == set(item), section
+
+
+def test_schema_1_is_refused_with_an_explicit_reason():
+    # /1 wrote host adapters as vm_id: null peers; reading it back would be a guess, so it is refused.
+    result = _evaluate(_measurement(schema_version="liebert-re.guest-measurement/1"))
+    assert set(_status(result).values()) == {"UNKNOWN"}
+    for cap in result["capabilities"].values():
+        assert cap["reasons"] == ["SCHEMA_MISMATCH", "SCHEMA_SUPERSEDED"]
+    assert result["isolation_basis"] == "none"
+    assert result["schema_version"] == GuestAttestation.SCHEMA
+
+
+def _internal_switch_with_host(host_switch_id=SWITCH_ID, switch_type="Internal"):
+    m = _with(_measurement(), "switches.items.0.switch_type", switch_type)
+    return _with(m, "host_adapters.items", [{"switch_id": host_switch_id, "kind": "host_management"}])
+
+
+def test_host_adapter_on_internal_switch_is_a_shared_switch_fact():
+    result = _evaluate(_internal_switch_with_host())
+    net = result["capabilities"]["network_control"]
+    assert net["status"] == "UNKNOWN"
+    assert "SWITCH_SHARED_WITH_HOST" in net["reasons"] and "SWITCH_NOT_PRIVATE" in net["reasons"]
+    assert not any(r.startswith(("INVALID:", "MISSING:", "SECTION_NOT_OK")) for r in net["reasons"])
+    assert net["evidence"]["switch_shared_with_host"] is True
+    assert result["capabilities"]["isolated_guest"]["status"] == "VERIFIED"
+    assert result["isolation_basis"] == "observed_partial"
+    _assert_invariants(result)
+
+
+def test_private_switch_without_host_adapter_still_verifies():
+    result = _evaluate(_measurement())
+    net = result["capabilities"]["network_control"]
+    assert net["status"] == "VERIFIED"
+    assert net["evidence"]["switch_shared_with_host"] is False
+    assert result["isolation_verified"] is True
+    # a host adapter on a switch this VM is not attached to does not matter
+    elsewhere = _with(_measurement(), "host_adapters.items",
+                      [{"switch_id": OTHER_SWITCH_ID, "kind": "host_management"}])
+    assert _evaluate(elsewhere)["capabilities"]["network_control"]["status"] == "VERIFIED"
+
+
+def test_host_adapter_on_a_private_switch_contradicts_the_file():
+    net = _evaluate(_internal_switch_with_host(switch_type="Private"))["capabilities"]["network_control"]
+    assert net["status"] == "UNKNOWN"
+    assert "SWITCH_SHARED_WITH_HOST" in net["reasons"] and "CONTRADICTION:host_adapters" in net["reasons"]
+
+
+def test_switch_peer_with_null_vm_id_is_still_invalid():
+    # The old ambiguity is not silently re-read as a host adapter.
+    m = _with(_measurement(), "switch_peers.items", [{"switch_id": SWITCH_ID, "vm_id": None}])
+    net = _evaluate(m)["capabilities"]["network_control"]
+    assert net["status"] == "UNKNOWN" and "INVALID:switch_peers" in net["reasons"]
+
+
+@pytest.mark.parametrize("item,reason", [
+    ({"switch_id": "not-a-guid", "kind": "host_management"}, "INVALID:host_adapters.switch_id"),
+    ({"switch_id": None, "kind": "host_management"}, "INVALID:host_adapters.switch_id"),
+    ({"switch_id": SWITCH_ID}, "MISSING:host_adapters.kind"),
+    ({"switch_id": SWITCH_ID, "kind": "vm"}, "INVALID:host_adapters.kind"),
+])
+def test_malformed_host_adapter_item_is_unknown(item, reason):
+    m = _with(_measurement(), "host_adapters.items", [item])
+    net = _evaluate(m)["capabilities"]["network_control"]
+    assert net["status"] == "UNKNOWN" and reason in net["reasons"]
+
+
+def test_unconnected_adapter_needs_no_host_adapter_section():
+    m = _with(_without(_measurement(), "host_adapters"), "adapters.items.0.connected", False)
+    assert _evaluate(m)["capabilities"]["network_control"]["status"] == "VERIFIED"
+
+
+def _failed_guest(category):
+    return {"ok": False, "error": "System.Management.Automation.Remoting.PSDirectException",
+            "error_category": category, "vm_id_from_kvp": None, "os_build": None,
+            "vbs_status": None, "security_services_running": None}
+
+
+def test_error_category_is_carried_into_the_reason():
+    result = _evaluate(_with(_measurement(), "guest", _failed_guest("AuthenticationError/InvalidPassword")))
+    iso = result["capabilities"]["isolated_guest"]
+    assert iso["status"] == "UNKNOWN"
+    assert "SECTION_NOT_OK:guest:AuthenticationError/InvalidPassword" in iso["reasons"]
+    # the message-like error text is never copied
+    assert "PSDirectException" not in json.dumps(result)
+    steps = _with(_measurement(), "guest", _failed_guest("kvp:ObjectNotFound,vbs:PermissionDenied"))
+    assert "SECTION_NOT_OK:guest:kvp:ObjectNotFound,vbs:PermissionDenied" in \
+        _evaluate(steps)["capabilities"]["isolated_guest"]["reasons"]
+    host_down = _with(_measurement(), "host_adapters",
+                      {"ok": False, "error": "x", "error_category": "NotSpecified", "items": []})
+    assert "SECTION_NOT_OK:host_adapters:NotSpecified" in \
+        _evaluate(host_down)["capabilities"]["network_control"]["reasons"]
+
+
+@pytest.mark.parametrize("category", [None, "", "has space", "D:\\secret\\x", "x" * 500, 7, ["Cat"], "a\nb",
+                                      "9start", "quote'd"])
+def test_unsafe_error_category_is_not_copied(category):
+    reasons = _evaluate(_with(_measurement(), "guest", _failed_guest(category)))["capabilities"][
+        "isolated_guest"]["reasons"]
+    assert "SECTION_NOT_OK:guest" in reasons
+    assert not any(r.startswith("SECTION_NOT_OK:guest:") for r in reasons)
+
+
+def test_category_on_an_ok_section_is_a_contradiction():
+    m = _with(_measurement(), "host_adapters.error_category", "PermissionDenied")
+    assert "CONTRADICTION:host_adapters.error_category" in \
+        _evaluate(m)["capabilities"]["network_control"]["reasons"]
+    absent = _without(_measurement(), "host_adapters.error_category")
+    assert _evaluate(absent)["capabilities"]["network_control"]["status"] == "VERIFIED"
