@@ -2,9 +2,17 @@
 
 The dynamic-lab gate cannot see whether the machine it runs in is a disposable, snapshotted,
 network-controlled guest. This module decides that from a measurement document (schema
-``liebert-re.guest-measurement/1``) that a separate host-side script produces. It is PURE: it
+``liebert-re.guest-measurement/2``) that a separate host-side script produces. It is PURE: it
 reads no file, no clock and no registry. The caller passes the measurement, the current time
 (``now_utc``) and the VM id of the machine the gate is running on (``local_vm_id``).
+
+Schema history. ``/1`` wrote the host's own management adapters into ``switch_peers`` with
+``vm_id: null``, which is not a VM and made the section unreadable. ``/2`` reports them in a
+separate ``host_adapters`` section and adds ``error_category`` next to every ``error``. ``/1``
+is REFUSED with ``SCHEMA_SUPERSEDED`` rather than read back-compatibly: reading a ``/1`` file
+would mean treating "``vm_id`` null" as "host adapter", which is a guess the file never states
+(CONTRIBUTING.md, first rule), and ``/1`` has no ``host_adapters`` section to prove the host is
+not on the switch. The operator re-runs the script.
 
 Three capabilities are judged independently. Each is ``VERIFIED`` only when every condition in
 its table holds; anything missing, malformed, stale or contradictory is ``UNKNOWN`` with a
@@ -17,7 +25,9 @@ machine-readable reason. There is no third answer and no default (CONTRIBUTING.m
   checkpoint that belongs to this VM and was created before the measurement.
 * ``network_control``: the adapter section is measured and either no adapter exists (a measured
   absence) or every connected adapter resolves to exactly one Private switch with no other VM
-  on it.
+  on it, and no host management adapter is attached to that switch (``SWITCH_SHARED_WITH_HOST``
+  otherwise; an Internal or External switch is shared with the host by construction and is
+  ``SWITCH_NOT_PRIVATE`` as well).
 
 Preconditions for all three: the schema matches, the measurement is fresh (``0 <= age <=
 max_age_s``; a clock skew of up to 120 s into the future is tolerated, more is a contradiction),
@@ -33,6 +43,11 @@ contains). An operator assertion that the lab is isolated (``isolation_asserted_
 is carried through and may label ``isolation_basis`` as ``asserted``; no rule reads it and it
 never produces VERIFIED. ``informational.guest_hvci_running`` is a report only; this module
 never inspects, changes or advises on it.
+
+``error_category`` (``ErrorRecord.CategoryInfo.Category``, optionally ``/<error id>``) is
+diagnostic only. It is copied into a ``SECTION_NOT_OK:<section>:<category>`` reason only when it
+matches a strict identifier pattern, so a hostile file cannot inject free text into a reason.
+Error messages are never read.
 
 Evidence holds counts, booleans and switch types only; no VM names, GUIDs or host identity are
 copied into the result (AGENTS.md rule 9).
@@ -58,6 +73,11 @@ _GUEST_SERVICE_SUFFIX = "6c09bb55-d683-4da0-8931-c9bf705f6480"  # unmeasured ass
 _HVCI_SERVICE_CODE = 2  # unmeasured assumption (spec VARSAYIM 5)
 _HVCI_NOTE = "service code 2 read as HVCI is an unmeasured assumption"
 _KNOWN_SWITCH_TYPES = ("Private", "Internal", "External")
+_SUPERSEDED_SCHEMAS = ("liebert-re.guest-measurement/1",)
+_HOST_ADAPTER_KIND = "host_management"
+# Identifier characters only (no space, path separator or quote). A guest section joins one
+# "step:Category" per failed step with commas.
+_ERROR_CATEGORY = re.compile(r"[A-Za-z][A-Za-z0-9_.:/,]{0,159}")
 
 _CAPABILITIES = ("isolated_guest", "snapshot_and_rollback", "network_control")
 _NOT_COVERED = MappingProxyType({
@@ -115,11 +135,16 @@ def _section(m: dict, name: str, reasons: list[str]) -> dict | None:
     if not isinstance(ok, bool):
         reasons.append(f"INVALID:{name}.ok")
         return None
+    category = sec.get("error_category")
     if not ok:
-        reasons.append(f"SECTION_NOT_OK:{name}")
+        suffix = f":{category}" if isinstance(category, str) and _ERROR_CATEGORY.fullmatch(category) else ""
+        reasons.append(f"SECTION_NOT_OK:{name}{suffix}")
         return None
     if sec.get("error") not in (None, ""):
         reasons.append(f"CONTRADICTION:{name}.error")
+        return None
+    if category not in (None, ""):
+        reasons.append(f"CONTRADICTION:{name}.error_category")
         return None
     return sec
 
@@ -178,8 +203,11 @@ def _precheck(m: Any, now_utc: Any, local_vm_id: Any, max_age_s: Any) -> _Contex
     if not isinstance(m, dict):
         r.append("MEASUREMENT_NOT_AN_OBJECT")
         return ctx
-    if m.get("schema_version") != GuestAttestation.SCHEMA:
+    schema = m.get("schema_version")
+    if schema != GuestAttestation.SCHEMA:
         r.append("SCHEMA_MISMATCH")
+        if isinstance(schema, str) and schema in _SUPERSEDED_SCHEMAS:
+            r.append("SCHEMA_SUPERSEDED")
         return ctx
     now = now_utc if isinstance(now_utc, datetime) and now_utc.tzinfo is not None else None
     if now is None:
@@ -338,7 +366,8 @@ def _check_checkpoint(cp: dict, ctx: _Context, ev: dict, r: list[str]) -> None:
 def _eval_network(m: Any, ctx: _Context) -> dict:
     r = list(ctx.reasons)
     ev: dict[str, Any] = {"measurement_age_s": ctx.age_s, "adapter_count": None,
-                          "connected_adapter_count": None, "switch_types": None}
+                          "connected_adapter_count": None, "switch_types": None,
+                          "switch_shared_with_host": None}
     note = None
     if isinstance(m, dict) and ctx.vm_id is not None:
         adapters = _items(m, "adapters", r)
@@ -369,7 +398,8 @@ def _check_adapters(m: dict, adapters: list[dict], vm_id: str, ev: dict, r: list
         return
     switches = _items(m, "switches", r)
     peers = _items(m, "switch_peers", r)
-    if switches is None or peers is None:
+    host_items = _items(m, "host_adapters", r)
+    if switches is None or peers is None or host_items is None:
         return
     switch_ids = [_guid(s.get("id")) for s in switches]
     if any(i is None for i in switch_ids) or not _unique(switch_ids, "switches.id", r):
@@ -383,8 +413,20 @@ def _check_adapters(m: dict, adapters: list[dict], vm_id: str, ev: dict, r: list
             r.append("INVALID:switch_peers")
             return
         peer_pairs.append((sid, pvm))
+    host_switches: set[str] = set()
+    for h in host_items:
+        hsid = _guid(h.get("switch_id"))
+        kind = h.get("kind")
+        if hsid is None:
+            r.append("INVALID:host_adapters.switch_id")
+            return
+        if kind != _HOST_ADAPTER_KIND:
+            r.append("MISSING:host_adapters.kind" if kind is None else "INVALID:host_adapters.kind")
+            return
+        host_switches.add(hsid)
     by_id = dict(zip(switch_ids, switches))
     types: set[str] = set()
+    shared = False
     for a in connected:
         sid = _field_guid(a, "switch_id", "adapters.switch_id", r)
         if sid is None:
@@ -393,11 +435,16 @@ def _check_adapters(m: dict, adapters: list[dict], vm_id: str, ev: dict, r: list
         if sw is None:
             r.append("SWITCH_NOT_RESOLVED")
             continue
-        _check_switch(a, sw, [pvm for psid, pvm in peer_pairs if psid == sid], vm_id, types, r)
+        on_host_switch = sid in host_switches
+        shared = shared or on_host_switch
+        _check_switch(a, sw, [pvm for psid, pvm in peer_pairs if psid == sid], vm_id, types, r,
+                      shared_with_host=on_host_switch)
     ev["switch_types"] = sorted(types)
+    ev["switch_shared_with_host"] = shared
 
 
-def _check_switch(a: dict, sw: dict, others: list[str], vm_id: str, types: set[str], r: list[str]) -> None:
+def _check_switch(a: dict, sw: dict, others: list[str], vm_id: str, types: set[str], r: list[str],
+                  *, shared_with_host: bool) -> None:
     if a.get("switch_name") is None or sw.get("name") is None:
         r.append("MISSING:switch_name")
     elif a["switch_name"] != sw["name"]:
@@ -409,6 +456,10 @@ def _check_switch(a: dict, sw: dict, others: list[str], vm_id: str, types: set[s
     types.add(stype if stype in _KNOWN_SWITCH_TYPES else "OTHER")
     if stype != "Private":
         r.append("SWITCH_NOT_PRIVATE")
+    if shared_with_host:
+        r.append("SWITCH_SHARED_WITH_HOST")
+        if stype == "Private":  # a Private switch has no host adapter; the file contradicts itself
+            r.append("CONTRADICTION:host_adapters")
     if vm_id in others:
         r.append("CONTRADICTION:switch_peers")
     elif others:
@@ -431,35 +482,38 @@ def _guest_hvci(m: Any) -> bool | None:
 
 
 class GuestAttestation:
-    """Evaluate a ``liebert-re.guest-measurement/1`` document; see the module docstring."""
+    """Evaluate a ``liebert-re.guest-measurement/2`` document; see the module docstring."""
 
-    SCHEMA = "liebert-re.guest-measurement/1"
+    SCHEMA = "liebert-re.guest-measurement/2"
     DEFAULT_MAX_AGE_S = 900
     CAPABILITIES = _CAPABILITIES
 
     # Wire format the host-side script must emit. Key "" is the top level. ``checkpoints``,
-    # ``adapters``, ``switches``, ``switch_peers`` and ``integration_services`` are list sections:
+    # ``adapters``, ``switches``, ``switch_peers``, ``host_adapters`` and ``integration_services``
+    # are list sections:
     # {ok, error, items: [<SCHEMA_ITEM_FIELDS>]}. ``host``, ``vm``, ``security`` and ``guest``
     # carry their fields directly next to ok/error. The optional top-level key
     # ``isolation_asserted_by_operator`` is never emitted by the script.
     SCHEMA_FIELDS = MappingProxyType({
         "": ("schema_version", "measured_at_utc", "script_version", "elevated"),
-        "host": ("ok", "error", "identity_sha256"),
-        "vm": ("ok", "error", "id", "name", "state", "generation", "automatic_checkpoints",
+        "host": ("ok", "error", "error_category", "identity_sha256"),
+        "vm": ("ok", "error", "error_category", "id", "name", "state", "generation", "automatic_checkpoints",
                "parent_checkpoint_id"),
-        "checkpoints": ("ok", "error", "items"),
-        "adapters": ("ok", "error", "items"),
-        "switches": ("ok", "error", "items"),
-        "switch_peers": ("ok", "error", "items"),
-        "integration_services": ("ok", "error", "items"),
-        "security": ("ok", "error", "tpm_enabled", "shielded"),
-        "guest": ("ok", "error", "vm_id_from_kvp", "os_build", "vbs_status", "security_services_running"),
+        "checkpoints": ("ok", "error", "error_category", "items"),
+        "adapters": ("ok", "error", "error_category", "items"),
+        "switches": ("ok", "error", "error_category", "items"),
+        "switch_peers": ("ok", "error", "error_category", "items"),
+        "host_adapters": ("ok", "error", "error_category", "items"),
+        "integration_services": ("ok", "error", "error_category", "items"),
+        "security": ("ok", "error", "error_category", "tpm_enabled", "shielded"),
+        "guest": ("ok", "error", "error_category", "vm_id_from_kvp", "os_build", "vbs_status", "security_services_running"),
     })
     SCHEMA_ITEM_FIELDS = MappingProxyType({
         "checkpoints": ("id", "name", "vm_id", "created_utc", "type"),
         "adapters": ("id", "switch_id", "switch_name", "connected"),
         "switches": ("id", "name", "switch_type"),
         "switch_peers": ("switch_id", "vm_id"),
+        "host_adapters": ("switch_id", "kind"),
         "integration_services": ("id_suffix", "enabled"),
     })
 
