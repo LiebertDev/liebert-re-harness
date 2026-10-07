@@ -157,6 +157,8 @@ jobs:
           assert patch_plan_worker.is_file(), "the IDAPython patch-plan worker is missing from the wheel"
           annotate_worker = _res.files("liebert_re.tools").joinpath("ida_scripts/annotate_write.idapy")
           assert annotate_worker.is_file(), "the IDAPython annotation write worker is missing from the wheel"
+          idalib_worker = _res.files("liebert_re.tools").joinpath("ida_scripts/idalib_worker.idapy")
+          assert idalib_worker.is_file(), "the idalib worker is missing from the wheel"
           ghidra_script = _res.files("liebert_re.tools").joinpath("ghidra_scripts/ProgramFacts.java")
           assert ghidra_script.is_file(), "the Ghidra Java post-script is missing from the wheel"
           for m in mods:

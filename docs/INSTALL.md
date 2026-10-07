@@ -5,7 +5,7 @@
 Only what you need to run and develop the analysis code. Concretely:
 
 - **74<!-- count:modules --> Python modules** in the `liebert_re/` package — the analysis code itself.
-- **115<!-- count:test_files --> test files** in `tests/` (`tests/test_*.py`), plus `conftest.py` and an empty `__init__.py`
+- **116<!-- count:test_files --> test files** in `tests/` (`tests/test_*.py`), plus `conftest.py` and an empty `__init__.py`
   (the latter is required so the flat top-level modules resolve on `sys.path`).
 - No challenge-solution scripts: they are not distributed in this public package (see [SOLVED_INDEX.md](../SOLVED_INDEX.md) for the record of what was solved).
 - Documentation, licence, CI configuration, and issue templates.
@@ -118,7 +118,7 @@ naming it — it does not silently degrade or guess.
 | **JADX** | Decompiling one named class from a DEX, APK-derived DEX or JVM `.class` / `.jar` (`liebert_re/tools/dex.py`, `liebert_re/tools/jvm.py`); structural listing works without it and the decompile operation returns `JADX_TOOL_MISSING` | `JADX_EXE`, else `jadx` on `PATH`, else a `teacher-tools/jadx/bin/jadx.bat` under the user's home directory |
 | **Il2CppDumper** | Unity IL2CPP type and method name to address mapping (`liebert_re/tools/il2cpp.py`); every operation returns `IL2CPPDUMPER_TOOL_MISSING` without it | `IL2CPPDUMPER_EXE`, else a `teacher-tools/il2cppdumper/Il2CppDumper.exe` under the user's home directory |
 | **UPX** | Static UPX unpacking with `upx -d` on a copy of the input (`liebert_re/tools/upx.py`); returns `TOOL_MISSING` without it | `UPX_HOME`, else `upx` on `PATH`, else a `teacher-tools/upx/upx.exe` under the user's home directory |
-| **IDA Pro 9.x** (licensed, with the Hex-Rays decompiler for `decompile_function`) | Headless queries through `idat -A` (reads, plus a plan-then-apply annotation write path): summary, function list, segments, function-at-address, pseudocode, cross-references (to and from, with name resolution), import callers, byte reads, imports/exports, strings, and one function's microcode as a graph (`ida_microcode_cfg`; raw by default, with an opt-in d810 pass that needs the third-party d810 package in IDA's Python and says so in the answer) (`liebert_re/tools/ida.py`); returns `TOOL_MISSING` without it. also `ida_type_member_offset`, a patch *plan* (`ida_patch_plan`) and a read of the annotation log (`ida_annotations`, which needs no IDA). Persistent renames and comments: `ida_rename_plan` or `ida_set_comments_plan` then `ida_annotations_apply` (annotated data in its own root, byte ceiling `LIEBERT_IDA_ANNOTATED_BYTES`, default 2 GiB). Not wrapped: a disassembly listing, decompiler comments | `IDAT_EXE` (file or folder), else `IDA_HOME`, else `idat` on `PATH`, else the installer's default `IDA Professional 9*` / `IDA Pro 9*` folder under Program Files. Cache size cap: `LIEBERT_IDA_CACHE_BYTES` (default 5 GiB) |
+| **IDA Pro 9.x** (licensed, with the Hex-Rays decompiler for `decompile_function`) | Headless queries through `idat -A` (reads, plus a plan-then-apply annotation write path): summary, function list, segments, function-at-address, pseudocode, cross-references (to and from, with name resolution), import callers, byte reads, imports/exports, strings, and one function's microcode as a graph (`ida_microcode_cfg`; raw by default, with an opt-in d810 pass that needs the third-party d810 package in IDA's Python and says so in the answer) (`liebert_re/tools/ida.py`); returns `TOOL_MISSING` without it. also `ida_type_member_offset`, a patch *plan* (`ida_patch_plan`) and a read of the annotation log (`ida_annotations`, which needs no IDA). Persistent renames and comments: `ida_rename_plan` or `ida_set_comments_plan` then `ida_annotations_apply` (annotated data in its own root, byte ceiling `LIEBERT_IDA_ANNOTATED_BYTES`, default 2 GiB). Not wrapped: a disassembly listing, decompiler comments | `IDAT_EXE` (file or folder), else `IDA_HOME`, else `idat` on `PATH`, else the installer's default `IDA Professional 9*` / `IDA Pro 9*` folder under Program Files. Cache size cap: `LIEBERT_IDA_CACHE_BYTES` (default 5 GiB). Second, optional engine for `ida_query`: idalib (the `idapro` package), named by `LIEBERT_RE_IDALIB_PYTHON`; see "What the IDA wrapper does on your machine" |
 | **Ghidra** | Decompilation, cross-references, callers and callees | Shipped (`liebert_re/tools/ghidra.py`): `ghidra_status`, `ghidra_program_facts` (loader, language, processor, endianness, address width, compiler spec, image base, entry points, memory blocks, function count) and `ghidra_decompile` (read-only decompilation of at most 16 functions you name by address or name; a function that does not decompile has `c_code: null` and its reason). No cross-references yet. `analyzeHeadless` exits 0 even when its post-script fails, so success is judged from the log and the result file. Java script only (Jython does not run on a stock install). CLI: `ghidrastatus`, `ghidrafacts`, `ghidradecompile`. Located by `GHIDRA_INSTALL_DIR`, else `GHIDRA_HOME`, else `PATH`, else known install folders |
 
 Set an environment variable to the tool's install directory, for example:
@@ -200,6 +200,41 @@ whether the decompiler initialises.
   licence line, home-directory paths, and the input and scratch paths replaced.
 - Not shipped: a disassembly listing and decompiler comments. Only IDA 9.x is supported (IDA 9 has a
   single `idat`; there is no `idat64`).
+
+### Optional second engine: idalib
+
+`ida_query` (CLI `ida --backend`) can be answered by **idalib**, Hex-Rays' `idapro` Python package, instead
+of `idat`. It is the same licensed IDA, the same cache and the same questions (the worker runs the very
+same operation functions); what changes is that one worker process answers a question even on a first
+analysis, where idat needs two sessions. It is not faster for a single question (a fresh interpreter has to
+import `idapro` and open a copy of the database: measured about 1 s per call on one machine against about
+0.9 s for idat), so it is an alternative engine, not an upgrade.
+
+1. Install the `idapro` package that ships with IDA into a Python of your choice (a virtual environment is
+   fine; IDA 9.4 shipped `idapro 0.0.11`) and run IDA's `py-activate-idalib` once so the package can find
+   your IDA install. Check with `python -c "import idapro"`.
+2. Point the harness at that interpreter, and only that interpreter:
+
+   ```powershell
+   $env:LIEBERT_RE_IDALIB_PYTHON = "C:\path\to\venv\Scripts\python.exe"
+   ```
+
+   The interpreter is never guessed. With the variable unset, idalib is "not configured" and everything
+   uses idat.
+3. `backend` picks the engine: `idat`, `idalib`, or `auto` (the default: idalib only when the variable is
+   set and `import idapro` works in that interpreter, otherwise idat). Every answer carries
+   `backend: {requested, used, reason}`, and `idastatus` has an `idalib` block (the redacted interpreter
+   path, the `idapro` and library versions, the result of the `import idapro` probe) and says which engine
+   `auto` would use. An `idalib` request that cannot be served is `TOOL_MISSING`, never a silent switch
+   to idat.
+
+Two rules the code holds to, because the engine does not forgive breaking them: **one database per worker
+process** (a second `open_database` in the same process silently saves and closes the first one, so the
+worker opens exactly once and always closes with `close_database(False)`), and **a cached database is
+never opened in place**: a copy is opened in a scratch directory and the cache file's hash is taken before
+and after (`CACHE_VIOLATION` if it moved). A timed-out or cancelled session therefore does not cost the
+cache slot. The result comes back through a JSON file, never from the worker's stdout (IDA plugins print
+banners and warnings there).
 
 ## The heavy test tier
 

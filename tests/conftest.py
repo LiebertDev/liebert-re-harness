@@ -46,6 +46,11 @@ import liebert_re.workspace as tools_workspace
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_EVIDENCE_ROOT = (REPO_ROOT / "dataset" / "evidence").resolve()
 
+# The idalib interpreter the operator configured in the environment the suite was started from. Every test runs
+# WITHOUT it (the autouse fixture below), so "auto" means idat for the whole suite whatever the shell exports;
+# only the heavy idalib tests read this value and set it themselves.
+IDALIB_PYTHON_AT_START = os.environ.get("LIEBERT_RE_IDALIB_PYTHON", "")
+
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
@@ -616,3 +621,18 @@ def _redirect_tool_evidence_dirs_away_from_the_real_ledger(tmp_path, monkeypatch
 #  module-level ``EVIDENCE`` Path (``dataset/evidence/ledger``), discovered
 #  and redirected exactly like every ``tools_*.py`` adapter's ``EVIDENCE``,
 #  so this snapshot no longer needs a carve-out.
+
+
+@pytest.fixture(autouse=True)
+def _idalib_is_not_configured_unless_a_test_says_so(monkeypatch):
+    """`ida_query(backend="auto")` chooses idalib when LIEBERT_RE_IDALIB_PYTHON is set. A developer shell that
+    exports it must not turn the fast tests (which fake idat at the process boundary) into idalib runs, and a
+    probe cached by an earlier test must not leak into the next."""
+    monkeypatch.delenv("LIEBERT_RE_IDALIB_PYTHON", raising=False)
+    ida = sys.modules.get("liebert_re.tools.ida")
+    if ida is not None:
+        ida._IDALIB_PROBE_CACHE.clear()
+    yield
+    ida = sys.modules.get("liebert_re.tools.ida")
+    if ida is not None:
+        ida._IDALIB_PROBE_CACHE.clear()
