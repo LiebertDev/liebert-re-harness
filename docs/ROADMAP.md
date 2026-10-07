@@ -81,7 +81,8 @@ hidden feature.
   callers/callees, answers normalised across engines so a caller does not need to
   know which one ran). **Partly done.** The read-only half of an IDA wrapper
   ships (`liebert_re/tools/ida.py`: `ida_query`, `ida_status`; summary, function list,
-  segments, function-at-address, Hex-Rays pseudocode, cross-references, imports/exports,
+  segments, function-at-address, Hex-Rays pseudocode, cross-references to and from an
+  address or name, import callers, byte reads, imports/exports,
   strings; database cache keyed by input hash and size-capped; PDB downloads off). It
   needs a licensed IDA Pro 9.x, so CI cannot exercise it: the default tier tests the
   wrapper against a stand-in `idat`, and one `heavy` class runs the real thing locally.
@@ -107,24 +108,24 @@ hidden feature.
   a gap consistent with that. It does not help with an import's callers. Prologue scanning and
   cross-checking against what a disassembly engine found are not built, and x86 has no such
   table (`X86_NO_PDATA`).
-- **A cross-reference query answers an unresolved question as an empty one.** `ida --operation
-  xrefs_to` on an import name, an IAT slot or a jump thunk returns `status OK` with `items: []`.
-  That reads as "this import has no callers" when it means "the query was not resolved through the
-  import thunk and indirect uses were not searched": a negative that looks measured and is not.
-  The honest shape separates "no callers found" from "resolved to a thunk, callers not followed".
-  `kerneliat` comes closest, but it is explicitly heuristic (`proves_call: false`) and gives the
-  thunk, not the callers. **Open**, found on a second crackme.
-- **No caller search for an import's indirect uses, and no data-reference tool.** Settling "is
-  this import ever called" and "who reads this data blob" both needed a hand-written byte scan of
-  `.text` for rel32 and RIP-relative targets. Whole-program dataflow is already recorded under
-  "Interprocedural taint analysis / whole-program dataflow" below; the new part is narrower: no
-  shipped operation resolves an import's callers or a static data pointer's readers. **Open.**
-- **No operation reads the bytes at a virtual address or resolves a data pointer's target to its
-  contents.** The opposite direction from the entry above (that one is who *reads* a pointer; this
-  is what the pointer *points at*), so the two are not to be merged. On three separate crackmes a
-  `.data` pointer, a `.rdata` string, a fill constant and a bit-text blob each had to be read by
-  hand in Python. Not covered by the dataflow or def-use entries below. **Open**, found on three
-  targets.
+- **A cross-reference query answers an unresolved question as an empty one.** ~~`ida --operation
+  xrefs_to` on an import name, an IAT slot or a jump thunk returns `status OK` with `items: []`.~~
+  **Closed for its stated scope.** `xrefs_to` now resolves a name exact, then demangled, then as an
+  import name (any module), says which in `resolved_by`, lists every candidate address instead of
+  choosing one, and answers a name that resolves to nothing with `SYMBOL_NOT_FOUND`, never an empty
+  `OK`. Still open: it follows no thunk by itself (a thunk and its import slot are listed as two
+  candidates), and `kerneliat` stays heuristic.
+- **No caller search for an import's indirect uses, and no data-reference tool.** ~~Settling "is
+  this import ever called" and "who reads this data blob" both needed a hand-written byte scan.~~
+  **Partly closed.** `ida --operation callers_of_import` lists the functions (address, name, call
+  site) that reference an import's slot and follows one level of thunk; `xrefs_to` and `xrefs_from`
+  separate code from data references by `kind`. Computed calls (`GetProcAddress`, a pointer copied
+  elsewhere) are still not searched, and whole-program dataflow stays under its own entry below.
+- **No operation reads the bytes at a virtual address.** ~~On three separate crackmes a `.data`
+  pointer, a `.rdata` string, a fill constant and a bit-text blob each had to be read by hand.~~
+  **Closed for its stated scope.** `ida --operation read_bytes` reads 1..4096 bytes of the loaded
+  database at an address; a byte IDA holds no value for is null, never zero. Resolving a pointer's
+  target to its contents is not automated: it is a second `read_bytes` on the address read first.
 - **Crash symbolisation.** ~~Minidump *parsing* is already here
   (`liebert_re/recover/minidump_structural.py`); turning a raw address recovered from a dump into a
   symbol is not.~~ **Closed for its stated scope.** `liebert_re/recover/minidump_analyzer.py` maps

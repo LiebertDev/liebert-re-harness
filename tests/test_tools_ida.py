@@ -996,7 +996,7 @@ class WorkerFileTests(IdaCase):
 def _load_worker():
     """The worker executed against stub `ida_*` modules (it is only ever run
     inside idat, so this is the one way to test its logic without IDA)."""
-    names = ["ida_auto", "ida_funcs", "ida_hexrays", "ida_ida", "ida_loader", "ida_name", "ida_nalt",
+    names = ["ida_auto", "ida_bytes", "ida_funcs", "ida_hexrays", "ida_ida", "ida_loader", "ida_name", "ida_nalt",
              "ida_pro", "ida_segment", "ida_xref", "idaapi", "idautils", "idc"]
     stubs = {n: mock.MagicMock(name=n) for n in names}
     stubs["ida_xref"].fl_CF, stubs["ida_xref"].fl_CN = 16, 17
@@ -1009,6 +1009,7 @@ def _load_worker():
     stubs["ida_ida"].inf_is_64bit.return_value = True
     stubs["ida_loader"].get_file_type_name.return_value = "Portable executable for AMD64 (PE)"
     stubs["ida_nalt"].get_imagebase.return_value = 0x140000000
+    stubs["ida_nalt"].get_import_module_qty.return_value = 0
     stubs["idaapi"].get_kernel_version.return_value = "9.4"
     with mock.patch.dict(sys.modules, stubs):
         loader = SourceFileLoader("liebert_ida_worker_under_test", str(WORKER_PATH))
@@ -1613,7 +1614,7 @@ class StricterVerdictTests(IdaCase):
         for operation in ti._ALLOWED_OPERATIONS:
             for state in ("CREATED", "HIT"):
                 with self.subTest(operation=operation, state=state):
-                    data = self.q(operation, "start")
+                    data = self.q(operation, "0x1000 8" if operation == "read_bytes" else "start")
                     self.assertTrue(data["ok"], data)
                     self.assertEqual(data["status"], "OK")
                     self.assertEqual(data["operation"], operation)
@@ -2227,6 +2228,22 @@ class IdaRealInstallTests(unittest.TestCase):
         code = self.q("decompile_function", "start")
         self.assertTrue(code["ok"], code)
         self.assertIn("return 0;", code["decompiled"])
+
+    def test_the_four_queries_on_the_synthetic_function(self):
+        """read_bytes, name-resolving xrefs_to, xrefs_from and callers_of_import against the real engine."""
+        code = self.q("read_bytes", "0x140001000 8")
+        self.assertTrue(code["ok"], code)
+        self.assertEqual((code["bytes_hex"], code["fully_loaded"], code["segment"]["name"]), ("554889e531c05dc3", True, ".text"))
+        self.assertFalse(self.q("read_bytes", "0x10 4")["ok"])
+        self.assertEqual(self.q("read_bytes", "0x10 4")["error"], "ADDRESS_NOT_MAPPED")
+        refs = self.q("xrefs_to", "start")
+        self.assertEqual((refs["resolved_by"], refs["ambiguous"]), ("exact_name", False), refs)
+        self.assertEqual([(x["from"], x["kind"], x["is_call"]) for x in refs["items"]], [("0x140001010", "code", True)])
+        out = self.q("xrefs_from", "0x140001010")
+        self.assertEqual(out["scope"], "address", out)
+        self.assertEqual([(x["to"], x["kind"], x["is_call"]) for x in out["items"]], [("0x140001000", "code", True)])
+        missing = self.q("callers_of_import", "CreateFileW")
+        self.assertEqual(missing["error"], "IMPORT_NOT_FOUND", missing)
 
     def test_a_decompile_does_not_change_the_cached_database(self):
         self.q("summary")

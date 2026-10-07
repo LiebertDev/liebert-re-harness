@@ -40,6 +40,7 @@ import time
 import traceback
 
 import ida_auto
+import ida_bytes
 import ida_funcs
 import ida_hexrays
 import ida_ida
@@ -58,7 +59,13 @@ JOB_ENV = "LIEBERT_IDA_JOB"
 _OPERATIONS = (
     "summary", "list_functions", "segments", "function_at_address",
     "decompile_function", "xrefs_to", "imports_exports", "strings", "type_member_offset",
+    "read_bytes", "xrefs_from", "callers_of_import",
 )
+
+# read_bytes: the size window the wrapper enforces too (it refuses before IDA starts).
+_READ_BYTES_MAX = 4096
+# Candidates kept when a name resolves to several addresses (all are listed, none is chosen).
+_CANDIDATE_LIMIT = 50
 
 # Defense-in-depth ceilings for the two walks whose size is controlled by the
 # target, not the caller. Deliberately not equal to ``max_results`` (which the
@@ -286,30 +293,350 @@ def _op_decompile_function(result, query, max_results, offset):
     result["decompiled"] = str(cfunc)
 
 
+def _kind(xref):
+    return "code" if xref.iscode else "data"
+
+
+def _find_imports(name, budget, errors):
+    """Every import-table entry whose name is ``name`` (any module), as dicts
+    with the module, the name, the ordinal and the import-slot address. A
+    lookup that fails is recorded in ``errors``, never turned into an empty
+    answer."""
+    found = []
+    try:
+        module_count = ida_nalt.get_import_module_qty()
+        state = {"stop": False}
+
+        def collect(ea, entry_name, ordinal, module):
+            if entry_name == name:
+                found.append({"module": module, "name": entry_name, "ordinal": ordinal or None, "ea": ea})
+            if budget.tick():
+                state["stop"] = True
+                return False
+            return True
+
+        for index in range(module_count):
+            module = ida_nalt.get_import_module_name(index) or ""
+            ida_nalt.enum_import_names(index, lambda ea, n, o, m=module: collect(ea, n, o, m))
+            if state["stop"]:
+                break
+    except Exception as exc:  # noqa: BLE001
+        errors.append("IMPORT_LOOKUP_FAILED: %s: %s" % (type(exc).__name__, exc))
+    return found
+
+
+def _demangled_matches(query, budget, errors):
+    """Addresses whose demangled name (short or long form) equals ``query``."""
+    matches = []
+    forms = [f for f in (_safe(lambda: ida_name.MNG_SHORT_FORM), _safe(lambda: ida_name.MNG_LONG_FORM)) if f is not None]
+    try:
+        for ea, mangled in idautils.Names():
+            if budget.tick():
+                break
+            if not isinstance(mangled, str) or not mangled.startswith(("?", "_Z")):
+                continue
+            for form in forms:
+                if ida_name.demangle_name(mangled, form) == query:
+                    matches.append((ea, mangled))
+                    break
+    except Exception as exc:  # noqa: BLE001
+        errors.append("DEMANGLE_LOOKUP_FAILED: %s: %s" % (type(exc).__name__, exc))
+    return matches
+
+
+_RESOLVED_BY_ORDER = ("exact_name", "demangled_name", "import_name", "address")
+
+
+def _resolve_candidates(query, errors):
+    """Where a query points, with how each address was found. Order: the exact
+    name, else the demangled name; the import-table slots of an import of that
+    name are added in every case (a thunk and its import slot are different
+    addresses and both are listed). A raw address is used only when no name
+    matched. Several candidates are returned as they are, none is chosen.
+    Returns (candidates, the demangled-name walk's budget)."""
+    candidates = []
+    seen = set()
+
+    def add(ea, resolved_by, name=None, extra=None):
+        if ea in seen or ea is None or ea == idc.BADADDR:
+            return
+        seen.add(ea)
+        entry = {"ea": ea, "resolved_by": resolved_by, "name": name if name is not None else ida_name.get_name(ea)}
+        if extra:
+            entry.update(extra)
+        candidates.append(entry)
+
+    exact = idc.get_name_ea_simple(query)
+    if exact != idc.BADADDR:
+        add(exact, "exact_name")
+    budget = _Budget("xref_target_names")
+    if not candidates:
+        for ea, mangled in _demangled_matches(query, budget, errors):
+            add(ea, "demangled_name", mangled)
+    for entry in _find_imports(query, _Budget("import_names"), errors):
+        add(entry["ea"], "import_name", None, {"import_module": entry["module"], "import_ordinal": entry["ordinal"]})
+    if not candidates:
+        value = _parse_address(query)
+        if value is not None and value != idc.BADADDR and idc.get_segm_name(value):
+            add(value, "address")
+    return candidates, budget
+
+
 def _op_xrefs_to(result, query, max_results, offset):
     # Not restricted to function starts: a great many real targets are data
     # or import-table slots, which IDA places as data items, not functions.
-    ea = _resolve_name_or_address(query)
-    if ea is None:
+    # A name is resolved exact -> demangled -> import name (any module); an
+    # address is used as it is. ``resolved_by`` says which, ``candidates``
+    # lists every address the query pointed at (none is chosen for the caller).
+    errors = []
+    candidates, budget = _resolve_candidates(query, errors)
+    if not candidates:
         result["ok"] = False
         result["error"] = "SYMBOL_NOT_FOUND"
+        if errors:
+            result["lookup_errors"] = errors
         return
-    result["resolved_address"] = hex(ea)
+    shown = candidates[:_CANDIDATE_LIMIT]
+    methods = sorted({c["resolved_by"] for c in shown}, key=_RESOLVED_BY_ORDER.index)
+    result["resolved_by"] = methods[0] if len(shown) == 1 else "multiple"
+    result["resolved_address"] = hex(shown[0]["ea"]) if len(candidates) == 1 else None
+    result["candidates"] = [
+        {"address": hex(c["ea"]), "name": c["name"] or None, "resolved_by": c["resolved_by"],
+         **({"import_module": c["import_module"], "import_ordinal": c["import_ordinal"]} if "import_module" in c else {})}
+        for c in shown]
+    result["candidate_count"] = len(candidates)
+    result["candidates_truncated"] = len(candidates) > len(shown)
+    result["ambiguous"] = len(candidates) > 1
+    if errors:
+        result["lookup_errors"] = errors
+    if budget.tripped:
+        result.update(budget.as_limited())
     call_types = (ida_xref.fl_CF, ida_xref.fl_CN)  # call far / call near; jumps are not calls
-    refs = list(idautils.XrefsTo(ea))
+    refs = []
+    for candidate in shown:
+        for xref in idautils.XrefsTo(candidate["ea"]):
+            refs.append((candidate["ea"], xref))
     result["total_xref_count"] = len(refs)
-    for xref in refs[offset:offset + max_results]:
+    for target, xref in refs[offset:offset + max_results]:
         func = ida_funcs.get_func(xref.frm)
         result["items"].append({
             "from": hex(xref.frm),
+            "to": hex(target),
             "from_function": ida_name.get_name(func.start_ea) if func else None,
             "type": xref.type,
             "type_name": _safe(lambda: idautils.XrefTypeName(xref.type)),
+            "kind": _kind(xref),
             "is_call": bool(xref.iscode) and xref.type in call_types,
         })
     result["offset"] = offset
     following = offset + len(result["items"])
     result["next_offset"] = following if following < len(refs) else None
+    result["truncated"] = result["next_offset"] is not None
+
+
+def _op_xrefs_from(result, query, max_results, offset):
+    """References leaving one address, or leaving every instruction of one
+    function (when the query names a function or is a function's start
+    address). Code and data references are told apart by ``kind``; ordinary
+    fall-through is not a reference and is left out. Paged: ``truncated`` is
+    true while ``next_offset`` is not null."""
+    ea = _resolve_name_or_address(query)
+    if ea is None:
+        result["ok"] = False
+        result["error"] = "SYMBOL_NOT_FOUND"
+        return
+    func = ida_funcs.get_func(ea)
+    function_scope = bool(func) and func.start_ea == ea
+    result["resolved_address"] = hex(ea)
+    result["scope"] = "function" if function_scope else "address"
+    sources = list(idautils.FuncItems(ea)) if function_scope else [ea]
+    call_types = (ida_xref.fl_CF, ida_xref.fl_CN)
+    budget = _Budget("xrefs_from")
+    seen = 0
+    for source in sources:
+        for xref in idautils.XrefsFrom(source, 0):
+            if xref.type == ida_xref.fl_F:
+                continue
+            if seen >= offset and len(result["items"]) < max_results:
+                result["items"].append({
+                    "from": hex(xref.frm),
+                    "to": hex(xref.to),
+                    "to_name": ida_name.get_name(xref.to) or None,
+                    "to_segment": idc.get_segm_name(xref.to) or None,
+                    "type": xref.type,
+                    "type_name": _safe(lambda: idautils.XrefTypeName(xref.type)),
+                    "kind": _kind(xref),
+                    "is_call": bool(xref.iscode) and xref.type in call_types,
+                })
+            seen += 1
+            if budget.tick():
+                break
+        if budget.tripped:
+            break
+    result["total_xref_count"] = seen
+    result["offset"] = offset
+    following = offset + len(result["items"])
+    result["next_offset"] = following if following < seen else None
+    result["truncated"] = result["next_offset"] is not None
+    if budget.tripped:
+        result.update(budget.as_limited())
+
+
+def _op_callers_of_import(result, query, max_results, offset):
+    """Functions that reference the import-table slot of the import named
+    ``query`` (any module): the function, its address and the call site. A
+    reference from a thunk function (a one-jump stub the compiler put in
+    front of the slot) is followed one level: the thunk's own callers are
+    listed with ``via_thunk`` naming it. Computed calls (GetProcAddress, a
+    pointer copied elsewhere) are not searched, so an empty list is "no
+    reference found", not "never called"."""
+    errors = []
+    budget = _Budget("callers_of_import")
+    imports = _find_imports(query, _Budget("import_names"), errors)
+    if not imports:
+        result["ok"] = False
+        result["error"] = "IMPORT_NOT_FOUND"
+        result["detail"] = ("No import-table entry has this name (matched by name, any module; an import by ordinal "
+                            "only has no name). That is about the import table as IDA read it, not about the program.")
+        if errors:
+            result["lookup_errors"] = errors
+        return
+    used = imports[:_CANDIDATE_LIMIT]
+    result["imports"] = [{"module": i["module"], "name": i["name"], "ordinal": i["ordinal"], "slot": hex(i["ea"])}
+                         for i in used]
+    result["imports_truncated"] = len(imports) > len(used)
+    rows = []
+    seen = set()
+
+    def add_row(entry, frm, xref, via_thunk=None):
+        key = (frm, entry["ea"], via_thunk["address"] if via_thunk else None)
+        if key in seen:
+            return
+        seen.add(key)
+        func = ida_funcs.get_func(frm)
+        mnemonic = _safe(lambda: idc.print_insn_mnem(frm))
+        rows.append({
+            "_sort": (frm, entry["ea"]),
+            "function_address": hex(func.start_ea) if func else None,
+            "function_name": (ida_name.get_name(func.start_ea) or None) if func else None,
+            "call_site": hex(frm),
+            "mnemonic": mnemonic or None,
+            "is_call": bool(mnemonic) and mnemonic.lower().startswith("call"),
+            "kind": _kind(xref),
+            "type_name": _safe(lambda: idautils.XrefTypeName(xref.type)),
+            "import_module": entry["module"],
+            "import_slot": hex(entry["ea"]),
+            "via_thunk": via_thunk,
+        })
+
+    for entry in used:
+        for xref in idautils.XrefsTo(entry["ea"]):
+            if budget.tick():
+                break
+            func = ida_funcs.get_func(xref.frm)
+            if func and (func.flags & ida_funcs.FUNC_THUNK):
+                thunk = {"address": hex(func.start_ea), "name": ida_name.get_name(func.start_ea) or None}
+                add_row(entry, xref.frm, xref)
+                for outer in idautils.XrefsTo(func.start_ea):
+                    if budget.tick():
+                        break
+                    add_row(entry, outer.frm, outer, thunk)
+            else:
+                add_row(entry, xref.frm, xref)
+        if budget.tripped:
+            break
+    rows.sort(key=lambda r: r["_sort"])
+    for row in rows:
+        del row["_sort"]
+    result["total_caller_count"] = len(rows)
+    result["items"] = rows[offset:offset + max_results]
+    result["offset"] = offset
+    following = offset + len(result["items"])
+    result["next_offset"] = following if following < len(rows) else None
+    result["truncated"] = result["next_offset"] is not None
+    result["search_scope"] = ("references to the import slot and, one level, to a thunk that jumps to it; "
+                              "computed or dynamically resolved calls are not searched")
+    if errors:
+        result["lookup_errors"] = errors
+    if budget.tripped:
+        result.update(budget.as_limited())
+
+
+def _read_bytes_request(query):
+    """((address, size), None) from the job's query, or (None, error code).
+    The query is a JSON object {"address": ..., "size": ...} or the text
+    "ADDRESS SIZE" (blank or comma separated); both numbers are hex or
+    decimal."""
+    address = size = None
+    try:
+        text = (query or "").strip()
+        if text.startswith("{"):
+            request = json.loads(text)
+            address, size = request.get("address"), request.get("size")
+        else:
+            parts = text.replace(",", " ").split()
+            if len(parts) == 2:
+                address, size = parts
+    except Exception:  # noqa: BLE001
+        return None, "INVALID_READ_BYTES_REQUEST"
+    if address is None or size is None or isinstance(address, bool) or isinstance(size, bool):
+        return None, "INVALID_READ_BYTES_REQUEST"
+    ea = address if isinstance(address, int) else _parse_address(address)
+    count = size if isinstance(size, int) else _parse_address(size)
+    if ea is None or ea < 0 or ea == idc.BADADDR:
+        return None, "INVALID_ADDRESS"
+    if count is None or not 1 <= count <= _READ_BYTES_MAX:
+        return None, "INVALID_SIZE"
+    return (ea, count), None
+
+
+def _op_read_bytes(result, query, max_results, offset):
+    """Bytes of the loaded database at a virtual address. A byte IDA holds no
+    value for (outside the file image, uninitialised) is never reported as a
+    number: ``bytes_hex`` is null unless every byte is loaded, the bytes that
+    are loaded come back in ``loaded_ranges`` (contiguous runs, each with its
+    own hex) and the rest in ``unloaded_ranges`` (state ``unloaded``: inside a
+    segment, no value; ``unmapped``: outside every segment). The start address
+    must lie in a segment (``ADDRESS_NOT_MAPPED`` otherwise). This is the
+    database as IDA mapped it from the file, not process memory."""
+    request, problem = _read_bytes_request(query)
+    if problem:
+        result["ok"] = False
+        result["error"] = problem
+        result["detail"] = ("query must be a JSON object {\"address\": \"0x...\", \"size\": N} or the text "
+                            "\"0x... N\", with 1 <= size <= %d." % _READ_BYTES_MAX)
+        return
+    ea, size = request
+    seg = ida_segment.getseg(ea)
+    if seg is None:
+        result["ok"] = False
+        result["error"] = "ADDRESS_NOT_MAPPED"
+        result["address"] = hex(ea)
+        return
+    runs = []  # [state, start, bytearray]
+    for index in range(size):
+        cur = ea + index
+        if ida_segment.getseg(cur) is None:
+            state = "unmapped"
+        elif ida_bytes.is_loaded(cur):
+            state = "loaded"
+        else:
+            state = "unloaded"
+        if not runs or runs[-1][0] != state:
+            runs.append([state, cur, bytearray()])
+        runs[-1][2].append(ida_bytes.get_byte(cur) & 0xFF if state == "loaded" else 0)
+    loaded = [r for r in runs if r[0] == "loaded"]
+    loaded_count = sum(len(r[2]) for r in loaded)
+    result["address"] = hex(ea)
+    result["size"] = size
+    result["segment"] = {"name": ida_segment.get_segm_name(seg), "start": hex(seg.start_ea), "end": hex(seg.end_ea)}
+    result["crosses_segment_boundary"] = ea + size > seg.end_ea
+    result["loaded_count"] = loaded_count
+    result["fully_loaded"] = loaded_count == size
+    result["bytes_hex"] = bytes(loaded[0][2]).hex() if loaded_count == size else None
+    result["loaded_ranges"] = [{"address": hex(r[1]), "size": len(r[2]), "bytes_hex": bytes(r[2]).hex()} for r in loaded]
+    result["unloaded_ranges"] = [{"address": hex(r[1]), "size": len(r[2]), "state": r[0]}
+                                 for r in runs if r[0] != "loaded"]
 
 
 def _op_imports_exports(result, query, max_results, offset):
@@ -473,6 +800,9 @@ _DISPATCH = {
     "imports_exports": _op_imports_exports,
     "strings": _op_strings,
     "type_member_offset": _op_type_member_offset,
+    "read_bytes": _op_read_bytes,
+    "xrefs_from": _op_xrefs_from,
+    "callers_of_import": _op_callers_of_import,
 }
 
 

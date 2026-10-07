@@ -284,7 +284,10 @@ _KNOWN_INSTALL_GLOBS = ("IDA Professional 9*", "IDA Pro 9*")
 _ALLOWED_OPERATIONS = (
     "summary", "list_functions", "segments", "function_at_address",
     "decompile_function", "xrefs_to", "imports_exports", "strings",
+    "read_bytes", "xrefs_from", "callers_of_import",
 )
+# `read_bytes` takes 1..this many bytes; the worker enforces the same window.
+_READ_BYTES_MAX_SIZE = 4096
 _DATABASE_SUFFIXES = {".i64", ".idb", ".id0", ".id1", ".id2", ".nam", ".til"}
 _LOOSE_COMPONENTS = (".id0", ".id1", ".id2", ".nam", ".til")
 
@@ -315,7 +318,41 @@ _PDB_LOOKUP_DECLARED = {
 _WORKER_BOOKKEEPING = {"ok", "tool", "script_completed", "engine_input_sha256", "engine_input_md5"}
 # Operations whose `offset` indexes the result sequence, so a response that
 # had to be trimmed can report where to resume.
-_PAGED_OPERATIONS = {"list_functions", "segments", "xrefs_to", "imports_exports", "strings"}
+_PAGED_OPERATIONS = {"list_functions", "segments", "xrefs_to", "imports_exports", "strings",
+                     "xrefs_from", "callers_of_import"}
+
+
+def _read_bytes_request_problem(query):
+    """None when `query` is a usable `read_bytes` request, else the error code the worker would give.
+    Same grammar as the worker: a JSON object {"address", "size"} or the text "ADDRESS SIZE" (hex or
+    decimal numbers). Checked here too so a bad request never starts IDA."""
+    try:
+        text = (query or "").strip()
+        if text.startswith("{"):
+            request = json.loads(text)
+            address, size = request.get("address"), request.get("size")
+        else:
+            parts = text.replace(",", " ").split()
+            address, size = parts if len(parts) == 2 else (None, None)
+    except Exception:  # noqa: BLE001
+        return "INVALID_READ_BYTES_REQUEST"
+    if address is None or size is None or isinstance(address, bool) or isinstance(size, bool):
+        return "INVALID_READ_BYTES_REQUEST"
+
+    def number(value):
+        if isinstance(value, int):
+            return value
+        try:
+            return int(str(value), 0)
+        except ValueError:
+            return None
+
+    ea, count = number(address), number(size)
+    if ea is None or ea < 0 or ea == 0xFFFFFFFFFFFFFFFF:
+        return "INVALID_ADDRESS"
+    if count is None or not 1 <= count <= _READ_BYTES_MAX_SIZE:
+        return "INVALID_SIZE"
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -1095,7 +1132,7 @@ def _fit(body, max_chars):
             body["decompiled"] = text[:keep]
             trimmed = True
             rendered = _j(body)
-    list_keys = [k for k in ("items", "exports") if isinstance(body.get(k), list)]
+    list_keys = [k for k in ("items", "exports", "loaded_ranges", "unloaded_ranges") if isinstance(body.get(k), list)]
     while len(rendered) > max_chars and any(body.get(k) for k in list_keys):
         for key in list_keys:
             if body.get(key):
@@ -1211,11 +1248,32 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
     * `function_at_address` `query` is a symbol name or a virtual address
                             (e.g. "0x140001000"); resolves the containing function.
     * `decompile_function`  same `query`; returns Hex-Rays pseudocode.
-    * `xrefs_to`            `query` is a symbol name or virtual address; any
-                            target, but a query on an import name, IAT slot or jump
-                            thunk returns OK with an empty list that cannot tell
-                            "no callers" from "not resolved through the thunk". Calls are
-                            flagged (`is_call`); jumps are not calls.
+    * `xrefs_to`            `query` is a symbol name or virtual address. A name is
+                            resolved exact name, then demangled name, then import name
+                            (any module; the import slot is added to the candidates);
+                            `resolved_by` says how, `candidates` lists EVERY address the
+                            name pointed at (none is chosen) and each item carries `to`.
+                            Items split code and data by `kind`; calls are flagged
+                            (`is_call`), jumps are not calls. A name that resolves to
+                            nothing is `SYMBOL_NOT_FOUND`, never an empty OK.
+    * `xrefs_from`          `query` is a symbol name or address. A function (its name
+                            or start address) gives the code and data references out of
+                            every instruction in it (`scope: function`); any other
+                            address gives that one item's (`scope: address`). Paged,
+                            `truncated` while `next_offset` is not null.
+    * `callers_of_import`   `query` is an import name (any module). Lists the
+                            functions that reference its import slot, with function name
+                            and address and the call site; a reference from a jump thunk
+                            is followed one level (`via_thunk`). Computed calls are not
+                            searched: an empty list is "none found", not "never called".
+                            An unknown import is `IMPORT_NOT_FOUND`.
+    * `read_bytes`          `query` is JSON `{"address": "0x...", "size": N}` or the text
+                            "0x... N", 1 <= N <= 4096 (larger is refused before IDA
+                            starts). Reads the database as IDA mapped it. A byte IDA has
+                            no value for is never reported as a number: `bytes_hex` is
+                            null unless every byte is loaded, `loaded_ranges` hold the
+                            loaded runs and `unloaded_ranges` the rest. An address outside
+                            every segment is `ADDRESS_NOT_MAPPED`.
     * `imports_exports`     IDA's own import resolution plus entry points.
     * `strings`             IDA's string list; a non-empty `query` filters
                             case-insensitively on the decoded text.
@@ -1254,6 +1312,16 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
             "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "UNKNOWN_OPERATION",
             "given": str(operation), "accepted": list(_ALLOWED_OPERATIONS),
         })
+    if operation == "read_bytes":
+        problem = _read_bytes_request_problem(query)
+        if problem:
+            return _j({
+                "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": problem, "path": relative(p),
+                "detail": (
+                    "`query` for read_bytes must be a JSON object {\"address\": \"0x...\", \"size\": N} or the "
+                    f"text \"0x... N\", with 1 <= size <= {_READ_BYTES_MAX_SIZE}. Nothing was started."
+                ),
+            })
     if p.suffix.lower() in _DATABASE_SUFFIXES:
         return _j({
             "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "DATABASE_INPUT_NOT_SUPPORTED",

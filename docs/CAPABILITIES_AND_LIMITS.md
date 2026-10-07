@@ -125,9 +125,15 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
 
 - `tools/ida.py`: `ida_query` (read-only), `ida_microcode_cfg` (below), `ida_type_member_offset`, `ida_patch_plan` (a plan only), `ida_annotations` (reads the annotation log), the write path `ida_rename_plan` / `ida_set_comments_plan` / `ida_annotations_apply` / `ida_annotations_purge` (below) and `ida_status`, driving IDA Pro 9.x headless
   (`idat -A`) in a bounded subprocess. Operations: `summary`, `list_functions`, `segments`,
-  `function_at_address`, `decompile_function` (Hex-Rays pseudocode), `xrefs_to` (any symbol or
-  address, including import slots; calls are flagged, jumps are not calls), `imports_exports`,
-  `strings`. Listings page with `offset` / `next_offset`.
+  `function_at_address`, `decompile_function` (Hex-Rays pseudocode), `xrefs_to` (a name is
+  resolved exact, then demangled, then as an import name, and `resolved_by` says which; every candidate
+  address is listed and none is chosen; code and data references are told apart by `kind`; calls are
+  flagged, jumps are not calls), `xrefs_from` (references out of one address or out of a whole
+  function, fall-through left out), `callers_of_import` (functions, addresses and call sites that
+  reference an import's slot, one level of thunk followed; computed calls are not searched, so an
+  empty list is "none found"), `read_bytes` (1..4096 bytes of the loaded database at an address; a
+  byte IDA holds no value for is null, never zero), `imports_exports`, `strings`. Listings page with
+  `offset` / `next_offset`.
 - Partial, by design: symbol-server (PDB download) lookups are switched off on every launch, so names
   that exist only in a PDB are absent. IDA's auto-analysis can miss or mis-split code in obfuscated or
   packed targets, so an absent function or xref is not proof of absence. Pseudocode is IDA's reading,
