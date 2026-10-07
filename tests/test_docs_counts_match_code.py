@@ -25,8 +25,8 @@ the bare-count check then skips that file (its numbers are the record of that da
 Ownership: each measured fact is marked in exactly ONE file (``test_a_fact_is_marked_in_exactly_one_file``);
 elsewhere the prose points at the owner instead of repeating the number. Owners: modules and test files in
 docs/INSTALL.md (the "what is in the package" page), the windows-kernel family counts in
-docs/CAPABILITIES_AND_LIMITS.md (where those tools are described), the evidence-directory owner count in README.md
-(where the capability table names each tool). CI types no module count: the wheel job measures it.
+docs/CAPABILITIES_AND_LIMITS.md (where those tools are described), the evidence-directory owner count and the two CLI-reach counts (`cli_direct_commands`, `cli_python_only`) in README.md
+(where the capability table names each tool and the CLI is described). CI types no module count: the wheel job measures it.
 
 Scope: ``README.md``, ``CONTRIBUTING.md`` and every ``docs/*.md``. Not covered, because they are
 not measurable without running the suite: the collected-test totals in CAPABILITIES_AND_LIMITS.md
@@ -41,6 +41,7 @@ from pathlib import Path
 import liebert_re
 from liebert_re.report import tool_families
 from tests import test_docs_do_not_deny_shipped_tools as other
+from tests.cli_literals import directly_dispatched
 
 ROOT = Path(__file__).resolve().parent.parent
 DOCS = [ROOT / "README.md", ROOT / "CONTRIBUTING.md", *sorted((ROOT / "docs").glob("*.md"))]
@@ -88,6 +89,10 @@ MEASURE = {
     "kernel_family_named": lambda: len(tool_families.FAMILIES["windows-kernel"]),
     "kernel_family_defined": lambda: len(tool_families.published_tools("windows-kernel")),
     "evidence_modules": _evidence_owner_modules,
+    # README.md owns both: how many published tools cli.py names by string literal (AST, shared with
+    # tests/test_cli_reachability.py), and how many declare `CLI: python-only` in their docstring.
+    "cli_direct_commands": lambda: len(directly_dispatched()),
+    "cli_python_only": lambda: len(tool_families.python_only_declarations()),
 }
 
 

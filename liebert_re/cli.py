@@ -68,8 +68,6 @@ _TEXT_SHAPES = {
     "imports": re.compile(rf"(?:\S+!.+ @IAT 0x[0-9a-f]+|No import table\.|No matches\.|{_MARKER})"),
     "exports": re.compile(rf"(?:.+ RVA=0x[0-9a-f]+ ordinal=\d+|No export table\.|{_MARKER})"),
     "disasm": re.compile(rf"(?:0x[0-9A-F]+: .+|No instruction could be decoded\.|{_MARKER})"),
-    # `tool run` answers are looked up by tool name; only text-returning tools with a known listing shape belong here.
-    "binary_strings": re.compile(rf"(?:0x[0-9A-F]+ \[(?:ascii|utf16)\] .*|No strings found\.|{_MARKER})"),
 }
 
 
@@ -92,8 +90,15 @@ def _envelope(command, payload, workspace=None):
     return {"command": command, **extra, "result": payload}
 
 
-def _decode(raw, shape=None):
+def _decode(raw, shape=None, tool=None):
     """Module return value -> JSON-able. Text that is not JSON is carried verbatim.
+
+    ``tool`` is set by ``tool run`` only: the text is then the answer of a registry tool, wrapped
+    in the generic envelope ``{"tool": name, "text": ...}`` with no per-tool shape. Such a text has
+    no listing grammar the CLI knows, so it is NOT classified: ``classified: false`` says so, and
+    ``ok: true`` then means only "the tool returned and no known failure code or broken truncation
+    marker was found", never "the prose is a success". A tool that reports failure in prose
+    ("Directory not found: ...") is therefore indistinguishable here; read ``text``.
 
     Text is an answer only if it carries a known failure code or every line fits
     ``shape``; otherwise it is an unclassifiable result and becomes a FAILED
@@ -111,11 +116,13 @@ def _decode(raw, shape=None):
     except ValueError:
         pass
     out = {"result_format": "text", "text": raw}
+    if tool is not None:
+        out = {"tool": tool, **out}
     if raw.startswith(_TEXT_UNSUPPORTED_PREFIXES):
         out.update(ok=False, status="UNSUPPORTED")
     elif raw.startswith(_TEXT_LIMITED_PREFIXES):
         out.update(ok=False, status="ANALYSIS_LIMITED")
-    elif shape is None or not all(shape.fullmatch(line) for line in raw.splitlines() if line):
+    elif tool is None and (shape is None or not all(shape.fullmatch(line) for line in raw.splitlines() if line)):
         out.update(ok=False, status="FAILED", error="UNCLASSIFIED_OUTPUT",
                    message="The command returned text the CLI cannot classify as an answer or a known failure.")
     else:
@@ -129,6 +136,8 @@ def _decode(raw, shape=None):
             out.update(ok=True, status="OK", truncation=truncation)
         else:
             out.update(ok=True, status="OK")
+        if tool is not None:
+            out["classified"] = False
     return out
 
 
@@ -432,7 +441,7 @@ def _capabilities(a):
 
 def _shape(a):
     if a.command == "tool":
-        return _TEXT_SHAPES.get(getattr(a, "name", None))
+        return None  # `tool run` text answers use the generic envelope (see _decode), not a per-tool shape
     return _TEXT_SHAPES.get(a.mode) if a.command == "pe" else _TEXT_SHAPES.get(a.command)
 
 
@@ -598,6 +607,10 @@ def _tool_prepare(a):
     return None
 
 
+class _TextAnswer(str):
+    """A ``str`` a registry tool returned; tells main() to apply the generic text envelope."""
+
+
 def _tool(a):
     modules, declared = _tool_registry()
     if a.tool_command == "list":
@@ -618,7 +631,14 @@ def _tool(a):
         if _is_path_param(key) and value is not None:
             for item in value if isinstance(value, list) else [value]:
                 safe_path(item)  # PermissionError -> PATH_REFUSED, before the tool's module is imported
-    return _load(modules[a.name], a.name)(**kwargs)
+    result = _load(modules[a.name], a.name)(**kwargs)
+    if isinstance(result, (bytes, bytearray)):
+        try:
+            result = bytes(result).decode("utf-8")
+        except UnicodeDecodeError:
+            return {"ok": False, "status": "FAILED", "error": "BINARY_OUTPUT", "tool": a.name,
+                    "message": "the tool returned bytes that are not UTF-8 text; use the Python API"}
+    return _TextAnswer(result) if isinstance(result, str) else result
 
 
 def _gate_args(sp):
@@ -816,7 +836,9 @@ def main(argv=None):
                 args.path = new_path
             undo = _apply_workspace(root)
         try:
-            return _emit(command, _decode(args.handler(args), _shape(args)), info)
+            raw = args.handler(args)
+            tool = args.name if isinstance(raw, _TextAnswer) else None
+            return _emit(command, _decode(raw, _shape(args), tool), info)
         finally:
             undo()
     except PermissionError as exc:

@@ -137,8 +137,8 @@ def test_run_binary_strings_on_a_small_byte_string_file(capsys, workspace):
     (workspace / "blob.bin").write_bytes(b"\x00\x01needle-string-here\x00\xff\xfe" + "wide!".encode("utf-16le"))
     code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "binary_strings",
                     "--args", json.dumps({"path": str(workspace / "blob.bin"), "contains": "needle", "min_length": 4}))
-    assert code == 0
-    assert "needle-string-here" in json.dumps(out)
+    assert code == 0 and out["tool"] == "binary_strings" and out["ok"] is True and out["classified"] is False
+    assert "needle-string-here" in out["text"]
 
 
 def test_path_outside_the_workspace_is_refused_before_the_tool_runs(capsys, workspace, tmp_path):
@@ -165,9 +165,66 @@ def test_missing_target_file_is_the_usual_file_not_found_refusal(capsys, workspa
     assert code == 3 and out["status"] == "PATH_REFUSED" and out["error"] == "FILE_NOT_FOUND"
 
 
-def test_unclassifiable_text_result_is_failed_not_a_silent_success(capsys, workspace):
-    # read_file answers in prose; the CLI's text contract has no shape for it, so it must not pass as OK.
+def test_text_answer_is_wrapped_in_the_generic_envelope_and_says_it_is_unclassified(capsys, workspace):
+    # read_file answers in prose; the generic path carries it as {"tool", "text"} and does not pretend
+    # to have classified it (a prose "File not found" from another tool looks the same).
     (workspace / "t.txt").write_text("hello\n", encoding="utf-8")
     code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "read_file",
                     "--args", json.dumps({"path": str(workspace / "t.txt")}))
-    assert code == 1 and out["status"] == "FAILED" and out["error"] == "UNCLASSIFIED_OUTPUT"
+    assert code == 0 and out["command"] == "tool" and out["tool"] == "read_file"
+    assert out["result_format"] == "text" and "hello" in out["text"]
+    assert out["ok"] is True and out["status"] == "OK" and out["classified"] is False
+
+
+def _str_annotated_tools():
+    """Published tools declared ``-> str``, read from the AST (never imported), minus the python-only ones."""
+    import ast
+    modules, declared = cli._tool_registry()
+    out = []
+    for name, module in sorted(modules.items()):
+        node = cli._tool_node(module, name)
+        if node is not None and node.returns is not None and ast.unparse(node.returns) == "str" and name not in declared:
+            out.append(name)
+    return out
+
+
+def test_str_annotated_analysis_tool_runs_through_the_generic_path(capsys, workspace):
+    # Every `-> str` analysis tool in this package returns a JSON document as text; the generic path
+    # must hand back the parsed document (not a {"text": ...} wrapper) and exit 0.
+    tools = _str_annotated_tools()
+    assert "generic_static_probe" in tools, "the str-annotated selection is broken"
+    (workspace / "s.bin").write_bytes(b"MZ\x90\x00 liebert fixture \x00")
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "generic_static_probe",
+                    "--args", json.dumps({"path": str(workspace / "s.bin")}))
+    assert code == 0 and out["command"] == "tool" and out["tool"] == "generic_static_probe"
+    assert "text" not in out and "classified" not in out and out["status"] == "READY"
+
+
+def test_plain_text_from_a_str_tool_is_enveloped_and_bytes_are_decoded_or_refused(capsys, workspace, monkeypatch):
+    (workspace / "s.bin").write_bytes(b"x" * 8)
+    answers = {}
+    real_load = cli._load
+    monkeypatch.setattr(cli, "_load", lambda m, n: (lambda **kw: answers["v"])
+                        if (m, n) == ("liebert_re.tools.binary", "hash_file") else real_load(m, n))
+    argv = ("--workspace", str(workspace), "tool", "run", "hash_file", "--args", json.dumps({"path": str(workspace / "s.bin")}))
+    answers["v"] = "plain prose answer\n[limit:5; truncated=true; returned=5; total=9]"
+    code, out = run(capsys, *argv)
+    assert code == 0 and out["tool"] == "hash_file" and out["text"] == answers["v"]
+    assert out["truncation"]["omitted"] == 4 and out["classified"] is False
+    answers["v"] = "plain\n[limit:5; truncated=true; returned=9; total=9]"
+    code, out = run(capsys, *argv)
+    assert code == 1 and out["error"] == "UNCLASSIFIED_OUTPUT"
+    answers["v"] = "Authenticode verification requires Windows."
+    code, out = run(capsys, *argv)
+    assert code == 3 and out["status"] == "UNSUPPORTED" and out["tool"] == "hash_file"
+    answers["v"] = "bytes answer".encode()
+    code, out = run(capsys, *argv)
+    assert code == 0 and out["text"] == "bytes answer" and out["tool"] == "hash_file"
+    answers["v"] = b"\xff\xfe\x00"
+    code, out = run(capsys, *argv)
+    assert code == 1 and out["error"] == "BINARY_OUTPUT"
+
+
+def test_no_per_tool_text_shape_remains_for_tool_run():
+    assert cli._shape(cli._build_parser().parse_args(["tool", "run", "binary_strings"])) is None
+    assert "binary_strings" not in cli._TEXT_SHAPES
