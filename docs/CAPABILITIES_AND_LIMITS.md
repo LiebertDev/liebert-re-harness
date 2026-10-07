@@ -319,15 +319,45 @@ return a named tool-missing status when absent. Function inventory
   `liebert-re` CLI (`identify`, `probe`, `pe`, `disasm`, `packer`, `die`, `rzbin`, `flirt`, `flirtinventory`,
   `sieve`, `labgate`, `labregister`, `sievestatus`, `rzbinstatus`, `diestatus`, `yarastatus`, `upxstatus`,
   `il2cppstatus`, `dexstatus`, `jvmstatus`, `capa`, `capastatus`, `ida`, `idamicrocode`, `idastatus`, `idaannotations`,
-  `kerneltriage`, `kerneldispatch`, `kerneliat`, `kernelcallbacks`, `ioctldecode`, `ghidrastatus`, `ghidrafacts`, `ghidradecompile`, `unpack`,
-  `scan`, `minidump`, `pdata`, `trailing`, `tool`, `capabilities`; 41 subcommands, from `cli.py`):
+  `kerneltriage`, `kerneldispatch`, `kerneliat`, `kernelcallbacks`, `ioctldecode`, `ghidrastatus`, `ghidrafacts`, `ghidradecompile`, `emulate`, `unpack`,
+  `scan`, `minidump`, `pdata`, `trailing`, `tool`, `capabilities`; 42 subcommands, from `cli.py`):
   `workspace.py`, `bounded_subprocess.py`, `cli.py`.
 
 ### Dynamic and emulation
 
-- Unicorn is imported only by `recover/vex.py`, which corrects AVX instruction
-  execution inside an emulation session someone else sets up. No range
-  emulation, tracing or slicing ships.
+- `recover/emulate.py` (`emulate_range`; family `emulation`; CLI `emulate`, or `tool run emulate_range`): bounded emulation
+  of a range of an x86-64 PE32+ image with Unicorn. **What it does.** Maps the image at its preferred base (no relocation; a
+  collision with the fixed stack, TEB, PEB or trap regions is `MAP_CONFLICT`), with section permissions exactly as declared
+  (`perm_mode="rwx"` maps everything read-write-execute and is reported as an approximation). Points every ordinary import
+  slot at its own unmapped trap address, so a call into an import stops the run as `IMPORT_CALL` with `dll!name`. Pushes a
+  sentinel return address, so the entry routine returning is `RETURNED`. Runs from the `start_va` the caller gives (TLS
+  callbacks and loader initialisers do not run). Provides a minimal TEB/PEB (GS base; StackBase, StackLimit, Self, the PEB
+  pointer, ImageBaseAddress, BeingDebugged 0, Ldr NULL) and lists exactly which fields it assigned in `teb_peb_model`; every
+  other byte is zero, which is the absence of a model, not a Windows value. Every run stops with a named `stop_reason`:
+  `RETURNED`, `STOP_ADDRESS`, `IMPORT_CALL`, `SYSCALL` (a `syscall` or `sysenter`; RAX is reported), `INTERRUPT`, `INT3`,
+  `UD2`, `HLT`, `PORT_IO`, `UNMAPPED_READ`/`WRITE`/`FETCH`, `WRITE_PROTECT`, `READ_PROTECT`, `FETCH_PROTECT`,
+  `INVALID_INSTRUCTION`, `INSN_LIMIT`, `TIMEOUT`, `UNMODELLED_VEX`, `ENGINE_ERROR`, `ENGINE_CRASH` and `UNKNOWN_STOP`. It reports
+  the instruction count, the stop-time registers, the last 64 instruction addresses, every region the code wrote (merged where
+  bytes touch, with its SHA-256 and whether any instruction was executed from it after it was written, the signature of a
+  self-decoding image), and per-section differences from the loaded image with the changed sections dumped as raw bytes (not a
+  PE) under `dataset/emulation/<input_sha16>/<run_id>/`. Instructions are counted by a per-instruction hook. Measured on one machine, a decrypt-style XOR loop of 4.85 million
+  instructions took about 8.5 seconds end to end (about 0.6 million instructions per second when the loop shares a page with
+  the bytes it rewrites, 0.8 million when it writes elsewhere, 1.3 million for a loop with no writes), so the default bound of
+  5 million instructions takes roughly 4 to 9 seconds, well inside the default 120 seconds. VEX-encoded instructions are executed by `recover/vex.py`, and one it does not model stops the run.
+  **What it does not do.** It executes nothing natively on the host: the engine runs inside Unicorn, in a separate interpreter
+  with a timeout and a memory limit. That is a process boundary and **not a sandbox**, and every response says so
+  (`host_isolation`). It answers no import and no syscall (there are no API stubs, no handles, files, threads or exceptions),
+  it does not read delay-load or bound imports, it refuses 32-bit images, and it does not know what a real CPU would return
+  for `cpuid` or `rdtsc` (Unicorn's model answers). It is not a way to run a sample safely, and the gate is not a way to
+  establish that you may analyse it. **The gate.** `target_class` is required: `public_crackme` (a challenge written to be
+  solved) or `owned_target` (the caller owns it: an authorization names who authorised the run and why, and its
+  `sample_sha256` must equal the file's real SHA-256, else `SAMPLE_HASH_MISMATCH`). Anything else, or nothing, is
+  `TARGET_CLASS_REQUIRED`, and a third-party target is refused. A `public_crackme` whose file name matches an entry of the
+  operator's own list in `~/.liebert-re/targets.txt` is `CLASS_CONFLICT`; that check is best effort and `registry_checked` says
+  whether the list was read. The declaration is not verified and no environment variable opens the gate. Evidence goes under
+  `dataset/evidence/emulate_range/`; if the final record cannot be written the result is withheld
+  (`EVIDENCE_FINALIZE_FAILED`). A native crash of the engine process is `ENGINE_CRASH`, and what it had written is listed as
+  `unverified`. Responses contain no file-system path.
 - `tools/pe_sieve.py` (`pe_sieve_scan`, `pe_sieve_status`; family `dynamic`): a scan of ONE running process, by PID,
   for in-memory differences from its on-disk image (patched or hooked code, IAT hooks, replaced or hollowed images, implanted PEs and shellcode). Read from pe-sieve's own `/json /jlvl 2` report, and its category names are passed through as given. Scan only: `/ofilter 2` is always passed and no dump, import-recovery, minidump or reflection switch can be. The PID is required; a missing, invalid or all-processes request is `PID_REQUIRED` and starts nothing. The 64-bit scanner is used whenever it is present, because measured on 0.4.1.1 it scans 32-bit (WOW64) targets too (and also reports the native modules those load), while the 32-bit scanner cannot scan a 64-bit target and prints an all-zero, clean-looking report; that case is `SCANNER_MISMATCH`.
   **No result here means "clean" unless it is `OK` with `anomalies_found: false`,** and even then only for the modules and regions scanned at the depth in `scan_flags`: a process that could not be opened is `ACCESS_DENIED` or `PROCESS_NOT_OPENED`, zero modules scanned is `NOTHING_SCANNED`, unread or skipped modules make `SCAN_PARTIAL` (findings still listed). The access-denied wording and a non-zero `errors` report were not reproduced on the measuring machine; they are handled from the documented shape and the tests say so. Non-executable pages, thread stacks and kernel memory are not covered by default.
@@ -457,8 +487,9 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
   lists (`pe_function_extent`, CLI `pdata`): leaf functions have no entry, so most small functions
   are not recoverable this way, and there is no recovery for x86 images or from prologue patterns.
   The unwind records are not decoded.
-- No bounded code-range emulation, so nothing can exercise a routine in
-  isolation.
+- Bounded code-range emulation exists (`emulate_range`), but it stops at the first import or syscall and has no API stubs,
+  so a routine that calls the operating system cannot be run through it yet; there are no traces beyond the last 64
+  instruction addresses and no slicer.
 - No kernel-debugger or live-kernel integration, and no parser for kernel-dump
   formats. Only `MDMP`-format dumps are read.
 - No decompiler and no cross-reference engine of its own. With a licensed IDA Pro 9.x on the
@@ -509,7 +540,7 @@ sit on disk.
    `tools/dex.py`, `tools/android.py` and `tools/jvm.py` ship (structure only).
    `ROADMAP.md` has the corrected wording.
 3. `INSTALL.md` says core analysis, including emulation, runs on the Python
-   dependencies alone. No range emulation ships; `recover/vex.py` is an
+   dependencies alone. At that check no range emulation shipped; `recover/vex.py` is an
    instruction-semantics correction layer. It also lists function inventory
    there, but `rizin_functions` needs rizin.
 4. `INSTALL.md` counts: "64<!-- count:historic --> Python modules at the repository root", "47<!-- count:historic --> test

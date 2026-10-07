@@ -252,3 +252,10 @@ implementation here; it needs more than a path, so it was taken out of the path-
 (ghidra_decompile). The module's private helpers are not part of the pin. The Java script it drives
 (ghidra_scripts/DecompileFunctions.java) is a data file and adds no names. No new Python module.
 Digest recomputed from the source.
+Updated again: the published tool set gained emulate_range (liebert_re/recover/emulate.py), the bounded
+Unicorn emulation of a code range inside an x86-64 PE, reached from the CLI as `emulate`. It was already a
+FAMILIES["emulation"] name with no implementation here. One new module, and one public name
+(emulate_range): the gate (EmulationGate), the parent-side runner and the emulator-process engine are classes,
+and the only other top-level functions are underscore-private, so they are not part of the pin. The module
+owns an EVIDENCE directory (dataset/evidence/emulate_range), which is why EVIDENCE_OWNERS in
+tests/test_layout_invariants.py gained it. Digest recomputed from the source.

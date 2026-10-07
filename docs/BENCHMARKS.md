@@ -152,7 +152,7 @@ distinction is usually where tool inventories lie.
 | IDA (Professional) | **Real subset in this package** — `idat -A` batch in a bounded subprocess, database cache keyed by the input file's SHA-256 and size-capped; the annotation write path (rename and comment plans, `ida_annotations_apply`, `ida_annotations_purge`), microcode reading, type-member offsets, patch planning (a plan only), the annotation-log read and read-only listings (disassembly of a database range, basic blocks, call graph, stack frame, local variables, byte and immediate search, structs, FLIRT signatures) are here; decompiler comments are not |
 | Ghidra | **Real, partly in this package** — `analyzeHeadless`, one throw-away project per call; install status, read-only program facts and read-only decompilation of selected functions, no cross-references; exit code 0 is not trusted, the log and result file decide |
 | rizin / radare2 | **Real** (rizin wrapper only in this package; no radare2 driver) — bounded subprocess wrapper |
-| Capstone, Unicorn | **Real** — in-process imports (Unicorn only for the VEX self-check in `recover/vex.py`; no range emulation ships) |
+| Capstone, Unicorn | **Real** — Capstone is imported in process; Unicorn runs the VEX self-check in `recover/vex.py` in process and bounded range emulation (`recover/emulate.py`) in a separate interpreter |
 | angr | **Not in this package** — nothing imports it |
 | capa | **Real** (wrapper in `liebert_re/tools/capa.py`; the binary is separately obtained and is not bundled) |
 | FLOSS | Real in the private tree only, where it is a separately obtained binary. **Not part of this package: no driver, nothing bundled** |

@@ -22,7 +22,7 @@ EVIDENCE_OWNERS = {
     "liebert_re.dynamic.apimonitor", "liebert_re.dynamic.lab_gate", "liebert_re.tools.binary", "liebert_re.tools.capa",
     "liebert_re.tools.die", "liebert_re.tools.generic_static_probe", "liebert_re.tools.ghidra",
     "liebert_re.tools.ida",
-    "liebert_re.tools.pe_sieve", "liebert_re.tools.rizin",
+    "liebert_re.tools.pe_sieve", "liebert_re.tools.rizin", "liebert_re.recover.emulate",
     "liebert_re.tools.upx", "liebert_re.tools.yara_x",
 }
 
@@ -63,7 +63,7 @@ def test_published_tool_name_set_is_unchanged():
         n for n in tool_families._locally_defined_tool_names() if not n.startswith("_")
     )
     digest = hashlib.sha256(repr(public).encode()).hexdigest()
-    assert digest == "36f1e6ddd4424cfa359e528f96a4e29687cb9886fa21d446cb09024febeca3ec"
+    assert digest == "4a7f083f2be04f876e1f6d2af52b7a0e8783be191d7333617c64a6daf4c38d64"
 
 
 def test_the_imported_package_is_this_checkout():

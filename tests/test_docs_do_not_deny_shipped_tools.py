@@ -52,6 +52,8 @@ DENIALS = {
     "pe_function_extent": (r"no function-boundary recovery for stripped x64 images",),
     "pe_trailing_data": (r"does not (?:report|cover)[^.]*(?:overlay|data past the end of the last section)",
                          r"No module reports[^.]*(?:overlay|trailing data)"),
+    "emulate_range": (r"No range emulation, tracing or slicing ships", r"No bounded code-range emulation, so nothing can",
+                      r"Unicorn is imported only by `recover/vex\.py`"),
 }
 
 # Wording that states an absence which a shipped tool closes. Key: the tool that closes it.
@@ -68,6 +70,7 @@ README_DENIALS = {
     "kernel_triage": (r"`kernel_triage`:[^|]*not wired to the CLI",),
     "ghidra_program_facts": (r"`ghidra_status`:[^|]*not wired to the CLI",),
     "pe_function_extent": (r"Function-boundary recovery from exception-directory unwind data[^|]{0,80}Not here",),
+    "emulate_range": (r"it cannot emulate a code range, and",),
 }
 
 README_ABSENCES = ABSENCES
@@ -122,6 +125,13 @@ class DocsDoNotDenyShippedTools(unittest.TestCase):
                       "and engine cross-check. Not here.")
         for pat in README_DENIALS["pe_function_extent"]:
             self.assertRegex(old_readme, pat)
+        old_emulation = ("Unicorn is imported only by `recover/vex.py`, which corrects AVX instruction execution inside an "
+                         "emulation session someone else sets up. No range emulation, tracing or slicing ships. "
+                         "- No bounded code-range emulation, so nothing can exercise a routine in isolation.")
+        for pat in DENIALS["emulate_range"]:
+            self.assertRegex(old_emulation, pat)
+        self.assertRegex("facts and decompile selected functions through Ghidra headless, it cannot emulate a code range, and when it guesses",
+                         README_DENIALS["emulate_range"][0])
         old_trailing = ("No module reports the overlay. The PE surface does not report data past the end "
                         "of the last section.")
         for pat in DENIALS["pe_trailing_data"]:
