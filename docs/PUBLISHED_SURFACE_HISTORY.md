@@ -252,3 +252,12 @@ implementation here; it needs more than a path, so it was taken out of the path-
 (ghidra_decompile). The module's private helpers are not part of the pin. The Java script it drives
 (ghidra_scripts/DecompileFunctions.java) is a data file and adds no names. No new Python module.
 Digest recomputed from the source.
+Updated again: the published tool set gained ida_script (liebert_re/tools/ida.py): caller-written IDAPython run
+once in an idalib session on a discarded COPY of the cached database, returning the JSON the script leaves in
+`result`. It is gated (LIEBERT_RE_IDA_SCRIPT=authorized; off by default), idalib-only (`backend="idat"` is
+UNSUPPORTED), protected by an AST accident guard that is explicitly not a sandbox, and its answer labels the
+script's value `SCRIPT_REPORTED`. Registered in tool_families.FAMILIES["native"] (coordinate-requiring tier: it
+needs a script, so a bare path call cannot run it); the CLI reaches it as `idascript` and through `tool run`.
+Public names: one (ida_script). Its helpers are private and not part of the pin. The worker is a mode (`script`)
+of the existing data file ida_scripts/idalib_worker.idapy and adds no names and no module. Digest recomputed from
+the source.

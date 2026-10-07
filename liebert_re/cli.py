@@ -374,6 +374,22 @@ def _ida(a):
     )
 
 
+def _ida_script(a):
+    # The gate (LIEBERT_RE_IDA_SCRIPT) is checked by ida_script itself, before anything else. The script file is
+    # read through the same workspace rule as every other path argument.
+    try:
+        source = _load("liebert_re.workspace", "safe_path")(a.script_file).read_text(encoding="utf-8")
+    except PermissionError as exc:
+        return {"ok": False, "status": "PATH_REFUSED", "tool": "ida_script", "error": str(exc)}
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        return {"ok": False, "status": "ANALYSIS_LIMITED", "tool": "ida_script", "error": "SCRIPT_FILE_UNREADABLE",
+                "error_type": type(exc).__name__}
+    return _load("liebert_re.tools.ida", "ida_script")(
+        a.path, source, timeout_seconds=a.timeout, max_result_chars=a.max_result_chars, max_chars=a.max_chars,
+        backend=a.backend,
+    )
+
+
 def _ida_microcode(a):
     return _load("liebert_re.tools.ida", "ida_microcode_cfg")(
         a.path, a.function, maturity=a.maturity, deobfuscate=a.deobfuscate, d810_project=a.d810_project,
@@ -794,6 +810,12 @@ def _build_parser():
     sp.add_argument("--max-chars", type=int, default=60000, help="bound on the JSON response")
     sp.add_argument("--timeout", type=int, default=180, help="seconds for the whole call, clamped to 5-600; the first analysis of a file may use all of it, the session that answers is capped at 300")
     sp.add_argument("--backend", default="auto", choices=("auto", "idat", "idalib"), help="engine that answers: idat (batch binary), idalib (the idapro package in the interpreter named by LIEBERT_RE_IDALIB_PYTHON) or auto (idalib only when that variable is set and `import idapro` works there, else idat); every answer says which was used")
+    sp = add("idascript", _ida_script, "run a caller-written IDAPython script on a discarded copy of the cached IDA database and print the JSON it leaves in `result` (idalib backend only; gated: needs LIEBERT_RE_IDA_SCRIPT=authorized; NOT a sandbox)")
+    sp.add_argument("--script-file", required=True, metavar="FILE", help="the IDAPython source (UTF-8, at most 64 KiB, inside the workspace); its answer is the JSON-serialisable variable `result`")
+    sp.add_argument("--timeout", type=int, default=120, help="seconds for the script session, clamped to 5-300; the process tree is killed at the limit")
+    sp.add_argument("--max-result-chars", type=int, default=60000, help="bound on the script's `result` as JSON text; a larger one is withheld, never cut")
+    sp.add_argument("--max-chars", type=int, default=60000, help="bound on the whole JSON response; a result that does not fit is withheld, never cut")
+    sp.add_argument("--backend", default="auto", choices=("auto", "idat", "idalib"), help="only idalib can run a script: idat is refused UNSUPPORTED, auto means idalib (LIEBERT_RE_IDALIB_PYTHON must name an interpreter that imports idapro)")
     sp = add("idamicrocode", _ida_microcode, "read one function's microcode from headless IDA as a control-flow graph (raw by default; --deobfuscate runs the optional d810 pass and says so)")
     sp.add_argument("--function", required=True, metavar="TEXT", help="a symbol name or a virtual address inside the function")
     sp.add_argument("--maturity", default="MMAT_LVARS", choices=_IDA_MATURITIES, help="microcode maturity level (default: MMAT_LVARS)")

@@ -104,6 +104,10 @@ hidden feature.
   `ghidra_decompile`, the read-only decompile of up to 16 selected functions, have landed),
   and normalising answers across engines. `ida_query` also has a second backend, idalib
   (`backend="idalib"` or `auto`, `LIEBERT_RE_IDALIB_PYTHON`), for the same read-only questions; the other IDA tools stay on idat.
+  **Caller-written IDAPython has landed as `ida_script`** (gated by `LIEBERT_RE_IDA_SCRIPT=authorized`, idalib only, run on a
+  discarded copy, `SCRIPT_REPORTED` answers, **not a sandbox**: child processes, network and file system are not enforced). **Still open:**
+  running scripts in an isolated guest, and a mechanism (guest or job object) that would make the file-system and process
+  claims enforceable instead of reported as not enforced.
 - **Function-boundary recovery from exception-directory unwind data.** **Partly closed.**
   `liebert_re/tools/pe_unwind.py` reads the x64 exception directory (`.pdata`): published tools
   `pe_runtime_functions` (the table, summarised, with a bounded page of entries) and
