@@ -368,7 +368,7 @@ def _minidump(a):
 def _ida(a):
     return _load("liebert_re.tools.ida", "ida_query")(
         a.path, operation=a.operation, query=a.query, max_results=a.max_results,
-        offset=a.offset, timeout_seconds=a.timeout, max_chars=a.max_chars,
+        offset=a.offset, timeout_seconds=a.timeout, max_chars=a.max_chars, backend=a.backend,
     )
 
 
@@ -791,6 +791,7 @@ def _build_parser():
     sp.add_argument("--offset", type=int, default=0, help="page offset for the listing operations")
     sp.add_argument("--max-chars", type=int, default=60000, help="bound on the JSON response")
     sp.add_argument("--timeout", type=int, default=180, help="seconds for the whole call, clamped to 5-600; the first analysis of a file may use all of it, the session that answers is capped at 300")
+    sp.add_argument("--backend", default="auto", choices=("auto", "idat", "idalib"), help="engine that answers: idat (batch binary), idalib (the idapro package in the interpreter named by LIEBERT_RE_IDALIB_PYTHON) or auto (idalib only when that variable is set and `import idapro` works there, else idat); every answer says which was used")
     sp = add("idamicrocode", _ida_microcode, "read one function's microcode from headless IDA as a control-flow graph (raw by default; --deobfuscate runs the optional d810 pass and says so)")
     sp.add_argument("--function", required=True, metavar="TEXT", help="a symbol name or a virtual address inside the function")
     sp.add_argument("--maturity", default="MMAT_LVARS", choices=_IDA_MATURITIES, help="microcode maturity level (default: MMAT_LVARS)")

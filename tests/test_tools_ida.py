@@ -2200,6 +2200,7 @@ class IdaRealInstallTests(unittest.TestCase):
         stack.enter_context(mock.patch.object(ti, "_evidence_index_record_write", return_value={}))
 
     def q(self, operation="summary", query="", **kw):
+        kw.setdefault("backend", "idat")      # these check the batch binary; the idalib backend has its own heavy tests
         return json.loads(ti.ida_query(str(self.pe), operation, query, **kw))
 
     def test_status_probe_launches_headless_and_reports_the_decompiler(self):

@@ -32,6 +32,16 @@ script that raised before writing can still exit 0).
 
 Read-only: nothing in this file renames, comments, patches or retypes
 anything. Write operations are a separate, later change.
+
+Second caller. The idalib backend (``idalib_worker.idapy``, run in a separate
+interpreter that has ``idapro``) loads this very file as a module and calls
+``_run`` once per requested operation, so the query logic exists in one place.
+That caller passes ``"mode": "idalib"``: it opens a COPY of the cached database
+(or analyses the raw input in a scratch directory), so ``_run`` neither marks
+the session temporary nor claims ``database_changes_discarded``; the idalib
+worker closes the database without saving, and the wrapper measures the slot
+before and after. Importing this file has no side effects (the entry point is
+guarded by ``__name__ == "__main__"``).
 """
 import json
 import os

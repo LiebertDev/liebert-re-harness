@@ -138,7 +138,19 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
   that exist only in a PDB are absent. IDA's auto-analysis can miss or mis-split code in obfuscated or
   packed targets, so an absent function or xref is not proof of absence. Pseudocode is IDA's reading,
   not the source. An IDA database is not accepted as input.
-- The first call on a file pays for IDA's analysis (two idat sessions); later calls reuse a database
+- Two engines answer `ida_query`, chosen by `backend` (`auto` default): `idat` (the batch binary) and
+  `idalib` (Hex-Rays' `idapro` package, in the interpreter named by `LIEBERT_RE_IDALIB_PYTHON`, which is
+  never guessed). The operations are the same functions in both (one file, `query_program.idapy`, which the
+  idalib worker loads), the cache is shared, and the answers were measured equal on the four checked
+  questions (`list_functions`, `decompile_function`, `xrefs_to`, `read_bytes`) on one machine; the engine
+  that answered is in `backend` in every response. Limits: idalib needs a separate Python with `idapro`
+  installed and activated; one worker process holds ONE database (opening a second silently saves and
+  closes the first, so the worker cannot); the cached database is opened as a copy and measured before
+  and after; per call it is no faster than idat (about 1 s versus 0.9 s here), and the `import idapro`
+  probe that `auto` needs is cached for two minutes per process; a session that failed on the chosen
+  engine is not retried on the other one. `ida_microcode_cfg`, `ida_type_member_offset`, `ida_patch_plan`
+  and the annotation tools stay on idat.
+- The first call on a file pays for IDA's analysis (two idat sessions, or one idalib session); later calls reuse a database
   cached by the input file's SHA-256 (`dataset/ida_cache/`, 5 GiB cap by default). `timeout_seconds`
   is one budget clamped to 5-600 s: the first analysis may use all of it (it runs once per file
   content), the session that answers a question never runs longer than 300 s. A timed-out analysis

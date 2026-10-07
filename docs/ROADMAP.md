@@ -97,7 +97,8 @@ hidden feature.
   **Still open:** `ida_disasm_listing` (read-only, next
   round), Ghidra cross-references (`ghidra_status`, `ghidra_program_facts` and
   `ghidra_decompile`, the read-only decompile of up to 16 selected functions, have landed),
-  and normalising answers across engines.
+  and normalising answers across engines. `ida_query` also has a second backend, idalib
+  (`backend="idalib"` or `auto`, `LIEBERT_RE_IDALIB_PYTHON`), for the same read-only questions; the other IDA tools stay on idat.
 - **Function-boundary recovery from exception-directory unwind data.** **Partly closed.**
   `liebert_re/tools/pe_unwind.py` reads the x64 exception directory (`.pdata`): published tools
   `pe_runtime_functions` (the table, summarised, with a bounded page of entries) and

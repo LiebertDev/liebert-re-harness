@@ -14,9 +14,24 @@ It needs a licensed IDA Pro 9.x on the machine. Without one every operation
 returns TOOL_MISSING; nothing here falls back to another engine, because a
 result from a different engine is a different claim.
 
-**Isolation.** Every call is a bounded subprocess (`run_bounded_process`), not
-the in-process `idalib` API: an analysis-kernel crash takes down idat, not the
-caller. The query itself is the read-only worker `ida_scripts/query_program.idapy`
+**Isolation.** Every call is a bounded subprocess (`run_bounded_process`), never
+the in-process `idalib` API: an analysis-kernel crash takes down the worker, not the
+caller. There are two engines for `ida_query` (`backend=`, default "auto"):
+`idat -A` as described here, and **idalib** (Hex-Rays' `idapro` package) run by a
+worker (`ida_scripts/idalib_worker.idapy`) in a SEPARATE interpreter, the one named by
+`LIEBERT_RE_IDALIB_PYTHON` (never guessed; unset means idalib is not configured and "auto"
+is idat). Both run the same operation functions of `query_program.idapy` (the idalib worker
+loads that file as a module), share the cache slots, and put `backend: {requested, used,
+reason}` in every answer. The idalib rules: ONE database per worker process (a second
+`open_database` in a process silently SAVES and closes the first one, measured, so the
+worker opens once and always ends with `close_database(False)`); a cached database is never
+opened in place (a copy is opened in the scratch directory and the slot's hash is taken
+before and after: `CACHE_VIOLATION`, slot dropped, if it moved; a timeout or cancellation
+does not cost the slot); a first analysis answers the question in the same session but
+saves the pristine analysis BEFORE running it; the result comes back through a JSON file
+with a size ceiling, never from stdout (IDA plugins print banners there); the other IDA
+tools (`ida_microcode_cfg`, `ida_type_member_offset`, `ida_patch_plan`, the annotation
+tools) stay on idat. The idat query itself is the read-only worker `ida_scripts/query_program.idapy`
 (a data file, not a module: it imports IDA's own modules and cannot be imported here),
 copied into a private work directory and driven through a JSON job file named
 in the `LIEBERT_IDA_JOB` environment variable (not through `-S`'s own argument
@@ -168,6 +183,21 @@ _JOB_SCRIPT = "liebert_ida_job.py"
 _LOG_NAME = "ida.log"
 _DB_NAME = "db.i64"
 _RESULT_NAME = "result.json"
+
+# The second backend: idalib (Hex-Rays' `idapro` package), driven in a SEPARATE interpreter. The
+# interpreter is never guessed: it is the one named by this variable, or idalib is "not configured".
+IDALIB_PYTHON_ENV = "LIEBERT_RE_IDALIB_PYTHON"
+_BACKENDS = ("auto", "idat", "idalib")
+_IDALIB_WORKER_SOURCE = Path(__file__).resolve().parent / "ida_scripts" / "idalib_worker.idapy"
+_IDALIB_JOB_SCRIPT = "liebert_idalib_job.py"     # the worker, copied into the scratch directory
+_IDALIB_OPS_NAME = "liebert_query_ops.py"        # query_program.idapy, copied beside it (shared operations)
+_IDALIB_JOB_NAME = "idalib_job.json"
+_IDALIB_RESULT_NAME = "idalib_result.json"
+_IDALIB_PROBE_TIMEOUT_SECONDS = 30
+_IDALIB_PROBE_CACHE_SECONDS = 120                # a successful probe is reused this long (it costs ~0.5 s)
+_IDALIB_MAX_RESULT_BYTES = 16 * 1024 * 1024      # the worker refuses to write more, the wrapper refuses to read more
+_IDALIB_MAX_OUTPUT_CHARS = 64 * 1024             # stdout/stderr of the worker: diagnosis only, bounded, never parsed
+_IDALIB_PROBE_CACHE = {}                         # (interpreter, stat, IDADIR) -> (monotonic time, probe)
 
 # Part of the cache key. Bump it when a launch flag that changes what the
 # analysis contains changes (it is "pdb off, worker v1" today), so a database
@@ -1235,7 +1265,7 @@ def _write_evidence(p, operation, data, directory=None, stem=None):
 # --------------------------------------------------------------------------
 
 def ida_query(path, operation="summary", query="", max_results=200, offset=0,
-              timeout_seconds=_DEFAULT_TIMEOUT_SECONDS, max_chars=60000, cancellation_token=None):
+              timeout_seconds=_DEFAULT_TIMEOUT_SECONDS, max_chars=60000, cancellation_token=None, backend="auto"):
     """Ask IDA one read-only question about `path` (a PE or other binary IDA
     can load; an IDA database file is refused, see below).
 
@@ -1299,9 +1329,28 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
     would not start -- those carry `environment_error` with the errno and make
     no claim about the input or about IDA), READ_FAILED (the input could not
     be read), RESULT_PARSE_FAILED.
+
+    `backend` (keyword, last) picks the engine: "idat" is the batch binary (two sessions on a first
+    analysis), "idalib" is Hex-Rays' `idapro` package run in the interpreter named by
+    LIEBERT_RE_IDALIB_PYTHON (one session per question; a COPY of a cached database is opened and the
+    slot is measured before and after), and "auto" (the default) is idalib only when that variable is
+    set and `import idapro` works in that interpreter, else idat. The interpreter is never guessed.
+    Every response carries `backend: {requested, used, reason}`; an idalib that was requested but is
+    not usable is TOOL_MISSING, never a silent switch to idat, and a session that failed on the chosen
+    engine is not retried on the other one.
     """
+    choice = _choose_backend(backend)
+    if choice["failure"] is not None:
+        return _tag_backend(_j(choice["failure"]), choice["info"])
+    return _tag_backend(_ida_query(path, operation, query, max_results, offset, timeout_seconds, max_chars,
+                                   cancellation_token, choice), choice["info"])
+
+
+def _ida_query(path, operation, query, max_results, offset, timeout_seconds, max_chars, cancellation_token, choice):
+    """`ida_query` after the engine has been chosen (see there for the arguments)."""
     tool = "ida_query"
-    exe = _ida_binary()
+    idalib = choice["used"] == "idalib"
+    exe = choice["engine_exe"] if idalib else _ida_binary()
     if not exe:
         return _tool_missing(tool)
     p, fail = _checked_path(path, tool)
@@ -1333,7 +1382,7 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
                 "cache keys on that file's hash."
             ),
         })
-    if not _WORKER_SOURCE.is_file():
+    if not _WORKER_SOURCE.is_file() or (idalib and not _IDALIB_WORKER_SOURCE.is_file()):
         return _j({"ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "IDA_WORKER_MISSING",
                    "detail": "The packaged IDAPython worker is absent from this install (a packaging defect, not an IDA problem)."})
     timeout_seconds = _clamp(timeout_seconds, _MIN_TIMEOUT_SECONDS, _MAX_CREATE_TIMEOUT_SECONDS, _DEFAULT_TIMEOUT_SECONDS)
@@ -1344,15 +1393,18 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
     invocation = {"operation": operation, "query": query, "max_results": max_results, "offset": offset,
                   "timeout_seconds": timeout_seconds}
 
-    return _locked_call(tool, exe, p, invocation, max_chars, cancellation_token)
+    profile = {"backend": "idalib", "python": choice["python"]} if idalib else None
+    return _locked_call(tool, exe, p, invocation, max_chars, cancellation_token, profile)
 
 
 def _locked_call(tool, exe, p, invocation, max_chars, cancellation_token, profile=None):
     """The part every question shares: hash the input, take its slot lock, run
     the staged session(s) under it, enforce the cache budget on success. Returns
-    the finished JSON string. `profile` (None for `ida_query`) carries what a
+    the finished JSON string. `profile` (None for an idat `ida_query`) carries what a
     different operation changes: its worker, the extra job fields, the ceiling
-    of its reopen session, its evidence directory and its note."""
+    of its reopen session, its evidence directory and its note; for the idalib
+    backend it is `{"backend": "idalib", "python": <interpreter>}` and `exe` is the
+    nominal idat path that names the engine in the slot key."""
     try:
         sha256, md5 = _sha256_md5(p)
     except OSError as exc:
@@ -1376,7 +1428,8 @@ def _locked_call(tool, exe, p, invocation, max_chars, cancellation_token, profil
             "detail": "Another process is analysing this exact file; retry when it finishes.",
         })
     try:
-        outcome = _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation_token, profile)
+        run = _query_locked_idalib if (profile or {}).get("backend") == "idalib" else _query_locked
+        outcome = run(exe, p, sha256, md5, slot, invocation, max_chars, cancellation_token, profile)
         if isinstance(outcome, dict) and outcome.get("ok") is True:
             outcome_evict = _enforce_cache_budget(slot)
             if outcome_evict[0]:
@@ -2048,52 +2101,9 @@ def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation
                 exe, p, sha256, md5, slot, mode="reopen", operation=operation, invocation=invocation,
                 timeout_seconds=left, cancellation_token=cancellation_token, profile=profile,
             )
-        if data.get("ok") is False:
-            # The worker ran and answered "no" (unknown symbol, decompiler refused). The database is fine.
-            refusal = {
-                "ok": False, "tool": tool,
-                "status": (profile.get("error_status") or {}).get(data.get("error"), "ANALYSIS_LIMITED"),
-                "error": data.get("error", "UNKNOWN_ERROR"),
-                **{k: v for k, v in data.items() if k not in _WORKER_BOOKKEEPING and k not in ("error", "items", "traceback")},
-                "path": relative(p), "target_sha256": sha256, "database_cache": cache_state,
-                "invocation": invocation, "provenance": provenance,
-                "traceback": _redact(data.get("traceback", ""), work=slot, target=p) or None,
-            }
-            if profile.get("omit_path"):
-                del refusal["path"]
-            if "database_integrity" in signals:
-                refusal["database_integrity"] = signals["database_integrity"]
-            if profile.get("evidence_on_refusal"):
-                # The worker's raw refusal is evidence too (it is how a negative can be told from a failure).
-                refusal["internal_evidence_name"], refusal["evidence_write_error"] = _write_evidence(
-                    p, operation, data, profile.get("evidence_dir"), stem=sha256[:16])
-            if profile.get("refusal_note"):
-                refusal["note"] = profile["refusal_note"]
-            if isinstance(refusal.get("detail"), str):
-                refusal["detail"] = _redact(refusal["detail"], work=slot, target=p)   # an exception text can carry a path
-            return refusal
-        mislabelled = profile["validate"](data) if profile.get("validate") else None
-        if mislabelled:
-            # The answer does not say what it is (raw or d810-processed) the way the call asked for it.
-            # Returning it would present transformed microcode as raw, or the reverse.
-            unlabelled = {
-                "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": mislabelled,
-                "path": relative(p), "target_sha256": sha256, "database_cache": cache_state,
-                "invocation": invocation, "provenance": provenance,
-                "detail": "The worker's result did not carry the label this call requires; no result is returned.",
-            }
-            if profile.get("omit_path"):
-                del unlabelled["path"]
-            return unlabelled
-        evidence = _write_evidence(p, operation, data, profile.get("evidence_dir"),
-                                   stem=sha256[:16] if profile.get("omit_path") else None)
-        # Fields the worker's shared envelope adds that mean nothing for this operation (an `items` list
-        # that is always empty would read as "found nothing") are left out of the answer, not of the evidence.
-        data = {k: v for k, v in data.items() if k not in profile.get("strip_fields", ())}
-        return _success_response(
-            tool, p, sha256, md5, operation, data, cache_state=cache_state, signals=signals,
-            invocation=invocation, max_chars=max_chars, evidence=evidence, note=profile.get("note"),
-            omit_path=bool(profile.get("omit_path")),
+        return _answer_from_worker(
+            tool, p, sha256, md5, slot, operation, data, signals, provenance, cache_state=cache_state,
+            invocation=invocation, max_chars=max_chars, profile=profile,
         )
     except _StageFailure as failure:
         scratch_kept = "scratch_retained" in failure.body
@@ -2101,6 +2111,540 @@ def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation
     finally:
         if not (slot / _DB_NAME).exists() and not scratch_kept:
             shutil.rmtree(slot, ignore_errors=True)  # a slot with no database is never kept (unless it holds a retained failed scratch)
+
+
+def _answer_from_worker(tool, p, sha256, md5, slot, operation, data, signals, provenance, *, cache_state,
+                      invocation, max_chars, profile):
+    """The part of a question that comes AFTER a verified worker result, shared by both backends: a worker
+    that answered "no" (unknown symbol, decompiler refused) is a named refusal, an answer that is not
+    labelled the way the call asked is withheld, otherwise the evidence file is written and the response
+    is shaped. `slot` is only used to redact scratch paths out of exception text."""
+    if data.get("ok") is False:
+        # The worker ran and answered "no" (unknown symbol, decompiler refused). The database is fine.
+        refusal = {
+            "ok": False, "tool": tool,
+            "status": (profile.get("error_status") or {}).get(data.get("error"), "ANALYSIS_LIMITED"),
+            "error": data.get("error", "UNKNOWN_ERROR"),
+            **{k: v for k, v in data.items() if k not in _WORKER_BOOKKEEPING and k not in ("error", "items", "traceback")},
+            "path": relative(p), "target_sha256": sha256, "database_cache": cache_state,
+            "invocation": invocation, "provenance": provenance,
+            "traceback": _redact(data.get("traceback", ""), work=slot, target=p) or None,
+        }
+        if profile.get("omit_path"):
+            del refusal["path"]
+        if "database_integrity" in signals:
+            refusal["database_integrity"] = signals["database_integrity"]
+        if profile.get("evidence_on_refusal"):
+            # The worker's raw refusal is evidence too (it is how a negative can be told from a failure).
+            refusal["internal_evidence_name"], refusal["evidence_write_error"] = _write_evidence(
+                p, operation, data, profile.get("evidence_dir"), stem=sha256[:16])
+        if profile.get("refusal_note"):
+            refusal["note"] = profile["refusal_note"]
+        if isinstance(refusal.get("detail"), str):
+            refusal["detail"] = _redact(refusal["detail"], work=slot, target=p)   # an exception text can carry a path
+        return refusal
+    mislabelled = profile["validate"](data) if profile.get("validate") else None
+    if mislabelled:
+        # The answer does not say what it is (raw or d810-processed) the way the call asked for it.
+        # Returning it would present transformed microcode as raw, or the reverse.
+        unlabelled = {
+            "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": mislabelled,
+            "path": relative(p), "target_sha256": sha256, "database_cache": cache_state,
+            "invocation": invocation, "provenance": provenance,
+            "detail": "The worker's result did not carry the label this call requires; no result is returned.",
+        }
+        if profile.get("omit_path"):
+            del unlabelled["path"]
+        return unlabelled
+    evidence = _write_evidence(p, operation, data, profile.get("evidence_dir"),
+                               stem=sha256[:16] if profile.get("omit_path") else None)
+    # Fields the worker's shared envelope adds that mean nothing for this operation (an `items` list
+    # that is always empty would read as "found nothing") are left out of the answer, not of the evidence.
+    data = {k: v for k, v in data.items() if k not in profile.get("strip_fields", ())}
+    return _success_response(
+        tool, p, sha256, md5, operation, data, cache_state=cache_state, signals=signals,
+        invocation=invocation, max_chars=max_chars, evidence=evidence, note=profile.get("note"),
+        omit_path=bool(profile.get("omit_path")),
+    )
+
+
+
+# --------------------------------------------------------------------------
+# the idalib backend: one database per worker process, shared query operations
+# --------------------------------------------------------------------------
+#
+# `ida_query(..., backend=)` picks the engine that answers: "idat" (the batch binary, above), "idalib"
+# (Hex-Rays' `idapro` package in a separate interpreter) or "auto". The questions are the same ones:
+# both workers run the operation functions of `query_program.idapy` (the idalib worker loads that file
+# as a module), and the response shape is the same plus `backend`.
+#
+# What differs, and why:
+#   * one session answers a question even on a first analysis (idat needs two: analyse-and-save, then
+#     reopen). The idalib worker saves the pristine analysis BEFORE it runs the operation and closes
+#     without saving, so what is cached is still the pristine analysis;
+#   * the cached database is never opened in place. A COPY is opened in the scratch directory and the
+#     slot's hash is taken before and after (`CACHE_VIOLATION` if it moved), instead of the idat
+#     path's "mark the session temporary" guarantee;
+#   * a timed-out or cancelled session does not cost the slot (the copy was open, not the slot);
+#   * one database per process, always `close_database(False)`: a second `open_database` in a process
+#     silently saves and closes the first one (measured), so the worker has exactly one open.
+
+_IDALIB_PROBE_CODE = r'''
+import json, sys
+out = sys.argv[1]
+info = {"import_ok": False}
+try:
+    import idapro
+    info["import_ok"] = True
+    try:
+        from importlib import metadata
+        info["idapro_version"] = metadata.version("idapro")
+    except Exception:
+        info["idapro_version"] = None
+    try:
+        info["library_version"] = list(idapro.get_library_version())
+    except Exception:
+        info["library_version"] = None
+    try:
+        info["install_dir"] = str(idapro.get_ida_install_dir())
+    except Exception:
+        info["install_dir"] = None
+except BaseException as exc:
+    info["error"] = type(exc).__name__ + ": " + str(exc)[:300]
+with open(out, "w", encoding="utf-8") as handle:
+    json.dump(info, handle)
+'''
+
+
+def _idalib_probe(*, use_cache=True):
+    """Can the interpreter named by LIEBERT_RE_IDALIB_PYTHON `import idapro`? Returns `(public, private)`.
+
+    `public` is safe to return (paths redacted); `private` carries the raw interpreter and install
+    directory for the caller. The probe is an import and nothing else: it does not open a database and
+    it does not prove a licence, so `status: OK` means "the package imports", not "a file will analyse".
+    A successful probe is cached for `_IDALIB_PROBE_CACHE_SECONDS`; a failure never is. The interpreter is
+    never guessed: no variable, no idalib."""
+    raw = os.environ.get(IDALIB_PYTHON_ENV, "").strip()
+    public = {"env_var": IDALIB_PYTHON_ENV, "configured": bool(raw), "status": "NOT_CONFIGURED",
+              "interpreter": None, "idapro_version": None, "library_version": None, "install_dir": None,
+              "measured_by": ("ran `import idapro` in that interpreter; no database was opened and no licence "
+                              "check was made")}
+    if not raw:
+        public["reason"] = f"{IDALIB_PYTHON_ENV} is not set; no interpreter is guessed"
+        return public, {}
+    interpreter = Path(raw)
+    public["interpreter"] = _redact(str(interpreter))
+    try:
+        info = interpreter.stat()
+    except OSError:
+        info = None
+    if info is None or not interpreter.is_file():
+        public.update(status="INTERPRETER_NOT_FOUND", reason=f"{IDALIB_PYTHON_ENV} does not name an existing file")
+        return public, {}
+    key = (str(interpreter), info.st_mtime_ns, info.st_size, os.environ.get("IDADIR", ""))
+    cached = _IDALIB_PROBE_CACHE.get(key) if use_cache else None
+    if cached and time.monotonic() - cached[0] < _IDALIB_PROBE_CACHE_SECONDS:
+        return dict(cached[1][0]), dict(cached[1][1])
+    try:
+        scratch = tempfile.TemporaryDirectory(prefix="liebert-idalib-probe-")
+    except OSError as exc:
+        public.update(status="PROBE_FAILED", reason=f"{type(exc).__name__}: no scratch directory for the probe")
+        return public, {}
+    with scratch as directory:
+        out = Path(directory) / "probe.json"
+        try:
+            cp = run_bounded_process(
+                [str(interpreter), "-I", "-X", "utf8", "-c", _IDALIB_PROBE_CODE, str(out)],
+                timeout_seconds=_IDALIB_PROBE_TIMEOUT_SECONDS, cwd=directory, environment=dict(os.environ),
+                max_output_chars=_IDALIB_MAX_OUTPUT_CHARS,
+            )
+        except OSError as exc:
+            public.update(status="INTERPRETER_NOT_LAUNCHABLE", reason=f"{type(exc).__name__}: the interpreter did not start")
+            return public, {}
+        if cp.launch_failed is True:
+            public.update(status="INTERPRETER_NOT_LAUNCHABLE", reason=_redact(str(cp.launch_error or "the interpreter did not start")))
+            return public, {}
+        if cp.timed_out:
+            public.update(status="PROBE_TIMEOUT", reason=f"`import idapro` did not finish in {_IDALIB_PROBE_TIMEOUT_SECONDS} s")
+            return public, {}
+        try:
+            data = json.loads(out.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        if not isinstance(data, dict):
+            public.update(status="PROBE_FAILED", exit_code=cp.returncode,
+                          reason="the probe wrote no readable result", stderr_tail=_tail(cp.stderr, limit=500))
+            return public, {}
+    if data.get("import_ok") is not True:
+        public.update(status="IDAPRO_IMPORT_FAILED", reason=_redact(str(data.get("error") or "import idapro failed")))
+        return public, {}
+    version, library, install = data.get("idapro_version"), data.get("library_version"), data.get("install_dir")
+    public.update(idapro_version=version if isinstance(version, str) else None,
+                  library_version=library if isinstance(library, list) else None,
+                  install_dir=_redact(install) if isinstance(install, str) and install else None)
+    if not (isinstance(install, str) and install):
+        # Cache slots are keyed by the engine that built them; an engine that cannot be identified cannot key one.
+        public.update(status="ENGINE_UNIDENTIFIED",
+                      reason="`import idapro` worked but the IDA install directory could not be read, so the "
+                             "cache cannot tell which engine built a database")
+        return public, {}
+    public["status"] = "OK"
+    public["reason"] = "`import idapro` succeeded in that interpreter"
+    private = {"python": str(interpreter), "install_dir": install}
+    if use_cache:
+        _IDALIB_PROBE_CACHE[key] = (time.monotonic(), (dict(public), dict(private)))
+    return public, private
+
+
+def _idalib_engine_exe(install_dir):
+    """The path whose neighbours name the engine in a slot's key: idat in the same install when there is one
+    (so both backends share slots built by the same IDA), else a nominal idat path whose neighbouring
+    kernel library still identifies the install."""
+    return _binary_in(install_dir) or str(Path(install_dir) / "idat.exe")
+
+
+def _choose_backend(requested):
+    """Decide which engine answers. Returns `{"info", "used", "python", "engine_exe", "failure"}`.
+
+    `info` is the `backend` object of every response: `{"requested", "used", "reason"}` (plus the idalib
+    interpreter and versions when idalib is used). `failure` is a finished refusal body (or None).
+    "auto" is idalib only when LIEBERT_RE_IDALIB_PYTHON is set AND `import idapro` works in that
+    interpreter; otherwise idat, and `reason` says which of the two it was. A fallback is announced, and a
+    session that failed on the selected backend is not retried on the other one."""
+    requested = str(requested)
+    info = {"requested": requested, "used": None, "reason": ""}
+    out = {"info": info, "used": None, "python": None, "engine_exe": None, "failure": None}
+    if requested not in _BACKENDS:
+        info["reason"] = "backend must be one of " + ", ".join(_BACKENDS)
+        out["failure"] = {"ok": False, "tool": "ida_query", "status": "ANALYSIS_LIMITED", "error": "UNKNOWN_BACKEND",
+                          "given": requested, "accepted": list(_BACKENDS)}
+        return out
+    if requested == "idat":
+        info.update(used="idat", reason="requested explicitly")
+        out["used"] = "idat"
+        return out
+    public, private = _idalib_probe()
+    if requested == "idalib":
+        if public["status"] != "OK":
+            info["reason"] = f"idalib was requested but is not usable: {public['status']}"
+            out["failure"] = {
+                "ok": False, "tool": "ida_query", "status": "TOOL_MISSING",
+                "error": "IDALIB_NOT_CONFIGURED" if public["status"] == "NOT_CONFIGURED" else "IDALIB_UNUSABLE",
+                "required_capability": "an interpreter with Hex-Rays' `idapro` package (idalib)",
+                "idalib": public,
+                "detail": (f"Set {IDALIB_PYTHON_ENV} to the full path of a Python interpreter in which `import idapro` "
+                           "works (pip install the `idapro` package that ships with IDA and run its py-activate-idalib). "
+                           "Nothing was started and no other backend was used."),
+            }
+            return out
+        used, why = "idalib", f"requested explicitly; {IDALIB_PYTHON_ENV} is set and `import idapro` succeeded"
+    elif public["status"] == "OK":
+        used, why = "idalib", f"{IDALIB_PYTHON_ENV} is set and `import idapro` succeeded in that interpreter"
+    elif public["status"] == "NOT_CONFIGURED":
+        info.update(used="idat", reason=f"{IDALIB_PYTHON_ENV} is not set, so idalib is not configured (no interpreter is guessed)")
+        out["used"] = "idat"
+        return out
+    else:
+        info.update(used="idat", reason=(f"{IDALIB_PYTHON_ENV} is set but the idalib probe failed ({public['status']}: "
+                                         f"{public.get('reason')}); fell back to idat"))
+        out["used"] = "idat"
+        return out
+    info.update(used=used, reason=why, interpreter=public["interpreter"], idapro_version=public["idapro_version"],
+                library_version=public["library_version"])
+    out.update(used=used, python=private["python"], engine_exe=_idalib_engine_exe(private["install_dir"]))
+    return out
+
+
+def _tag_backend(text, info):
+    """Put the `backend` object into a finished JSON response (every response of `ida_query` carries it)."""
+    try:
+        body = json.loads(text)
+    except (TypeError, ValueError):
+        return text
+    if not isinstance(body, dict):
+        return text
+    body["backend"] = info
+    return _j(body)
+
+
+def _write_idalib_files(work, job):
+    """The worker, the shared operations file and the job, in the scratch directory (BOM-free, LF)."""
+    try:
+        sources = ((_IDALIB_JOB_SCRIPT, _IDALIB_WORKER_SOURCE.read_bytes()), (_IDALIB_OPS_NAME, _WORKER_SOURCE.read_bytes()))
+    except OSError as exc:
+        raise _EnvironmentFailure("IDA_WORKER_UNREADABLE", exc) from exc
+    try:
+        for name, raw in sources:
+            if raw.startswith(b"\xef\xbb\xbf"):
+                raw = raw[3:]
+            (work / name).write_bytes(raw.replace(b"\r\n", b"\n"))
+        (work / _IDALIB_JOB_NAME).write_text(json.dumps(job), encoding="utf-8")
+    except OSError as exc:
+        raise _EnvironmentFailure("IDA_LAUNCH_FAILED", exc) from exc
+
+
+def _launch_idalib(python, work, job, *, timeout_seconds, cancellation_token):
+    """Run the idalib worker once in `work`. `-I` keeps the interpreter from reading PYTHON* variables, the
+    user site or the working directory's modules; `-X utf8` fixes the encoding of the (ignored) console output."""
+    _write_idalib_files(work, job)
+    command = [str(python), "-I", "-X", "utf8", _IDALIB_JOB_SCRIPT, _IDALIB_JOB_NAME]
+    try:
+        cp = run_bounded_process(
+            command, timeout_seconds=timeout_seconds, cancellation_token=cancellation_token, cwd=work,
+            environment=dict(os.environ), max_output_chars=_IDALIB_MAX_OUTPUT_CHARS,
+        )
+    except OSError as exc:
+        raise _EnvironmentFailure("IDA_LAUNCH_FAILED", exc) from exc
+    if cp.launch_failed is True:
+        raise _EnvironmentFailure("IDA_LAUNCH_FAILED", OSError(None, cp.launch_error))
+    return cp, command
+
+
+def _verdict_idalib(cp, work, *, creating, operations):
+    """The idalib session's signals, read together (the idat `_verdict` for a worker that answers a list
+    of operations). Returns `(envelope, first_result, error, signals)`; `error` is None only when every
+    signal agrees. stdout is deliberately NOT scanned for failure markers: IDA plugins print banners and
+    warnings there; only the log and stderr are."""
+    try:
+        log = Path(work / _LOG_NAME).read_text(encoding="utf-8", errors="replace")
+        log_readable = True
+    except OSError:
+        log, log_readable = "", False
+    combined = "\n".join((log, cp.stderr or "")).lower()
+    markers = sorted({m for m in _FATAL_MARKERS if m in combined})
+    network = sorted({m for m in _NETWORK_MARKERS if m in log.lower()})
+    db_path = work / _DB_NAME
+    try:
+        db_bytes = db_path.stat().st_size if db_path.is_file() else 0
+    except OSError:
+        db_bytes = 0
+    loose = sorted(q.name for q in work.iterdir() if q.suffix.lower() in _LOOSE_COMPONENTS) if work.is_dir() else []
+    result_path = work / _IDALIB_RESULT_NAME
+    result_present = result_path.is_file()
+    try:
+        result_bytes = result_path.stat().st_size if result_present else 0
+    except OSError:
+        result_bytes = 0
+    envelope, parse_error, completed, too_large = None, None, False, False
+    if result_present and result_bytes > _IDALIB_MAX_RESULT_BYTES:
+        too_large = True
+    elif result_present:
+        try:
+            envelope = json.loads(result_path.read_text(encoding="utf-8"))
+            completed = isinstance(envelope, dict) and envelope.get("script_completed") is True
+        except (OSError, ValueError) as exc:
+            parse_error = f"{type(exc).__name__}: {exc}"
+    if not isinstance(envelope, dict):
+        envelope = None
+    results = envelope.get("results") if envelope else None
+    expected = [o["operation"] for o in operations]
+    operation_matches = bool(completed and isinstance(results, list) and len(results) == len(expected)
+                             and all(isinstance(r, dict) and r.get("operation") == name for r, name in zip(results, expected)))
+    signals = {
+        "exit_code": cp.returncode,
+        "log_present": bool(log),
+        "log_readable": log_readable,
+        "log_fatal_markers": markers,
+        "database_present": db_bytes > 0,
+        "database_bytes": db_bytes,
+        "loose_components": loose,
+        "result_file_present": result_present,
+        "result_file_bytes": result_bytes,
+        "result_script_completed": completed,
+        "result_operation_matches": operation_matches,
+        "database_closed_without_save": (envelope or {}).get("database_closed_without_save") is True,
+        "log_network_text_found": bool(network),
+        "log_network_text_markers_scanned": list(_NETWORK_MARKERS),
+        "log_network_text_evidence_limit": _NETWORK_SCAN_LIMIT,
+        "worker": {"idapro_version": (envelope or {}).get("idapro_version"),
+                   "library_version": (envelope or {}).get("library_version"),
+                   "open_rc": (envelope or {}).get("open_rc"),
+                   "database_saved_before_queries": (envelope or {}).get("database_saved_before_queries")},
+    }
+    first = results[0] if operation_matches else None
+    if too_large:
+        return None, None, "IDALIB_RESULT_TOO_LARGE", {**signals, "result_limit_bytes": _IDALIB_MAX_RESULT_BYTES}
+    if parse_error:
+        return None, None, "RESULT_PARSE_FAILED", {**signals, "parse_error": parse_error}
+    if cp.returncode not in (0, None):
+        if completed:
+            kind = "NONZERO_EXIT_RESULT_COMPLETE"
+        elif result_present:
+            kind = "NONZERO_EXIT_RESULT_INCOMPLETE"
+        else:
+            kind = "NONZERO_EXIT_NO_RESULT"
+        signals["exit_diagnosis"] = {"class": kind, "exit_code": cp.returncode, "result_file_present": result_present,
+                                     "script_completed": completed, "log_fatal_markers": markers}
+        return envelope, None, "IDA_EXITED_NONZERO", signals
+    if markers:
+        return envelope, None, "IDA_LOG_REPORTS_FAILURE", signals
+    if not log_readable or not log:
+        return envelope, None, "IDA_LOG_UNREADABLE", signals
+    if not result_present:
+        return None, None, "IDA_NO_OUTPUT", signals
+    if not completed:
+        return None, None, "IDA_OUTPUT_INCOMPLETE", signals
+    if envelope.get("ok") is False and envelope.get("error"):
+        return envelope, None, "IDALIB_WORKER_FAILED", signals
+    if not operation_matches:
+        return envelope, None, "IDA_RESULT_OPERATION_MISMATCH", signals
+    if not signals["database_closed_without_save"]:
+        return envelope, first, "DATABASE_CHANGES_NOT_DISCARDED", signals
+    if creating and (envelope.get("database_saved_before_queries") is not True or db_bytes <= 0 or loose):
+        return envelope, first, "IDA_NO_DATABASE", signals
+    return envelope, first, None, signals
+
+
+def _run_idalib_session(python, p, sha256, md5, slot, *, creating, invocation, cancellation_token):
+    """One idalib worker process in its own scratch directory, and its verdict. `creating` analyses `p` into
+    the scratch directory and, only if every signal agrees, promotes the saved database into `slot`; otherwise
+    a COPY of the cached database is opened and the slot is measured before and after. Returns
+    `(data, signals, provenance)` (`data` is the one query result) or raises `_StageFailure`.
+
+    The scratch directory is always deleted. A timed-out or cancelled session leaves the slot alone (the
+    slot was not what was open); only a measured change of the slot, a provenance mismatch or an unreadable
+    slot drops it."""
+    tool = "ida_query"
+    operation = invocation["operation"]
+    total = invocation["timeout_seconds"]
+    timeout_seconds = min(total, _MAX_CREATE_TIMEOUT_SECONDS if creating else _MAX_QUERY_TIMEOUT_SECONDS)
+    work = slot / f"work-{uuid.uuid4().hex[:8]}"
+    work.mkdir()
+    job = {
+        "schema": 1, "mode": "create" if creating else "copy", "output": str(work / _IDALIB_RESULT_NAME),
+        "ops_path": str(work / _IDALIB_OPS_NAME), "database_name": _DB_NAME, "log_name": _LOG_NAME,
+        "max_result_bytes": _IDALIB_MAX_RESULT_BYTES,
+        "operations": [{"operation": operation, "query": invocation.get("query", ""),
+                        "max_results": invocation["max_results"], "offset": invocation["offset"]}],
+    }
+    if creating:
+        job["input"] = str(p)
+    keep_work = False
+    try:
+        db_before = None
+        if not creating:
+            try:
+                db_before = _sha256_md5(slot / _DB_NAME)[0]
+                shutil.copyfile(slot / _DB_NAME, work / _DB_NAME)
+            except OSError as exc:
+                raise _StageFailure(_EnvironmentFailure("IDA_DATABASE_UNREADABLE", exc).body(
+                    tool, invocation=invocation, target_sha256=sha256)) from exc
+        started = time.monotonic()
+        try:
+            cp, _command = _launch_idalib(python, work, job, timeout_seconds=timeout_seconds,
+                                          cancellation_token=cancellation_token)
+        except _EnvironmentFailure as failure:
+            raise _StageFailure(failure.body(tool, invocation=invocation, target_sha256=sha256)) from failure
+        elapsed = round(time.monotonic() - started, 3)
+        integrity = None
+        if not creating:
+            try:
+                db_after = _sha256_md5(slot / _DB_NAME)[0]
+            except OSError:
+                db_after = None
+            integrity = {"database_sha256_before": db_before, "database_sha256_after": db_after,
+                         "unchanged": db_after == db_before, "opened": "a copy in the scratch directory"}
+            if db_after != db_before:
+                _evict_slot(slot)
+                raise _StageFailure({
+                    "ok": False, "tool": tool, "status": "CACHE_VIOLATION", "error": "CACHE_VIOLATION",
+                    "invocation": invocation, "target_sha256": sha256, "database_integrity": integrity,
+                    "detail": (
+                        "The cached database file differed after the session (or could not be read again), "
+                        "although only a copy of it was opened. The cache slot was deleted and no answer is "
+                        "returned; the next call analyses the input again."
+                    ),
+                })
+        if cp.cancelled or cp.timed_out:
+            body = {"ok": False, "tool": tool, "status": "CANCELLED" if cp.cancelled else "TIMEOUT",
+                    "invocation": invocation, "target_sha256": sha256,
+                    "error": "IDA_CANCELLED_PROCESS_TREE_TERMINATED" if cp.cancelled
+                    else "IDA_TIMEOUT_PROCESS_TREE_TERMINATED"}
+            if integrity is not None:
+                body["database_integrity"] = integrity
+            if cp.timed_out:
+                body["timeout_seconds"] = timeout_seconds
+                body["timed_out_stage"] = "analysis" if creating else "query"
+                body["stage_ceiling_seconds"] = _MAX_CREATE_TIMEOUT_SECONDS if creating else _MAX_QUERY_TIMEOUT_SECONDS
+                body["detail"] = (
+                    "The first analysis of a large file can exceed the timeout; an incomplete analysis is "
+                    "discarded, so the next call starts over. A question on a cached database ran on a copy, "
+                    "so the cache slot was kept. Do not read a timeout as 'nothing found'."
+                )
+            raise _StageFailure(body)
+        envelope, data, error, signals = _verdict_idalib(cp, work, creating=creating, operations=job["operations"])
+        signals["elapsed_seconds"] = elapsed
+        if integrity is not None:
+            signals["database_integrity"] = integrity
+        if error:
+            extra = {"invocation": invocation, "target_sha256": sha256}
+            if isinstance(envelope, dict) and envelope.get("error"):
+                extra["worker_error"] = envelope.get("error")
+                if envelope.get("traceback"):
+                    extra["worker_traceback"] = _redact(str(envelope["traceback"]), work=work, target=p)[-2000:]
+            raise _StageFailure(_failure_response(
+                tool, "RESULT_PARSE_FAILED" if error == "RESULT_PARSE_FAILED" else "ANALYSIS_LIMITED", error,
+                operation=operation, signals=signals, cp=cp, work=work, target=p, extra=extra,
+            ))
+        # The verdict above already required the worker's `database_closed_without_save`; the answer carries
+        # the same field the idat path's reopen session reports, so the two backends' answers have one shape.
+        data["database_changes_discarded"] = True
+        provenance = _provenance(sha256, md5, data)
+        if provenance["status"] == "MISMATCH":
+            if not creating:
+                _evict_slot(slot)
+            raise _StageFailure({
+                "ok": False, "tool": tool, "status": "ANALYSIS_LIMITED", "error": "IDA_INPUT_HASH_MISMATCH",
+                "target_sha256": sha256, "provenance": provenance, "invocation": invocation, "signals": signals,
+                "detail": "the engine's recorded input is not the file that was hashed; refusing to return a result computed over other bytes.",
+            })
+        if creating:
+            os.replace(work / _DB_NAME, slot / _DB_NAME)
+            _touch_meta(slot, sha256, created=True)
+        else:
+            _touch_meta(slot, sha256)
+        return data, signals, provenance
+    except _StageFailure as failure:
+        if _keep_failed_scratch() and work.is_dir():
+            keep_work = True
+            failure.body["scratch_retained"] = _retained_scratch(work, _cache_root(), "<CACHE>")
+        raise
+    finally:
+        if not keep_work:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def _query_locked_idalib(engine_exe, p, sha256, md5, slot, invocation, max_chars, cancellation_token, profile):
+    """`_query_locked` for the idalib backend: the same slot lifecycle, one session per question (a first
+    analysis answers the question in the session that builds the database)."""
+    tool = "ida_query"
+    operation = invocation["operation"]
+    scratch_kept = False
+    slot.mkdir(parents=True, exist_ok=True)
+    for stale in slot.glob("work-*"):       # under the lock, any scratch directory here is an abandoned attempt
+        shutil.rmtree(stale, ignore_errors=True)
+    cache_state = "HIT"
+    if (slot / _DB_NAME).exists() and not _slot_is_healthy(slot):
+        _evict_slot(slot)
+        slot.mkdir(parents=True, exist_ok=True)
+        cache_state = "REBUILT"
+    elif not (slot / _DB_NAME).exists():
+        cache_state = "CREATED"
+    try:
+        data, signals, provenance = _run_idalib_session(
+            profile["python"], p, sha256, md5, slot, creating=cache_state != "HIT", invocation=invocation,
+            cancellation_token=cancellation_token,
+        )
+        return _answer_from_worker(
+            tool, p, sha256, md5, slot, operation, data, signals, provenance, cache_state=cache_state,
+            invocation=invocation, max_chars=max_chars, profile=profile,
+        )
+    except _StageFailure as failure:
+        scratch_kept = "scratch_retained" in failure.body
+        return failure.body
+    finally:
+        if not (slot / _DB_NAME).exists() and not scratch_kept:
+            shutil.rmtree(slot, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------
@@ -4007,7 +4551,10 @@ def _d810_probe():
 
 def ida_status():
     """Whether IDA is reachable, where from, and whether it actually works
-    headless -- the probe to run before reporting IDA as unavailable.
+    headless -- the probe to run before reporting IDA as unavailable. The
+    `idalib` block reports the second backend (the interpreter named by
+    LIEBERT_RE_IDALIB_PYTHON, redacted; the `idapro` version; the result of an
+    `import idapro` probe) and `auto_backend` says which engine `backend="auto"` would use.
 
     Launches idat once on an EMPTY database (`-t -pmetapc`, about a second, no
     input file) and reads back the kernel version and whether the decompiler
@@ -4047,9 +4594,15 @@ def ida_status():
                               "the IDB name and the input file MD5 to a Lumina server, identifying the target")
         return out
 
+    idalib, _private = _idalib_probe(use_cache=False)
+    auto_backend = {"selects": "idalib" if idalib["status"] == "OK" else "idat",
+                    "basis": (f"{IDALIB_PYTHON_ENV} is set and the idalib probe succeeded" if idalib["status"] == "OK"
+                              else "idalib is not usable (see idalib.status), so auto uses idat")}
     resolved_by, exe = _resolved_by_and_binary()
     if not exe:
-        return _tool_missing(tool)
+        body = json.loads(_tool_missing(tool))
+        body.update(idalib=idalib, auto_backend=auto_backend)
+        return _j(body)
     root = _cache_root()
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -4097,6 +4650,8 @@ def ida_status():
             "log_network_text_found": signals["log_network_text_found"],
             "log_network_text_evidence_limit": _NETWORK_SCAN_LIMIT,
             "lumina_config": lumina,
+            "idalib": idalib,
+            "auto_backend": auto_backend,
             "d810": _d810_probe(),
             "warnings": warnings,
             "cache": _cache_summary(),
@@ -4107,7 +4662,9 @@ def ida_status():
             "note": (
                 "OK means idat launched headless and exited cleanly on an empty database; it does not "
                 "mean a particular file will analyse. decompiler_available false means decompile_function "
-                "will fail; every other operation still works. Only IDA 9.x is supported."
+                "will fail; every other operation still works. Only IDA 9.x is supported. `idalib` is a separate "
+                "report on the second backend: its probe is an `import idapro` in the interpreter named by "
+                f"{IDALIB_PYTHON_ENV}, not a database open or a licence check."
             ),
         })
     finally:
