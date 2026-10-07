@@ -288,7 +288,10 @@ def _discover_installs():
         if on_path:
             add("PATH", Path(on_path).resolve().parent.parent)
         for root in _known_roots():
-            for pattern in _KNOWN_INSTALL_GLOBS:
+            # A filesystem root (C:/) is searched one level deep only: "*/ghidra*" there would list every
+            # top-level directory on the drive; C:/Tools, Program Files and LOCALAPPDATA are separate roots.
+            globs = _KNOWN_INSTALL_GLOBS[:1] if root == Path(root.anchor) else _KNOWN_INSTALL_GLOBS
+            for pattern in globs:
                 try:
                     matches = sorted(root.glob(pattern))
                 except (OSError, ValueError):

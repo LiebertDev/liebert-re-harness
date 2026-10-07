@@ -688,3 +688,37 @@ def test_hook_version_follows_the_template_text():
     import hashlib
     assert gate.HOOK_VERSION == hashlib.sha256(gate.HOOK_TEMPLATE.encode()).hexdigest()[:12]
     assert f"# liebert-hook-template: {gate.HOOK_VERSION}" in gate.render_hook("/x/python")
+
+
+def _fake_run(stdout, returncode=0):
+    return lambda cmd, **kw: subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr="")
+
+
+def test_git_with_unreadable_stdout_raises_instead_of_returning_empty(monkeypatch):
+    monkeypatch.setattr(gate.subprocess, "run", _fake_run(None))
+    with pytest.raises(gate.GitOutputError, match=r"rev-list HEAD, rc=0"):
+        gate._git("rev-list", "HEAD")
+
+
+def test_git_nonzero_exit_raises_and_empty_success_is_still_empty(monkeypatch):
+    monkeypatch.setattr(gate.subprocess, "run", _fake_run("", 128))
+    with pytest.raises(gate.GitOutputError, match="rc=128"):
+        gate._git("rev-list", "HEAD")
+    monkeypatch.setattr(gate.subprocess, "run", _fake_run(""))
+    assert gate._git("rev-list", "HEAD") == ""
+
+
+def test_stage_4_blocks_with_an_explicit_message_when_git_output_is_unreadable(monkeypatch, capsys):
+    monkeypatch.setattr(gate, "run_pytest", lambda cmd, **kw: (0, []))
+    monkeypatch.setattr(gate, "run_contract_stage", lambda: False)
+    monkeypatch.setattr(gate.subprocess, "run", _fake_run(None))
+    assert gate.run_gate([["HEAD"]]) == 1
+    err = capsys.readouterr().err
+    assert "BLOCKED, could not run the message scan: git output unreadable (rev-list HEAD, rc=0)" in err
+    assert "AttributeError" not in err
+    assert "pre-push gate: ok" not in err
+
+
+def test_hook_path_falls_back_when_git_gives_no_answer(monkeypatch):
+    monkeypatch.setattr(gate.subprocess, "run", _fake_run(None))
+    assert gate.hook_path() == ROOT / ".git" / "hooks" / "pre-push"
