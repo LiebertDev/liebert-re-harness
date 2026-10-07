@@ -679,12 +679,15 @@ def _real_ghidra_usable():
 
 
 @pytest.mark.heavy
-@unittest.skipUnless(_real_ghidra_usable(), "Ghidra with a suitable Java is not installed")
 class GhidraRealInstallTests(unittest.TestCase):
     """Imports a tiny synthetic x86-64 PE built in code (nothing shipped, nothing third-party)."""
 
     @classmethod
     def setUpClass(cls):
+        # Discovery walks the file system, so it runs here (only when these tests run), never at
+        # collection time: a decorator would execute it on every import of this module.
+        if not _real_ghidra_usable():
+            raise unittest.SkipTest("Ghidra with a suitable Java is not installed")
         from liebert_re.recover.owned_binary_fixtures import build_owned_pe_with_code
         cls._tmp = TemporaryDirectory()
         cls.root = Path(cls._tmp.name)
@@ -694,7 +697,9 @@ class GhidraRealInstallTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls._tmp.cleanup()
+        tmp = getattr(cls, "_tmp", None)
+        if tmp is not None:
+            tmp.cleanup()
 
     def setUp(self):
         stack = ExitStack()
@@ -748,3 +753,38 @@ class GhidraRealInstallTests(unittest.TestCase):
         for t in threads:
             t.join()
         self.assertTrue(all(r["ok"] for r in results), results)
+
+
+# ---------------------------------------------------------------------------
+# discovery is lazy: importing / collecting this module must not touch the file system
+# ---------------------------------------------------------------------------
+def test_importing_this_module_does_not_run_ghidra_discovery(monkeypatch):
+    import importlib.util
+    calls = []
+    monkeypatch.setattr(tg, "_discover_installs", lambda: (calls.append(1), ([], []))[1])
+    spec = importlib.util.spec_from_file_location("_ghidra_tests_reimport", Path(__file__))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert hasattr(mod, "GhidraRealInstallTests")
+    assert calls == []
+
+
+def test_real_install_tests_skip_when_nothing_is_usable_and_only_then_discover(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tg, "_discover_installs", lambda: (calls.append(1), ([], []))[1])
+    with pytest.raises(unittest.SkipTest):
+        GhidraRealInstallTests.setUpClass()
+    assert calls == [1]
+
+
+def test_a_filesystem_root_is_searched_one_level_deep_only(monkeypatch):
+    anchor = Path(Path.cwd().anchor)
+    seen = []
+    monkeypatch.setattr(tg, "_known_roots", lambda: [anchor, anchor / "Tools"])
+    monkeypatch.setattr(Path, "glob", lambda self, pattern: (seen.append((self, pattern)), iter(()))[1])
+    monkeypatch.delenv("GHIDRA_INSTALL_DIR", raising=False)
+    monkeypatch.delenv("GHIDRA_HOME", raising=False)
+    monkeypatch.setattr(tg.shutil, "which", lambda name: None)
+    tg._discover_installs()
+    assert [p for r, p in seen if r == anchor] == ["ghidra*"]
+    assert [p for r, p in seen if r == anchor / "Tools"] == list(tg._KNOWN_INSTALL_GLOBS)

@@ -458,9 +458,18 @@ def run_contract_stage(env=None) -> bool:
     return blocked
 
 
+class GitOutputError(RuntimeError):
+    """git ran but its output cannot be trusted (non-zero exit, or no stdout captured at all)."""
+
+
 def _git(*args: str) -> str:
+    """stdout of a git command. Empty stdout with exit 0 is a real answer (for instance "no commits");
+    an unreadable stdout (None, as when the reader thread died) or a non-zero exit raises
+    GitOutputError instead of being turned into "" and read as "nothing found"."""
     r = subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True, encoding="utf-8", errors="replace")
-    return r.stdout if r.returncode == 0 else ""
+    if r.stdout is None or r.returncode != 0:
+        raise GitOutputError(f"{' '.join(args)}, rc={r.returncode}")
+    return r.stdout
 
 
 def _discipline():
@@ -611,10 +620,16 @@ def _run_gate(ranges: list[list[str]]) -> int:
     print("pre-push gate: [4/4] commit-message identity probes ...", file=sys.stderr, flush=True)
     rule_state, rule_text = product_rule_state()
     print(f"pre-push gate: rules: {rule_text}", file=sys.stderr)
+    scan_error = None
     try:
         hits = message_findings(ranges)
+    except GitOutputError as e:                      # empty/unreadable git output is not "no commits"
+        hits, scan_error = [], f"could not run the message scan: git output unreadable ({e})"
     except Exception as e:                           # cannot scan messages => do not wave it through
-        hits = [f"could not run the message scan: {e!r}"]
+        hits, scan_error = [], f"could not run the message scan: {e!r}"
+    if scan_error:
+        print(f"pre-push gate: BLOCKED, {scan_error}", file=sys.stderr)
+        failed = True
     if hits:
         print("pre-push gate: BLOCKED, commit metadata matches the identity probes "
               "(values masked):", file=sys.stderr)
@@ -641,7 +656,11 @@ def _run_gate(ranges: list[list[str]]) -> int:
 
 
 def hook_path() -> Path:
-    p = Path(_git("rev-parse", "--git-path", "hooks").strip() or ".git/hooks")
+    try:
+        out = _git("rev-parse", "--git-path", "hooks").strip()
+    except GitOutputError:
+        out = ""                                     # no usable git answer: fall back to the default path
+    p = Path(out or ".git/hooks")
     return (p if p.is_absolute() else ROOT / p) / "pre-push"
 
 
