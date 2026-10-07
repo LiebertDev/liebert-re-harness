@@ -158,7 +158,7 @@ def test_unrecognised_failure_text_does_not_exit_zero(monkeypatch, capsys):
 
 def test_known_text_answers_still_exit_zero(monkeypatch, capsys):
     from liebert_re.tools import binary
-    monkeypatch.setattr(binary, "pe_imports", lambda path: "No import table.")
+    monkeypatch.setattr(binary, "pe_imports", lambda path: "EMPTY_RESULT: No import table.")
     assert cli.main(["pe", str(ROOT / "pyproject.toml"), "--imports"]) == 0
     capsys.readouterr()
 

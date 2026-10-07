@@ -1,4 +1,4 @@
-import hashlib, json, math, os, re
+import hashlib, json, math, re, sys
 from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.workspace import safe_path, relative, skipped, _limit_marker
 
@@ -37,6 +37,18 @@ def _pe(p):
     # Windows file handle after the caller is done with the returned object.
     return pefile.PE(data=p.read_bytes(),fast_load=False)
 
+# Text tools state "nothing found" as a line that starts with this prefix, followed by the old
+# sentence. It is NOT a failure: liebert_re.cli._decode reads it as ok=true plus empty=true, so an
+# empty answer is distinguishable from a listing and from an error. A failure starts with one of the
+# machine codes in cli._TEXT_LIMITED_PREFIXES / _TEXT_UNSUPPORTED_PREFIXES instead.
+# tests/test_cli_tool_dispatch.py pins this equal to cli._TEXT_EMPTY_PREFIX.
+EMPTY_RESULT_PREFIX="EMPTY_RESULT: "
+DOTNET_METADATA_UNREADABLE="DOTNET_METADATA_UNREADABLE"
+DISASSEMBLY_FAILED="DISASSEMBLY_FAILED"
+
+def _empty(sentence):
+    return EMPTY_RESULT_PREFIX+sentence
+
 def find_binaries(path=".",max_results=300):
     root=safe_path(path); out=[]
     for p in root.rglob("*"):
@@ -45,7 +57,7 @@ def find_binaries(path=".",max_results=300):
             if len(out)>=max_results:
                 return "\n".join(out)+"\n"+_limit_marker(len(out),max_results)
             out.append(f"{relative(p)} ({p.stat().st_size} bytes)")
-    return "\n".join(out) if out else "No binary found."
+    return "\n".join(out) if out else _empty("No binary found.")
 
 def hash_file(path):
     p=safe_path(path)
@@ -88,7 +100,7 @@ def binary_strings(path,min_length=4,contains=None,max_results=300):
         matched+=1
         if len(out)<max_results:out.append(f"0x{off:X} [{k}] {s}")
     if matched>len(out):out.append(_limit_marker(len(out),max_results,matched))
-    return "\n".join(out) if out else "No strings found."
+    return "\n".join(out) if out else _empty("No strings found.")
 
 def pe_sections(path):
     p=safe_path(path); pe=_pe(p)
@@ -150,7 +162,7 @@ def pe_imports(path,filter_text=None,max_results=500):
     entries=getattr(pe,"DIRECTORY_ENTRY_IMPORT",None)
     if not entries:
         if problem:return f"{IMPORT_DIRECTORY_UNREADABLE}: {problem}. This is NOT the same as a binary with no imports."
-        return "No import table."
+        return _empty("No import table.")
     out=[]; flt=filter_text.lower() if filter_text else None
     tail=f"\n[{IMPORT_DIRECTORY_PARTIAL}: {problem}]" if problem else ""
     for d in entries:
@@ -161,7 +173,7 @@ def pe_imports(path,filter_text=None,max_results=500):
             if flt and flt not in line.lower():continue
             if len(out)>=max_results:return "\n".join(out)+"\n"+_limit_marker(len(out),max_results)+tail
             out.append(line)
-    return "\n".join(out)+tail if out else "No matches."+tail
+    return "\n".join(out)+tail if out else _empty("No matches.")+tail
 
 def pe_exports(path,max_results=500):
     pe=_pe(safe_path(path))
@@ -169,7 +181,7 @@ def pe_exports(path,max_results=500):
     ex=getattr(pe,"DIRECTORY_ENTRY_EXPORT",None)
     if not ex:
         if problem:return f"{EXPORT_DIRECTORY_UNREADABLE}: {problem}. This is NOT the same as a binary with no exports."
-        return "No export table."
+        return _empty("No export table.")
     out=[]
     all_symbols=list(ex.symbols)
     for s in all_symbols[:max_results]:
@@ -182,7 +194,7 @@ def pe_exports(path,max_results=500):
 def dotnet_metadata(path,max_types=300):
     p=safe_path(path); pe=_pe(p)
     clr=len(pe.OPTIONAL_HEADER.DATA_DIRECTORY)>14 and pe.OPTIONAL_HEADER.DATA_DIRECTORY[14].VirtualAddress!=0
-    if not clr:return "No CLR/.NET header present."
+    if not clr:return _empty("No CLR/.NET header present.")
     import dnfile
     dn=dnfile.dnPE(str(p)); out=[]
     try:
@@ -192,8 +204,8 @@ def dotnet_metadata(path,max_types=300):
             ns=str(row.TypeNamespace or ""); name=str(row.TypeName or "")
             out.append(f"{ns}.{name}".strip("."))
         if len(all_rows)>max_types:out.append(_limit_marker(len(out),max_types,len(all_rows)))
-    except Exception as e:return f".NET metadata incomplete or failed: {e}"
-    return "\n".join(out) if out else ".NET assembly parsed, but TypeDef table is empty."
+    except Exception as e:return f"{DOTNET_METADATA_UNREADABLE}: .NET metadata incomplete or failed: {e}"
+    return "\n".join(out) if out else _empty(".NET assembly parsed, but TypeDef table is empty.")
 
 # Bytes handed to a single capstone disasm() call (module-level so a test can
 # shrink it to exercise chunk seams). Same default the sweep modules use.
@@ -307,7 +319,7 @@ def disassemble_pe(path,section=None,start_offset=0,max_instructions=250,va=None
     # follows, so a listing that ends exactly at the cap is left unmarked.
     if more_at is not None and out:
         out.append(f"[ANALYSIS_LIMITED: stopped after max_instructions={cap}; more code follows at 0x{more_at:X}]")
-    return "\n".join(out) if out else "No instruction could be decoded."
+    return "\n".join(out) if out else f"{DISASSEMBLY_FAILED}: No instruction could be decoded."
 
 def _dps_form(pe,va):
     """The shared AddressForm (pe_address.AddressForm, same hex-string spelling as
@@ -399,7 +411,7 @@ def search_binary_bytes(path,pattern,max_results=100):
         if all(v is None or data[i+j]==v for j,v in enumerate(pat)):
             if len(out)>=max_results:return "\n".join(out)+"\n"+_limit_marker(len(out),max_results)
             out.append(f"file_offset=0x{i:X}")
-    return "\n".join(out) if out else "No matches."
+    return "\n".join(out) if out else _empty("No matches.")
 
 class _ResourceMalformed(Exception):
     """Raised when the resource directory (or one leaf's declared-vs-actual
@@ -559,11 +571,39 @@ def pe_resources(path,operation='list',resource_type='',resource_name='',languag
 
     return json.dumps({'ok':False,'path':relative(p),'error':'UNKNOWN_OPERATION'},indent=2)
 
+def _authenticode_fields(stdout):
+    """Parse the JSON Get-AuthenticodeSignature script's stdout into the result dict.
+
+    Every field comes from that JSON object; one that is absent, null or not a string is None
+    ("UNKNOWN"), never a guess. ``raw`` is the stdout text unchanged. Output that is not a JSON
+    object is an ANALYSIS_LIMITED failure carrying the raw text, not a half-filled success."""
+    try:
+        data=json.loads(stdout)
+    except ValueError:
+        data=None
+    if not isinstance(data,dict):
+        return {"ok":False,"status":"ANALYSIS_LIMITED","error":"AUTHENTICODE_OUTPUT_UNPARSEABLE","raw":stdout}
+    def field(key):
+        v=data.get(key)
+        return v if isinstance(v,str) and v else None
+    return {"ok":True,"status":"OK","signature_status":field("Status"),"status_message":field("StatusMessage"),
+            "signer":field("SignerSubject"),"issuer":field("Issuer"),"thumbprint":field("Thumbprint"),
+            "timestamper":field("TimestamperSubject"),"raw":stdout}
+
 def authenticode_signature(path,cancellation_token=None):
+    """Authenticode status of a file, as JSON (Windows only; elsewhere a JSON failure with
+    ``status`` UNSUPPORTED and ``error`` AUTHENTICODE_REQUIRES_WINDOWS, in ``_failure``'s shape).
+
+    ``signature_status`` is PowerShell's own verdict string (Valid, NotSigned, HashMismatch, ...),
+    kept apart from ``status``, which is the package vocabulary (OK on a parsed answer).
+    ``signer``, ``issuer``, ``thumbprint`` and ``timestamper`` (the subject of the timestamp
+    countersigner's certificate; Get-AuthenticodeSignature does not expose the signing time) are
+    None when the file carries no such certificate or the field could not be read. ``raw`` is the
+    script's stdout. A failed run is a JSON failure with ``ok`` false, never bare stderr."""
     p=safe_path(path)
-    if os.name!="nt":return "Authenticode verification requires Windows."
+    if sys.platform!="win32":return json.dumps(_failure("AUTHENTICODE_REQUIRES_WINDOWS","UNSUPPORTED","Authenticode verification requires Windows."))
     esc=str(p).replace("'","''")
-    ps=f"$s=Get-AuthenticodeSignature -LiteralPath '{esc}'; [pscustomobject]@{{Status=[string]$s.Status;StatusMessage=$s.StatusMessage;SignerSubject=if($s.SignerCertificate){{$s.SignerCertificate.Subject}}else{{$null}};Thumbprint=if($s.SignerCertificate){{$s.SignerCertificate.Thumbprint}}else{{$null}}}} | ConvertTo-Json -Compress"
+    ps=f"$s=Get-AuthenticodeSignature -LiteralPath '{esc}'; [pscustomobject]@{{Status=[string]$s.Status;StatusMessage=$s.StatusMessage;SignerSubject=if($s.SignerCertificate){{$s.SignerCertificate.Subject}}else{{$null}};Issuer=if($s.SignerCertificate){{$s.SignerCertificate.Issuer}}else{{$null}};Thumbprint=if($s.SignerCertificate){{$s.SignerCertificate.Thumbprint}}else{{$null}};TimestamperSubject=if($s.TimeStamperCertificate){{$s.TimeStamperCertificate.Subject}}else{{$null}}}} | ConvertTo-Json -Compress"
     cp=run_bounded_process(
         ["powershell.exe","-NoProfile","-NonInteractive","-Command",ps],
         timeout_seconds=30,cancellation_token=cancellation_token,
@@ -572,7 +612,9 @@ def authenticode_signature(path,cancellation_token=None):
         return json.dumps(launch_failure(cp, "authenticode_signature", "AUTHENTICODE_LAUNCH_FAILED"))
     if cp.cancelled:return json.dumps({"ok":False,"status":"CANCELLED","error":"TOOL_CALL_CANCELLED","process_tree_terminated":cp.process_tree_terminated})
     if cp.timed_out:return json.dumps({"ok":False,"status":"TIMEOUT","error":"PROCESS_TIMEOUT","process_tree_terminated":cp.process_tree_terminated})
-    return cp.stdout.strip() if cp.returncode==0 else cp.stderr.strip()
+    if cp.returncode!=0:
+        return json.dumps({"ok":False,"status":"ANALYSIS_LIMITED","error":"AUTHENTICODE_COMMAND_FAILED","returncode":cp.returncode,"stderr":cp.stderr.strip()})
+    return json.dumps(_authenticode_fields(cp.stdout.strip()),ensure_ascii=False)
 
 
 # ---- kernel_triage ---------------------------------------------------------

@@ -455,8 +455,11 @@ liebert-re tool run <name> --args '{"path": "sample.bin"}'
 tool's keyword arguments as one JSON object, keeps path arguments inside the workspace root like every
 other subcommand, and answers in the same JSON envelope with the same exit codes. A tool that answers
 in plain text comes back as `{"tool": <name>, "text": ...}` with `classified: false`: the CLI has no
-grammar for that prose, so it does not claim to have judged it, and a failure the tool reports in
-prose is not told apart from an answer.
+grammar for that prose, so it does not claim to have judged it. It does recognise one thing: a text
+that starts with a status code (`ANALYSIS_LIMITED`-class codes such as `IMPORT_DIRECTORY_UNREADABLE`,
+`DOTNET_METADATA_UNREADABLE`, `DISASSEMBLY_FAILED`) is `ok: false` with that status, and one that starts
+with `EMPTY_RESULT: ` is `ok: true` with `empty: true`; failure in unprefixed prose is still not told
+apart from an answer. `authenticode_signature` answers in JSON (`signature_status`, `signer`, `issuer`, `raw`).
 
 52<!-- count:cli_direct_commands --> published tools also have a dedicated subcommand (`cli.py` names
 them by string literal). `tool run` reaches the rest, except the tools that write to disk or need a

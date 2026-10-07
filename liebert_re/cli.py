@@ -57,17 +57,21 @@ _REFUSAL_ERRORS = frozenset({"FILE_NOT_FOUND", "FILE_NOT_ACCESSIBLE"})
 # a structured dict (disassemble_pe) or starts with a stable machine code; the CLI
 # never matches prose. Anything else must fit the command's known listing shape,
 # otherwise it is an unclassifiable answer and exits 1 (see _decode).
-_TEXT_LIMITED_PREFIXES = ("IMPORT_DIRECTORY_UNREADABLE", "EXPORT_DIRECTORY_UNREADABLE")
+_TEXT_LIMITED_PREFIXES = ("IMPORT_DIRECTORY_UNREADABLE", "EXPORT_DIRECTORY_UNREADABLE",
+                          "DOTNET_METADATA_UNREADABLE", "DISASSEMBLY_FAILED")
 _TEXT_UNSUPPORTED_PREFIXES = ("Authenticode verification requires Windows",)
+# "Nothing found" is an answer, not a failure: a text that starts with this prefix is ok=true and
+# carries ``empty: true`` (see _decode). Pinned equal to liebert_re.tools.binary.EMPTY_RESULT_PREFIX.
+_TEXT_EMPTY_PREFIX = "EMPTY_RESULT: "
 # The end-of-list line liebert_re.workspace._limit_marker writes for a listing cut at its cap.
 # Anchored and numeric on purpose: only this exact form is read as "truncated", nothing looser.
 _TRUNCATION_MARKER = r"\[limit:(\d+); truncated=true; returned=(\d+); total=(\d+|unknown \(more exist\))\]"
 _MARKER = rf"\[(?:limit:\d+|[A-Z_]+: .*)\]|{_TRUNCATION_MARKER}"
 # command/mode -> regex every line of a successful text answer must match.
 _TEXT_SHAPES = {
-    "imports": re.compile(rf"(?:\S+!.+ @IAT 0x[0-9a-f]+|No import table\.|No matches\.|{_MARKER})"),
-    "exports": re.compile(rf"(?:.+ RVA=0x[0-9a-f]+ ordinal=\d+|No export table\.|{_MARKER})"),
-    "disasm": re.compile(rf"(?:0x[0-9A-F]+: .+|No instruction could be decoded\.|{_MARKER})"),
+    "imports": re.compile(rf"(?:\S+!.+ @IAT 0x[0-9a-f]+|EMPTY_RESULT: No import table\.|EMPTY_RESULT: No matches\.|{_MARKER})"),
+    "exports": re.compile(rf"(?:.+ RVA=0x[0-9a-f]+ ordinal=\d+|EMPTY_RESULT: No export table\.|{_MARKER})"),
+    "disasm": re.compile(rf"(?:0x[0-9A-F]+: .+|{_MARKER})"),
 }
 
 
@@ -97,8 +101,15 @@ def _decode(raw, shape=None, tool=None):
     in the generic envelope ``{"tool": name, "text": ...}`` with no per-tool shape. Such a text has
     no listing grammar the CLI knows, so it is NOT classified: ``classified: false`` says so, and
     ``ok: true`` then means only "the tool returned and no known failure code or broken truncation
-    marker was found", never "the prose is a success". A tool that reports failure in prose
-    ("Directory not found: ...") is therefore indistinguishable here; read ``text``.
+    marker was found", never "the prose is a success". A failure is recognised only by a status
+    prefix (``_TEXT_UNSUPPORTED_PREFIXES``, ``_TEXT_LIMITED_PREFIXES``); a tool that reports failure
+    in unprefixed prose is indistinguishable here, so read ``text``.
+
+    Empty result rule: a text that starts with ``_TEXT_EMPTY_PREFIX`` (``"EMPTY_RESULT: "`` followed
+    by the tool's own sentence, e.g. ``EMPTY_RESULT: No strings found.``) is a genuine "nothing
+    found" answer. It is not a failure: ``ok: true``, ``status: "OK"`` and the extra field
+    ``empty: true``. ``empty`` is present only when true; its absence means the text was not
+    stated as empty, not that it is non-empty.
 
     Text is an answer only if it carries a known failure code or every line fits
     ``shape``; otherwise it is an unclassifiable result and becomes a FAILED
@@ -136,6 +147,8 @@ def _decode(raw, shape=None, tool=None):
             out.update(ok=True, status="OK", truncation=truncation)
         else:
             out.update(ok=True, status="OK")
+        if out["ok"] and raw.startswith(_TEXT_EMPTY_PREFIX):
+            out["empty"] = True
         if tool is not None:
             out["classified"] = False
     return out

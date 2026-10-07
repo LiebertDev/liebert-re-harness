@@ -42,13 +42,13 @@ class PeDirectoryVisibilityTests(unittest.TestCase):
 
     def test_genuinely_absent_directories_keep_the_plain_message(self):
         p = _build(self.dir / "none.exe")
-        self.assertEqual(pe_imports(str(p)), "No import table.")
-        self.assertEqual(pe_exports(str(p)), "No export table.")
+        self.assertEqual(pe_imports(str(p)), "EMPTY_RESULT: No import table.")
+        self.assertEqual(pe_exports(str(p)), "EMPTY_RESULT: No export table.")
 
     def test_corrupt_import_directory_is_not_reported_as_absent(self):
         p = _build(self.dir / "bad.exe", import_dir=(0x90000000, 40))
         out = pe_imports(str(p))
-        self.assertNotEqual(out, "No import table.")
+        self.assertNotEqual(out, "EMPTY_RESULT: No import table.")
         self.assertTrue(out.startswith("IMPORT_DIRECTORY_UNREADABLE"), out)
         self.assertIn("declared", out)
 
@@ -61,7 +61,7 @@ class PeDirectoryVisibilityTests(unittest.TestCase):
     def test_corrupt_export_directory_is_not_reported_as_absent(self):
         p = _build(self.dir / "badx.exe", export_dir=(0x90000000, 40))
         out = pe_exports(str(p))
-        self.assertNotEqual(out, "No export table.")
+        self.assertNotEqual(out, "EMPTY_RESULT: No export table.")
         self.assertTrue(out.startswith("EXPORT_DIRECTORY_UNREADABLE"), out)
 
     def test_the_two_cases_are_distinguishable_for_both_functions(self):
