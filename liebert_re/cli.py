@@ -429,6 +429,11 @@ def _ghidra_facts(a):
     return _load("liebert_re.tools.ghidra", "ghidra_program_facts")(a.path, timeout_seconds=a.timeout)
 
 
+def _ghidra_decompile(a):
+    return _load("liebert_re.tools.ghidra", "ghidra_decompile")(
+        a.path, a.function, per_function_timeout_seconds=a.function_timeout, timeout_seconds=a.timeout)
+
+
 def _ida_annotations(a):
     return _load("liebert_re.tools.ida", "ida_annotations")(a.path, max_results=a.max_results, max_chars=a.max_chars)
 
@@ -815,6 +820,10 @@ def _build_parser():
     add("ghidrastatus", _ghidra_status, "report where Ghidra's analyzeHeadless is, its version and the Java it needs (does not launch Ghidra)", path=False)
     sp = add("ghidrafacts", _ghidra_facts, "import a file into a throwaway Ghidra project, run default analysis and report read-only facts about the program (the source file is not modified)")
     sp.add_argument("--timeout", type=int, default=300, help="seconds for the whole headless run")
+    sp = add("ghidradecompile", _ghidra_decompile, "import a file into a throwaway Ghidra project, run default analysis and decompile selected functions with Ghidra's decompiler (read-only: nothing is saved; a function that does not decompile has c_code null and a reason)")
+    sp.add_argument("--function", required=True, nargs="+", metavar="FUNCTION", help="one or more function addresses written 0x... or function names, at most 16; a string not written 0x... is a name")
+    sp.add_argument("--function-timeout", dest="function_timeout", type=int, default=30, help="seconds for one function's decompilation (5-120)")
+    sp.add_argument("--timeout", type=int, default=None, help="seconds for the whole headless run (default: 300 plus the per-function bound for each function)")
     add("unpack", _unpack, "statically unpack a UPX-packed PE (output goes to the evidence cache)").add_argument("--timeout", type=int, default=60)
     add("scan", _scan, "scan with YARA-X rules").add_argument("--rules", required=True, help="rules file")
     sp = add("minidump", _minidump, "analyse a Windows minidump")

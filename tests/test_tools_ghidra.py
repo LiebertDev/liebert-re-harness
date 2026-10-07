@@ -205,7 +205,7 @@ class StatusContractTests(GhidraBase):
         self.assertEqual(data["status"], "OK")
         self.assertEqual(data["version"], "12.1.3")
         self.assertEqual(data["resolved_by"], "GHIDRA_INSTALL_DIR")
-        self.assertEqual(data["operations"], ["ghidra_status", "ghidra_program_facts"])
+        self.assertEqual(data["operations"], ["ghidra_status", "ghidra_program_facts", "ghidra_decompile"])
         self.assertEqual(data["java"]["required_minimum"], 21)
         self.assertEqual(data["java"]["found_major"], 21)
         self.assertIs(data["java"]["satisfies_minimum"], True)

@@ -95,8 +95,9 @@ hidden feature.
   `case_purge` integration is not done: the annotated purge does not read case state today, so a case
   becoming `solved` or `abandoned` does not trigger it.
   **Still open:** `ida_disasm_listing` (read-only, next
-  round), Ghidra decompilation and cross-references (slice 1, `ghidra_status` and
-  `ghidra_program_facts`, has landed), and normalising answers across engines.
+  round), Ghidra cross-references (`ghidra_status`, `ghidra_program_facts` and
+  `ghidra_decompile`, the read-only decompile of up to 16 selected functions, have landed),
+  and normalising answers across engines.
 - **Function-boundary recovery from exception-directory unwind data.** **Partly closed.**
   `liebert_re/tools/pe_unwind.py` reads the x64 exception directory (`.pdata`): published tools
   `pe_runtime_functions` (the table, summarised, with a bounded page of entries) and

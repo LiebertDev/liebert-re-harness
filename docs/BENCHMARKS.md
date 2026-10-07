@@ -150,7 +150,7 @@ distinction is usually where tool inventories lie.
 | Engine | Integration |
 |---|---|
 | IDA (Professional) | **Real subset in this package** — `idat -A` batch in a bounded subprocess, database cache keyed by the input file's SHA-256 and size-capped; the annotation write path (rename and comment plans, `ida_annotations_apply`, `ida_annotations_purge`), microcode reading, type-member offsets, patch planning (a plan only) and the annotation-log read are here; a disassembly listing is not |
-| Ghidra | **Real, slice 1 only in this package** — `analyzeHeadless`, one throw-away project per call; install status and read-only program facts, no decompilation; exit code 0 is not trusted, the log and result file decide |
+| Ghidra | **Real, partly in this package** — `analyzeHeadless`, one throw-away project per call; install status, read-only program facts and read-only decompilation of selected functions, no cross-references; exit code 0 is not trusted, the log and result file decide |
 | rizin / radare2 | **Real** (rizin wrapper only in this package; no radare2 driver) — bounded subprocess wrapper |
 | Capstone, Unicorn | **Real** — in-process imports (Unicorn only for the VEX self-check in `recover/vex.py`; no range emulation ships) |
 | angr | **Not in this package** — nothing imports it |

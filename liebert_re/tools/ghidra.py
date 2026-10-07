@@ -1,6 +1,6 @@
-"""Ghidra headless wrapper, slice 1: install status and read-only program facts.
+"""Ghidra headless wrapper: install status, read-only program facts and read-only decompilation.
 
-Two operations, both of which drive Ghidra's own ``support/analyzeHeadless``
+Three operations, both of which drive Ghidra's own ``support/analyzeHeadless``
 and never reimplement analysis:
 
 * ``ghidra_status`` measures the install (where ``analyzeHeadless`` is, which
@@ -11,6 +11,11 @@ and never reimplement analysis:
   back facts that need no judgement: loader, language, entry points, memory
   blocks, function count, imported library names. The source file is only
   read (its SHA-256 is compared before and after and reported).
+* ``ghidra_decompile`` runs the same import and analysis, then decompiles at most 16 named or
+  addressed functions with Ghidra's own decompiler (``ghidra_scripts/DecompileFunctions.java``). A
+  function that cannot be resolved or decompiled has ``c_code: null`` and its reason; nothing is saved
+  back to the program. It shares the facts operation's run, refusal and cleanup path
+  (``_headless_run``).
 
 **Exit code 0 is not success.** Measured on Ghidra 12.1.3: a post-script that
 fails to run (a Jython ``.py`` script on a build without PyGhidra, a Java
@@ -19,8 +24,8 @@ script that fails to compile, a script that throws) still lets
 code as one signal among several: the log is scanned for the failure markers
 in ``_FAILURE_MARKERS``, the result file the script was told to write must
 exist, parse, and carry the script's own completion flag. Any of them missing
-is a refusal, never a success. The script is a Java data file
-(``ghidra_scripts/ProgramFacts.java``) because Java post-scripts run on a
+is a refusal, never a success. The scripts are Java data files
+(``ghidra_scripts/ProgramFacts.java``, ``ghidra_scripts/DecompileFunctions.java``) because Java post-scripts run on a
 stock install, with no PyGhidra; PyGhidra is deliberately not used.
 
 Every run gets its own project directory, so two concurrent runs cannot hit
@@ -97,7 +102,7 @@ _FAILURE_MARKERS = (
     ("unsupportedclassversionerror", "JAVA_TOO_OLD"),
 )
 
-_OPERATIONS = ["ghidra_status", "ghidra_program_facts"]
+_OPERATIONS = ["ghidra_status", "ghidra_program_facts", "ghidra_decompile"]
 
 # The fact keys ProgramFacts.java must write, with the type each must have when it is not null.
 # This is the contract the reader enforces: a key missing from the result is "not measured", never
@@ -111,6 +116,8 @@ _FACT_SPEC = {
     "external_library_count": int, "external_libraries": list,
     "errors": list,
 }
+
+_FACT_CONTRACT_KEYS = tuple(key for key in _FACT_SPEC if key != "errors")
 
 _KNOWN_INSTALL_GLOBS = (
     "ghidra*", "*/ghidra*",
@@ -492,9 +499,11 @@ def _count_error_lines(log):
     return sum(1 for line in (log or "").splitlines() if re.match(r"\s*ERROR\b", line))
 
 
-def _read_result(result_path):
-    """(facts, error_code). Anything short of a complete, schema-matching file
-    is an error code and no facts."""
+def _read_result(result_path, contract_keys=None):
+    """(data, error_code). Anything short of a complete, schema-matching file is an error code and no
+    data. ``contract_keys``: at least one of them must be present (the facts keys by default)."""
+    if contract_keys is None:
+        contract_keys = _FACT_CONTRACT_KEYS
     try:
         raw = result_path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -511,7 +520,7 @@ def _read_result(result_path):
         return None, "GHIDRA_RESULT_INCOMPLETE"
     if data.get("schema") != _RESULT_SCHEMA:
         return None, "GHIDRA_RESULT_SCHEMA_MISMATCH"
-    if not any(key in data for key in _FACT_SPEC if key != "errors"):
+    if not any(key in data for key in contract_keys):
         return None, "GHIDRA_RESULT_CONTRACT_VIOLATION"
     return data, None
 
@@ -539,48 +548,73 @@ def ghidra_program_facts(path, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS, cancell
     ANALYSIS_LIMITED, never OK.
     """
     tool = "ghidra_program_facts"
+    selection, p, refusal = _preflight(tool, path)
+    if refusal:
+        return refusal
+    timeout = _clamp_timeout(timeout_seconds)
+    analysis_timeout = max(5, int(timeout * 0.6))
+    before, refusal = _hash_source(tool, p)
+    if refusal:
+        return refusal
+    return _j(_scratch_run(tool, lambda work: _facts_in_work(
+        tool, selection, p, before, timeout, analysis_timeout, work, cancellation_token)))
+
+
+def _preflight(tool, path):
+    """The checks every headless operation starts with. (selection, path, None) when a run may
+    start, else (None, None, refusal JSON): no install, a path the workspace refuses or that is not a
+    file, an unreadable application.properties, no Java, or a Java below the install's minimum."""
     selection, _candidates, skipped = _select_install()
     if selection is None:
-        return _tool_missing(tool, skipped)
+        return None, None, _tool_missing(tool, skipped)
     p, fail = _checked_path(path, tool)
     if fail:
-        return fail
+        return None, None, fail
     if not selection["properties_readable"]:
-        return _j({"ok": False, "tool": tool, "status": "INSTALL_INCOMPLETE",
-                   "error": "GHIDRA_APPLICATION_PROPERTIES_UNREADABLE"})
+        return None, None, _j({"ok": False, "tool": tool, "status": "INSTALL_INCOMPLETE",
+                               "error": "GHIDRA_APPLICATION_PROPERTIES_UNREADABLE"})
     java = _probe_java()
     java_min = _int_or_none(selection["java_min"])
     if not java["found"]:
-        return _j({"ok": False, "tool": tool, "status": "JAVA_MISSING", "error": "JAVA_NOT_FOUND"})
+        return None, None, _j({"ok": False, "tool": tool, "status": "JAVA_MISSING", "error": "JAVA_NOT_FOUND"})
     if java["major"] is not None and java_min is not None and java["major"] < java_min:
-        return _j({"ok": False, "tool": tool, "status": "JAVA_TOO_OLD",
-                   "error": "JAVA_BELOW_REQUIRED_MINIMUM",
-                   "java_found_major": java["major"], "java_required_minimum": java_min})
+        return None, None, _j({"ok": False, "tool": tool, "status": "JAVA_TOO_OLD",
+                               "error": "JAVA_BELOW_REQUIRED_MINIMUM",
+                               "java_found_major": java["major"], "java_required_minimum": java_min})
+    return selection, p, None
 
+
+def _clamp_timeout(value, default=_DEFAULT_TIMEOUT_SECONDS):
     try:
-        timeout = max(_MIN_TIMEOUT_SECONDS, min(int(timeout_seconds), _MAX_TIMEOUT_SECONDS))
+        return max(_MIN_TIMEOUT_SECONDS, min(int(value), _MAX_TIMEOUT_SECONDS))
     except (TypeError, ValueError):
-        timeout = _DEFAULT_TIMEOUT_SECONDS
-    analysis_timeout = max(5, int(timeout * 0.6))
+        return default
 
+
+def _hash_source(tool, p):
+    """(sha256, None), or (None, refusal JSON) when the source cannot be read."""
     try:
-        before = _sha256_file(p)
+        return _sha256_file(p), None
     except OSError as exc:
-        return _j({"ok": False, "tool": tool, "status": "NOT_FOUND", "error": type(exc).__name__})
+        return None, _j({"ok": False, "tool": tool, "status": "NOT_FOUND", "error": type(exc).__name__})
 
+
+def _scratch_run(tool, run):
+    """Call ``run(work)`` inside a unique scratch directory and remove it afterwards. Returns the
+    response dict; a directory that could not be removed is reported in ``cleanup_failures``."""
     try:
         work = Path(tempfile.mkdtemp(prefix="liebert-ghidra-", dir=str(WORK_ROOT) if WORK_ROOT else None))
     except OSError as exc:
-        return _j({"ok": False, "tool": tool, "status": "ENVIRONMENT_ERROR",
-                   "error": "GHIDRA_WORK_OR_SCRIPT_UNUSABLE",
-                   "detail": f"{type(exc).__name__} while creating the scratch directory."})
+        return {"ok": False, "tool": tool, "status": "ENVIRONMENT_ERROR",
+                "error": "GHIDRA_WORK_OR_SCRIPT_UNUSABLE",
+                "detail": f"{type(exc).__name__} while creating the scratch directory."}
     try:
-        body = _facts_in_work(tool, selection, p, before, timeout, analysis_timeout, work, cancellation_token)
+        body = run(work)
     finally:
         cleanup_failure = _remove_work(work)
     if cleanup_failure:
         body["cleanup_failures"] = [cleanup_failure]
-    return _j(body)
+    return body
 
 
 def _remove_work(work):
@@ -624,10 +658,29 @@ def _normalise_facts(raw):
     return facts, sorted(unreadable), sorted(missing), sorted(malformed)
 
 
-def _facts_in_work(tool, selection, p, before, timeout, analysis_timeout, work, cancellation_token):
-    """The run itself, inside an already created scratch directory. Returns the response as a dict."""
+def _fail(tool, status, error, **extra):
+    return dict({"ok": False, "tool": tool, "status": status, "error": error}, **extra)
+
+
+def _headless_run(tool, selection, p, before, timeout, analysis_timeout, work, cancellation_token,
+                  script, contract_keys, extra_files=None, extra_args=()):
+    """One analyzeHeadless run with a Java post-script, inside an already created scratch directory.
+    Returns ``(failure, raw, common)``: ``failure`` is a response dict when the run must be refused
+    (then ``raw`` and ``common`` are None); otherwise ``raw`` is the script's parsed result and
+    ``common`` the invocation and log facts every response carries.
+
+    ``script`` is ``(source_path, script_name, result_name)``. The script gets the result file path
+    as its first argument, then ``extra_args``; an extra argument ``"@work/<name>"`` is replaced by
+    the absolute path of ``extra_files[<name>]``, a text file written into the scratch directory
+    (request data goes through a file, never through the command line: analyzeHeadless splits
+    arguments on whitespace and its Windows launcher is a batch file).
+
+    Exit code 0 is not trusted, see the module docstring. The source file's hash is re-taken after
+    the run and a change is a refusal."""
+    source_path, script_name, result_name = script
+
     def fail(status, error, **extra):
-        return dict({"ok": False, "tool": tool, "status": status, "error": error}, **extra)
+        return _fail(tool, status, error, **extra), None, None
 
     if any(part.startswith(".") and part not in (".", "..") for part in work.parts):
         return fail("ENVIRONMENT_ERROR", "GHIDRA_SCRATCH_PATH_HAS_DOT_ELEMENT",
@@ -638,19 +691,25 @@ def _facts_in_work(tool, selection, p, before, timeout, analysis_timeout, work, 
         scripts.mkdir()
         projects = work / "project"
         projects.mkdir()
-        source = _SCRIPT_SOURCE.read_bytes()
+        source = Path(source_path).read_bytes()
         if source.startswith(b"\xef\xbb\xbf"):
             source = source[3:]
-        (scripts / _SCRIPT_NAME).write_bytes(source.replace(b"\r\n", b"\n"))
+        (scripts / script_name).write_bytes(source.replace(b"\r\n", b"\n"))
+        for name, text in (extra_files or {}).items():
+            (work / name).write_text(text, encoding="utf-8", newline="\n")
     except OSError as exc:
         return fail("ENVIRONMENT_ERROR", "GHIDRA_WORK_OR_SCRIPT_UNUSABLE",
                     detail=f"{type(exc).__name__} while preparing the scratch directory or script.")
-    result_path = work / _RESULT_NAME
+    result_path = work / result_name
+    script_args = [str(result_path)]
+    for arg in extra_args:
+        arg = str(arg)
+        script_args.append(str(work / arg[len("@work/"):]) if arg.startswith("@work/") else arg)
     argv = [
         str(selection["headless"]), str(projects), _PROJECT_NAME,
         "-import", str(p),
         "-scriptPath", str(scripts),
-        "-postScript", _SCRIPT_NAME, str(result_path),
+        "-postScript", script_name, *script_args,
         "-analysisTimeoutPerFile", str(analysis_timeout),
         "-deleteProject",
     ]
@@ -678,7 +737,7 @@ def _facts_in_work(tool, selection, p, before, timeout, analysis_timeout, work, 
                                "terminated; a JVM may still be running.")
         if cp.timed_out:
             extra["log_tail"] = _tail(log, work, p)
-            extra.setdefault("detail", "Raise timeout_seconds; a timeout is not 'no facts' and no "
+            extra.setdefault("detail", "Raise timeout_seconds; a timeout is not 'no result' and no "
                                        "partial result is used.")
         return fail(what, error, **extra)
     signals = _scan_failures(log)
@@ -695,22 +754,33 @@ def _facts_in_work(tool, selection, p, before, timeout, analysis_timeout, work, 
                             "result file was ignored.")))
     if cp.returncode != 0:
         return fail("ANALYSIS_LIMITED", "GHIDRA_EXITED_NONZERO", **common)
-    raw, error = _read_result(result_path)
+    raw, error = _read_result(result_path, contract_keys)
     if error:
         return fail("ANALYSIS_LIMITED", error, **dict(
             common, detail="Exit code 0 and no failure marker, but the script's result file is "
-                           "missing, incomplete or does not match the contract; no facts are reported."))
+                           "missing, incomplete or does not match the contract; nothing is reported."))
     try:
         after = _sha256_file(p)
     except OSError as exc:
         return fail("ANALYSIS_LIMITED", "SOURCE_UNVERIFIED", source_sha256_before=before,
                     detail=f"The source could not be re-read after the run ({type(exc).__name__}), so "
-                           "it is not known whether it was left unmodified; no facts are reported.")
+                           "it is not known whether it was left unmodified; nothing is reported.")
     if after != before:
         return fail("ANALYSIS_LIMITED", "SOURCE_MODIFIED", source_sha256_before=before,
                     source_sha256_after=after,
                     detail="The input file changed during the run. The import is read-only by design, so "
-                           "no facts are reported.")
+                           "nothing is reported.")
+    return None, raw, common
+
+
+def _facts_in_work(tool, selection, p, before, timeout, analysis_timeout, work, cancellation_token):
+    """The facts run, inside an already created scratch directory. Returns the response as a dict."""
+    failure, raw, common = _headless_run(
+        tool, selection, p, before, timeout, analysis_timeout, work, cancellation_token,
+        (_SCRIPT_SOURCE, _SCRIPT_NAME, _RESULT_NAME), _FACT_CONTRACT_KEYS)
+    if failure:
+        return failure
+    invocation = common["invocation"]
     facts, unreadable, missing, malformed = _normalise_facts(raw)
     facts["errors"] = [_redact(str(e), work=work, target=p) for e in (facts.get("errors") or [])]
     unreadable = [k for k in unreadable if k != "errors"]
@@ -749,3 +819,220 @@ def _facts_in_work(tool, selection, p, before, timeout, analysis_timeout, work, 
             "capped in the script; the *_count fields carry the true totals."
         ),
     }
+
+
+# --------------------------------------------------------------------------
+# decompile
+# --------------------------------------------------------------------------
+
+_DECOMPILE_SCRIPT_SOURCE = Path(__file__).resolve().parent / "ghidra_scripts" / "DecompileFunctions.java"
+_DECOMPILE_SCRIPT_NAME = "DecompileFunctions.java"
+_DECOMPILE_RESULT_NAME = "decompile.json"
+_DECOMPILE_REQUEST_NAME = "requests.txt"
+_DECOMPILE_MAX_FUNCTIONS = 16
+_DECOMPILE_DEFAULT_PER_FUNCTION_SECONDS = 30
+_DECOMPILE_MIN_PER_FUNCTION_SECONDS = 5
+_DECOMPILE_MAX_PER_FUNCTION_SECONDS = 120
+_DECOMPILE_BASE_TIMEOUT_SECONDS = 300
+_DECOMPILE_MAX_NAME_CHARS = 512
+_ADDRESS_TEXT = re.compile(r"0[xX]([0-9a-fA-F]{1,16})")
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+# What one entry of the script's "functions" list must carry, with the type each has when not null.
+_DECOMPILE_ENTRY_SPEC = {
+    "requested": str, "address": str, "name": str, "signature": str, "decompiled_signature": str,
+    "c_code": str, "c_code_truncated": bool, "decompile_completed": bool, "warnings": list, "error": str,
+}
+
+
+def _usage(tool, error, detail, **extra):
+    return _j(dict({"ok": False, "tool": tool, "status": "TOOL_USAGE", "error": error, "detail": detail}, **extra))
+
+
+def _function_requests(functions):
+    """(requests, None) or (None, (error, detail)). A request is ``("A", hex)`` for an address or
+    ``("N", name)`` for a function name. An ``int`` and a string written ``0x...`` are addresses; every
+    other string is a name, so a name that happens to look like hex (``deadbeef``) is never taken for
+    an address. Nothing is guessed: an unusable item refuses the whole call."""
+    if functions is None:
+        return None, ("FUNCTIONS_REQUIRED", "name at least one function address (0x...) or name")
+    items = [functions] if isinstance(functions, (str, int)) and not isinstance(functions, bool) else functions
+    if not isinstance(items, (list, tuple)):
+        return None, ("FUNCTION_SPEC_INVALID", "functions must be a list of addresses and names")
+    if not items:
+        return None, ("FUNCTIONS_REQUIRED", "name at least one function address (0x...) or name")
+    if len(items) > _DECOMPILE_MAX_FUNCTIONS:
+        return None, ("TOO_MANY_FUNCTIONS",
+                      f"{len(items)} requested, at most {_DECOMPILE_MAX_FUNCTIONS} per call; split the call")
+    requests = []
+    for item in items:
+        if isinstance(item, bool) or not isinstance(item, (int, str)):
+            return None, ("FUNCTION_SPEC_INVALID", f"{type(item).__name__} is not an address or a name")
+        if isinstance(item, int):
+            if not 0 <= item < 1 << 64:
+                return None, ("FUNCTION_SPEC_INVALID", "an integer address must fit in 64 bits")
+            requests.append(("A", format(item, "x")))
+            continue
+        text = item.strip()
+        if not text or len(text) > _DECOMPILE_MAX_NAME_CHARS or _CONTROL_CHARS.search(text):
+            return None, ("FUNCTION_SPEC_INVALID",
+                          "a function name must be non-empty, without control characters, and at most "
+                          f"{_DECOMPILE_MAX_NAME_CHARS} characters")
+        match = _ADDRESS_TEXT.fullmatch(text)
+        requests.append(("A", match.group(1).lower()) if match else ("N", text))
+    return requests, None
+
+
+def ghidra_decompile(path, functions, per_function_timeout_seconds=_DECOMPILE_DEFAULT_PER_FUNCTION_SECONDS,
+                     timeout_seconds=None, cancellation_token=None):
+    """Import `path` into a throwaway Ghidra project, let Ghidra's default analysis run, and decompile
+    the selected functions with Ghidra's own decompiler. Read-only: nothing is saved, renamed, created
+    or retyped, and the source file is only read.
+
+    `functions` is a list (one string or integer is accepted too) of at most 16 items. An item is an
+    address (an ``int`` or a string written ``0x140001000``; the function containing it is decompiled
+    and the answer carries that function's entry address) or a function name as Ghidra knows it,
+    including its auto names such as ``FUN_140001000``. A string that is not written ``0x...`` is
+    always a name. A name that matches no function is ``FUNCTION_NOT_FOUND``; a name shared by several
+    functions is ``AMBIGUOUS_FUNCTION_NAME`` and lists their addresses, never a pick.
+
+    Each requested item gets one entry in ``functions``, in request order: ``requested``, ``address``,
+    ``name``, ``signature`` (Ghidra's listing prototype), ``decompiled_signature``, ``c_code``,
+    ``c_code_truncated``, ``decompile_completed`` (bool), ``warnings`` (decompiler markers found in the
+    code, e.g. ``halt_baddata``: the bytes did not decode, the C is not trustworthy) and ``error``. A
+    function that did not decompile has ``c_code: null`` and the reason in ``error``; the call as a
+    whole is ``OK`` when every function decompiled, ``PARTIAL`` when some did, and
+    ``ANALYSIS_LIMITED`` when none did.
+
+    `per_function_timeout_seconds` (5..120, default 30) bounds one decompilation inside the decompiler.
+    `timeout_seconds` bounds the whole headless run (import, analysis and decompiling); by default it
+    is 300 plus the per-function bound for each requested function, and it is clamped to 10..1800.
+
+    Status vocabulary as ``ghidra_program_facts``, plus TOOL_USAGE for a request that is refused before
+    anything starts (FUNCTIONS_REQUIRED, TOO_MANY_FUNCTIONS, FUNCTION_SPEC_INVALID).
+    """
+    tool = "ghidra_decompile"
+    requests, bad = _function_requests(functions)
+    if bad:
+        return _usage(tool, *bad)
+    selection, p, refusal = _preflight(tool, path)
+    if refusal:
+        return refusal
+    try:
+        per_function = int(per_function_timeout_seconds)
+    except (TypeError, ValueError):
+        per_function = _DECOMPILE_DEFAULT_PER_FUNCTION_SECONDS
+    per_function = max(_DECOMPILE_MIN_PER_FUNCTION_SECONDS, min(per_function, _DECOMPILE_MAX_PER_FUNCTION_SECONDS))
+    decompile_budget = per_function * len(requests)
+    default_timeout = _clamp_timeout(_DECOMPILE_BASE_TIMEOUT_SECONDS + decompile_budget)
+    timeout = default_timeout if timeout_seconds is None else _clamp_timeout(timeout_seconds, default_timeout)
+    analysis_timeout = max(5, int(max(timeout - decompile_budget, timeout // 2) * 0.6))
+    before, refusal = _hash_source(tool, p)
+    if refusal:
+        return refusal
+    return _j(_scratch_run(tool, lambda work: _decompile_in_work(
+        tool, selection, p, before, timeout, analysis_timeout, work, cancellation_token,
+        requests, per_function)))
+
+
+def _normalise_entry(raw, work, target):
+    """(entry, problems). Every key of ``_DECOMPILE_ENTRY_SPEC`` is present in the entry. A key the
+    script left null stays null; a key of the wrong type is null and listed in problems. An entry
+    that claims a completed decompile without code is not completed, and a failure without a reason
+    gets one that says the reason is unknown."""
+    entry, problems = {}, []
+    if not isinstance(raw, dict):
+        raw = {}
+        problems.append("entry_not_an_object")
+    for key, kind in _DECOMPILE_ENTRY_SPEC.items():
+        value = raw.get(key)
+        if value is None:
+            entry[key] = None
+        elif (kind is bool and not isinstance(value, bool)) or (kind is not bool and (
+                isinstance(value, bool) or not isinstance(value, kind))):
+            entry[key] = None
+            problems.append(key)
+        else:
+            entry[key] = value
+    entry["warnings"] = [] if entry["warnings"] is None else [str(w) for w in entry["warnings"]]
+    if entry["c_code_truncated"] is None:
+        entry["c_code_truncated"] = False
+    if entry["decompile_completed"] is True and entry["c_code"] is None:
+        entry["decompile_completed"] = False
+        entry["error"] = entry["error"] or "DECOMPILE_RESULT_MALFORMED: completed without C code"
+    if entry["decompile_completed"] is not True:
+        entry["decompile_completed"] = False
+        entry["c_code"] = None
+        entry["error"] = entry["error"] or "DECOMPILE_NOT_COMPLETED: the script gave no reason"
+    if entry["error"] is not None:
+        entry["error"] = _redact(entry["error"], work=work, target=target)
+    return entry, problems
+
+
+def _decompile_in_work(tool, selection, p, before, timeout, analysis_timeout, work, cancellation_token,
+                       requests, per_function):
+    """The decompile run, inside an already created scratch directory. Returns the response as a dict."""
+    request_text = "".join(f"{kind}\t{value}\n" for kind, value in requests)
+    failure, raw, common = _headless_run(
+        tool, selection, p, before, timeout, analysis_timeout, work, cancellation_token,
+        (_DECOMPILE_SCRIPT_SOURCE, _DECOMPILE_SCRIPT_NAME, _DECOMPILE_RESULT_NAME), ("functions",),
+        extra_files={_DECOMPILE_REQUEST_NAME: request_text},
+        extra_args=("@work/" + _DECOMPILE_REQUEST_NAME, per_function, _DECOMPILE_MAX_FUNCTIONS))
+    if failure:
+        return failure
+    rows = raw.get("functions")
+    if not isinstance(rows, list) or len(rows) != len(requests):
+        return _fail(tool, "ANALYSIS_LIMITED", "GHIDRA_RESULT_CONTRACT_VIOLATION", **dict(
+            common, detail="The script's result does not carry exactly one entry per requested function; "
+                           "nothing is reported."))
+    functions, problems = [], {}
+    for index, row in enumerate(rows):
+        entry, bad = _normalise_entry(row, work, p)
+        functions.append(entry)
+        if bad:
+            problems[str(index)] = bad
+    done = sum(1 for e in functions if e["decompile_completed"])
+    script_errors = [_redact(str(e), work=work, target=p) for e in (raw.get("errors") or [])]
+    summary = {
+        "path": relative(p),
+        "ghidra_version": selection["version"],
+        "resolved_by": selection["resolved_by"],
+        "invocation": dict(common["invocation"], per_function_timeout_seconds=per_function),
+        "source_sha256": before,
+        "source_unchanged": True,
+        "requested_count": len(requests),
+        "decompiled_count": done,
+        "failed_count": len(functions) - done,
+        "functions": functions,
+        "entries_malformed": problems,
+        "script_errors": script_errors,
+        "log_error_lines": common["log_error_lines"],
+    }
+    if done == 0:
+        return _fail(tool, "ANALYSIS_LIMITED", "NO_FUNCTION_DECOMPILED", **dict(
+            summary, detail="Ghidra ran, but none of the requested functions decompiled; see each entry's error."))
+    out_dir = EVIDENCE.parent / "ghidra_decompile"
+    out = out_dir / f"{p.stem}_{uuid.uuid4().hex[:8]}_decompile.json"
+    evidence_error = None
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"source_sha256": before, "functions": functions}, ensure_ascii=False),
+                       encoding="utf-8")
+        _evidence_index_record_write(out)
+    except OSError as exc:
+        evidence_error = type(exc).__name__
+    except Exception:  # noqa: BLE001
+        pass
+    return dict(summary, **{
+        "ok": True, "tool": tool, "status": "OK" if done == len(functions) else "PARTIAL",
+        "internal_evidence_name": out.name,
+        "evidence_write_error": evidence_error,
+        "note": (
+            "Read-only C from Ghidra's own decompiler after its default analysis. The code is Ghidra's "
+            "reading of the bytes, not source: types, names and control flow are inferred and can be "
+            "wrong, and a non-empty `warnings` (for example halt_baddata) means Ghidra met bytes it could "
+            "not decode, so that function's C is not evidence of what the code does. c_code is returned as "
+            "Ghidra produced it, without path redaction, and can contain strings from the target. A "
+            "function with decompile_completed false has c_code null and its reason in `error`; it is not "
+            "empty code."
+        ),
+    })

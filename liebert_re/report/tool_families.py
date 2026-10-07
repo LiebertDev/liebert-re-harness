@@ -51,7 +51,7 @@ between ``FAMILIES[family]`` and :func:`published_tools` (counts per family:
 :func:`published_family_report`). Measured at the time of writing, from
 :func:`published_family_report` (named / locally defined): workspace 15/10,
 identity 14/4, source 7/3, binary 4/4,
-native 84/61, windows-kernel 19/10, dotnet 9/4, archive 2/2, android 6/6,
+native 84/62, windows-kernel 19/10, dotnet 9/4, archive 2/2, android 6/6,
 game-engine 11/9, network 3/3, database 2/2, structured 3/2, jvm 5/5,
 webassembly 2/2, correlation 18/5, debug 9/6, web 2/2, dynamic 39/9,
 crypto 7/5, emulation 6/1. Re-measure rather than trust this list.
@@ -337,7 +337,7 @@ _NATIVE_PATH_ONLY_TOOL_NAMES = frozenset({
     "delphi_inspect", "cpp_rtti_inspect", "capa_analyze", "floss_analyze",
     "patch_preflight", "known_plaintext_scan", "native_function_inventory", "rizin_functions", "disassemble_pe",
     "disassemble_pe_structured",  # same selection and defaults as disassemble_pe, dict instead of text
-    "pe_resources", "analyze_tls_directory", "ghidra_decompile",
+    "pe_resources", "analyze_tls_directory",
     # Headless import into a throwaway project; the path is the only required argument.
     "ghidra_program_facts",
     # The whole RUNTIME_FUNCTION table read needs only the path. Its sibling pe_function_extent
