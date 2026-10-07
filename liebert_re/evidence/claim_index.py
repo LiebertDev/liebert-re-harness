@@ -823,7 +823,10 @@ def claim_index(
     status_filter="", limit=20, offset=0, events_root=None, db_path=None, evidence_root=None, evidence_db_path=None,
 ):
     """Top-level dispatcher, JSON-string-returning (mirrors
-    evidence_index.evidence_index's own top-level convention)."""
+    evidence_index.evidence_index's own top-level convention).
+
+    CLI: python-only: its operations create and update claims in a persistent index; the generic path never writes state
+    """
     bound_evidence = EvidenceIndex(root=evidence_root, db_path=evidence_db_path) if (evidence_root or evidence_db_path) else None
     index = ClaimIndex(db_path=db_path, events_root=events_root, evidence_index=bound_evidence)
     try:

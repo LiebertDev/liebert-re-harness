@@ -236,9 +236,12 @@ def python_only_declarations(package_dir: Path | None = None) -> dict[str, str]:
     import ast
 
     declared: dict[str, str] = {}
+    trees: dict[Path, ast.Module] = {}  # a file defining many tools is parsed once, not once per tool
     for name, (module, path) in _published_definitions(package_dir).items():
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8-sig", errors="ignore"), filename=str(path))
+            if path not in trees:
+                trees[path] = ast.parse(path.read_text(encoding="utf-8-sig", errors="ignore"), filename=str(path))
+            tree = trees[path]
         except SyntaxError as exc:
             raise ValueError(f"cannot parse {module} to read the docstring of {name!r}: {exc}") from exc
         node = next(

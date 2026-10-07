@@ -314,6 +314,10 @@ def extract_asar(path: str | Path, destination: str | Path, *, max_files: int = 
 
 
 def asar_inspect(path: str, operation: str = "summary", destination: str = "", max_files: int = 256) -> str:
+    """Inspect/extract an ASAR archive.
+
+    CLI: python-only: operation 'extract' writes the archive's files to disk (default destination included)
+    """
     from liebert_re.workspace import relative, safe_path
 
     target = safe_path(path)

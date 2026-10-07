@@ -1,0 +1,173 @@
+"""``liebert-re tool list | describe | run``: the registry-driven generic dispatcher in ``cli.py``.
+
+Names and modules come from ``liebert_re.report.tool_families`` (a source scan), signatures from the AST,
+so nothing here hard-codes how many tools exist: ``list`` is compared with ``published_tools``. The
+exit-code contract is the CLI's own (module docstring of ``liebert_re/cli.py``): 0 answered, 2 bad
+invocation, 3 structured refusal.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from liebert_re import cli
+from liebert_re.report.tool_families import FAMILIES, published_tools, python_only_declarations
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def run(capsys, *argv):
+    code = cli.main(list(argv))
+    return code, json.loads(capsys.readouterr().out)
+
+
+@pytest.fixture
+def workspace(tmp_path):
+    root = tmp_path / "ws"
+    root.mkdir()
+    return root
+
+
+def _published():
+    return set().union(*(published_tools(family) for family in FAMILIES))
+
+
+def test_list_covers_every_published_tool_and_shows_declarations(capsys):
+    code, out = run(capsys, "tool", "list")
+    assert code == 0 and out["ok"] is True and out["command"] == "tool"
+    names = [row["name"] for row in out["tools"]]
+    assert set(names) == _published() and len(names) == len(set(names)) == out["count"]
+    assert {row["name"]: row["python_only"] for row in out["tools"] if row["python_only"]} == python_only_declarations()
+    assert all(row["module"].startswith("liebert_re.") for row in out["tools"])
+
+
+def test_describe_reads_the_signature_from_source(capsys):
+    code, out = run(capsys, "tool", "describe", "binary_strings")
+    assert code == 0 and out["tool"] == "binary_strings" and out["module"] == "liebert_re.tools.binary"
+    params = {p["name"]: p for p in out["parameters"]}
+    assert list(params) == ["path", "min_length", "contains", "max_results"]
+    assert params["path"]["required"] is True and "default" not in params["path"]
+    assert params["min_length"]["default"] == 4 and params["min_length"]["default_source"] == "4"
+    assert params["contains"]["default"] is None and params["contains"]["required"] is False
+
+
+def test_describe_gives_the_first_docstring_paragraph_and_works_for_a_declared_tool(capsys):
+    code, out = run(capsys, "tool", "describe", "binary_patch")
+    assert code == 0 and out["python_only"] == python_only_declarations()["binary_patch"]
+    assert out["summary"].startswith("General-purpose, reusable disk-patch capability")
+    assert "\n" not in out["summary"] and "CLI: python-only" not in out["summary"]
+    assert out["async"] is False and out["parameters"][0]["name"] == "path"
+
+
+def test_describe_does_not_import_the_tool_module():
+    # In a fresh interpreter: another test may already have imported the module in this process.
+    code = (
+        "import io, json, sys, contextlib\n"
+        "from liebert_re import cli\n"
+        "buf = io.StringIO()\n"
+        "with contextlib.redirect_stdout(buf):\n"
+        "    rc = cli.main(['tool', 'describe', 'hash_file'])\n"
+        "    rc2 = cli.main(['tool', 'list'])\n"
+        "loaded = [m for m in ('liebert_re.tools.binary', 'liebert_re.workspace', 'liebert_re.tools.ida',"
+        " 'liebert_re.tools.rizin', 'liebert_re.tools.formats') if m in sys.modules]\n"
+        "print(json.dumps({'rc': [rc, rc2], 'loaded': loaded}))\n"
+    )
+    done = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, capture_output=True, text=True, timeout=120,
+                          env={**os.environ, "PYTHONPATH": str(REPO_ROOT)})
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout.splitlines()[-1]) == {"rc": [0, 0], "loaded": []}
+
+
+@pytest.mark.parametrize("argv, error", [
+    (("tool", "run", "no_such_tool"), "UNKNOWN_TOOL"),
+    (("tool", "describe", "no_such_tool"), "UNKNOWN_TOOL"),
+    (("tool", "run", "hash_file", "--args", "{not json"), "BAD_ARGS_JSON"),
+    (("tool", "run", "hash_file", "--args", "[1, 2]"), "ARGS_NOT_OBJECT"),
+    (("tool", "run", "hash_file", "--args", '{"path": "x", "extra": 1}'), "UNKNOWN_ARGUMENT"),
+    (("tool", "run", "hash_file", "--args", "{}"), "MISSING_ARGUMENT"),
+    (("tool", "run", "hash_file", "--args", '{"path": 5}'), "BAD_ARGUMENT_TYPE"),
+    # a write destination is never accepted, even though archive_inspect itself declares it
+    (("tool", "run", "archive_inspect", "--args", '{"path": "x.zip", "operation": "extract", "dest_path": "out"}'),
+     "ARGUMENT_NOT_ACCEPTED"),
+    (("tool", "run", "pe_sections", "--args", '{"path": "x", "cancellation_token": "t"}'), "UNKNOWN_ARGUMENT"),
+    (("tool", "run", "authenticode_signature", "--args", '{"path": "x", "cancellation_token": "t"}'),
+     "ARGUMENT_NOT_ACCEPTED"),
+])
+def test_bad_invocations_are_usage_errors(capsys, argv, error):
+    code, out = run(capsys, *argv)
+    assert code == 2 and out["status"] == "TOOL_USAGE" and out["error"] == error and out["ok"] is False
+
+
+def test_declared_tool_is_unsupported_with_its_reason(capsys):
+    declared = python_only_declarations()
+    assert declared, "the write-capable tools must be declared"
+    for name, reason in declared.items():
+        code, out = run(capsys, "tool", "run", name, "--args", "{}")
+        assert code == 3 and out["status"] == "UNSUPPORTED" and out["error"] == "PYTHON_ONLY"
+        assert out["reason"] == reason and out["tool"] == name
+
+
+def test_no_archive_inspect_or_rar_7z_extraction_destination(capsys):
+    # rar_7z has no destination parameter at all; archive_inspect's is refused by the dispatcher.
+    code, out = run(capsys, "tool", "describe", "rar_7z")
+    assert code == 0 and "dest_path" not in {p["name"] for p in out["parameters"]}
+    code, out = run(capsys, "tool", "describe", "archive_inspect")
+    assert code == 0 and "dest_path" in {p["name"] for p in out["parameters"]}
+    assert "archive_inspect" not in python_only_declarations()
+
+
+def test_run_hash_file_on_a_temp_file(capsys, workspace):
+    target = workspace / "sample.bin"
+    target.write_bytes(b"liebert dispatch fixture")
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "hash_file",
+                    "--args", json.dumps({"path": str(target)}))
+    assert code == 0 and out["command"] == "tool"
+    assert out["sha256"] == hashlib.sha256(b"liebert dispatch fixture").hexdigest()
+    assert out["md5"] == hashlib.md5(b"liebert dispatch fixture").hexdigest()
+    assert out["workspace"]["source"] == "--workspace"
+
+
+def test_run_binary_strings_on_a_small_byte_string_file(capsys, workspace):
+    (workspace / "blob.bin").write_bytes(b"\x00\x01needle-string-here\x00\xff\xfe" + "wide!".encode("utf-16le"))
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "binary_strings",
+                    "--args", json.dumps({"path": str(workspace / "blob.bin"), "contains": "needle", "min_length": 4}))
+    assert code == 0
+    assert "needle-string-here" in json.dumps(out)
+
+
+def test_path_outside_the_workspace_is_refused_before_the_tool_runs(capsys, workspace, tmp_path):
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"x" * 8)
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "hash_file",
+                    "--args", json.dumps({"path": str(outside)}))
+    assert code == 3 and out["status"] == "PATH_REFUSED"
+
+
+def test_secondary_path_parameter_is_checked_too(capsys, workspace, tmp_path):
+    inside = workspace / "a.bin"
+    inside.write_bytes(b"y" * 8)
+    outside = tmp_path / "b.bin"
+    outside.write_bytes(b"z" * 8)
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "minidump_analyzer",
+                    "--args", json.dumps({"path": str(inside), "pe_path": str(outside)}))
+    assert code == 3 and out["status"] == "PATH_REFUSED"
+
+
+def test_missing_target_file_is_the_usual_file_not_found_refusal(capsys, workspace):
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "hash_file",
+                    "--args", json.dumps({"path": "absent.bin"}))
+    assert code == 3 and out["status"] == "PATH_REFUSED" and out["error"] == "FILE_NOT_FOUND"
+
+
+def test_unclassifiable_text_result_is_failed_not_a_silent_success(capsys, workspace):
+    # read_file answers in prose; the CLI's text contract has no shape for it, so it must not pass as OK.
+    (workspace / "t.txt").write_text("hello\n", encoding="utf-8")
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "read_file",
+                    "--args", json.dumps({"path": str(workspace / "t.txt")}))
+    assert code == 1 and out["status"] == "FAILED" and out["error"] == "UNCLASSIFIED_OUTPUT"

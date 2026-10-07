@@ -30,7 +30,6 @@ NOT_NAMED_IN_CLI = (
     "archive_inspect",
     "asar_inspect",
     "binary_patch",
-    "binary_strings",
     "binary_summary",
     "binary_version_diff",
     "claim_index",
@@ -128,4 +127,4 @@ def test_not_named_in_cli_count_is_pinned_exactly():
     # A shrink must also shrink the list above; otherwise the list goes stale.
     stale = set(NOT_NAMED_IN_CLI) - _not_named_in_cli()
     assert not stale, f"now named in cli.py or unpublished, remove from list: {sorted(stale)}"
-    assert len(_not_named_in_cli()) == len(NOT_NAMED_IN_CLI) == 80
+    assert len(_not_named_in_cli()) == len(NOT_NAMED_IN_CLI) == 79

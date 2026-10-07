@@ -68,8 +68,21 @@ def test_tool_modules_ignores_unpublished_names(tmp_path):
     assert tf.tool_modules(package) == {}
 
 
-def test_python_only_declarations_is_empty_for_this_slice():
-    assert tf.python_only_declarations() == {}
+def test_python_only_declarations_are_well_formed_published_and_not_dispatched_by_cli():
+    import ast
+
+    declared = tf.python_only_declarations()
+    assert declared, "the generic dispatcher relies on write-capable tools being declared"
+    # (a) every declaration carries a reason
+    assert all(reason.strip() for reason in declared.values())
+    # (b) only published tools can be declared
+    published = set().union(*(tf.published_tools(family) for family in tf.FAMILIES))
+    assert set(declared) <= published
+    # (c) cli.py dispatches by string literal (`_load("module", "function")`, or a literal in a name table);
+    # collect every string literal in it and require that no declared tool is among them.
+    cli_source = (Path(__file__).resolve().parent.parent / "liebert_re" / "cli.py").read_text(encoding="utf-8")
+    literals = {n.value for n in ast.walk(ast.parse(cli_source)) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    assert not set(declared) & literals, f"declared python-only but dispatched by cli.py: {sorted(set(declared) & literals)}"
 
 
 def test_python_only_declaration_parsing(tmp_path):

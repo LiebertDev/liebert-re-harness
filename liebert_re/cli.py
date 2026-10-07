@@ -14,7 +14,7 @@ Exit codes
   3  structured refusal: the question is answerable, but not by this install
      (TOOL_MISSING, UNSUPPORTED, ANALYSIS_LIMITED, PATH_REFUSED, TIMEOUT, or a
      module's own NOT_FOUND / UPX_UNPACK_FAILED)
-  2  bad invocation (argparse, or a module's RULES_MISSING)
+  2  bad invocation (argparse, a module's RULES_MISSING, or TOOL_USAGE from `tool`)
   1  unexpected internal failure; still JSON with status FAILED, never a traceback
 
 Each command imports its module lazily inside its handler, so ``identify`` does
@@ -23,6 +23,8 @@ TOOL_MISSING refusal instead of crashing. This file never imports
 ``liebert_re.dynamic.frida_trace_client``.
 """
 import argparse
+import ast
+import functools
 import importlib
 import json
 import os
@@ -48,7 +50,7 @@ _MODULE_REFUSALS = frozenset({"NOT_FOUND", "UPX_UNPACK_FAILED", "PID_REQUIRED", 
                               "PROCESS_NOT_OWNED", "OWNERSHIP_UNVERIFIABLE", "SAMPLE_HASH_REQUIRED",
                               "SAMPLE_HASH_MISMATCH", "SAMPLE_HASH_UNVERIFIABLE", "BOUNDS_REQUIRED",
                               "RESOURCE_LIMIT_UNAVAILABLE"})
-_MODULE_USAGE = frozenset({"RULES_MISSING"})
+_MODULE_USAGE = frozenset({"RULES_MISSING", "TOOL_USAGE"})
 _REFUSAL_ERRORS = frozenset({"FILE_NOT_FOUND", "FILE_NOT_ACCESSIBLE"})
 
 # The text-returning pe/disasm functions answer with a listing. A failure either is
@@ -66,6 +68,8 @@ _TEXT_SHAPES = {
     "imports": re.compile(rf"(?:\S+!.+ @IAT 0x[0-9a-f]+|No import table\.|No matches\.|{_MARKER})"),
     "exports": re.compile(rf"(?:.+ RVA=0x[0-9a-f]+ ordinal=\d+|No export table\.|{_MARKER})"),
     "disasm": re.compile(rf"(?:0x[0-9A-F]+: .+|No instruction could be decoded\.|{_MARKER})"),
+    # `tool run` answers are looked up by tool name; only text-returning tools with a known listing shape belong here.
+    "binary_strings": re.compile(rf"(?:0x[0-9A-F]+ \[(?:ascii|utf16)\] .*|No strings found\.|{_MARKER})"),
 }
 
 
@@ -427,6 +431,8 @@ def _capabilities(a):
 
 
 def _shape(a):
+    if a.command == "tool":
+        return _TEXT_SHAPES.get(getattr(a, "name", None))
     return _TEXT_SHAPES.get(a.mode) if a.command == "pe" else _TEXT_SHAPES.get(a.command)
 
 
@@ -485,6 +491,134 @@ def _apply_workspace(root):
     def undo():
         ws.WORKSPACE_ROOT, ws.WORKSPACE = prev
     return undo
+
+
+# Generic dispatcher: `tool list | describe | run`. Names and modules come from
+# liebert_re.report.tool_families (a source scan); signatures are read with ast, so `describe` (and every
+# check before the call) never imports the tool's module and optional dependencies stay unloaded.
+# Never accepted here: destinations a tool would write to, and a live Python object JSON cannot carry.
+# A tool whose docstring declares `CLI: python-only: <reason>` is answered UNSUPPORTED with that reason.
+_TOOL_REFUSED_PARAMS = frozenset({"dest_path", "destination", "output_path", "backup_path", "cancellation_token"})
+_TOOL_KINDS = ("positional_or_keyword", "keyword_only")
+
+
+def _tool_usage(code, message, **more):
+    return {"ok": False, "status": "TOOL_USAGE", "error": code, "message": message, **more}
+
+
+@functools.lru_cache(maxsize=1)
+def _tool_registry():
+    return (_load("liebert_re.report.tool_families", "tool_modules")(),
+            _load("liebert_re.report.tool_families", "python_only_declarations")())
+
+
+def _tool_node(module, name):
+    """The top-level ``def name`` of ``module``, parsed from source (never imported); None if not found."""
+    parts = module.split(".")[1:]
+    base = Path(__file__).resolve().parent
+    for source in (base.joinpath(*parts).with_suffix(".py"), base.joinpath(*parts, "__init__.py")):
+        if source.is_file():
+            tree = ast.parse(source.read_text(encoding="utf-8-sig", errors="ignore"), filename=str(source))
+            return next((n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name), None)
+    return None
+
+
+def _tool_params(node):
+    """Parameters of a parsed function: name, kind, required, annotation and default (``default`` only
+    when the default is a literal; ``default_source`` is always the source text, never an evaluated guess)."""
+    a = node.args
+    pos = a.posonlyargs + a.args
+    rows = [(x, d, "positional_only" if i < len(a.posonlyargs) else "positional_or_keyword")
+            for i, (x, d) in enumerate(zip(pos, [None] * (len(pos) - len(a.defaults)) + a.defaults))]
+    rows += [(x, d, "keyword_only") for x, d in zip(a.kwonlyargs, a.kw_defaults)]
+    out = []
+    for x, d, kind in rows:
+        row = {"name": x.arg, "kind": kind, "required": d is None}
+        if x.annotation is not None:
+            row["annotation"] = ast.unparse(x.annotation)
+        if d is not None:
+            row["default_source"] = ast.unparse(d)
+            try:
+                row["default"] = ast.literal_eval(d)
+            except (ValueError, TypeError, SyntaxError):
+                pass
+        out.append(row)
+    out += [{"name": x.arg, "kind": kind, "required": False} for kind, x in (("var_positional", a.vararg), ("var_keyword", a.kwarg)) if x]
+    return out
+
+
+def _is_path_param(name):
+    return name in ("path", "paths") or name.endswith(("_path", "_file"))
+
+
+def _tool_prepare(a):
+    """Checks a `tool` invocation before the workspace is chosen. Returns a payload to emit when it is refused,
+    else None. For `run` it leaves the parsed kwargs on ``a`` and, if a path argument is given, sets
+    ``a.path``/``a.needs_file`` so main() applies the same workspace rules as every other command."""
+    if a.tool_command == "list":
+        return None
+    modules, declared = _tool_registry()
+    if a.name not in modules:
+        return _tool_usage("UNKNOWN_TOOL", f"no published tool named {a.name!r}; `tool list` shows them")
+    if a.tool_command == "describe":
+        return None
+    if a.name in declared:
+        return {"ok": False, "status": "UNSUPPORTED", "error": "PYTHON_ONLY", "tool": a.name, "reason": declared[a.name]}
+    try:
+        kwargs = json.loads(a.args)
+    except ValueError as exc:
+        return _tool_usage("BAD_ARGS_JSON", f"--args is not valid JSON: {exc}")
+    if not isinstance(kwargs, dict):
+        return _tool_usage("ARGS_NOT_OBJECT", "--args must be a JSON object of keyword arguments")
+    node = _tool_node(modules[a.name], a.name)
+    if node is None:
+        return {"ok": False, "status": "FAILED", "error": "SIGNATURE_UNREADABLE", "tool": a.name, "module": modules[a.name]}
+    if isinstance(node, ast.AsyncFunctionDef):
+        return {"ok": False, "status": "UNSUPPORTED", "error": "ASYNC_TOOL", "tool": a.name,
+                "reason": "an async function; the generic path does not run an event loop"}
+    params = _tool_params(node)
+    accepted = sorted(p["name"] for p in params if p["kind"] in _TOOL_KINDS)
+    if not any(p["kind"] == "var_keyword" for p in params) and set(kwargs) - set(accepted):
+        return _tool_usage("UNKNOWN_ARGUMENT", f"{a.name} does not take {sorted(set(kwargs) - set(accepted))}", accepted=accepted)
+    if set(kwargs) & _TOOL_REFUSED_PARAMS:
+        return _tool_usage("ARGUMENT_NOT_ACCEPTED", f"{sorted(set(kwargs) & _TOOL_REFUSED_PARAMS)} is never accepted by the generic "
+                           "path (a write destination or a live object); use the Python API")
+    missing = [p["name"] for p in params if p["required"] and p["kind"] in _TOOL_KINDS and p["name"] not in kwargs]
+    if missing:
+        return _tool_usage("MISSING_ARGUMENT", f"{a.name} needs {missing}", accepted=accepted)
+    paths = {k: v for k, v in kwargs.items() if _is_path_param(k) and v is not None}
+    for k, v in paths.items():
+        if not (isinstance(v, str) or (k == "paths" and isinstance(v, list) and all(isinstance(i, str) for i in v))):
+            return _tool_usage("BAD_ARGUMENT_TYPE", f"{k} must be a string" + (" or a list of strings" if k == "paths" else ""))
+    a.tool_kwargs = kwargs
+    primary = next((k for k in sorted(paths) if isinstance(paths[k], str) and (k == "path" or k.endswith("_path"))), None)
+    a.tool_primary = primary
+    if primary:
+        a.path, a.needs_file = paths[primary], True
+    return None
+
+
+def _tool(a):
+    modules, declared = _tool_registry()
+    if a.tool_command == "list":
+        return {"ok": True, "status": "OK", "count": len(modules),
+                "tools": [{"name": n, "module": m, "python_only": declared.get(n)} for n, m in sorted(modules.items())]}
+    if a.tool_command == "describe":
+        node = _tool_node(modules[a.name], a.name)
+        if node is None:
+            return {"ok": False, "status": "FAILED", "error": "SIGNATURE_UNREADABLE", "tool": a.name, "module": modules[a.name]}
+        summary = " ".join((ast.get_docstring(node) or "").split("\n\n")[0].split())
+        return {"ok": True, "status": "OK", "tool": a.name, "module": modules[a.name], "python_only": declared.get(a.name),
+                "async": isinstance(node, ast.AsyncFunctionDef), "summary": summary or None, "parameters": _tool_params(node)}
+    kwargs = dict(a.tool_kwargs)
+    if a.tool_primary:
+        kwargs[a.tool_primary] = a.path  # main() may have made it absolute when the target lies outside the root
+    safe_path = _load("liebert_re.workspace", "safe_path")
+    for key, value in kwargs.items():
+        if _is_path_param(key) and value is not None:
+            for item in value if isinstance(value, list) else [value]:
+                safe_path(item)  # PermissionError -> PATH_REFUSED, before the tool's module is imported
+    return _load(modules[a.name], a.name)(**kwargs)
 
 
 def _gate_args(sp):
@@ -652,6 +786,14 @@ def _build_parser():
     sp = add("minidump", _minidump, "analyse a Windows minidump")
     sp.add_argument("--pe", default="", help="matching PE, for symbolization")
     sp.add_argument("--pdb", default="", help="matching PDB, for symbolization")
+    sp = add("tool", _tool, "registry-driven access to every published tool: list, describe (signature, no import) or "
+                            "run with JSON keyword arguments", path=False)
+    tsub = sp.add_subparsers(dest="tool_command", required=True, metavar="ACTION")
+    tsub.add_parser("list", help="every published tool: name, module, python-only reason if declared")
+    tsub.add_parser("describe", help="a tool's signature and summary, read from source").add_argument("name")
+    sp = tsub.add_parser("run", help="call a tool with keyword arguments given as a JSON object")
+    sp.add_argument("name")
+    sp.add_argument("--args", default="{}", metavar="JSON", help="JSON object of keyword arguments (default: {})")
     add("capabilities", _capabilities, "report which routed tool families this install can reach", path=False)
     return p
 
@@ -661,6 +803,9 @@ def main(argv=None):
     command = args.command
     info = None
     try:
+        refusal = _tool_prepare(args) if command == "tool" else None
+        if refusal:
+            return _emit(command, refusal)
         if args.needs_file and not os.path.exists(args.path):
             return _emit(command, {"ok": False, "status": "PATH_REFUSED", "error": "FILE_NOT_FOUND", "path": args.path})
         undo = (lambda: None)
