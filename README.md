@@ -440,6 +440,32 @@ Samples are not included and never will be. See
 [docs/CORPUS.md](docs/CORPUS.md) for how write-ups identify the file they analysed
 and how to build test fixtures in code instead of committing binaries.
 
+### Reaching every published tool from the CLI
+
+Every published tool can be listed and described from the command line without importing it, and
+every one that is safe to expose can be run:
+
+```
+liebert-re tool list
+liebert-re tool describe <name>
+liebert-re tool run <name> --args '{"path": "sample.bin"}'
+```
+
+`tool list` and `tool describe` read names, modules and signatures from source. `tool run` takes the
+tool's keyword arguments as one JSON object, keeps path arguments inside the workspace root like every
+other subcommand, and answers in the same JSON envelope with the same exit codes. A tool that answers
+in plain text comes back as `{"tool": <name>, "text": ...}` with `classified: false`: the CLI has no
+grammar for that prose, so it does not claim to have judged it, and a failure the tool reports in
+prose is not told apart from an answer.
+
+52<!-- count:cli_direct_commands --> published tools also have a dedicated subcommand (`cli.py` names
+them by string literal). `tool run` reaches the rest, except the tools that write to disk or need a
+live Python object: 9<!-- count:cli_python_only --> tools declare `CLI: python-only: <reason>` in their
+docstring, and `tool run` answers those as unsupported and prints the reason. The reason lives in the
+docstring, next to the code it is about; write-capable tools (patching, annotation changes, extraction
+destinations) are not opened through the generic path, and `tests/test_cli_reachability.py` measures that
+every published tool is reached by one of the three routes.
+
 ## Contributing
 
 Genuinely wanted — that is why this repository exists. **This project is not under

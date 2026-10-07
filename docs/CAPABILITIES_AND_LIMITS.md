@@ -228,7 +228,7 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
 ### Ghidra (headless, slice 1: status and program facts)
 
 - `tools/ghidra.py`: `ghidra_status` and `ghidra_program_facts`, driving Ghidra's own `support/analyzeHeadless`.
-  Not wired to the CLI.
+  CLI: `ghidrastatus` and `ghidrafacts`.
 - `ghidra_status` discovers the install (`GHIDRA_INSTALL_DIR`, `GHIDRA_HOME`, `PATH`, then known locations) and
   reports the version, the Java the install needs and the Java found. It does NOT launch Ghidra
   (`launcher_verified: false`): `OK` means files present and Java new enough, not that a run will succeed.
@@ -360,8 +360,8 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
   - `ioctl_control_code_decode`: bit arithmetic that splits `CTL_CODE`
     integers into their fields. It does not find the integers itself; the
     caller supplies them, by hand or from `ioctl_candidate_scan` (below).
-- Two further operations in `tools/binary.py`, both reachable only as Python
-  functions: neither is wired to the CLI.
+- Two further operations in `tools/binary.py`, neither with a dedicated
+  subcommand: both are reached through `liebert-re tool run <name> --args '{...}'`.
   - `ioctl_candidate_scan`: the feeder for `ioctl_control_code_decode`. It
     disassembles a code region linearly from a start RVA and lists immediates
     that are compared, each split by the decoder. It lists compared
