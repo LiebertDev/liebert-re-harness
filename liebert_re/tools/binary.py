@@ -1,4 +1,4 @@
-import hashlib, json, math, os, re
+import hashlib, json, math, re, sys
 from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.workspace import safe_path, relative, skipped, _limit_marker
 
@@ -591,8 +591,8 @@ def _authenticode_fields(stdout):
             "timestamper":field("TimestamperSubject"),"raw":stdout}
 
 def authenticode_signature(path,cancellation_token=None):
-    """Authenticode status of a file, as JSON (Windows only; elsewhere the text line
-    "Authenticode verification requires Windows." is returned and the CLI reads it as UNSUPPORTED).
+    """Authenticode status of a file, as JSON (Windows only; elsewhere a JSON failure with
+    ``status`` UNSUPPORTED and ``error`` AUTHENTICODE_REQUIRES_WINDOWS, in ``_failure``'s shape).
 
     ``signature_status`` is PowerShell's own verdict string (Valid, NotSigned, HashMismatch, ...),
     kept apart from ``status``, which is the package vocabulary (OK on a parsed answer).
@@ -601,7 +601,7 @@ def authenticode_signature(path,cancellation_token=None):
     None when the file carries no such certificate or the field could not be read. ``raw`` is the
     script's stdout. A failed run is a JSON failure with ``ok`` false, never bare stderr."""
     p=safe_path(path)
-    if os.name!="nt":return "Authenticode verification requires Windows."
+    if sys.platform!="win32":return json.dumps(_failure("AUTHENTICODE_REQUIRES_WINDOWS","UNSUPPORTED","Authenticode verification requires Windows."))
     esc=str(p).replace("'","''")
     ps=f"$s=Get-AuthenticodeSignature -LiteralPath '{esc}'; [pscustomobject]@{{Status=[string]$s.Status;StatusMessage=$s.StatusMessage;SignerSubject=if($s.SignerCertificate){{$s.SignerCertificate.Subject}}else{{$null}};Issuer=if($s.SignerCertificate){{$s.SignerCertificate.Issuer}}else{{$null}};Thumbprint=if($s.SignerCertificate){{$s.SignerCertificate.Thumbprint}}else{{$null}};TimestamperSubject=if($s.TimeStamperCertificate){{$s.TimeStamperCertificate.Subject}}else{{$null}}}} | ConvertTo-Json -Compress"
     cp=run_bounded_process(

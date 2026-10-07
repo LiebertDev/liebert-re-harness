@@ -326,10 +326,11 @@ _PS_OK = json.dumps({"Status": "Valid", "StatusMessage": "Signature verified.", 
 
 
 def _fake_powershell(monkeypatch, *, stdout="", stderr="", returncode=0):
+    import sys
     import types
 
     from liebert_re.tools import binary
-    monkeypatch.setattr(binary, "os", types.SimpleNamespace(name="nt"))  # only os.name is read on this path
+    monkeypatch.setattr(sys, "platform", "win32")  # the gate reads sys.platform
     monkeypatch.setattr(binary, "run_bounded_process", lambda *a, **k: types.SimpleNamespace(
         launch_failed=False, cancelled=False, timed_out=False, stdout=stdout, stderr=stderr, returncode=returncode))
 
@@ -365,3 +366,13 @@ def test_authenticode_direct_command_returns_the_same_json(capsys, workspace, mo
     _fake_powershell(monkeypatch, stdout=_PS_OK)
     code, out = run(capsys, "--workspace", str(workspace), "pe", str(workspace / "s.exe"), "--signature")
     assert code == 0 and out["command"] == "pe" and out["signature_status"] == "Valid" and out["ok"] is True
+
+
+def test_authenticode_off_windows_is_a_structured_unsupported_failure(capsys, workspace, monkeypatch):
+    import sys
+    (workspace / "s.exe").write_bytes(b"MZ")
+    monkeypatch.setattr(sys, "platform", "linux")
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "authenticode_signature",
+                    "--args", json.dumps({"path": str(workspace / "s.exe")}))
+    assert code == 3 and out["ok"] is False and out["status"] == "UNSUPPORTED"
+    assert out["error"] == "AUTHENTICODE_REQUIRES_WINDOWS" and "Windows" in out["message"] and "text" not in out
