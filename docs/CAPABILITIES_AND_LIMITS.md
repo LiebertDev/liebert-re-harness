@@ -134,6 +134,26 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
   empty list is "none found"), `read_bytes` (1..4096 bytes of the loaded database at an address; a
   byte IDA holds no value for is null, never zero), `imports_exports`, `strings`. Listings page with
   `offset` / `next_offset`.
+- Read-only listing operations of `ida_query` (CLI `ida --operation ...`), each bounded and paged
+  (`truncated` / `next_offset`), each refusing a malformed request before IDA starts, none calling anything
+  that writes to the database (a static test parses the code and refuses a mutating call):
+  `disasm_range` (up to 2000 rows from an address, or up to an end address; a row is an `instruction`
+  with mnemonic and operands and no comments, defined `data`, an `undefined` run or an `inside_item`
+  start, and only an instruction is ever disassembled), `basic_blocks` (IDA's flow chart: start, end,
+  type, successor and predecessor starts), `callgraph` (breadth first from a function, depth 1-4, at
+  most 500 nodes: direct edges, import edges and thunk jumps; a call through a register or a
+  non-import memory operand is counted per node as `indirect_call_count` and never resolved, and a node
+  not looked into says why), `stack_frame` (the frame IDA recorded: sizes, landmark offsets and members
+  split into local, saved registers, return address and argument by those offsets; a function with no
+  frame is `NO_STACK_FRAME`), `local_variables` (the decompiler's variables with type, argument or not
+  and location; no Hex-Rays or a failed decompile is an error), `find_bytes` (an IDA byte pattern with
+  `?` wildcards, in a range or a segment name, with the function containing each match),
+  `find_immediate` (instructions with an immediate operand equal to a number, by IDA's own immediate
+  search: the same constant written negated or sign-extended is another number and is not found),
+  `list_structs` / `get_struct` (struct and union names of the local type library, and one type's
+  members with bit-exact offsets) and `flirt_signatures` (the signature list with state and the
+  matched-function count IDA recorded; listing only, no signature is applied). All of them read the
+  database as IDA mapped the file, not process memory.
 - Partial, by design: symbol-server (PDB download) lookups are switched off on every launch, so names
   that exist only in a PDB are absent. IDA's auto-analysis can miss or mis-split code in obfuscated or
   packed targets, so an absent function or xref is not proof of absence. Pseudocode is IDA's reading,
@@ -142,7 +162,8 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
   `idalib` (Hex-Rays' `idapro` package, in the interpreter named by `LIEBERT_RE_IDALIB_PYTHON`, which is
   never guessed). The operations are the same functions in both (one file, `query_program.idapy`, which the
   idalib worker loads), the cache is shared, and the answers were measured equal on the four checked
-  questions (`list_functions`, `decompile_function`, `xrefs_to`, `read_bytes`) on one machine; the engine
+  questions (`list_functions`, `decompile_function`, `xrefs_to`, `read_bytes`) on one machine, and, for
+  the read-only listing operations above, on every request of a 20-request run over one small PE on this machine, success and error answers alike once the engine-labelled envelope is set aside (`backend`, and the idalib `database_integrity` block that error answers carry); the engine
   that answered is in `backend` in every response. Limits: idalib needs a separate Python with `idapro`
   installed and activated; one worker process holds ONE database (opening a second silently saves and
   closes the first, so the worker cannot); the cached database is opened as a copy and measured before
@@ -230,7 +251,7 @@ The wrappers named below have a zero-argument `<tool>_status` that returns JSON 
   sizes: it opens no file, writes nothing, deletes nothing, reads no content and returns no file name, only
   fixed relative labels, counts and byte totals. A missing directory says `present: false`; one that cannot be
   read reports `read_errors` and the error types, never an empty count.
-- Not here: disassembly listing and decompiler comments. Ghidra: see the next section.
+- Not here: decompiler comments, and a disassembly listing from rizin or Ghidra into the same shape (IDA's database range is `disasm_range`). Ghidra: see the next section.
 - A copy handed to an engine session is verified by hash: on a mismatch the session is not started. "The copy
   differs" (`COPY_INTEGRITY_FAILED`) and "the copy could not be checked" (`COPY_INTEGRITY_UNVERIFIABLE`) are
   separate refusals.

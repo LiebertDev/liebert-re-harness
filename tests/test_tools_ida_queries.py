@@ -17,10 +17,19 @@ What the cases pin:
 * `xrefs_from` scopes to a function or to one address, drops fall-through, reports `truncated`;
 * `callers_of_import` lists function, address and call site, follows one level of thunk, and an
   unknown import is an error naming the import table, not an empty OK.
+
+The second half of the file covers the ten read-only listing operations (`disasm_range`,
+`basic_blocks`, `callgraph`, `stack_frame`, `local_variables`, `find_bytes`, `find_immediate`,
+`list_structs`, `get_struct`, `flirt_signatures`): what is not an instruction is never disassembled,
+indirect calls are counted and never resolved, a missing frame or decompiler is an error, every
+listing is bounded and paged, the wrapper and the worker refuse the same requests, and the new
+worker code calls nothing that writes.
 """
 from __future__ import annotations
 
+import ast
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -452,3 +461,958 @@ class QueryWrapperTests(IdaCase):
         self.assertTrue(data["truncated"])
         self.assertLess(len(data["loaded_ranges"]), 600)
         self.assertLessEqual(len(json.dumps(data)), 4200)
+
+
+# ===========================================================================
+# W2: the read-only listing operations (disasm_range, basic_blocks, callgraph, stack_frame,
+# local_variables, find_bytes, find_immediate, list_structs, get_struct, flirt_signatures).
+#
+# The worker runs against the same stub modules; `CodeModel` adds decoded items (instructions, data,
+# undefined bytes), `FakeTypes` the type library and frames, and the ida_gdl / ida_frame / ida_search /
+# ida_typeinf modules the operations import when they run.
+# ===========================================================================
+OT_VOID, OT_REG, OT_MEM, OT_FAR, OT_NEAR, OT_IMM = 0, 1, 2, 6, 7, 5
+FL_CF, FL_CN, FL_JF, FL_JN = 16, 17, 18, 19
+FUNC_LIB = 0x4
+
+
+class CodeModel:
+    """Decoded items over a `FakeDatabase`: `add_insn` / `add_data` define them, any other byte of a segment
+    is undefined. Wired into the worker's `ida_bytes`, `idc`, `idautils`, `idaapi` and segment stubs."""
+
+    def __init__(self, db):
+        self.db = db
+        self.items = {}         # head ea -> dict(kind, size, ops, optypes, call, imms)
+        self.segs = []          # (name, start, end); the same name may repeat
+
+    def add_insn(self, ea, size, mnemonic, ops=(), optypes=None, call=False, data=None, imms=None):
+        self.items[ea] = dict(kind="code", size=size, ops=list(ops), optypes=list(optypes or [OT_REG] * len(ops)),
+                              call=call, imms=dict(imms or {}))
+        self.db.mnemonics[ea] = mnemonic
+        for i in range(size):
+            self.db.loaded[ea + i] = (data[i] if data else (0x90 + i)) & 0xFF
+
+    def add_data(self, ea, size, data=None):
+        self.items[ea] = dict(kind="data", size=size, ops=[], optypes=[], call=False, imms={})
+        for i in range(size):
+            self.db.loaded[ea + i] = (data[i] if data else 0xAA) & 0xFF
+
+    def head_of(self, ea):
+        for head, item in self.items.items():
+            if head <= ea < head + item["size"]:
+                return head
+        return None
+
+    def seg_of(self, ea):
+        for name, start, end in self.segs:
+            if start <= ea < end:
+                return name, start, end
+        return None
+
+    def wire(self, ida):
+        m, db = self, self.db
+        byt, idc, seg, utils, idaapi = (ida[n] for n in ("ida_bytes", "idc", "ida_segment", "idautils", "idaapi"))
+        idc.o_void, idc.o_near, idc.o_far = OT_VOID, OT_NEAR, OT_FAR
+        ida["ida_xref"].fl_CF, ida["ida_xref"].fl_CN = FL_CF, FL_CN
+        ida["ida_xref"].fl_JF, ida["ida_xref"].fl_JN = FL_JF, FL_JN
+        ida["ida_funcs"].FUNC_LIB = FUNC_LIB
+        byt.get_flags.side_effect = lambda ea: ea
+        byt.is_tail.side_effect = lambda f: m.head_of(f) not in (None, f)
+        byt.is_code.side_effect = lambda f: m.items.get(f, {}).get("kind") == "code"
+        byt.is_unknown.side_effect = lambda f: m.head_of(f) is None
+        byt.get_item_head.side_effect = lambda ea: m.head_of(ea) if m.head_of(ea) is not None else ea
+        byt.get_item_end.side_effect = lambda head: head + m.items[head]["size"]
+        byt.get_item_size.side_effect = lambda ea: m.items[ea]["size"] if ea in m.items else 1
+
+        def get_bytes(ea, count):
+            try:
+                return bytes(db.loaded[ea + i] for i in range(count))
+            except KeyError:
+                return None
+
+        byt.get_bytes.side_effect = get_bytes
+
+        def find_bytes(pattern, start, range_end=None):
+            tokens = pattern.split()
+            for ea in range(start, (range_end if range_end is not None else start + 1) - len(tokens) + 1):
+                if all(t == "?" or db.loaded.get(ea + i) == int(t, 16) for i, t in enumerate(tokens)):
+                    return ea
+            return BADADDR
+
+        byt.find_bytes.side_effect = find_bytes
+        idc.get_operand_type.side_effect = lambda ea, n: (
+            m.items[ea]["optypes"][n] if ea in m.items and n < len(m.items[ea]["optypes"]) else OT_VOID)
+        idc.print_operand.side_effect = lambda ea, n: m.items[ea]["ops"][n]
+        idc.get_segm_name.side_effect = lambda ea: (m.seg_of(ea) or ("",))[0]
+        idaapi.is_call_insn.side_effect = lambda ea: bool(m.items.get(ea, {}).get("call"))
+        seg.getseg.side_effect = lambda ea: (
+            SimpleNamespace(start_ea=m.seg_of(ea)[1], end_ea=m.seg_of(ea)[2], perm=5) if m.seg_of(ea) else None)
+        seg.get_segm_name.side_effect = lambda s: m.seg_of(s.start_ea)[0]
+        utils.Segments.side_effect = lambda: iter([start for _name, start, _end in sorted(m.segs, key=lambda x: x[1])])
+        utils.Functions.side_effect = lambda: iter(sorted(db.functions))
+        utils.FuncItems.side_effect = lambda start: iter(sorted(h for h in m.items if start <= h < db.functions[start][0]))
+        ida["ida_ida"].inf_get_min_ea.return_value = min(s for _n, s, _e in m.segs)
+        ida["ida_ida"].inf_get_max_ea.return_value = max(e for _n, _s, e in m.segs)
+
+
+class FakeTypes:
+    """The type library, named types and per-function frames behind `ida_typeinf` / `ida_frame`."""
+
+    def __init__(self):
+        self.numbered = {}      # ordinal -> type dict
+        self.named = {}         # name -> type dict
+        self.frames = {}        # function start -> type dict
+        self.landmarks = {}     # function start -> (savregs, retaddr, args) or None
+
+    @staticmethod
+    def type_(name, members=(), union=False, udt=True, size=None):
+        return dict(name=name, members=list(members), union=union, udt=udt, size=size)
+
+    def tinfo_class(self):
+        types = self
+
+        class FakeTif:
+            def __init__(self):
+                self.t = None
+
+            def get_numbered_type(self, til, ordinal, *rest):
+                self.t = types.numbered.get(ordinal)
+                return self.t is not None
+
+            def get_named_type(self, til, name, flags, resolve):
+                self.t = types.named.get(name)
+                return self.t is not None
+
+            def get_function_frame(self, ea):
+                self.t = types.frames.get(ea)
+                return self.t is not None
+
+            def is_udt(self):
+                return self.t["udt"]
+
+            def is_union(self):
+                return self.t["union"]
+
+            def get_type_name(self):
+                return self.t["name"]
+
+            def get_size(self):
+                return self.t["size"] if self.t["size"] is not None else 0xFFFFFFFFFFFFFFFF
+
+            def get_udt_nmembers(self):
+                return len(self.t["members"])
+
+            def get_udm(self, index):
+                name, bits, size_bits, type_str, bitfield = self.t["members"][index]
+                return index, SimpleNamespace(name=name, offset=bits, size=size_bits, type=type_str,
+                                              is_bitfield=lambda: bitfield)
+
+        return FakeTif
+
+    def modules(self):
+        types = self
+        typeinf = SimpleNamespace(tinfo_class=None, BTF_TYPEDEF=1, get_idati=lambda: "til",
+                                  get_ordinal_limit=lambda til: max(types.numbered, default=0) + 1)
+        typeinf.tinfo_t = self.tinfo_class()
+        frame = SimpleNamespace()
+        frame.frame_off_savregs_ea = lambda ea: types.landmarks[ea][0]
+        frame.frame_off_retaddr_ea = lambda ea: types.landmarks[ea][1]
+        frame.frame_off_args_ea = lambda ea: types.landmarks[ea][2]
+        frame.get_frame_size_ea = lambda ea: types.landmarks[ea][2]
+        return {"ida_typeinf": typeinf, "ida_frame": frame}
+
+
+class W2:
+    pass
+
+
+@pytest.fixture
+def w2(monkeypatch):
+    module, ida = _load_worker()
+    db = FakeDatabase()
+    model = CodeModel(db)
+    model.segs = [(".text", 0x1000, 0x2000), (".rdata", 0x3000, 0x3100), (".idata", 0x4000, 0x4100),
+                  (".rdata", 0x5000, 0x5100)]
+    db.segments = {n: (s, e) for n, s, e in model.segs}
+    db.wire(ida)
+    model.wire(ida)
+    types = FakeTypes()
+    gdl = SimpleNamespace(fcb_normal=0, fcb_indjump=1, fcb_ret=2, fcb_cndret=3, fcb_noret=4, fcb_enoret=5,
+                          fcb_extern=6, fcb_error=7, FlowChart=lambda func: [])
+    search = SimpleNamespace(SEARCH_DOWN=1, SEARCH_NEXT=2)
+
+    def find_imm(cursor, flags, value):
+        hits = sorted(ea for ea, it in model.items.items() if ea > cursor and value in it["imms"].values())
+        if not hits:
+            return (BADADDR, 0)
+        ea = hits[0]
+        return (ea, next(i for i, v in model.items[ea]["imms"].items() if v == value))
+
+    search.find_imm = find_imm
+    for name, mod in {**types.modules(), "ida_gdl": gdl, "ida_search": search}.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    ctx = W2()
+    ctx.module, ctx.ida, ctx.db, ctx.model, ctx.types, ctx.gdl = module, ida, db, model, types, gdl
+    return ctx
+
+
+def _w2_run(ctx, operation, query, max_results=200, offset=0):
+    return _run(ctx.module, operation, query, max_results, offset)
+
+
+# ---------------------------------------------------------------------------
+# disasm_range
+# ---------------------------------------------------------------------------
+def _code_run(model):
+    model.add_insn(0x1000, 4, "sub", ["rsp", "48h"], data=[0x48, 0x83, 0xEC, 0x48])
+    model.add_insn(0x1004, 3, "mov", ["rax", "rcx"], data=[0x48, 0x89, 0xC8])
+    model.add_data(0x1007, 8, data=[1, 2, 3, 4, 5, 6, 7, 8])
+    # 0x100f.. are undefined bytes IDA decoded to nothing
+
+
+def test_disasm_range_lists_instructions_with_operands_and_no_comment(w2):
+    _code_run(w2.model)
+    r = _w2_run(w2, "disasm_range", "0x1000 2")
+    assert r["ok"] and r["stop_reason"] == "count_reached" and r["resume_address"] == "0x1007"
+    assert [(i["address"], i["kind"], i["text"], i["bytes_hex"]) for i in r["items"]] == [
+        ("0x1000", "instruction", "sub rsp, 48h", "4883ec48"), ("0x1004", "instruction", "mov rax, rcx", "4889c8")]
+    assert r["items"][0]["operands"] == ["rsp", "48h"] and r["items"][0]["mnemonic"] == "sub"
+    assert "comment" not in json.dumps(r["items"]) and r["instruction_count"] == 2
+
+
+def test_defined_data_and_undefined_bytes_are_not_disassembled(w2):
+    """Rule 4: a byte that is not an instruction never gets a mnemonic."""
+    _code_run(w2.model)
+    r = _w2_run(w2, "disasm_range", "0x1007 3")
+    data_row, undefined_row = r["items"][0], r["items"][1]
+    assert (data_row["kind"], data_row["mnemonic"], data_row["operands"], data_row["text"]) == ("data", None, None, None)
+    assert data_row["size"] == 8 and data_row["bytes_hex"] == "0102030405060708"
+    assert undefined_row["kind"] == "undefined" and undefined_row["mnemonic"] is None and undefined_row["text"] is None
+    assert undefined_row["address"] == "0x100f" and undefined_row["size"] == 16
+    assert r["undefined_row_count"] == 2 and r["instruction_count"] == 0
+
+
+def test_undefined_bytes_with_no_value_have_null_bytes_not_zeros(w2):
+    w2.model.add_insn(0x1000, 1, "nop", data=[0x90])
+    r = _w2_run(w2, "disasm_range", "0x1001 1")
+    assert r["items"][0]["kind"] == "undefined" and r["items"][0]["bytes_hex"] is None
+
+
+def test_an_undefined_row_stops_at_the_next_defined_item(w2):
+    w2.model.add_insn(0x1005, 1, "nop", data=[0x90])
+    r = _w2_run(w2, "disasm_range", "0x1000 2")
+    assert [(i["address"], i["kind"], i["size"]) for i in r["items"]] == [("0x1000", "undefined", 5), ("0x1005", "instruction", 1)]
+
+
+def test_a_start_in_the_middle_of_an_instruction_is_said_so(w2):
+    _code_run(w2.model)
+    r = _w2_run(w2, "disasm_range", "0x1001 2")
+    assert r["items"][0]["kind"] == "inside_item" and r["items"][0]["item_head"] == "0x1000"
+    assert r["items"][0]["size"] == 3 and r["items"][0]["mnemonic"] is None
+    assert r["items"][1]["address"] == "0x1004"
+
+
+def test_an_end_address_bounds_the_walk_and_the_last_item_may_cross_it(w2):
+    _code_run(w2.model)
+    r = _w2_run(w2, "disasm_range", json.dumps({"address": "0x1000", "end": "0x1005"}))
+    assert [i["address"] for i in r["items"]] == ["0x1000", "0x1004"]
+    assert r["stop_reason"] == "end_address_reached" and r["resume_address"] is None
+
+
+def test_the_walk_stops_where_the_segments_end(w2):
+    w2.model.segs = [(".text", 0x1000, 0x1004)]
+    w2.model.add_insn(0x1000, 4, "nop")
+    r = _w2_run(w2, "disasm_range", "0x1000 10")
+    assert len(r["items"]) == 1 and r["stop_reason"] == "left_mapped_segments"
+
+
+def test_an_end_request_stops_at_the_2000_row_cap_and_says_where_to_resume(w2):
+    w2.model.segs = [(".big", 0x10000, 0x20000)]
+    for i in range(2100):
+        w2.model.add_insn(0x10000 + i, 1, "nop")
+    r = _w2_run(w2, "disasm_range", json.dumps({"address": 0x10000, "end": 0x20000}), max_results=5)
+    assert r["total_row_count"] == 2000 and r["stop_reason"] == "row_cap_reached" and r["resume_address"] == hex(0x10000 + 2000)
+    assert len(r["items"]) == 5 and r["truncated"] is True and r["next_offset"] == 5
+
+
+def test_disasm_rows_page_with_offset(w2):
+    _code_run(w2.model)
+    first = _w2_run(w2, "disasm_range", "0x1000 3", max_results=2)
+    assert first["next_offset"] == 2 and first["truncated"] is True and first["total_row_count"] == 3
+    rest = _w2_run(w2, "disasm_range", "0x1000 3", max_results=2, offset=2)
+    assert [i["kind"] for i in rest["items"]] == ["data"] and rest["next_offset"] is None
+
+
+def test_an_unmapped_start_is_an_error(w2):
+    r = _w2_run(w2, "disasm_range", "0x10 4")
+    assert (r["ok"], r["error"]) == (False, "ADDRESS_NOT_MAPPED")
+
+
+DISASM_QUERIES = [
+    "0x1000 4", "0x1000,4", "0x1000 2000", "0x1000 2001", "0x1000 0", "0x1000 -1", "0x1000", "", "zz 4",
+    "-5 4", "0xffffffffffffffff 4", '{"address": "0x1000", "count": 8}', '{"address": "0x1000", "end": "0x1100"}',
+    '{"address": "0x1000", "end": "0x1000"}', '{"address": "0x1000", "end": "0x0fff"}',
+    '{"address": "0x1000", "count": 8, "end": "0x1100"}', '{"address": "0x1000"}', '{"count": 4}',
+    '{"address": "0x1000", "count": true}', '{"address": "0x1000", "count": 4.0}', '{"address": "0x1000", "bogus": 1}',
+    "[]", "{", '{"address": "0x1000", "end": "0x10000000000000000"}',
+]
+FUNCTION_QUERIES = ["", "   ", "start", "0x1000", "x" * 512, "x" * 513]
+CALLGRAPH_QUERIES = [
+    "", "start", "0x1000", '{"function": "start"}', '{"function": "start", "depth": 4, "max_nodes": 500}',
+    '{"function": "start", "depth": 0}', '{"function": "start", "depth": 5}', '{"function": "start", "max_nodes": 0}',
+    '{"function": "start", "max_nodes": 501}', '{"function": "start", "depth": true}', '{"function": "start", "depth": "3"}',
+    '{"function": 5}', '{"depth": 2}', '{"function": "", "depth": 2}', '{"function": "start", "extra": 1}', "{", "[]",
+]
+FIND_BYTES_QUERIES = [
+    "48 8B ?? 05", "48 8b ? 05", "48", "??", "? ?", "", "   ", "4", "488B", "48 8B 05 zz", "48,8B", " ".join(["90"] * 256),
+    " ".join(["90"] * 257), '{"pattern": "48 8B"}', '{"pattern": "48 8B", "segment": ".text"}',
+    '{"pattern": "48 8B", "start": "0x1000", "end": "0x2000"}', '{"pattern": "48 8B", "start": "0x2000", "end": "0x1000"}',
+    '{"pattern": "48 8B", "start": "0x1000", "segment": ".text"}', '{"pattern": "48 8B", "segment": ""}',
+    '{"pattern": "48 8B", "segment": 5}', '{"pattern": "48 8B", "start": "zz"}', '{"pattern": "48 8B", "end": 0}',
+    '{"pattern": "48 8B", "end": "0x10000000000000000"}', '{"pattern": 5}', '{"start": "0x1000"}', '{"pattern": "48", "x": 1}',
+    '{"pattern": "?? ??"}', "{",
+]
+FIND_IMMEDIATE_QUERIES = [
+    "0x5A827999", "1518500249", "0", "0xffffffffffffffff", "0x10000000000000000", "-1", "", "abc", "1.5",
+    '{"value": "0x5A827999"}', '{"value": 5}', '{"value": true}', '{"value": -5}', '{"value": "0x5", "segment": ".text"}',
+    '{"value": "0x5", "start": "0x1000", "end": "0x2000"}', '{"value": "0x5", "start": "0x2000", "end": "0x1000"}',
+    '{"value": "0x5", "start": "0x1000", "segment": ".text"}', '{"start": "0x1000"}', '{"value": 5, "bogus": 1}', "{",
+]
+NAME_QUERIES = ["", "  ", "_GUID", "GUID", "x" * 256, "x" * 257, "a\nb", "a\tb", "café", "\x00"]
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize("operation, queries", [
+    ("disasm_range", DISASM_QUERIES), ("basic_blocks", FUNCTION_QUERIES), ("stack_frame", FUNCTION_QUERIES),
+    ("local_variables", FUNCTION_QUERIES), ("callgraph", CALLGRAPH_QUERIES), ("find_bytes", FIND_BYTES_QUERIES),
+    ("find_immediate", FIND_IMMEDIATE_QUERIES), ("get_struct", NAME_QUERIES), ("list_structs", NAME_QUERIES),
+    ("flirt_signatures", ["", "  ", "x", "0x1"]),
+])
+def test_wrapper_and_worker_agree_on_which_listing_requests_are_bad(w2, operation, queries):
+    """The wrapper refuses before IDA starts and the worker re-checks: the two grammars must not drift. Only the
+    request error is compared; what the engine alone can answer (an address outside every segment, an unknown
+    function or segment or type) is not part of the request grammar."""
+    request_errors = {
+        "disasm_range": {"INVALID_DISASM_RANGE_REQUEST", "INVALID_ADDRESS", "INVALID_COUNT", "INVALID_END_ADDRESS"},
+        "basic_blocks": {"FUNCTION_REQUIRED"}, "stack_frame": {"FUNCTION_REQUIRED"},
+        "local_variables": {"FUNCTION_REQUIRED"},
+        "callgraph": {"INVALID_CALLGRAPH_REQUEST", "FUNCTION_REQUIRED", "INVALID_DEPTH", "INVALID_MAX_NODES"},
+        "find_bytes": {"INVALID_FIND_BYTES_REQUEST", "INVALID_PATTERN", "INVALID_ADDRESS", "INVALID_RANGE"},
+        "find_immediate": {"INVALID_FIND_IMMEDIATE_REQUEST", "INVALID_VALUE", "INVALID_ADDRESS", "INVALID_RANGE"},
+        "get_struct": {"INVALID_TYPE_NAME"}, "list_structs": {"INVALID_FILTER"}, "flirt_signatures": {"UNEXPECTED_QUERY"},
+    }[operation]
+    for query in queries:
+        worker_error = _w2_run(w2, operation, query).get("error")
+        if worker_error not in request_errors:
+            worker_error = None
+        assert ti._query_request_problem(operation, query) == worker_error, (operation, query)
+
+
+def test_every_listing_request_error_is_raised_by_the_worker_for_a_bad_request(w2):
+    """The battery above must actually contain bad requests, not only good ones."""
+    for operation, queries in (("disasm_range", DISASM_QUERIES), ("callgraph", CALLGRAPH_QUERIES),
+                               ("find_bytes", FIND_BYTES_QUERIES), ("find_immediate", FIND_IMMEDIATE_QUERIES)):
+        assert sum(1 for q in queries if ti._query_request_problem(operation, q)) >= len(queries) // 2, operation
+
+
+# ---------------------------------------------------------------------------
+# basic_blocks
+# ---------------------------------------------------------------------------
+def _block(start, end, type_, succs=(), preds=()):
+    return SimpleNamespace(start_ea=start, end_ea=end, type=type_, succs=lambda: list(succs), preds=lambda: list(preds))
+
+
+def _flow(w2, blocks):
+    w2.db.names["f"] = 0x1000
+    w2.db.functions[0x1000] = (0x1100, 0)
+    w2.gdl.FlowChart = lambda func: blocks
+
+
+def test_basic_blocks_lists_start_end_type_and_neighbours(w2):
+    a, b, c = _block(0x1000, 0x1010, 0), _block(0x1010, 0x1020, 0), _block(0x1020, 0x1030, 2)
+    a.succs = lambda: [c, b]
+    b.preds, b.succs = (lambda: [a]), (lambda: [c])
+    c.preds = lambda: [b, a]
+    _flow(w2, [c, a, b])
+    r = _w2_run(w2, "basic_blocks", "f")
+    assert [(i["start"], i["end"], i["type"]) for i in r["items"]] == [
+        ("0x1000", "0x1010", "normal"), ("0x1010", "0x1020", "normal"), ("0x1020", "0x1030", "return")]
+    assert r["items"][0]["successors"] == ["0x1010", "0x1020"] and r["items"][2]["predecessors"] == ["0x1000", "0x1010"]
+    assert r["total_block_count"] == 3 and r["edge_count"] == 3 and r["function"]["address"] == "0x1000"
+
+
+@pytest.mark.parametrize("code, name", [(0, "normal"), (1, "indirect_jump"), (2, "return"), (3, "conditional_return"),
+                                        (4, "no_return"), (5, "external_no_return"), (6, "external"), (7, "error"),
+                                        (99, "UNKNOWN")])
+def test_each_block_type_has_its_name_and_an_unknown_code_stays_unknown(w2, code, name):
+    _flow(w2, [_block(0x1000, 0x1010, code)])
+    r = _w2_run(w2, "basic_blocks", "f")
+    assert r["items"][0]["type"] == name and r["items"][0]["type_code"] == code
+
+
+def test_an_indirect_jump_block_lists_only_the_successors_ida_recorded(w2):
+    _flow(w2, [_block(0x1000, 0x1010, 1)])
+    assert _w2_run(w2, "basic_blocks", "f")["items"][0]["successors"] == []
+
+
+def test_block_neighbour_lists_are_cut_with_the_true_count(w2):
+    many = [_block(0x1100 + i, 0x1101 + i, 0) for i in range(300)]
+    _flow(w2, [_block(0x1000, 0x1010, 1, succs=many)])
+    row = _w2_run(w2, "basic_blocks", "f")["items"][0]
+    assert row["successor_count"] == 300 and len(row["successors"]) == 256 and row["edge_lists_truncated"] is True
+
+
+def test_basic_blocks_page_and_errors(w2):
+    _flow(w2, [_block(0x1000 + 0x10 * i, 0x1010 + 0x10 * i, 0) for i in range(5)])
+    r = _w2_run(w2, "basic_blocks", "0x1004", max_results=2, offset=1)
+    assert [i["start"] for i in r["items"]] == ["0x1010", "0x1020"] and r["next_offset"] == 3 and r["truncated"] is True
+    assert _w2_run(w2, "basic_blocks", "nope")["error"] == "FUNCTION_NOT_FOUND"
+    assert _w2_run(w2, "basic_blocks", "")["error"] == "FUNCTION_REQUIRED"
+
+
+# ---------------------------------------------------------------------------
+# callgraph
+# ---------------------------------------------------------------------------
+def _graph(w2):
+    """root -> {a (direct, twice), CreateFileW (import), a register call}; a -> {b}; b -> {c}; thunk -> slot."""
+    m, db = w2.model, w2.db
+    db.functions.update({0x1000: (0x1100, 0), 0x1100: (0x1200, 0), 0x1200: (0x1300, 0), 0x1300: (0x1400, 0),
+                         0x1500: (0x1510, FUNC_THUNK)})
+    db.names.update({"root": 0x1000, "a": 0x1100, "b": 0x1200, "c": 0x1300, "thunk": 0x1500})
+    db.imports = [("KERNEL32", "CreateFileW", None, 0x4010), ("KERNEL32", "Sleep", None, 0x4018)]
+    m.add_insn(0x1000, 5, "call", ["a"], [OT_NEAR], call=True)
+    m.add_insn(0x1010, 5, "call", ["a"], [OT_NEAR], call=True)
+    m.add_insn(0x1020, 6, "call", ["cs:CreateFileW"], [OT_MEM], call=True)
+    m.add_insn(0x1030, 2, "call", ["rax"], [OT_REG], call=True)
+    m.add_insn(0x1040, 6, "call", ["cs:fptr"], [OT_MEM], call=True)
+    m.add_insn(0x1050, 3, "mov", ["rax", "rbx"])
+    m.add_insn(0x1100, 5, "call", ["b"], [OT_NEAR], call=True)
+    m.add_insn(0x1200, 5, "call", ["c"], [OT_NEAR], call=True)
+    m.add_insn(0x1500, 6, "jmp", ["cs:Sleep"], [OT_MEM])
+    db.refs_from = {
+        0x1000: [_xref(0x1000, 0x1100, FL_CN, True)], 0x1010: [_xref(0x1010, 0x1100, FL_CN, True)],
+        0x1020: [_xref(0x1020, 0x4010, FL_CN, True), _xref(0x1020, 0x4010, 3, False)],
+        0x1040: [_xref(0x1040, 0x6000, FL_CN, True)],       # a memory call IDA resolved to a non-import address
+        0x1100: [_xref(0x1100, 0x1200, FL_CN, True)], 0x1200: [_xref(0x1200, 0x1300, FL_CN, True)],
+        0x1500: [_xref(0x1500, 0x4018, 3, False)],
+    }
+
+
+def _edges(r):
+    return sorted((e["from"], e["to"], e["kind"], e["call_count"]) for e in r["items"])
+
+
+def test_callgraph_has_direct_edges_import_edges_and_merges_repeated_calls(w2):
+    _graph(w2)
+    r = _w2_run(w2, "callgraph", json.dumps({"function": "root", "depth": 3}))
+    assert r["ok"] and r["root"] == "0x1000"
+    assert _edges(r) == [("0x1000", "0x1100", "direct", 2), ("0x1000", "0x4010", "import", 1),
+                         ("0x1100", "0x1200", "direct", 1), ("0x1200", "0x1300", "direct", 1)]
+    direct = next(e for e in r["items"] if e["to"] == "0x1100")
+    assert direct["call_sites"] == ["0x1000", "0x1010"]
+    nodes = {n["address"]: n for n in r["nodes"]}
+    assert nodes["0x4010"]["is_import"] is True and nodes["0x4010"]["name"] == "CreateFileW"
+    assert nodes["0x4010"]["import_module"] == "KERNEL32" and nodes["0x4010"]["not_expanded_reason"] == "import"
+    assert nodes["0x1100"]["is_import"] is False and nodes["0x1100"]["is_function"] is True
+
+
+def test_indirect_calls_are_counted_and_never_resolved(w2):
+    """Rule 4: a call through a register, or through a memory operand that is not an import slot, is no edge."""
+    _graph(w2)
+    r = _w2_run(w2, "callgraph", "root")
+    root = r["nodes"][0]
+    assert root["indirect_call_count"] == 2 and root["indirect_call_sites"] == ["0x1030", "0x1040"]
+    assert r["indirect_call_total"] == 2
+    assert all(e["to"] != "0x6000" for e in r["items"]) and "0x6000" not in {n["address"] for n in r["nodes"]}
+    assert "never resolved" in r["indirect_calls_note"]
+
+
+def test_the_depth_limit_marks_functions_that_were_not_looked_into(w2):
+    _graph(w2)
+    r = _w2_run(w2, "callgraph", json.dumps({"function": "root", "depth": 1}))
+    nodes = {n["address"]: n for n in r["nodes"]}
+    assert nodes["0x1000"]["expanded"] is True and nodes["0x1100"]["expanded"] is False
+    assert nodes["0x1100"]["not_expanded_reason"] == "depth_limit" and nodes["0x1100"]["depth"] == 1
+    assert "0x1200" not in nodes
+    deeper = _w2_run(w2, "callgraph", json.dumps({"function": "root", "depth": 2}))
+    assert "0x1200" in {n["address"] for n in deeper["nodes"]}
+
+
+def test_the_node_cap_is_reported_and_edges_to_dropped_nodes_are_counted(w2):
+    _graph(w2)
+    r = _w2_run(w2, "callgraph", json.dumps({"function": "root", "depth": 3, "max_nodes": 2}))
+    assert r["node_count"] == 2 and r["nodes_truncated"] is True and r["dropped_node_count"] >= 1
+    assert r["edges_not_recorded"] >= 1
+    assert len(r["nodes"]) == 2
+
+
+def test_a_thunk_function_has_an_edge_to_the_import_it_jumps_through(w2):
+    _graph(w2)
+    r = _w2_run(w2, "callgraph", "thunk")
+    assert _edges(r) == [("0x1500", "0x4018", "import", 1)] and r["nodes"][0]["is_thunk"] is True
+
+
+def test_a_call_to_a_non_function_address_is_a_leaf_not_expanded(w2):
+    _graph(w2)
+    w2.db.refs_from[0x1000] = [_xref(0x1000, 0x1700, FL_CN, True)]
+    r = _w2_run(w2, "callgraph", "root")
+    node = next(n for n in r["nodes"] if n["address"] == "0x1700")
+    assert node["is_function"] is False and node["not_expanded_reason"] == "not_a_function"
+
+
+def test_callgraph_pages_the_edges_and_reports_unknown_functions(w2):
+    _graph(w2)
+    r = _w2_run(w2, "callgraph", json.dumps({"function": "root", "depth": 3}), max_results=1)
+    assert len(r["items"]) == 1 and r["next_offset"] == 1 and r["total_edge_count"] == 4 and len(r["nodes"]) == 5
+    assert _w2_run(w2, "callgraph", "nope")["error"] == "FUNCTION_NOT_FOUND"
+    assert _w2_run(w2, "callgraph", '{"function": "root", "depth": 9}')["error"] == "INVALID_DEPTH"
+
+
+# ---------------------------------------------------------------------------
+# stack_frame
+# ---------------------------------------------------------------------------
+def _frame(w2, landmarks=(136, 136, 144)):
+    w2.db.names["g"] = 0x1000
+    w2.db.functions[0x1000] = (0x1100, 0)
+    w2.db.functions[0x1100] = (0x1200, 0)
+    w2.db.names["h"] = 0x1100
+    w2.types.frames[0x1000] = FakeTypes.type_("frame", [
+        ("var_68", 32 * 8, 4 * 8, "ULONG", False), ("var_18", 112 * 8, 8 * 8, "_QWORD", False),
+        ("__saved", 128 * 8, 8 * 8, "_QWORD", False), ("__return_address", 136 * 8, 8 * 8, "_UNKNOWN *", False),
+        ("arg_20", 176 * 8, 8 * 8, "_QWORD", False)])
+    w2.types.landmarks[0x1000] = landmarks
+
+
+def test_stack_frame_separates_locals_saved_registers_return_address_and_arguments(w2):
+    _frame(w2)
+    r = _w2_run(w2, "stack_frame", "g")
+    assert r["ok"]
+    assert [(i["name"], i["region"], i["is_argument"]) for i in r["items"]] == [
+        ("var_68", "local", False), ("var_18", "local", False), ("__saved", "local", False),
+        ("__return_address", "return_address", False), ("arg_20", "argument", True)]
+    first = r["items"][0]
+    assert (first["offset"], first["size"], first["type_str"], first["offset_from_return_address"]) == (32, 4, "ULONG", -104)
+    assert r["landmarks"] == {"saved_registers_offset": 136, "return_address_offset": 136, "arguments_offset": 144}
+    assert r["frame_size"] == 144 and r["total_member_count"] == 5
+
+
+def test_a_saved_register_member_is_told_apart_when_ida_recorded_a_saved_area(w2):
+    _frame(w2, (128, 136, 144))
+    regions = {i["name"]: i["region"] for i in _w2_run(w2, "stack_frame", "g")["items"]}
+    assert regions["__saved"] == "saved_registers" and regions["var_18"] == "local"
+
+
+def test_a_function_with_no_frame_is_an_error_and_nothing_is_inferred(w2):
+    _frame(w2)
+    r = _w2_run(w2, "stack_frame", "h")
+    assert (r["ok"], r["error"]) == (False, "NO_STACK_FRAME") and "items" in r and r["items"] == []
+    assert r["function"]["address"] == "0x1100"
+
+
+def test_unavailable_landmarks_leave_the_region_null(w2):
+    _frame(w2)
+    w2.types.landmarks.clear()           # frame_off_* raises KeyError: IDA gives no landmark
+    r = _w2_run(w2, "stack_frame", "g")
+    assert r["ok"] and all(i["region"] is None and i["is_argument"] is None for i in r["items"])
+    assert r["landmarks"] == {"saved_registers_offset": None, "return_address_offset": None, "arguments_offset": None}
+
+
+def test_stack_frame_pages_and_rejects_unknown_functions(w2):
+    _frame(w2)
+    r = _w2_run(w2, "stack_frame", "g", max_results=2, offset=3)
+    assert [i["name"] for i in r["items"]] == ["__return_address", "arg_20"] and r["next_offset"] is None
+    assert _w2_run(w2, "stack_frame", "nope")["error"] == "FUNCTION_NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# local_variables
+# ---------------------------------------------------------------------------
+def _location(kind, **kw):
+    flags = {"is_stkoff": False, "is_reg1": False, "is_reg2": False, "is_scattered": False, "is_rrel": False,
+             "is_ea": False}
+    flags["is_" + kind] = True if kind != "stack" else False
+    if kind == "stack":
+        flags["is_stkoff"] = True
+    loc = SimpleNamespace(**{k: (lambda v=v: v) for k, v in flags.items()})
+    loc.stkoff = lambda: kw.get("stkoff")
+    loc.reg1, loc.reg2, loc.regoff = (lambda: kw.get("reg1")), (lambda: kw.get("reg2")), (lambda: kw.get("regoff", 0))
+    loc.get_ea = lambda: kw.get("ea")
+    return loc
+
+
+def _lvar(name, type_, is_arg, location, width=8):
+    return SimpleNamespace(name=name, type=lambda: type_, is_arg_var=is_arg, width=width, location=location)
+
+
+def _hexrays(w2, lvars):
+    w2.db.names["f"] = 0x1000
+    w2.db.functions[0x1000] = (0x1100, 0)
+    hx = w2.ida["ida_hexrays"]
+    hx.init_hexrays_plugin.return_value = True
+    hx.get_mreg_name.side_effect = lambda reg, width: {24: "rcx", 16: "rax"}.get(reg, "r%d" % reg)
+    hx.decompile.side_effect = lambda ea: SimpleNamespace(lvars=lvars)
+
+
+def test_local_variables_report_name_type_arg_and_location(w2):
+    _hexrays(w2, [_lvar("a1", "__int64", True, _location("reg1", reg1=24)),
+                  _lvar("v7", "struct S", False, _location("stack", stkoff=48), 16),
+                  _lvar("", "int", False, _location("reg2", reg1=24, reg2=16), 8),
+                  _lvar("g", "int", False, _location("ea", ea=0x3000)),
+                  _lvar("s", "int", False, _location("scattered")), _lvar("r", "int", False, _location("rrel")),
+                  _lvar("u", "int", False, _location("nothing"))])
+    r = _w2_run(w2, "local_variables", "f")
+    assert r["ok"] and r["decompiler"] == "hexrays" and r["total_variable_count"] == 7
+    by = {i["index"]: i for i in r["items"]}
+    assert (by[0]["name"], by[0]["type"], by[0]["is_arg"], by[0]["size"]) == ("a1", "__int64", True, 8)
+    assert by[0]["location"] == {"kind": "register", "register": "rcx", "register_number": 24, "register_offset": 0}
+    assert by[1]["is_arg"] is False and by[1]["location"]["kind"] == "stack" and by[1]["location"]["stack_offset"] == 48
+    assert by[2]["name"] is None and by[2]["location"] == {"kind": "register_pair", "registers": ["rcx", "rax"]}
+    assert by[3]["location"] == {"kind": "static", "address": "0x3000"}
+    assert [by[i]["location"]["kind"] for i in (4, 5, 6)] == ["scattered", "register_relative", "unknown"]
+
+
+def test_no_decompiler_is_an_error_not_a_list_from_the_frame(w2):
+    _hexrays(w2, [])
+    w2.ida["ida_hexrays"].init_hexrays_plugin.return_value = False
+    r = _w2_run(w2, "local_variables", "f")
+    assert (r["ok"], r["error"]) == (False, "HEXRAYS_NOT_AVAILABLE") and r["items"] == []
+
+
+def test_a_failed_decompile_is_an_error_with_the_reason(w2):
+    _hexrays(w2, [])
+    w2.ida["ida_hexrays"].decompile.side_effect = w2.ida["ida_hexrays"].DecompilationFailure("call analysis failed")
+    r = _w2_run(w2, "local_variables", "f")
+    assert (r["ok"], r["error"]) == (False, "HEXRAYS_DECOMPILE_FAILED") and "call analysis failed" in r["detail"]
+    w2.ida["ida_hexrays"].decompile.side_effect = lambda ea: None
+    assert _w2_run(w2, "local_variables", "f")["error"] == "HEXRAYS_DECOMPILE_FAILED"
+
+
+def test_local_variables_page_and_unknown_function(w2):
+    _hexrays(w2, [_lvar("v%d" % i, "int", False, _location("stack", stkoff=i)) for i in range(5)])
+    r = _w2_run(w2, "local_variables", "f", max_results=2, offset=4)
+    assert [i["name"] for i in r["items"]] == ["v4"] and r["next_offset"] is None
+    assert _w2_run(w2, "local_variables", "nope")["error"] == "FUNCTION_NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# find_bytes
+# ---------------------------------------------------------------------------
+def _bytes_db(w2):
+    m = w2.model
+    m.add_insn(0x1000, 4, "mov", ["rax", "[rbx+5]"], data=[0x48, 0x8B, 0x43, 0x05])
+    m.add_insn(0x1010, 4, "mov", ["rcx", "[rbx+5]"], data=[0x48, 0x8B, 0x4B, 0x05])
+    m.add_insn(0x1020, 4, "mov", ["rdx", "[rbx+6]"], data=[0x48, 0x8B, 0x53, 0x06])
+    w2.db.loaded.update({0x3000: 0x48, 0x3001: 0x8B, 0x3002: 0x00, 0x3003: 0x05})
+    w2.db.loaded.update({0x5000: 0x48, 0x5001: 0x8B, 0x5002: 0x00, 0x5003: 0x05})
+    w2.db.functions[0x1000] = (0x1018, 0)
+    w2.db.names["fn"] = 0x1000
+
+
+def test_find_bytes_matches_wildcards_in_address_order_with_the_function(w2):
+    _bytes_db(w2)
+    r = _w2_run(w2, "find_bytes", "48 8b ?? 05")
+    assert [(i["address"], i["bytes_hex"], i["segment"]) for i in r["items"]] == [
+        ("0x1000", "488b4305", ".text"), ("0x1010", "488b4b05", ".text"), ("0x3000", "488b0005", ".rdata"),
+        ("0x5000", "488b0005", ".rdata")]
+    assert r["items"][0]["function"] == {"address": "0x1000", "name": "fn"}
+    assert r["items"][2]["function"] is None            # no function there: null, not a guess
+    assert r["pattern"] == "48 8B ? 05" and r["truncated"] is False and r["next_offset"] is None
+
+
+def test_find_bytes_caps_the_matches_and_resumes(w2):
+    _bytes_db(w2)
+    first = _w2_run(w2, "find_bytes", "48 8B", max_results=2)
+    assert len(first["items"]) == 2 and first["truncated"] is True and first["next_offset"] == 2
+    rest = _w2_run(w2, "find_bytes", "48 8B", max_results=10, offset=2)
+    assert [i["address"] for i in rest["items"]] == ["0x1020", "0x3000", "0x5000"] and rest["next_offset"] is None
+
+
+def test_find_bytes_in_a_range_and_in_a_segment_name_that_repeats(w2):
+    _bytes_db(w2)
+    ranged = _w2_run(w2, "find_bytes", json.dumps({"pattern": "48 8B", "start": "0x1005", "end": "0x1021"}))
+    assert [i["address"] for i in ranged["items"]] == ["0x1010"]       # 0x1020 does not fit inside the range
+    named = _w2_run(w2, "find_bytes", json.dumps({"pattern": "48 8B", "segment": ".rdata"}))
+    assert [i["address"] for i in named["items"]] == ["0x3000", "0x5000"]
+    assert named["ranges"] == [{"start": "0x3000", "end": "0x3100"}, {"start": "0x5000", "end": "0x5100"}]
+
+
+def test_find_bytes_unknown_segment_lists_the_known_names(w2):
+    _bytes_db(w2)
+    r = _w2_run(w2, "find_bytes", json.dumps({"pattern": "48", "segment": ".nope"}))
+    assert (r["ok"], r["error"]) == (False, "SEGMENT_NOT_FOUND") and ".text" in r["segment_names"]
+
+
+def test_find_bytes_with_no_match_is_an_ok_empty_list_that_states_its_scope(w2):
+    _bytes_db(w2)
+    r = _w2_run(w2, "find_bytes", "DE AD BE EF")
+    assert r["ok"] and r["items"] == [] and "never match" in r["search_scope"]
+
+
+def test_find_bytes_refuses_a_bad_pattern(w2):
+    assert _w2_run(w2, "find_bytes", "?? ??")["error"] == "INVALID_PATTERN"
+    assert _w2_run(w2, "find_bytes", "48 8")["error"] == "INVALID_PATTERN"
+
+
+# ---------------------------------------------------------------------------
+# find_immediate
+# ---------------------------------------------------------------------------
+def _imm_db(w2):
+    m = w2.model
+    m.add_insn(0x1000, 5, "mov", ["eax", "5A827999h"], [OT_REG, OT_IMM], imms={1: 0x5A827999})
+    m.add_insn(0x1010, 6, "add", ["ebx", "5A827999h"], [OT_REG, OT_IMM], imms={1: 0x5A827999})
+    m.add_insn(0x1020, 5, "mov", ["eax", "6ED9EBA1h"], [OT_REG, OT_IMM], imms={1: 0x6ED9EBA1})
+    m.add_insn(0x1030, 5, "cmp", ["eax", "5A827999h"], [OT_REG, OT_IMM], imms={1: 0x5A827999})
+    w2.db.functions[0x1000] = (0x1018, 0)
+    w2.db.names["fn"] = 0x1000
+
+
+def test_find_immediate_gives_address_operand_function_and_instruction_text(w2):
+    _imm_db(w2)
+    r = _w2_run(w2, "find_immediate", "0x5A827999")
+    assert [(i["address"], i["operand_index"], i["instruction"]) for i in r["items"]] == [
+        ("0x1000", 1, "mov eax, 5A827999h"), ("0x1010", 1, "add ebx, 5A827999h"), ("0x1030", 1, "cmp eax, 5A827999h")]
+    assert r["items"][0]["function"] == {"address": "0x1000", "name": "fn"} and r["items"][2]["function"] is None
+    assert r["value"] == "0x5a827999" and "different number" in r["search_scope"]
+
+
+def test_find_immediate_includes_a_match_at_the_start_of_the_range(w2):
+    _imm_db(w2)
+    r = _w2_run(w2, "find_immediate", json.dumps({"value": "0x5A827999", "start": "0x1010", "end": "0x1031"}))
+    assert [i["address"] for i in r["items"]] == ["0x1010", "0x1030"]
+    limited = _w2_run(w2, "find_immediate", json.dumps({"value": "0x5A827999", "start": "0x1000", "end": "0x1010"}))
+    assert [i["address"] for i in limited["items"]] == ["0x1000"]
+
+
+def test_find_immediate_pages_and_accepts_decimal(w2):
+    _imm_db(w2)
+    first = _w2_run(w2, "find_immediate", str(0x5A827999), max_results=1)
+    assert [i["address"] for i in first["items"]] == ["0x1000"] and first["truncated"] and first["next_offset"] == 1
+    rest = _w2_run(w2, "find_immediate", "0x5A827999", max_results=5, offset=1)
+    assert [i["address"] for i in rest["items"]] == ["0x1010", "0x1030"] and rest["next_offset"] is None
+
+
+def test_find_immediate_with_no_match_is_an_ok_empty_list_and_a_negative_is_refused(w2):
+    _imm_db(w2)
+    r = _w2_run(w2, "find_immediate", "0x1234")
+    assert r["ok"] and r["items"] == []
+    assert _w2_run(w2, "find_immediate", "-1")["error"] == "INVALID_VALUE"
+    assert _w2_run(w2, "find_immediate", json.dumps({"value": 5, "segment": ".nope"}))["error"] == "SEGMENT_NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# list_structs / get_struct
+# ---------------------------------------------------------------------------
+def _types(w2):
+    t = w2.types
+    guid = FakeTypes.type_("_GUID", [("Data1", 0, 32, "unsigned int", False), ("Data4", 64, 64, "unsigned __int8[8]", False)],
+                           size=16)
+    union = FakeTypes.type_("U", [("a", 0, 32, "int", False), ("b", 0, 8, "char", False)], union=True, size=4)
+    flags = FakeTypes.type_("Flags", [("lo", 0, 3, "unsigned int", True), ("hi", 3, 5, "unsigned int", True)], size=1)
+    enum = FakeTypes.type_("Color", udt=False)
+    forward = FakeTypes.type_("Fwd", [], size=None)
+    t.numbered = {1: guid, 2: enum, 3: union, 4: flags, 5: forward}
+    t.named = {"_GUID": guid, "U": union, "Flags": flags, "Color": enum, "GUID": guid}
+
+
+def test_list_structs_gives_name_kind_size_and_member_count_for_udts_only(w2):
+    _types(w2)
+    r = _w2_run(w2, "list_structs", "")
+    assert [(i["name"], i["ordinal"], i["kind"], i["size"], i["member_count"]) for i in r["items"]] == [
+        ("_GUID", 1, "struct", 16, 2), ("U", 3, "union", 4, 2), ("Flags", 4, "struct", 1, 2), ("Fwd", 5, "struct", None, 0)]
+    assert r["total_struct_count"] == 4 and r["next_offset"] is None
+
+
+def test_list_structs_filters_case_insensitively_and_pages(w2):
+    _types(w2)
+    assert [i["name"] for i in _w2_run(w2, "list_structs", "guid")["items"]] == ["_GUID"]
+    first = _w2_run(w2, "list_structs", "", max_results=2)
+    assert first["truncated"] is True and first["next_offset"] == 2 and first["total_struct_count"] == 4
+    rest = _w2_run(w2, "list_structs", "", max_results=5, offset=2)
+    assert [i["name"] for i in rest["items"]] == ["Flags", "Fwd"] and rest["next_offset"] is None
+
+
+def test_get_struct_lists_members_with_offset_size_and_type(w2):
+    _types(w2)
+    r = _w2_run(w2, "get_struct", "_GUID")
+    assert r["ok"] and r["kind"] == "struct" and r["size"] == 16 and r["member_count"] == 2
+    assert [(i["name"], i["offset"], i["size"], i["type_str"]) for i in r["items"]] == [
+        ("Data1", 0, 4, "unsigned int"), ("Data4", 8, 8, "unsigned __int8[8]")]
+
+
+def test_get_struct_tries_the_underscore_counterpart(w2):
+    _types(w2)
+    r = _w2_run(w2, "get_struct", "GUID")
+    assert r["resolved_type_name"] == "GUID" and r["tried_type_names"] == ["GUID", "_GUID"]
+    w2.types.named.pop("GUID")
+    r = _w2_run(w2, "get_struct", "GUID")
+    assert r["ok"] and r["resolved_type_name"] == "_GUID"
+
+
+def test_get_struct_keeps_bit_exact_offsets_for_bitfields_and_union_members_share_offset_zero(w2):
+    _types(w2)
+    flags = _w2_run(w2, "get_struct", "Flags")["items"]
+    assert [(i["offset"], i["offset_bits"], i["size"], i["size_bits"], i["byte_aligned"], i["is_bitfield"])
+            for i in flags] == [(0, 0, None, 3, True, True), (0, 3, None, 5, False, True)]
+    union = _w2_run(w2, "get_struct", "U")
+    assert union["kind"] == "union" and [i["offset"] for i in union["items"]] == [0, 0]
+
+
+def test_get_struct_errors_keep_no_type_apart_from_not_a_struct(w2):
+    _types(w2)
+    assert _w2_run(w2, "get_struct", "Nope")["error"] == "TYPE_NOT_FOUND"
+    r = _w2_run(w2, "get_struct", "Color")
+    assert r["error"] == "TYPE_NOT_STRUCT_OR_UNION" and r["tried_type_names"] == ["Color", "_Color"]
+
+
+def test_get_struct_pages_members(w2):
+    _types(w2)
+    r = _w2_run(w2, "get_struct", "_GUID", max_results=1, offset=1)
+    assert [i["name"] for i in r["items"]] == ["Data4"] and r["total_member_count"] == 2 and r["next_offset"] is None
+
+
+# ---------------------------------------------------------------------------
+# flirt_signatures
+# ---------------------------------------------------------------------------
+def _flirt(w2, descs, states=None, title="Title"):
+    funcs = w2.ida["ida_funcs"]
+    funcs.IDASGN_APPLIED, funcs.IDASGN_PLANNED, funcs.IDASGN_CURRENT = 2, 1, 3
+    funcs.get_idasgn_qty.return_value = len(descs)
+    funcs.get_idasgn_desc_with_matches.side_effect = lambda i: descs[i]
+    funcs.calc_idasgn_state.side_effect = lambda i: (states or {}).get(i, 2)
+    funcs.get_idasgn_title.side_effect = lambda name: "%s of %s" % (title, name)
+
+
+def test_flirt_signatures_list_state_and_matched_counts_and_keep_the_library_flag_count_apart(w2):
+    _flirt(w2, [("vc64_14", "vc64mfc", 50), ("vc64ucrt", "", 1), ("seh", "x", 0)], {1: 1, 2: 99})
+    w2.db.functions.update({0x1000: (0x1010, FUNC_LIB), 0x1010: (0x1020, 0), 0x1020: (0x1030, FUNC_LIB)})
+    r = _w2_run(w2, "flirt_signatures", "")
+    assert [(i["name"], i["matched_function_count"], i["state"], i["optional_libraries"]) for i in r["items"]] == [
+        ("vc64_14", 50, "applied", "vc64mfc"), ("vc64ucrt", 1, "planned", None), ("seh", 0, "UNKNOWN", "x")]
+    assert r["items"][0]["title"] == "Title of vc64_14" and r["signature_count"] == 3
+    assert r["library_flagged_function_count"] == 2 and "not summed" in r["note"]
+
+
+def test_a_signature_ida_cannot_describe_has_null_fields_not_zeros(w2):
+    _flirt(w2, [None, ("known", "", 3)])
+    r = _w2_run(w2, "flirt_signatures", "")
+    assert r["items"][0] == {"index": 0, "name": None, "title": None, "optional_libraries": None,
+                             "matched_function_count": None, "state": "applied"}
+    assert r["items"][1]["matched_function_count"] == 3
+
+
+def test_flirt_signatures_with_none_loaded_is_an_ok_empty_list_and_takes_no_query(w2):
+    _flirt(w2, [])
+    r = _w2_run(w2, "flirt_signatures", "")
+    assert r["ok"] and r["items"] == [] and r["signature_count"] == 0
+    assert _w2_run(w2, "flirt_signatures", "vc")["error"] == "UNEXPECTED_QUERY"
+
+
+# ---------------------------------------------------------------------------
+# the operations are read-only, dispatched and listed
+# ---------------------------------------------------------------------------
+W2_OPERATIONS = ("disasm_range", "basic_blocks", "callgraph", "stack_frame", "local_variables", "find_bytes",
+                 "find_immediate", "list_structs", "get_struct", "flirt_signatures")
+MUTATING_PREFIXES = ("set_", "put_", "del_", "delete_", "create_", "patch_", "apply_", "save_", "add_", "make_",
+                     "rename_", "plan_", "parse_", "import_", "define_", "force_", "revert_", "undo_", "write_")
+
+
+def _w2_region_calls():
+    from tests.test_tools_ida import WORKER_PATH
+    source = WORKER_PATH.read_text(encoding="utf-8")
+    begin = source.index("# ---- read-only listing operations (W2): begin")
+    end = source.index("# ---- read-only listing operations (W2): end")
+    first_line = source.count("\n", 0, begin) + 1
+    last_line = source.count("\n", 0, end) + 1
+    tree = ast.parse(source)
+    calls = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and first_line <= node.lineno <= last_line:
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call):
+                    func = sub.func
+                    name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                    calls.append((node.name, name))
+                if isinstance(sub, ast.Attribute) and isinstance(sub.ctx, ast.Store):
+                    calls.append((node.name, "store:" + sub.attr))
+    return calls
+
+
+@pytest.mark.contract
+def test_the_new_worker_code_makes_no_mutating_call():
+    """Every call in the W2 region is a read; no attribute of an IDA object is assigned either."""
+    calls = _w2_region_calls()
+    assert len(calls) > 200                      # the region was found and parsed, not an empty slice
+    bad = [(fn, name) for fn, name in calls if name.startswith(MUTATING_PREFIXES) or name.startswith("store:")]
+    assert bad == []
+
+
+@pytest.mark.contract
+def test_the_mutating_prefix_check_would_catch_a_write():
+    assert any("set_name".startswith(p) for p in MUTATING_PREFIXES) and any("apply_idasgn_to".startswith(p) for p in MUTATING_PREFIXES)
+    assert "plan_to_apply_idasgn".startswith(MUTATING_PREFIXES)
+
+
+def test_the_listing_operations_are_dispatched_and_listed_in_both_places(worker):
+    module, _ida, _db = worker
+    for operation in W2_OPERATIONS:
+        assert operation in module._OPERATIONS and operation in module._DISPATCH and operation in ti._ALLOWED_OPERATIONS
+    assert set(module._OPERATIONS) == set(module._DISPATCH) and set(ti._ALLOWED_OPERATIONS) <= set(module._DISPATCH)
+
+
+def test_the_listing_operations_that_page_resume_from_a_trimmed_response():
+    assert set(W2_OPERATIONS) <= ti._PAGED_OPERATIONS
+
+
+# ---------------------------------------------------------------------------
+# through ida_query (FakeIdat)
+# ---------------------------------------------------------------------------
+class ListingWrapperTests(IdaCase):
+    GOOD = {"disasm_range": "0x1000 8", "basic_blocks": "start", "callgraph": "start", "stack_frame": "start",
+            "local_variables": "start", "find_bytes": "48 8B ?? 05", "find_immediate": "0x5A827999",
+            "list_structs": "", "get_struct": "_GUID", "flirt_signatures": ""}
+    BAD = {"disasm_range": ("0x1000 2001", "INVALID_COUNT"), "basic_blocks": ("", "FUNCTION_REQUIRED"),
+           "callgraph": ('{"function": "f", "depth": 5}', "INVALID_DEPTH"), "stack_frame": ("  ", "FUNCTION_REQUIRED"),
+           "local_variables": ("x" * 513, "FUNCTION_REQUIRED"), "find_bytes": ("?? ??", "INVALID_PATTERN"),
+           "find_immediate": ("-1", "INVALID_VALUE"), "list_structs": ("x" * 257, "INVALID_FILTER"),
+           "get_struct": ("", "INVALID_TYPE_NAME"), "flirt_signatures": ("x", "UNEXPECTED_QUERY")}
+
+    def test_every_listing_operation_is_accepted_with_a_good_query(self):
+        for operation, query in self.GOOD.items():
+            data = self.q(operation, query)
+            self.assertTrue(data["ok"], (operation, data))
+            self.assertEqual((data["status"], data["operation"]), ("OK", operation))
+        self.assertEqual(self.fake.modes[0], "create")      # one analysis, then every question on the cached database
+        self.assertEqual(set(self.fake.modes[1:]), {"reopen"})
+
+    def test_a_bad_query_is_refused_before_idat_starts(self):
+        for operation, (query, error) in self.BAD.items():
+            data = self.q(operation, query)
+            self.assertEqual((data["ok"], data["status"], data["error"]), (False, "ANALYSIS_LIMITED", error), operation)
+            self.assertIn("Nothing was started", data["detail"])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_the_cli_choices_and_the_module_agree_on_the_new_operations(self):
+        import liebert_re.cli as cli
+        for operation in self.GOOD:
+            self.assertIn(operation, cli._IDA_OPERATIONS)
+
+    def test_a_capped_call_graph_is_partial_and_names_the_cap(self):
+        self.fake.fields["callgraph"] = dict(root="0x1000", nodes=[{"address": "0x1000"}], node_count=1, max_nodes=1,
+                                             nodes_truncated=True, dropped_node_count=3, items=[], total_edge_count=0,
+                                             next_offset=None)
+        data = self.q("callgraph", "start")
+        self.assertEqual(data["status"], "PARTIAL")
+        self.assertTrue(any("node cap of 1" in text and "3 further" in text for text in data["limitations"]))
+
+    def test_a_response_cut_to_max_chars_trims_nodes_and_items_and_resumes(self):
+        edges = [{"from": hex(0x1000 + i), "to": hex(0x2000 + i), "kind": "direct", "call_count": 1, "call_sites": []}
+                 for i in range(300)]
+        nodes = [{"address": hex(0x1000 + i), "name": "n%d" % i} for i in range(300)]
+        self.fake.fields["callgraph"] = dict(root="0x1000", nodes=nodes, items=edges, total_edge_count=300, offset=0,
+                                             next_offset=None, nodes_truncated=False)
+        data = self.q("callgraph", "start", max_chars=6000)
+        self.assertEqual(data["status"], "PARTIAL")
+        self.assertTrue(data["truncated"])
+        self.assertLess(len(data["items"]), 300)
+        self.assertEqual(data["next_offset"], len(data["items"]))
+        self.assertLessEqual(len(json.dumps(data)), 6200)

@@ -70,6 +70,8 @@ _OPERATIONS = (
     "summary", "list_functions", "segments", "function_at_address",
     "decompile_function", "xrefs_to", "imports_exports", "strings", "type_member_offset",
     "read_bytes", "xrefs_from", "callers_of_import",
+    "disasm_range", "basic_blocks", "callgraph", "stack_frame", "local_variables",
+    "find_bytes", "find_immediate", "list_structs", "get_struct", "flirt_signatures",
 )
 
 # read_bytes: the size window the wrapper enforces too (it refuses before IDA starts).
@@ -800,6 +802,920 @@ def _op_type_member_offset(result, query, max_results, offset):
     result["tried_type_names"] = candidates
 
 
+# ---- read-only listing operations (W2): begin ---------------------------------------------------
+# Everything between this marker and the matching "end" marker only READS the database. A static test
+# (tests/test_tools_ida_queries.py) parses this region and refuses any call whose name starts with a
+# mutating prefix. The requests are checked here and, with the same grammar, by the wrapper before IDA
+# starts (liebert_re.tools.ida); a contract test keeps the two from drifting.
+
+_U64 = 0xFFFFFFFFFFFFFFFF
+_DISASM_MAX_ROWS = 2000
+_DISASM_UNDEFINED_ROW_BYTES = 16     # an undefined run is listed in rows of at most this many bytes
+_DISASM_BYTES_CAP = 64               # bytes shown per instruction or data row
+_CALLGRAPH_MAX_DEPTH = 4
+_CALLGRAPH_MAX_NODES = 500
+_CALLGRAPH_DEFAULT_DEPTH = 2
+_CALLGRAPH_DEFAULT_NODES = 100
+_CALLGRAPH_SITES_PER_EDGE = 8
+_CALLGRAPH_INDIRECT_SITES_PER_NODE = 16
+_BLOCK_EDGE_LIST_MAX = 256
+_PATTERN_MAX_TOKENS = 256
+_FUNCTION_QUERY_MAX = 512
+_TYPE_NAME_QUERY_MAX = 256
+_SEGMENT_NAME_MAX = 64
+
+# (suffix of ida_gdl's fcb_* constant, name in the answer)
+_BLOCK_TYPES = (("normal", "normal"), ("indjump", "indirect_jump"), ("ret", "return"), ("cndret", "conditional_return"),
+                ("noret", "no_return"), ("enoret", "external_no_return"), ("extern", "external"), ("error", "error"))
+
+
+def _to_int(value):
+    """An int from a JSON number or a numeric string (decimal or 0x hex); never from a bool or a float."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip(), 0)
+        except ValueError:
+            return None
+    return None
+
+
+def _json_object(text, allowed):
+    """(dict, True) when `text` is a JSON object whose keys are all in `allowed`, else (None, False)."""
+    try:
+        request = json.loads(text)
+    except Exception:  # noqa: BLE001
+        return None, False
+    if not isinstance(request, dict) or not set(request) <= set(allowed):
+        return None, False
+    return request, True
+
+
+def _address_value(value):
+    """An address from a request field: an int in 0 .. 2**64 - 2, else None."""
+    ea = _to_int(value)
+    if ea is None or ea < 0 or ea >= _U64:
+        return None
+    return ea
+
+
+def _disasm_range_request(query):
+    """({"address", "count", "end"}, None) or (None, error code). JSON {"address", "count"} or
+    {"address", "end"} (exactly one of the two), or the text "ADDRESS COUNT". count is 1..2000."""
+    bad = "INVALID_DISASM_RANGE_REQUEST"
+    text = (query or "").strip()
+    if text.startswith("{"):
+        request, ok = _json_object(text, ("address", "count", "end"))
+        if not ok:
+            return None, bad
+        address, count, end = request.get("address"), request.get("count"), request.get("end")
+    else:
+        parts = text.replace(",", " ").split()
+        if len(parts) != 2:
+            return None, bad
+        address, count, end = parts[0], parts[1], None
+    if address is None or (count is None) == (end is None):
+        return None, bad
+    ea = _address_value(address)
+    if ea is None:
+        return None, "INVALID_ADDRESS"
+    if count is not None:
+        number = _to_int(count)
+        if number is None or not 1 <= number <= _DISASM_MAX_ROWS:
+            return None, "INVALID_COUNT"
+        return {"address": ea, "count": number, "end": None}, None
+    stop = _to_int(end)
+    if stop is None or not ea < stop <= _U64:
+        return None, "INVALID_END_ADDRESS"
+    return {"address": ea, "count": _DISASM_MAX_ROWS, "end": stop}, None
+
+
+def _function_query_problem(query):
+    """None for a usable function query (a name or an address, 1..512 characters), else the error code."""
+    text = (query or "").strip()
+    if not text or len(text) > _FUNCTION_QUERY_MAX:
+        return "FUNCTION_REQUIRED"
+    return None
+
+
+def _callgraph_request(query):
+    """({"function", "depth", "max_nodes"}, None) or (None, error code). The query is a function name or
+    address, or JSON {"function", "depth" (1..4, default 2), "max_nodes" (1..500, default 100)}."""
+    text = (query or "").strip()
+    depth, nodes = _CALLGRAPH_DEFAULT_DEPTH, _CALLGRAPH_DEFAULT_NODES
+    if text.startswith("{"):
+        request, ok = _json_object(text, ("function", "depth", "max_nodes"))
+        if not ok or not isinstance(request.get("function"), str):
+            return None, "INVALID_CALLGRAPH_REQUEST"
+        function = request["function"].strip()
+        if "depth" in request:
+            depth = _to_int(request["depth"])
+        if "max_nodes" in request:
+            nodes = _to_int(request["max_nodes"])
+    else:
+        function = text
+    if _function_query_problem(function):
+        return None, "FUNCTION_REQUIRED"
+    if depth is None or not 1 <= depth <= _CALLGRAPH_MAX_DEPTH:
+        return None, "INVALID_DEPTH"
+    if nodes is None or not 1 <= nodes <= _CALLGRAPH_MAX_NODES:
+        return None, "INVALID_MAX_NODES"
+    return {"function": function, "depth": depth, "max_nodes": nodes}, None
+
+
+def _search_range_fields(fields):
+    """(start, end, segment, error code) from the optional range fields of a find_* request: "start" and
+    "end" addresses (end exclusive, end > start) or a "segment" name, never both kinds."""
+    start, end, segment = fields.get("start"), fields.get("end"), fields.get("segment")
+    if segment is not None:
+        if not isinstance(segment, str) or not segment.strip() or len(segment) > _SEGMENT_NAME_MAX \
+                or start is not None or end is not None:
+            return None, None, None, "INVALID_RANGE"
+        return None, None, segment.strip(), None
+    low = high = None
+    if start is not None:
+        low = _address_value(start)
+        if low is None:
+            return None, None, None, "INVALID_ADDRESS"
+    if end is not None:
+        high = _to_int(end)
+        if high is None or not 0 < high <= _U64:
+            return None, None, None, "INVALID_ADDRESS"
+    if low is not None and high is not None and high <= low:
+        return None, None, None, "INVALID_RANGE"
+    return low, high, None, None
+
+
+def _find_bytes_request(query):
+    """({"pattern", "start", "end", "segment"}, None) or (None, error code). The query is the pattern text
+    ("48 8B ?? 05": hex bytes and ? or ?? wildcards, at most 256 tokens, at least one concrete byte) or JSON
+    {"pattern", "start"?, "end"?, "segment"?}."""
+    text = (query or "").strip()
+    fields = {}
+    if text.startswith("{"):
+        fields, ok = _json_object(text, ("pattern", "start", "end", "segment"))
+        if not ok or not isinstance(fields.get("pattern"), str):
+            return None, "INVALID_FIND_BYTES_REQUEST"
+        pattern = fields["pattern"]
+    else:
+        pattern = text
+    tokens = pattern.split()
+    if not 1 <= len(tokens) <= _PATTERN_MAX_TOKENS:
+        return None, "INVALID_PATTERN"
+    for token in tokens:
+        if token not in ("?", "??") and (len(token) != 2 or any(c not in "0123456789abcdefABCDEF" for c in token)):
+            return None, "INVALID_PATTERN"
+    if all(token in ("?", "??") for token in tokens):
+        return None, "INVALID_PATTERN"
+    start, end, segment, problem = _search_range_fields(fields)
+    if problem:
+        return None, problem
+    normal = " ".join("?" if token in ("?", "??") else token.upper() for token in tokens)
+    return {"pattern": normal, "start": start, "end": end, "segment": segment}, None
+
+
+def _find_immediate_request(query):
+    """({"value", "start", "end", "segment"}, None) or (None, error code). The query is the number (decimal or
+    0x hex, 0 .. 2**64 - 1; a negative number is refused, write its two's-complement form) or JSON
+    {"value", "start"?, "end"?, "segment"?}."""
+    text = (query or "").strip()
+    fields = {}
+    if text.startswith("{"):
+        fields, ok = _json_object(text, ("value", "start", "end", "segment"))
+        if not ok or "value" not in fields:
+            return None, "INVALID_FIND_IMMEDIATE_REQUEST"
+        raw = fields["value"]
+    else:
+        raw = text
+    value = _to_int(raw)
+    if value is None or not 0 <= value <= _U64:
+        return None, "INVALID_VALUE"
+    start, end, segment, problem = _search_range_fields(fields)
+    if problem:
+        return None, problem
+    return {"value": value, "start": start, "end": end, "segment": segment}, None
+
+
+def _type_name_problem(query):
+    """None for a usable type name (1..256 printable characters), else the error code."""
+    text = (query or "").strip()
+    if not text or len(text) > _TYPE_NAME_QUERY_MAX or not text.isprintable():
+        return "INVALID_TYPE_NAME"
+    return None
+
+
+def _filter_problem(query):
+    """None for a usable name filter (empty, or at most 256 printable characters), else the error code."""
+    text = (query or "").strip()
+    if len(text) > _TYPE_NAME_QUERY_MAX or not text.isprintable():
+        return "INVALID_FILTER"
+    return None
+
+
+def _fail(result, error, detail=None, **extra):
+    result["ok"] = False
+    result["error"] = error
+    if detail:
+        result["detail"] = detail
+    result.update(extra)
+
+
+def _page(result, rows, max_results, offset, total_key):
+    """Put one page of `rows` into result["items"] and say where the next one starts."""
+    result["items"] = rows[offset:offset + max_results]
+    result[total_key] = len(rows)
+    result["offset"] = offset
+    following = offset + len(result["items"])
+    result["next_offset"] = following if following < len(rows) else None
+    result["truncated"] = result["next_offset"] is not None
+
+
+def _function_ref(ea):
+    """{"address", "name"} for the function containing `ea`, else None."""
+    func = ida_funcs.get_func(ea)
+    if not func:
+        return None
+    return {"address": hex(func.start_ea), "name": ida_name.get_name(func.start_ea) or None}
+
+
+def _insn_text(ea):
+    """(mnemonic, operand texts) as IDA prints them, without comments or tags."""
+    mnemonic = idc.print_insn_mnem(ea) or ""
+    operands = []
+    for index in range(8):
+        if idc.get_operand_type(ea, index) == idc.o_void:
+            break
+        operands.append(idc.print_operand(ea, index) or "")
+    return mnemonic, operands
+
+
+def _joined(mnemonic, operands):
+    return (mnemonic + (" " + ", ".join(operands) if operands else "")) if mnemonic else None
+
+
+def _bytes_hex(ea, size, cap=_DISASM_BYTES_CAP):
+    """(hex of the first `cap` bytes, whether more bytes exist); (None, False) when IDA holds no value for the span."""
+    if size <= 0:
+        return None, False
+    shown = min(size, cap)
+    data = ida_bytes.get_bytes(ea, shown)
+    if data is None or len(data) != shown:
+        return None, False
+    return bytes(data).hex(), size > cap
+
+
+def _disasm_row(ea):
+    """(row, next address) for the item that starts at `ea`. Only an item IDA decoded as an instruction gets a
+    mnemonic; defined data and undefined bytes are listed as what they are, never disassembled."""
+    flags = ida_bytes.get_flags(ea)
+    row = {"address": hex(ea)}
+    mnemonic, operands = None, None
+    if ida_bytes.is_tail(flags):
+        head = ida_bytes.get_item_head(ea)
+        size = max(1, ida_bytes.get_item_end(head) - ea)
+        row.update(kind="inside_item", item_head=hex(head))
+    elif ida_bytes.is_code(flags):
+        size = max(1, ida_bytes.get_item_size(ea))
+        row["kind"] = "instruction"
+        mnemonic, operands = _insn_text(ea)
+    elif ida_bytes.is_unknown(flags):
+        seg = ida_segment.getseg(ea)
+        size = 0
+        while size < _DISASM_UNDEFINED_ROW_BYTES:
+            cur = ea + size
+            if (seg is not None and cur >= seg.end_ea) or not ida_bytes.is_unknown(ida_bytes.get_flags(cur)):
+                break
+            size += 1
+        size = max(1, size)
+        row["kind"] = "undefined"
+    else:
+        size = max(1, ida_bytes.get_item_size(ea))
+        row["kind"] = "data"
+    row["size"] = size
+    row["bytes_hex"], row["bytes_truncated"] = _bytes_hex(ea, size)
+    row["mnemonic"] = mnemonic or None
+    row["operands"] = operands if mnemonic else None
+    row["text"] = _joined(mnemonic, operands)
+    return row, ea + size
+
+
+def _op_disasm_range(result, query, max_results, offset):
+    """Instructions from an address: at most `count` rows (1..2000) or up to an exclusive `end` address. Each
+    row says what the item is: `instruction` (mnemonic and operands as IDA prints them, no comments),
+    `data` (defined data, not disassembled), `undefined` (bytes IDA has not decoded, listed in rows of at most
+    16 bytes, never disassembled) or `inside_item` (the start address is in the middle of an item). The walk
+    stops where the mapped segments end (`stop_reason`). The last item may extend past `end`. Paged by
+    `offset` / `max_results` over the rows."""
+    request, problem = _disasm_range_request(query)
+    if problem:
+        return _fail(result, problem, "query must be JSON {\"address\": \"0x...\", \"count\": N} or "
+                     "{\"address\": \"0x...\", \"end\": \"0x...\"}, or the text \"0x... N\", with 1 <= N <= %d."
+                     % _DISASM_MAX_ROWS)
+    start, stop, limit = request["address"], request["end"], request["count"]
+    if ida_segment.getseg(start) is None:
+        return _fail(result, "ADDRESS_NOT_MAPPED", address=hex(start))
+    rows = []
+    ea = start
+    stop_reason = None
+    while len(rows) < limit:
+        if stop is not None and ea >= stop:
+            stop_reason = "end_address_reached"
+            break
+        if ida_segment.getseg(ea) is None:
+            stop_reason = "left_mapped_segments"
+            break
+        row, following = _disasm_row(ea)
+        rows.append(row)
+        if following <= ea:
+            stop_reason = "NO_PROGRESS"
+            break
+        ea = following
+    if stop_reason is None:
+        if stop is not None and ea >= stop:
+            stop_reason = "end_address_reached"
+        else:
+            stop_reason = "count_reached" if stop is None else "row_cap_reached"
+    result["start"] = hex(start)
+    result["stop_reason"] = stop_reason
+    result["resume_address"] = hex(ea) if stop_reason in ("count_reached", "row_cap_reached") else None
+    result["instruction_count"] = sum(1 for r in rows if r["kind"] == "instruction")
+    result["undefined_row_count"] = sum(1 for r in rows if r["kind"] == "undefined")
+    result["note"] = ("rows are the database as IDA decoded it; `undefined` and `data` rows were not disassembled "
+                      "and no instruction is guessed for them")
+    _page(result, rows, max_results, offset, "total_row_count")
+
+
+def _op_basic_blocks(result, query, max_results, offset):
+    """Basic blocks of one function from IDA's own flow chart: start, end (exclusive), type, and the start
+    addresses of the successor and predecessor blocks (each list cut at 256 with its true count). A branch out
+    of the function is an `external` block. An indirect jump block is typed `indirect_jump` and its successors
+    are only those IDA itself recorded (a jump table it resolved); none are guessed. Blocks are ordered by start."""
+    if _function_query_problem(query):
+        return _fail(result, "FUNCTION_REQUIRED", "query is a function name or address (1..%d characters)."
+                     % _FUNCTION_QUERY_MAX)
+    ea = _resolve_function(query)
+    if ea is None:
+        return _fail(result, "FUNCTION_NOT_FOUND")
+    import ida_gdl
+    func = ida_funcs.get_func(ea)
+    type_names = {}
+    for suffix, name in _BLOCK_TYPES:
+        code = getattr(ida_gdl, "fcb_" + suffix, None)
+        if isinstance(code, int):
+            type_names[code] = name
+    budget = _Budget("basic_blocks")
+    blocks = []
+    for block in ida_gdl.FlowChart(func):
+        if budget.tick():
+            break
+        succs = sorted(s.start_ea for s in block.succs())
+        preds = sorted(p.start_ea for p in block.preds())
+        blocks.append({
+            "start": hex(block.start_ea), "end": hex(block.end_ea), "type": type_names.get(block.type, "UNKNOWN"),
+            "type_code": block.type,
+            "successor_count": len(succs), "successors": [hex(s) for s in succs[:_BLOCK_EDGE_LIST_MAX]],
+            "predecessor_count": len(preds), "predecessors": [hex(p) for p in preds[:_BLOCK_EDGE_LIST_MAX]],
+            "edge_lists_truncated": len(succs) > _BLOCK_EDGE_LIST_MAX or len(preds) > _BLOCK_EDGE_LIST_MAX,
+        })
+    blocks.sort(key=lambda b: int(b["start"], 16))
+    result["function"] = {"address": hex(func.start_ea), "end": hex(func.end_ea),
+                          "name": ida_name.get_name(func.start_ea) or None}
+    result["edge_count"] = sum(b["successor_count"] for b in blocks)
+    _page(result, blocks, max_results, offset, "total_block_count")
+    if budget.tripped:
+        result.update(budget.as_limited())
+
+
+def _import_slots(errors):
+    """{slot address: (module, name)} for every import-table entry IDA read; a failure is added to `errors`."""
+    slots = {}
+    budget = _Budget("import_slots")
+    try:
+        for index in range(ida_nalt.get_import_module_qty()):
+            module = ida_nalt.get_import_module_name(index) or ""
+
+            def collect(ea, name, ordinal, m=module):
+                slots[ea] = (m, name or (("#%d" % ordinal) if ordinal else None))
+                return not budget.tick()
+
+            ida_nalt.enum_import_names(index, collect)
+            if budget.tripped:
+                errors.append("IMPORT_SLOT_WALK_LIMIT")
+                break
+    except Exception as exc:  # noqa: BLE001
+        errors.append("IMPORT_LOOKUP_FAILED: %s: %s" % (type(exc).__name__, exc))
+    return slots
+
+
+def _op_callgraph(result, query, max_results, offset):
+    """Call graph from one root function, breadth first to `depth` (1..4) and at most `max_nodes` (1..500)
+    nodes. A direct call (a call instruction with a near/far operand IDA resolved to code) is an edge of kind
+    `direct`; a call through an import-table slot is an edge to the import (`is_import`); in a thunk function a
+    jump IDA resolved is a `thunk_jump` (or `import`) edge. A call through a register or a memory operand that is
+    not an import slot is COUNTED (`indirect_call_count` per node, `indirect_call_total`, the first sites listed)
+    and never resolved. A function not looked into is `expanded: false` with the reason (`depth_limit`,
+    `import`, `not_a_function`), so a leaf is told apart from one not examined. `items` are the edges, paged;
+    `nodes` is the complete node list (at most `max_nodes`)."""
+    request, problem = _callgraph_request(query)
+    if problem:
+        return _fail(result, problem, "query is a function name or address, or JSON {\"function\": ..., "
+                     "\"depth\": 1-%d, \"max_nodes\": 1-%d}." % (_CALLGRAPH_MAX_DEPTH, _CALLGRAPH_MAX_NODES))
+    root = _resolve_function(request["function"])
+    if root is None:
+        return _fail(result, "FUNCTION_NOT_FOUND")
+    errors = []
+    slots = _import_slots(errors)
+    budget = _Budget("callgraph")
+    nodes = {}
+    edges = {}
+    queue = []
+    dropped = set()
+    not_recorded = [0]
+
+    def node(ea, depth):
+        """The node at `ea`, created on first sight (and queued if it can be looked into); None when the node
+        cap is reached."""
+        existing = nodes.get(ea)
+        if existing is not None:
+            return existing
+        if len(nodes) >= request["max_nodes"]:
+            dropped.add(ea)
+            return None
+        func = ida_funcs.get_func(ea)
+        is_import = ea in slots
+        is_function = (not is_import) and bool(func) and func.start_ea == ea
+        info = {"address": hex(ea), "name": (slots[ea][1] if is_import else ida_name.get_name(ea)) or None,
+                "is_import": is_import, "import_module": slots[ea][0] if is_import else None,
+                "is_function": is_function,
+                "is_thunk": is_function and bool(func.flags & ida_funcs.FUNC_THUNK),
+                "depth": depth, "expanded": False,
+                "not_expanded_reason": None if is_function else ("import" if is_import else "not_a_function"),
+                "indirect_call_count": 0, "indirect_call_sites": []}
+        nodes[ea] = info
+        if is_function:
+            queue.append(ea)
+        return info
+
+    def connect(frm, to, kind, site, depth):
+        if node(to, depth) is None:
+            not_recorded[0] += 1
+            return
+        edge = edges.get((frm, to))
+        if edge is None:
+            edge = edges[(frm, to)] = {"from": hex(frm), "to": hex(to), "kind": kind, "call_count": 0,
+                                       "call_sites": [], "call_sites_truncated": False}
+        edge["call_count"] += 1
+        if len(edge["call_sites"]) < _CALLGRAPH_SITES_PER_EDGE:
+            edge["call_sites"].append(hex(site))
+        else:
+            edge["call_sites_truncated"] = True
+
+    node(root, 0)
+    call_types = (ida_xref.fl_CF, ida_xref.fl_CN)
+    jump_types = (ida_xref.fl_JF, ida_xref.fl_JN)
+    head = 0
+    while head < len(queue) and not budget.tripped:
+        current = queue[head]
+        head += 1
+        info = nodes[current]
+        if info["depth"] >= request["depth"]:
+            info["not_expanded_reason"] = "depth_limit"
+            continue
+        info["expanded"] = True
+        thunk = info["is_thunk"]
+        for site in idautils.FuncItems(current):
+            if budget.tick():
+                break
+            is_call = bool(idaapi.is_call_insn(site))
+            if not is_call and not thunk:
+                continue
+            refs = list(idautils.XrefsFrom(site, 0))
+            if is_call:
+                targets = [x.to for x in refs if x.iscode and x.type in call_types]
+            else:           # a jump inside a thunk: a code jump IDA resolved, or a reference to an import slot
+                targets = [x.to for x in refs if (x.iscode and x.type in call_types + jump_types) or x.to in slots]
+            direct_operand = idc.get_operand_type(site, 0) in (idc.o_near, idc.o_far)
+            resolved = False
+            for target in dict.fromkeys(targets):
+                if target in slots:
+                    connect(current, target, "import", site, info["depth"] + 1)
+                elif direct_operand or not is_call:
+                    connect(current, target, "direct" if is_call else "thunk_jump", site, info["depth"] + 1)
+                else:
+                    continue
+                resolved = True
+            if is_call and not resolved:
+                info["indirect_call_count"] += 1
+                if len(info["indirect_call_sites"]) < _CALLGRAPH_INDIRECT_SITES_PER_NODE:
+                    info["indirect_call_sites"].append(hex(site))
+    for info in nodes.values():
+        if info["is_function"] and not info["expanded"] and info["not_expanded_reason"] is None:
+            info["not_expanded_reason"] = "walk_limit"
+    ordered = list(nodes.values())
+    result["root"] = hex(root)
+    result["depth_limit"] = request["depth"]
+    result["max_nodes"] = request["max_nodes"]
+    result["nodes"] = ordered
+    result["node_count"] = len(ordered)
+    result["nodes_truncated"] = bool(dropped)
+    result["dropped_node_count"] = len(dropped)
+    result["edges_not_recorded"] = not_recorded[0]
+    result["indirect_call_total"] = sum(n["indirect_call_count"] for n in ordered)
+    result["indirect_calls_note"] = ("a call through a register or a memory operand that is not an import slot is "
+                                     "counted per node and never resolved; the graph has no edge for it")
+    if errors:
+        result["lookup_errors"] = errors
+    _page(result, list(edges.values()), max_results, offset, "total_edge_count")
+    if budget.tripped:
+        result.update(budget.as_limited())
+
+
+def _frame_tinfo(func):
+    """The function's frame as a tinfo_t, or None when the database holds none."""
+    import ida_typeinf
+    tif = ida_typeinf.tinfo_t()
+    frame_of = getattr(tif, "get_function_frame", None)
+    found = frame_of(func.start_ea) if frame_of is not None else tif.get_func_frame(func)
+    return tif if found else None
+
+
+def _frame_landmark(name, func):
+    """One of IDA's frame landmarks (`frame_off_savregs`, ...) for `func`, or None."""
+    import ida_frame
+    by_address = getattr(ida_frame, name + "_ea", None)
+    try:
+        return int(by_address(func.start_ea)) if by_address is not None else int(getattr(ida_frame, name)(func))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _member_json(index, udm):
+    """{"index", "offset", "name", "size", "type_str", ...} for one tinfo user-defined member."""
+    bits, size_bits = udm.offset, udm.size
+    return {
+        "index": index, "offset": bits // 8, "offset_bits": bits, "byte_aligned": bits % 8 == 0,
+        "name": udm.name or None, "size": (size_bits // 8) if size_bits and size_bits % 8 == 0 else None,
+        "size_bits": size_bits, "type_str": _safe(lambda: str(udm.type)),
+        "is_bitfield": bool(_safe(udm.is_bitfield, False)),
+    }
+
+
+def _op_stack_frame(result, query, max_results, offset):
+    """The stack frame IDA recorded for one function: sizes, IDA's landmark offsets, and the members
+    {offset, name, size, type_str, region}. `region` separates `local`, `saved_registers`, `return_address` and
+    `argument` by IDA's own frame landmarks (an offset below the saved-register start is a local, at or above
+    the argument start an argument); a member is not reclassified by its name. `offset` counts from the start of
+    the frame as IDA numbers it, `offset_from_return_address` is negative for locals. A function with no frame
+    in the database is `NO_STACK_FRAME`; nothing is rebuilt from the instructions."""
+    if _function_query_problem(query):
+        return _fail(result, "FUNCTION_REQUIRED", "query is a function name or address (1..%d characters)."
+                     % _FUNCTION_QUERY_MAX)
+    ea = _resolve_function(query)
+    if ea is None:
+        return _fail(result, "FUNCTION_NOT_FOUND")
+    import ida_frame
+    func = ida_funcs.get_func(ea)
+    tif = _frame_tinfo(func)
+    if tif is None:
+        return _fail(result, "NO_STACK_FRAME", "the database holds no frame for this function; none is inferred",
+                     function={"address": hex(func.start_ea), "name": ida_name.get_name(func.start_ea) or None})
+    saved = _frame_landmark("frame_off_savregs", func)
+    retaddr = _frame_landmark("frame_off_retaddr", func)
+    args = _frame_landmark("frame_off_args", func)
+    members = []
+    for index in range(tif.get_udt_nmembers()):
+        found = _safe(lambda i=index: tif.get_udm(i))
+        if not found:
+            continue
+        entry = _member_json(index, found[1])
+        position = entry["offset"]
+        if None in (saved, retaddr, args):
+            region = None
+        elif position < saved:
+            region = "local"
+        elif position < retaddr:
+            region = "saved_registers"
+        elif position < args:
+            region = "return_address"
+        else:
+            region = "argument"
+        entry["region"] = region
+        entry["is_argument"] = (region == "argument") if region else None
+        entry["offset_from_return_address"] = (position - retaddr) if retaddr is not None else None
+        members.append(entry)
+    result["function"] = {"address": hex(func.start_ea), "name": ida_name.get_name(func.start_ea) or None}
+    result["frame_size"] = _safe(lambda: int(ida_frame.get_frame_size_ea(func.start_ea)))
+    result["locals_size"] = _safe(lambda: int(func.frsize))
+    result["saved_registers_size"] = _safe(lambda: int(func.frregs))
+    result["arguments_size"] = _safe(lambda: int(func.argsize))
+    result["landmarks"] = {"saved_registers_offset": saved, "return_address_offset": retaddr, "arguments_offset": args}
+    result["landmarks_note"] = ("offsets are bytes from the start of the frame as IDA numbers it; `frame_size` is IDA's "
+                                "locals + saved registers + return address; `arguments_size` is what IDA recorded "
+                                "for stack-passed arguments and can be 0 on a register-passing ABI")
+    _page(result, members, max_results, offset, "total_member_count")
+
+
+def _mreg_name(reg, width):
+    return _safe(lambda: ida_hexrays.get_mreg_name(reg, width)) or None
+
+
+def _lvar_location(lvar):
+    loc = lvar.location
+    width = _safe(lambda: int(lvar.width), 0) or 0
+    if _safe(loc.is_stkoff, False):
+        return {"kind": "stack", "stack_offset": _safe(loc.stkoff),
+                "basis": "Hex-Rays' own stack offset for the variable, not translated to IDA's frame offset"}
+    if _safe(loc.is_reg1, False):
+        return {"kind": "register", "register": _mreg_name(loc.reg1(), width), "register_number": _safe(loc.reg1),
+                "register_offset": _safe(loc.regoff)}
+    if _safe(loc.is_reg2, False):
+        half = (width // 2) or width
+        return {"kind": "register_pair", "registers": [_mreg_name(loc.reg1(), half), _mreg_name(loc.reg2(), half)]}
+    if _safe(loc.is_scattered, False):
+        return {"kind": "scattered"}
+    if _safe(loc.is_rrel, False):
+        return {"kind": "register_relative"}
+    if _safe(loc.is_ea, False):
+        return {"kind": "static", "address": _hex(_safe(loc.get_ea))}
+    return {"kind": "unknown"}
+
+
+def _op_local_variables(result, query, max_results, offset):
+    """The decompiler's local-variable list for one function: {name, type, is_arg, location, size}. Needs
+    Hex-Rays: with no decompiler (`HEXRAYS_NOT_AVAILABLE`) or a function it cannot decompile
+    (`HEXRAYS_DECOMPILE_FAILED`) the answer is that error, never a list rebuilt from the frame. Names and types
+    are the decompiler's reading (an unnamed variable has name null). The session is temporary, so nothing the
+    decompiler infers is kept."""
+    if _function_query_problem(query):
+        return _fail(result, "FUNCTION_REQUIRED", "query is a function name or address (1..%d characters)."
+                     % _FUNCTION_QUERY_MAX)
+    ea = _resolve_function(query)
+    if ea is None:
+        return _fail(result, "FUNCTION_NOT_FOUND")
+    result["function"] = _func_json(ea)
+    if not ida_hexrays.init_hexrays_plugin():
+        return _fail(result, "HEXRAYS_NOT_AVAILABLE")
+    try:
+        cfunc = ida_hexrays.decompile(ea)
+    except ida_hexrays.DecompilationFailure as exc:
+        return _fail(result, "HEXRAYS_DECOMPILE_FAILED", str(exc))
+    if cfunc is None:
+        return _fail(result, "HEXRAYS_DECOMPILE_FAILED")
+    rows = []
+    for index, lvar in enumerate(cfunc.lvars):
+        rows.append({
+            "index": index, "name": lvar.name or None, "type": _safe(lambda v=lvar: str(v.type())),
+            "is_arg": bool(lvar.is_arg_var), "size": _safe(lambda v=lvar: int(v.width)),
+            "location": _lvar_location(lvar),
+        })
+    result["decompiler"] = "hexrays"
+    _page(result, rows, max_results, offset, "total_variable_count")
+
+
+def _search_ranges(request):
+    """([(low, high)], None) for a find_* request's range fields, or (None, "SEGMENT_NOT_FOUND"). A segment
+    name selects every segment of that name (a PE can have two `.rdata`); no range at all is the whole database."""
+    if request["segment"] is not None:
+        found = []
+        for start in idautils.Segments():
+            seg = ida_segment.getseg(start)
+            if seg is not None and ida_segment.get_segm_name(seg) == request["segment"]:
+                found.append((seg.start_ea, seg.end_ea))
+        return (found, None) if found else (None, "SEGMENT_NOT_FOUND")
+    low_db, high_db = ida_ida.inf_get_min_ea(), ida_ida.inf_get_max_ea()
+    low = low_db if request["start"] is None else max(request["start"], low_db)
+    high = high_db if request["end"] is None else min(request["end"], high_db)
+    return ([(low, high)] if low < high else []), None
+
+
+def _segment_not_found(result, request):
+    names = []
+    for start in idautils.Segments():
+        seg = ida_segment.getseg(start)
+        if seg is not None and ida_segment.get_segm_name(seg) not in names:
+            names.append(ida_segment.get_segm_name(seg))
+    _fail(result, "SEGMENT_NOT_FOUND", segment=request["segment"], segment_names=names[:100])
+
+
+def _match_page(result, matches, max_results, offset, budget):
+    """Skip `offset` matches, keep `max_results`, peek one more: `next_offset` is set only if one exists."""
+    seen = 0
+    more = False
+    for entry in matches:
+        if seen >= offset + max_results:
+            more = True
+            break
+        if seen >= offset:
+            result["items"].append(entry)
+        seen += 1
+        if budget.tick():
+            break
+    result["offset"] = offset
+    result["matches_seen"] = seen + (1 if more else 0)
+    result["next_offset"] = (offset + len(result["items"])) if more else None
+    result["truncated"] = more
+    if budget.tripped:
+        result.update(budget.as_limited())
+
+
+def _op_find_bytes(result, query, max_results, offset):
+    """Occurrences of a byte pattern (IDA's text form, "48 8B ?? 05": hex bytes and `?` / `??` wildcards) in the
+    loaded database, forward in address order, optionally within `start`..`end` (exclusive) or one `segment`
+    name. Each match: address, the matched bytes, the segment and the function containing it (null if none).
+    Only bytes IDA holds a value for can match. This is the database as IDA mapped the file, not process
+    memory. Paged: `truncated` while `next_offset` is not null; `max_results` is the match cap (1..1000)."""
+    request, problem = _find_bytes_request(query)
+    if problem:
+        return _fail(result, problem, "query is a pattern of hex bytes and ? / ?? wildcards (at most %d tokens, one "
+                     "concrete byte at least) or JSON {\"pattern\", \"start\"?, \"end\"?, \"segment\"?}."
+                     % _PATTERN_MAX_TOKENS)
+    ranges, problem = _search_ranges(request)
+    if problem:
+        return _segment_not_found(result, request)
+    width = len(request["pattern"].split())
+    budget = _Budget("find_bytes")
+
+    def matches():
+        for low, high in ranges:
+            cursor = low
+            while cursor < high:
+                hit = ida_bytes.find_bytes(request["pattern"], cursor, range_end=high)
+                if hit == idc.BADADDR or hit < cursor or hit >= high:
+                    break
+                matched, _more = _bytes_hex(hit, width, _PATTERN_MAX_TOKENS)
+                yield {"address": hex(hit), "bytes_hex": matched, "segment": idc.get_segm_name(hit) or None,
+                       "function": _function_ref(hit)}
+                cursor = hit + 1
+
+    result["pattern"] = request["pattern"]
+    result["ranges"] = [{"start": hex(a), "end": hex(b)} for a, b in ranges]
+    result["search_scope"] = ("the database as IDA mapped the file, in address order; bytes IDA holds no value for "
+                              "never match; overlapping matches are all listed")
+    _match_page(result, matches(), max_results, offset, budget)
+
+
+def _op_find_immediate(result, query, max_results, offset):
+    """Instructions that have an immediate operand equal to a number, by IDA's own immediate search, forward in
+    address order, optionally within `start`..`end` (exclusive) or one `segment` name. Each match: address,
+    operand index, the instruction text (no comments) and the function containing it. The number is compared as
+    IDA decoded the operand; the same constant written sign-extended, negated or inside a larger one is a
+    different number and is not found by this query. Paged like `find_bytes`."""
+    request, problem = _find_immediate_request(query)
+    if problem:
+        return _fail(result, problem, "query is a number (0 .. 2**64-1, decimal or 0x hex) or JSON {\"value\", "
+                     "\"start\"?, \"end\"?, \"segment\"?}.")
+    ranges, problem = _search_ranges(request)
+    if problem:
+        return _segment_not_found(result, request)
+    import ida_search
+    budget = _Budget("find_immediate")
+    flags = ida_search.SEARCH_DOWN | ida_search.SEARCH_NEXT
+
+    def matches():
+        for low, high in ranges:
+            cursor = low - 1 if low > 0 else 0       # IDA's search starts after the address it is given
+            while True:
+                found = ida_search.find_imm(cursor, flags, request["value"])
+                hit, operand = tuple(found) if isinstance(found, (tuple, list)) else (found, None)
+                if hit == idc.BADADDR or hit <= cursor or hit < low or hit >= high:
+                    break
+                mnemonic, operands = _insn_text(hit)
+                yield {"address": hex(hit), "operand_index": operand, "function": _function_ref(hit),
+                       "instruction": _joined(mnemonic, operands)}
+                cursor = hit
+
+    result["value"] = hex(request["value"])
+    result["ranges"] = [{"start": hex(a), "end": hex(b)} for a, b in ranges]
+    result["search_scope"] = ("immediate operands as IDA decoded them; a constant written sign-extended, negated or "
+                              "as part of a larger value is a different number and is not searched")
+    _match_page(result, matches(), max_results, offset, budget)
+
+
+def _tinfo_size(tif):
+    size = _safe(tif.get_size)
+    return None if size is None or size == _U64 else size
+
+
+def _op_list_structs(result, query, max_results, offset):
+    """Struct and union names in the database's local type library, in ordinal order, with their size and member
+    count. `query`, when non-empty, is a case-insensitive substring filter on the name. This lists the local
+    types; types that exist only in a loaded type library are not listed (`get_struct` can still resolve those
+    by name). Paged: `total_struct_count` counts the matches."""
+    if _filter_problem(query):
+        return _fail(result, "INVALID_FILTER", "query is an optional name filter of at most %d printable characters."
+                     % _TYPE_NAME_QUERY_MAX)
+    import ida_typeinf
+    needle = (query or "").strip().lower()
+    til = ida_typeinf.get_idati()
+    budget = _Budget("list_structs")
+    matched = 0
+    for ordinal in range(1, ida_typeinf.get_ordinal_limit(til)):
+        if budget.tick():
+            break
+        tif = ida_typeinf.tinfo_t()
+        if not tif.get_numbered_type(til, ordinal) or not tif.is_udt():
+            continue
+        name = _safe(tif.get_type_name)
+        if needle and needle not in (name or "").lower():
+            continue
+        matched += 1
+        if matched > offset and len(result["items"]) < max_results:
+            result["items"].append({
+                "name": name, "ordinal": ordinal, "kind": "union" if tif.is_union() else "struct",
+                "size": _tinfo_size(tif), "member_count": _safe(tif.get_udt_nmembers),
+            })
+    result["total_struct_count"] = matched
+    result["offset"] = offset
+    following = offset + len(result["items"])
+    result["next_offset"] = following if following < matched else None
+    result["truncated"] = result["next_offset"] is not None
+    if budget.tripped:
+        result.update(budget.as_limited())
+
+
+def _op_get_struct(result, query, max_results, offset):
+    """The members of one struct or union: {index, offset, name, size, type_str} with bit-exact offsets
+    (`offset_bits`, `byte_aligned`, `is_bitfield`). The name as given and its leading-underscore counterpart are
+    both tried (`_FOO` / `FOO`), against the local types and the loaded type libraries, as `type_member_offset`
+    does. A name that is no type is `TYPE_NOT_FOUND`, one that is no struct or union `TYPE_NOT_STRUCT_OR_UNION`;
+    both speak only for the type information loaded in the database. Members are paged."""
+    if _type_name_problem(query):
+        return _fail(result, "INVALID_TYPE_NAME", "query is a type name of at most %d printable characters."
+                     % _TYPE_NAME_QUERY_MAX)
+    import ida_typeinf
+    name = query.strip()
+    candidates = [name, name[1:] if name.startswith("_") else "_" + name]
+    til = ida_typeinf.get_idati()
+    not_struct = []
+    for candidate in candidates:
+        tif = ida_typeinf.tinfo_t()
+        if not tif.get_named_type(til, candidate, ida_typeinf.BTF_TYPEDEF, True):
+            continue
+        if not tif.is_udt():
+            not_struct.append(candidate)
+            continue
+        members = []
+        for index in range(tif.get_udt_nmembers()):
+            found = _safe(lambda i=index: tif.get_udm(i))
+            if found:
+                members.append(_member_json(index, found[1]))
+        result["resolved_type_name"] = candidate
+        result["tried_type_names"] = candidates
+        result["kind"] = "union" if tif.is_union() else "struct"
+        result["size"] = _tinfo_size(tif)
+        result["member_count"] = tif.get_udt_nmembers()
+        _page(result, members, max_results, offset, "total_member_count")
+        return
+    _fail(result, "TYPE_NOT_STRUCT_OR_UNION" if not_struct else "TYPE_NOT_FOUND", tried_type_names=candidates)
+
+
+def _op_flirt_signatures(result, query, max_results, offset):
+    """The FLIRT signature files in IDA's list for this database, each with its state and the number of
+    functions IDA recorded as matched by it. `library_flagged_function_count` is a separate count of functions
+    carrying IDA's library flag (from any source); the two are not added or reconciled. A count IDA does not
+    give is null. Listing only: no signature is applied or planned. Paged over the signatures."""
+    if (query or "").strip():
+        return _fail(result, "UNEXPECTED_QUERY", "flirt_signatures takes no query.")
+    states = {}
+    for label in ("APPLIED", "PLANNED", "CURRENT"):
+        value = _safe(lambda l=label: getattr(ida_funcs, "IDASGN_" + l))
+        if value is not None:
+            states[value] = label.lower()
+    rows = []
+    for index in range(ida_funcs.get_idasgn_qty()):
+        desc = _safe(lambda i=index: ida_funcs.get_idasgn_desc_with_matches(i))
+        name = desc[0] if desc else None
+        state = _safe(lambda i=index: ida_funcs.calc_idasgn_state(i))
+        rows.append({
+            "index": index, "name": name,
+            "title": _safe(lambda n=name: ida_funcs.get_idasgn_title(n)) if name else None,
+            "optional_libraries": (desc[1] or None) if desc else None,
+            "matched_function_count": desc[2] if desc and len(desc) > 2 else None,
+            "state": (states.get(state, "UNKNOWN")) if state is not None else None,
+        })
+    budget = _Budget("flirt_library_functions")
+    flagged = 0
+    for start in idautils.Functions():
+        func = ida_funcs.get_func(start)
+        if func and (func.flags & ida_funcs.FUNC_LIB):
+            flagged += 1
+        if budget.tick():
+            break
+    result["signature_count"] = len(rows)
+    result["library_flagged_function_count"] = None if budget.tripped else flagged
+    result["note"] = ("matched_function_count is what IDA recorded for each signature when it was applied; it is not "
+                      "summed with library_flagged_function_count, which counts every function flagged as library code")
+    _page(result, rows, max_results, offset, "total_signature_count")
+    if budget.tripped:
+        result.update(budget.as_limited())
+
+
+# ---- read-only listing operations (W2): end -----------------------------------------------------
+
+
 _DISPATCH = {
     "summary": _op_summary,
     "list_functions": _op_list_functions,
@@ -813,6 +1729,16 @@ _DISPATCH = {
     "read_bytes": _op_read_bytes,
     "xrefs_from": _op_xrefs_from,
     "callers_of_import": _op_callers_of_import,
+    "disasm_range": _op_disasm_range,
+    "basic_blocks": _op_basic_blocks,
+    "callgraph": _op_callgraph,
+    "stack_frame": _op_stack_frame,
+    "local_variables": _op_local_variables,
+    "find_bytes": _op_find_bytes,
+    "find_immediate": _op_find_immediate,
+    "list_structs": _op_list_structs,
+    "get_struct": _op_get_struct,
+    "flirt_signatures": _op_flirt_signatures,
 }
 
 
