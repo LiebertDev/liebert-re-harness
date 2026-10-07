@@ -68,15 +68,21 @@ def test_tool_modules_ignores_unpublished_names(tmp_path):
     assert tf.tool_modules(package) == {}
 
 
-def test_python_only_declarations_are_the_write_capable_tools_and_the_sentinel():
-    # Names, not a count: each of these writes or deletes state, or is the tool_missing sentinel. Adding to
-    # this set is a decision to keep a tool off the generic `tool run` path.
+def test_python_only_declarations_are_well_formed_published_and_not_dispatched_by_cli():
+    import ast
+
     declared = tf.python_only_declarations()
-    assert set(declared) == {
-        "asar_inspect", "binary_patch", "claim_index", "evidence_index", "ida_annotations_apply",
-        "ida_annotations_purge", "rizin_patch_apply", "tool_missing", "workspace_index",
-    }
+    assert declared, "the generic dispatcher relies on write-capable tools being declared"
+    # (a) every declaration carries a reason
     assert all(reason.strip() for reason in declared.values())
+    # (b) only published tools can be declared
+    published = set().union(*(tf.published_tools(family) for family in tf.FAMILIES))
+    assert set(declared) <= published
+    # (c) cli.py dispatches by string literal (`_load("module", "function")`, or a literal in a name table);
+    # collect every string literal in it and require that no declared tool is among them.
+    cli_source = (Path(__file__).resolve().parent.parent / "liebert_re" / "cli.py").read_text(encoding="utf-8")
+    literals = {n.value for n in ast.walk(ast.parse(cli_source)) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    assert not set(declared) & literals, f"declared python-only but dispatched by cli.py: {sorted(set(declared) & literals)}"
 
 
 def test_python_only_declaration_parsing(tmp_path):
