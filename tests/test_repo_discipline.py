@@ -68,22 +68,17 @@ KNOWN_PRIVATE_REFS = {
     "liebert_re/evidence/artifact_provenance.py": ({"TEACHER_"}, "teacher_* identifiers (e.g. prompts/teacher_system.md, teacher_model); surfaced by the case-insensitive scan"),
     "liebert_re/evidence/index.py": ({"research_state"}, _DEAD),
     "liebert_re/evidence/security.py": ({"TEACHER_", "research_state"}, _DEAD + "; lowercase teacher_runtime_tool_dispatch string"),
-    "liebert_re/recover/lll_exact.py": ({"teacher.py"}, _DEAD),
     "liebert_re/report/tool_families.py": ({"tools_emulation"}, _DEAD),
     "liebert_re/tools/rizin.py": ({"tools_decompiler"}, _DEAD),
-    "liebert_re/tools/il2cpp.py": ({"TEACHER_"}, "temp-dir prefix teacher_il2cpp_; surfaced by the case-insensitive scan"),
-    "liebert_re/workspace.py": ({"TEACHER_", "teacher.py"}, _ENV + " (live code: TEACHER_WORKSPACE etc.)"),
-    "liebert_re/tools/yara_x.py": ({"TEACHER_", "tools_capability_extract", "tools_decompiler"}, _DEAD + "; temp-dir prefix teacher_yarax_rule_"),
-    "liebert_re/evidence/workspace_index.py": ({"TEACHER_", "tools_memory_scan"}, _ENV + "; plus a dead docstring reference"),
-    "tests/conftest.py": ({"TEACHER_", "mcp_server", "research_state", "teacher.py"}, _DEAD),
+    "liebert_re/workspace.py": ({"TEACHER_"}, _ENV + " (live code: TEACHER_WORKSPACE etc.)"),
+    "liebert_re/tools/yara_x.py": ({"tools_capability_extract", "tools_decompiler"}, _DEAD),
+    "liebert_re/evidence/workspace_index.py": ({"tools_memory_scan"}, _DEAD),
+    "tests/conftest.py": ({"research_state"}, _DEAD),
     "tests/test_artifact_provenance_absent_inputs.py": ({"TEACHER_"}, "names prompts/teacher_system.md; surfaced by the case-insensitive scan"),
-    "tests/test_claim_guard.py": ({"TEACHER_", "teacher.py"}, _DEAD),
     "tests/test_disassemble_pe_va_resolution.py": ({"tools_emulation"}, _DEAD),
     "tests/test_evidence_attestation_honesty.py": ({"TEACHER_"}, "fixture string teacher_runtime_tool_dispatch; surfaced by the case-insensitive scan"),
     "tests/test_public_format_probes.py": ({"research_state", "tools_decompiler"}, _DEAD),
     "tests/test_public_generic_static_probe.py": ({"research_state"}, _DEAD),
-    "tests/test_structured_config_schema.py": ({"TEACHER_", "teacher.py"}, _DEAD),
-    "tests/test_tools_lattice.py": ({"teacher.py"}, _DEAD),
     "tests/test_tools_yara_x.py": ({"tools_decompiler"}, _DEAD),
 }
 
@@ -369,15 +364,17 @@ def test_allowlists_have_not_grown():
     assert hashlib.sha256(repr(PRIVATE_IDS).encode()).hexdigest().startswith("d51a752750a0f2a7")
     assert set(KNOWN_UNREFERENCED) == {"liebert_re.tools.asar_parser"}
     assert set(KNOWN_USER_PATHS) == {"tests/test_public_provenance_and_fixtures.py", "liebert_re/workspace.py"}
+    # 23 -> 18 entries, 34 -> 21 identifiers: dead mentions of the upstream project's earlier name
+    # removed (five files dropped; four more lost identifiers). Live compatibility env variables untouched.
     # tests/conftest.py: six stale tools_* identifiers removed (40 -> 34); earlier, 24 -> 23 entries,
     # 41 -> 40 identifiers: tests/test_pe_resources.py now builds its fixtures
     # (docs/CORPUS.md) and no longer names a private-tree identifier, so its entry was removed.
-    assert len(KNOWN_PRIVATE_REFS) == 23
-    assert sum(len(ids) for ids, _ in KNOWN_PRIVATE_REFS.values()) == 34
+    assert len(KNOWN_PRIVATE_REFS) == 18
+    assert sum(len(ids) for ids, _ in KNOWN_PRIVATE_REFS.values()) == 21
     # Fingerprint of every (path, identifiers) pair: swapping an entry, not only
     # adding one, changes it. Update it only when REMOVING entries.
     digest = hashlib.sha256(repr(sorted((f, sorted(i)) for f, (i, _) in KNOWN_PRIVATE_REFS.items())).encode()).hexdigest()
-    assert digest.startswith("63966aa9effe05b4")
+    assert digest.startswith("fb95cca16cd295cd")
     assert all(reason for _, reason in KNOWN_PRIVATE_REFS.values())
 
 

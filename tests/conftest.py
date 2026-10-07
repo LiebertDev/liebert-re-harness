@@ -47,68 +47,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_EVIDENCE_ROOT = (REPO_ROOT / "dataset" / "evidence").resolve()
 
 
-@pytest.fixture(autouse=True)
-def _reset_shared_tool_bus_call_budget():
-    """``teacher.TOOL_BUS`` (``teacher.py``, module scope) is constructed
-    exactly once per process, at ``import teacher`` time, with a
-    ``ToolBudget(max_calls=200)`` -- a deliberate per-real-session guard
-    against runaway tool usage. Its call/output counters
-    (``ToolBus._calls``/``_output_chars``/``_per_tool``/``_status_counts``)
-    live on that one long-lived instance and are never reset by anything,
-    by design: in production, one process is one session, so "since this
-    process started" and "since this session started" are the same thing.
-
-    A pytest run breaks that equivalence: ``sys.modules`` caches ``teacher``
-    for the WHOLE process, so every test that ever routes a real call through
-    the shared bus (``mcp_server.build_server(...).handle_message(...)``,
-    ``teacher.ask(...)``, or a direct ``teacher.TOOL_BUS.execute(...)``) adds
-    to the SAME counters as every other such test in the same pytest
-    process, in file/method order. Once the cumulative count anywhere in the
-    suite reaches 200 -- trivially reached across a 2000+-test run with many
-    real-tool-call tests -- every later call from ANY test, anywhere, silently
-    gets back ``{"status": "BUDGET_EXHAUSTED", ...}`` instead of its real
-    result, for the rest of the process. Measured live regression this
-    fixture closes (reproduced by directly setting
-    ``teacher.TOOL_BUS._calls = 999`` and re-running in-process):
-    ``tests/test_mcp_server.py::MCPServerTests::test_out_of_scope_path_is_refused``,
-    ``::MCPServerProfileTests::test_route_file_names_locked_tools_and_the_profile_to_unlock_them``,
-    ``::RizinAndFabricationAuditExposureTests::test_rizin_status_callable_through_the_bus_and_agrees_with_registry``,
-    ``::RizinAndFabricationAuditExposureTests::test_rizin_functions_callable_through_the_bus_on_a_real_binary``,
-    ``::ToolIndexToolBusConsistencyTests::test_dynamic_lab_gate_never_authorizes_by_default_fail_closed``, and
-    ``tests/test_phase4_offline_teacher.py::Phase4OfflineTeacherTests::test_fake_brain_runs_full_teacher_toolbus_evidence_flow``
-    (the last as a ``KeyError`` on a field only the real payload carries,
-    since ``BUDGET_EXHAUSTED``'s structured output has no ``driver_loaded``
-    key at all) -- all six reproduced instantly and deterministically this
-    way, matching every measured full-suite baseline's exact failure set,
-    and all six pass alone precisely because a solo run never accumulates
-    200 real calls first.
-
-    Fix: reset the counters on the ONE shared instance before (and after,
-    for a test that inspects them via ``teacher.TOOL_BUS.stats()`` after a
-    later test already ran) every test -- restoring "one call site, one
-    budget" isolation without touching the 200-call limit itself, which is
-    correct production behaviour for a real session and stays completely
-    untouched here. Looked up via ``sys.modules`` rather than ``import
-    teacher`` so a test file that never needs ``teacher`` is not forced to
-    pay its import cost or trigger its own import-time side effects."""
-    def _reset():
-        teacher_module = sys.modules.get("teacher")
-        if teacher_module is None:
-            return
-        bus = getattr(teacher_module, "TOOL_BUS", None)
-        if bus is None:
-            return
-        with bus._lock:
-            bus._calls = 0
-            bus._output_chars = 0
-            bus._per_tool.clear()
-            bus._status_counts.clear()
-
-    _reset()
-    yield
-    _reset()
-
-
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
@@ -312,7 +250,7 @@ def _is_repo_owned_module(module) -> bool:
 # and cache the boolean "is this a repo-owned module whose EVIDENCE attribute
 # resolves inside the real ledger". Every later test looks the name up in
 # O(1) with zero filesystem I/O; only modules imported for the very first
-# time (e.g. a lazy ``import teacher`` mid-test) ever pay the resolve() cost,
+# time (e.g. a lazy import of an orchestration module mid-test) ever pay the resolve() cost,
 # and only once each, ever. The guard's protection is unchanged: this only
 # memoizes WHICH modules to check, not the per-test coverage/content-diff
 # checks in ``_evidence_guard_failures`` below, which still run in full on
@@ -381,7 +319,7 @@ def _snapshot_real_subdir(relative: Path) -> tuple:
     false-positive: see ``_evidence_guard_failures``'s use of this).
 
     Root cause fixed here (measured live, 2026-09-26, two concurrent `pytest`
-    sessions both exercising the `teacher.ask()` path): ``research_state.py``'s
+    sessions both exercising an orchestration session): ``research_state.py``'s
     module-level ``EVIDENCE`` is ``dataset/evidence/ledger`` -- NOT a
     single-owner subdirectory but a directory NTFS updates the mtime of
     every time ANY session creates its own ``ledger/<session_id>/``
@@ -446,7 +384,7 @@ def _evidence_guard_failures(redirected: dict, pre_subdir_snapshots: dict) -> li
        scratch path, not reset back to the real ledger (e.g. by an
        ``importlib.reload`` mid-test). This deliberately does NOT flag a
        module that is merely *discovered* late (first imported partway
-       through the test body, e.g. a lazy ``import teacher`` inside a test
+       through the test body, e.g. a lazy import of an orchestration module inside a test
        -- which transitively imports most ``tools_*.py`` adapters for the
        first time, in whichever single test happens to run first) and
        still points at the real ledger: that reflects nothing more than
@@ -454,7 +392,7 @@ def _evidence_guard_failures(redirected: dict, pre_subdir_snapshots: dict) -> li
        is the overwhelmingly common case and not itself evidence of a
        write. An earlier version of this check flagged exposure instead of
        writes and fired on essentially every test that lazily imports
-       ``teacher`` -- exactly the "cries wolf" failure mode this guard
+       such a module -- exactly the "cries wolf" failure mode this guard
        exists to avoid.
 
     2. Narrow content diff: for exactly the real subdirectories this
@@ -592,7 +530,7 @@ def _redirect_tool_evidence_dirs_away_from_the_real_ledger(tmp_path, monkeypatch
     content, because the root is shared with concurrent unrelated
     activity and cannot be diffed without reintroducing false failures;
     and (3) a module imported for the first time during the test body
-    itself (e.g. a lazy ``import teacher``, which transitively imports
+    itself (e.g. a lazy import of an orchestration module, which transitively imports
     most ``tools_*.py`` adapters) is not covered by either check for that
     one test, by design -- see ``_evidence_guard_failures`` for why
     flagging it anyway turned out to be a worse, noisier failure mode than

@@ -328,7 +328,7 @@ class WorkspaceIndex:
         # already fully created -- so a process that only wanted to read
         # status()/search() (or another process's own unrelated refresh() on
         # the same shared workspace, e.g. every test that leaves
-        # TEACHER_WORKSPACE unset and defaults to the repo root) blocked for
+        # the workspace environment variable unset and defaults to the repo root) blocked for
         # up to the lock's own 600s ceiling behind a live, unrelated,
         # multi-minute refresh() -- purely to run idempotent
         # "CREATE TABLE IF NOT EXISTS" statements that would have been a
