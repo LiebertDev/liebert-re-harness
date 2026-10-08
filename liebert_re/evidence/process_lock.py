@@ -148,6 +148,9 @@ def record_reclaim(lock_path: str | Path, holder: dict | None, reason: str) -> d
     return event
 
 
+_DELETE_PENDING_GRACE_SECONDS = 2.0
+
+
 class LockTimeout(RuntimeError):
     pass
 
@@ -208,9 +211,24 @@ class DurableLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.reclaimed = None
         deadline = time.monotonic() + self.timeout_seconds
+        denied_until = None
         while True:
             try:
                 descriptor = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except PermissionError:
+                # Windows answers an exclusive create on a file that was unlinked but is still held open by
+                # another handle (delete pending) with access denied, not "exists". That state ends in
+                # milliseconds, so it is waited out for a short grace; access denied that lasts is a real
+                # permission problem and is raised as itself, never relabelled as contention.
+                if not _IS_WINDOWS:
+                    raise
+                now = time.monotonic()
+                if denied_until is None:
+                    denied_until = now + _DELETE_PENDING_GRACE_SECONDS
+                if now >= denied_until or now >= deadline:
+                    raise
+                time.sleep(self.poll_seconds)
+                continue
             except FileExistsError:
                 self._try_reclaim_if_dead()  # no-op unless the holder is confirmed dead
                 if time.monotonic() >= deadline:

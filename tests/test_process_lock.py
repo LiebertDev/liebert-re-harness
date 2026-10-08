@@ -140,3 +140,44 @@ def test_non_windows_dead_pid_still_false(monkeypatch):
 
     monkeypatch.setattr(os, "kill", kill)
     assert pl.pid_alive(4242) is False
+
+
+def test_access_denied_on_a_delete_pending_lock_file_is_waited_out_on_windows(tmp_path, monkeypatch):
+    """The other process just released the lock; Windows still answers the exclusive create with access denied."""
+    real_open, calls = os.open, []
+
+    def flaky_open(path, flags, *args):
+        calls.append(path)
+        if len(calls) <= 2:
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(pl, "_IS_WINDOWS", True)
+    monkeypatch.setattr(pl.os, "open", flaky_open)
+    with pl.DurableLock(tmp_path / "x.lock", poll_seconds=0.01) as lock:
+        assert lock.acquired and len(calls) == 3
+
+
+def test_lasting_access_denied_is_raised_as_itself_not_as_contention(tmp_path, monkeypatch):
+    def denied(path, flags, *args):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(pl, "_IS_WINDOWS", True)
+    monkeypatch.setattr(pl.os, "open", denied)
+    monkeypatch.setattr(pl, "_DELETE_PENDING_GRACE_SECONDS", 0.05)
+    with pytest.raises(PermissionError):
+        pl.DurableLock(tmp_path / "x.lock", poll_seconds=0.01).__enter__()
+
+
+def test_access_denied_is_not_waited_out_off_windows(tmp_path, monkeypatch):
+    calls = []
+
+    def denied(path, flags, *args):
+        calls.append(path)
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(pl, "_IS_WINDOWS", False)
+    monkeypatch.setattr(pl.os, "open", denied)
+    with pytest.raises(PermissionError):
+        pl.DurableLock(tmp_path / "x.lock", poll_seconds=0.01).__enter__()
+    assert len(calls) == 1
