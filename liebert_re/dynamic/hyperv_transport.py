@@ -537,15 +537,21 @@ def _positive_int(value: object) -> int | None:
 # --------------------------------------------------------------------------- script output
 
 
-def _parse_script_output(stdout: str) -> tuple[list[str], dict[str, Any] | None, str | None]:
-    """``(phases reached, result object, problem)``. A problem means no result may be trusted."""
+def _parse_script_output(stdout: str, schema: str | None = None, known_phases: Sequence[str] | None = None,
+                         ) -> tuple[list[str], dict[str, Any] | None, str | None]:
+    """``(phases reached, result object, problem)``. A problem means no result may be trusted.
+
+    ``schema`` and ``known_phases`` default to this module's own script; the guest launcher passes its own.
+    """
+    expected_schema = _SCRIPT_SCHEMA if schema is None else schema
+    allowed_phases = _PHASES if known_phases is None else known_phases
     phases: list[str] = []
     result_lines: list[str] = []
     for line in stdout.split("\n"):
         line = line.rstrip("\r")
         if line.startswith(_PHASE_PREFIX):
             name = line[len(_PHASE_PREFIX):].strip()
-            if name in _PHASES:
+            if name in allowed_phases:
                 phases.append(name)
         elif line.startswith(_RESULT_PREFIX):
             result_lines.append(line[len(_RESULT_PREFIX):])
@@ -559,7 +565,7 @@ def _parse_script_output(stdout: str) -> tuple[list[str], dict[str, Any] | None,
         if exc.reason == strict_json.DUPLICATE_KEY:
             return phases, None, "RESULT_DUPLICATE_KEY"
         return phases, None, "RESULT_NOT_JSON"
-    if not isinstance(body, dict) or body.get("schema") != _SCRIPT_SCHEMA:
+    if not isinstance(body, dict) or body.get("schema") != expected_schema:
         return phases, None, "RESULT_SCHEMA_MISMATCH"
     if not isinstance(body.get("ok"), bool) or not isinstance(body.get("data"), dict):
         return phases, None, "RESULT_MALFORMED"
@@ -707,6 +713,21 @@ class HypervTransport:
                  ) -> tuple[list[str], dict[str, Any] | None, tuple[str, str] | None]:
         """``(phases, script result, failure)``; failure is ``(error_class, reason)`` and means no
         script result may be used. Never raises."""
+        return self._run_script(op, vm, extra, timeout_s, script=_SCRIPT, script_name="transport.ps1",
+                                result_schema=_SCRIPT_SCHEMA, known_phases=_PHASES)
+
+    def _run_script(self, op: str, vm: str, extra: Mapping[str, Any], timeout_s: float, *, script: str,
+                    script_name: str, result_schema: str, known_phases: Sequence[str],
+                    extra_files: Mapping[str, str] | None = None, max_output_chars: int | None = None,
+                    ) -> tuple[list[str], dict[str, Any] | None, tuple[str, str] | None]:
+        """One PowerShell run of a CONSTANT script, with this transport's credential, runner and
+        executable, one base64 request argument, one wall-clock timeout and bounded process output.
+
+        Shared with ``hyperv_guest_launcher`` (same package, same PowerShell Direct configuration) so
+        that there is one place that builds the command line. ``extra_files`` are constant texts the
+        script reads from its own directory. Returns ``(phases, script result, failure)``; failure is
+        ``(error_class, reason)`` and means no script result may be used. Never raises.
+        """
         request = {
             "op": op, "vm": vm, "credential_path": self._credential_path,
             "run_id": uuid.uuid4().hex[:12],
@@ -718,13 +739,16 @@ class HypervTransport:
         exe = self._powershell or shutil.which("powershell.exe") or ("powershell.exe" if self._runner else None)
         if exe is None:
             return [], None, ("UNKNOWN", "POWERSHELL_UNAVAILABLE")
-        runner = self._runner or _default_runner
+        output_limit = _MAX_OUTPUT_CHARS if max_output_chars is None else max_output_chars
+        runner = self._runner or (lambda argv, seconds: _default_runner(argv, seconds, output_limit))
         try:
             with tempfile.TemporaryDirectory(prefix="liebert-hvt-") as scratch:
-                script = Path(scratch) / "transport.ps1"
-                script.write_text(_SCRIPT, encoding="ascii", newline="\r\n")
+                path = Path(scratch) / script_name
+                path.write_text(script, encoding="ascii", newline="\r\n")
+                for name, text in (extra_files or {}).items():
+                    (Path(scratch) / name).write_text(text, encoding="ascii", newline="\r\n")
                 argv = [exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                        "-File", str(script), "-RequestB64", blob]
+                        "-File", str(path), "-RequestB64", blob]
                 completed = runner(argv, timeout_s)
         except Exception as exc:  # a runner or temp-dir fault is an unknown, never a crash
             return [], None, ("UNKNOWN", f"RUNNER_FAULT_{type(exc).__name__.upper()[:30]}")
@@ -732,7 +756,7 @@ class HypervTransport:
         if launch_failed is True:
             return [], None, ("UNKNOWN", "POWERSHELL_LAUNCH_FAILED")
         stdout = completed.stdout if isinstance(completed.stdout, str) else ""
-        phases, body, problem = _parse_script_output(stdout)
+        phases, body, problem = _parse_script_output(stdout, result_schema, known_phases)
         if getattr(completed, "timed_out", False) is True or getattr(completed, "cancelled", False) is True:
             if op == "probe" or "session_open" not in phases:
                 return phases, None, ("PSDIRECT_TIMEOUT", "PROCESS_TIMEOUT")
@@ -1045,5 +1069,6 @@ class HypervTransport:
                             source_verified=source_verified, **more)
 
 
-def _default_runner(argv: Sequence[str], timeout_seconds: float) -> BoundedProcessResult:
-    return run_bounded_process(list(argv), timeout_seconds=timeout_seconds, max_output_chars=_MAX_OUTPUT_CHARS)
+def _default_runner(argv: Sequence[str], timeout_seconds: float,
+                    max_output_chars: int = _MAX_OUTPUT_CHARS) -> BoundedProcessResult:
+    return run_bounded_process(list(argv), timeout_seconds=timeout_seconds, max_output_chars=max_output_chars)
