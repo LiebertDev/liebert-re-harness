@@ -59,6 +59,16 @@ STATUS AND ITS TRANSITIONS (PROVEN / CANDIDATE / CONTRADICTED / INSUFFICIENT)
     (``PROVEN_REQUIRES_EVIDENCE_STORE`` when none is bound,
     ``EVIDENCE_NOT_FOUND`` when it does not resolve), checked before anything
     is written: an unchecked string is not evidence.
+  - REPLAY re-earns PROVEN: ``rebuild_from_events()`` keeps a claim PROVEN only
+    when an evidence store is bound and at least one SUPPORTS link still
+    resolves in it. Otherwise the claim is loaded as UNVERIFIED, with the
+    reason (``NO_EVIDENCE_STORE``, ``NO_SUPPORTING_EVIDENCE_LINK`` or
+    ``SUPPORTING_EVIDENCE_UNRESOLVED``) in its status history and in the
+    rebuild result. This is the one place the projection is not byte-for-byte
+    the log: the log records what a writer asserted, not what was verified.
+  - Every mutation stages its events and writes them to disk only after all
+    its DB statements succeeded, then commits; a failure removes what was
+    written, so a rolled-back mutation leaves no event for replay to revive.
   - CONTRADICTED can never be requested as an initial status (it is a
     consequence, not an assertion) -- ``CONTRADICTED_NOT_A_VALID_INITIAL_STATUS``.
   - THE load-bearing rule: any REFUTES evidence link added to a claim --
@@ -145,7 +155,7 @@ import json
 import re
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from liebert_re.evidence.index import EvidenceIndex, _normalize_anchor_value
@@ -161,7 +171,10 @@ CLAIM_INDEX_ROOT = APP / "dataset" / "metadata" / "claim_indexes"
 # rebuild_from_events() replays afterward.
 SCHEMA_VERSION = "1"
 
-VALID_STATUSES = {"PROVEN", "CANDIDATE", "CONTRADICTED", "INSUFFICIENT"}
+# UNVERIFIED is never an initial status and is never written by a mutation: it is what
+# rebuild_from_events() loads a PROVEN event as when its supporting evidence cannot be
+# resolved at replay time (see that method).
+VALID_STATUSES = {"PROVEN", "CANDIDATE", "CONTRADICTED", "INSUFFICIENT", "UNVERIFIED"}
 INITIAL_STATUSES = {"PROVEN", "CANDIDATE", "INSUFFICIENT"}  # CONTRADICTED is never an initial status
 VALID_RELATIONS = {"SUPPORTS", "REFUTES"}
 MAX_STATEMENT_CHARS = 2000
@@ -171,8 +184,20 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+_LAST_TS = [None]
+
+
 def _ts_compact():
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+    """A strictly increasing UTC timestamp for event file names. Replay order is the
+    sorted file-name order, so two events written back to back (a staged unit of work is
+    flushed in a tight loop) must never share a stamp or the order would fall to the
+    claim id, which can put a status change ahead of the claim it changes."""
+    now = datetime.now(timezone.utc)
+    last = _LAST_TS[0]
+    if last is not None and now <= last:
+        now = last + timedelta(microseconds=1)
+    _LAST_TS[0] = now
+    return now.strftime("%Y%m%dT%H%M%S%f")
 
 
 def _claim_uid():
@@ -227,6 +252,7 @@ class ClaimIndex:
         self.db_path = Path(db_path) if db_path else CLAIM_INDEX_ROOT / f"{_index_key(self.events_root)}.sqlite"
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.evidence_index: EvidenceIndex | None = evidence_index
+        self._pending: list | None = None
         self._ensure_schema()
 
     # -- plumbing (mirrors evidence_index.py's own shape deliberately) -----
@@ -338,10 +364,21 @@ class ClaimIndex:
 
     # -- event-file persistence (source of truth) ---------------------------
     def _write_event(self, event_type, payload):
+        """Build the event record. Inside a unit of work (every mutation) the record is only
+        STAGED here and reaches disk in :meth:`_unit_of_work` after every DB statement succeeded
+        and before the commit, so a failure part-way can no longer leave a ``claim_created``
+        event on disk for ``rebuild_from_events`` to resurrect."""
         record = {"event": event_type, "at": _now_iso(), **payload}
-        claim_uid = payload.get("claim_uid", "unclaimed")
-        name = f"{_ts_compact()}__{claim_uid}__{event_type}.json"
-        path = self.events_root / name
+        if self._pending is None:
+            self._persist_event(record)
+        else:
+            self._pending.append(record)
+        return record
+
+    def _persist_event(self, record):
+        event_type = record["event"]
+        claim_uid = record.get("claim_uid", "unclaimed")
+        path = self.events_root / f"{_ts_compact()}__{claim_uid}__{event_type}.json"
         # Collision-proof: the timestamp is microsecond-resolution and this
         # call always runs inside self._write_guard() (single writer at a
         # time across processes), so a duplicate name is not expected; guard
@@ -351,7 +388,29 @@ class ClaimIndex:
             suffix += 1
             path = self.events_root / f"{_ts_compact()}__{claim_uid}__{event_type}__{suffix}.json"
         path.write_text(json.dumps(record, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        return record
+        return path
+
+    @contextlib.contextmanager
+    def _unit_of_work(self):
+        """Lock, open a DB session and stage events. On a clean exit the staged events are
+        written, THEN the DB is committed; if either step fails every event file written by
+        this unit is removed and the DB rolls back, so the log and the projection agree."""
+        with self._write_guard(), self._session() as db:
+            pending = []
+            self._pending = pending
+            written = []
+            try:
+                yield db
+                for record in pending:
+                    written.append(self._persist_event(record))
+                db.commit()
+            except BaseException:
+                for path in written:
+                    with contextlib.suppress(OSError):
+                        path.unlink()
+                raise
+            finally:
+                self._pending = None
 
     # -- internal appliers (used by both the live path and event replay) ---
     def _apply_claim_created(self, db, ev):
@@ -439,10 +498,50 @@ class ClaimIndex:
             for method_name, ev in events:
                 getattr(self, method_name)(db, ev)
                 applied += 1
+            # The log is only a record of what a writer asserted, possibly under an older
+            # version of the rules or with no evidence store bound. PROVEN is a claim about
+            # evidence, so it is re-earned here rather than restored on the log's word.
+            demoted = self._demote_unproven_claims(db)
         return {
             "ok": True, "tool": "claim_index", "operation": "rebuild_from_events",
             "events_scanned": len(files), "events_applied": applied, "malformed": malformed,
+            "demoted_unverified": len(demoted), "demotions": demoted,
         }
+
+    def _demote_unproven_claims(self, db):
+        """Replay-time evidence check for every claim the log left PROVEN: it keeps PROVEN only
+        with an evidence store bound and at least one SUPPORTS link that still resolves in it.
+        Anything else is loaded as UNVERIFIED with the reason in the status history. A PROVEN
+        event is never trusted, and never silently dropped either."""
+        demoted = []
+        proven = db.execute("SELECT claim_uid FROM claims WHERE status='PROVEN' ORDER BY id").fetchall()
+        for row in proven:
+            claim_uid = row["claim_uid"]
+            if self.evidence_index is None:
+                reason = "NO_EVIDENCE_STORE"
+            else:
+                supports = [
+                    r["evidence_uid"] for r in db.execute(
+                        "SELECT evidence_uid FROM claim_evidence WHERE claim_uid=? AND relation='SUPPORTS'",
+                        (claim_uid,),
+                    )
+                ]
+                if not supports:
+                    reason = "NO_SUPPORTING_EVIDENCE_LINK"
+                elif not any(self._evidence_summary(uid) is not None for uid in supports):
+                    reason = "SUPPORTING_EVIDENCE_UNRESOLVED"
+                else:
+                    continue
+            at = _now_iso()
+            db.execute("UPDATE claims SET status='UNVERIFIED', updated_at=? WHERE claim_uid=?", (at, claim_uid))
+            db.execute(
+                "INSERT INTO claim_status_history(claim_uid,old_status,new_status,reason,caused_by,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (claim_uid, "PROVEN", "UNVERIFIED", f"replayed PROVEN event not re-verified: {reason}",
+                 "rebuild_from_events", at),
+            )
+            demoted.append({"claim_uid": claim_uid, "reason": reason})
+        return demoted
 
     # -- evidence validation --------------------------------------------
     def _evidence_summary(self, evidence_uid):
@@ -519,7 +618,7 @@ class ClaimIndex:
                     raise ClaimError("EVIDENCE_NOT_FOUND", uid)
 
         claim_uid = _claim_uid()
-        with self._write_guard(), self._session() as db:
+        with self._unit_of_work() as db:
             create_event = self._write_event("claim_created", {
                 "claim_uid": claim_uid, "target_raw": target_raw, "target_identity": target_identity,
                 "target_identity_kind": target_identity_kind, "subject_kind": norm_subject_kind,
@@ -617,7 +716,7 @@ class ClaimIndex:
         relation = str(relation or "").strip().upper()
         if relation not in VALID_RELATIONS:
             raise ClaimError("INVALID_EVIDENCE_RELATION", relation)
-        with self._write_guard(), self._session() as db:
+        with self._unit_of_work() as db:
             self._link_evidence_locked(db, claim_uid, evidence_uid, relation, note)
         return {
             "ok": True, "tool": "claim_index", "operation": "add_evidence", "claim_uid": claim_uid,
@@ -628,7 +727,7 @@ class ClaimIndex:
     def supersede_claim(self, new_claim_uid, old_claim_uid, reason=""):
         if new_claim_uid == old_claim_uid:
             raise ClaimError("CANNOT_SUPERSEDE_SELF")
-        with self._write_guard(), self._session() as db:
+        with self._unit_of_work() as db:
             new_row = db.execute("SELECT * FROM claims WHERE claim_uid=?", (new_claim_uid,)).fetchone()
             old_row = db.execute("SELECT * FROM claims WHERE claim_uid=?", (old_claim_uid,)).fetchone()
             if not new_row:

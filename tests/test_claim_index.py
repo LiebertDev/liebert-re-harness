@@ -613,6 +613,147 @@ class JsonlRecordTests(unittest.TestCase):
         self.assertTrue(row["parse_error"].startswith("TRUNCATED"))
 
 
+class ReplayReearnsProvenTests(unittest.TestCase):
+    """rebuild_from_events must not restore PROVEN on the log's word: the evidence is
+    resolved again at replay, and what cannot be resolved loads as UNVERIFIED with a reason."""
+
+    @staticmethod
+    def _proven(tmp):
+        root, evidence_index, claims = _make_indices(tmp)
+        _write_json(root / "s_1111111111_report_222222.json", {"ok": True})
+        evidence_index.refresh()
+        uid = evidence_index.record(path="s_1111111111_report_222222.json")["evidence_uid"]
+        made = claims.create_claim(
+            "t", "function", "FUN_1", "root_cause", "v1", status="PROVEN",
+            initial_evidence=[{"evidence_uid": uid, "relation": "SUPPORTS"}],
+        )
+        return root, evidence_index, claims, made["claim_uid"], uid
+
+    @staticmethod
+    def _history(claims, claim_uid):
+        connection = claims.connect()
+        try:
+            return [dict(r) for r in connection.execute(
+                "SELECT old_status,new_status,reason,caused_by FROM claim_status_history WHERE claim_uid=?", (claim_uid,))]
+        finally:
+            connection.close()
+
+    def test_resolvable_support_stays_proven_on_replay(self):
+        with TemporaryDirectory() as tmp:
+            _, _, claims, claim_uid, _ = self._proven(Path(tmp))
+            result = claims.rebuild_from_events()
+            self.assertEqual(result["demoted_unverified"], 0)
+            self.assertEqual(claims._current_status(claim_uid), "PROVEN")
+
+    def test_replay_with_no_evidence_store_loads_proven_as_unverified(self):
+        with TemporaryDirectory() as tmp:
+            _, _, claims, claim_uid, _ = self._proven(Path(tmp))
+            unbound = ClaimIndex(db_path=claims.db_path, events_root=claims.events_root)
+            result = unbound.rebuild_from_events()
+            self.assertEqual(result["demotions"], [{"claim_uid": claim_uid, "reason": "NO_EVIDENCE_STORE"}])
+            self.assertEqual(unbound._current_status(claim_uid), "UNVERIFIED")
+            row = self._history(unbound, claim_uid)[-1]
+            self.assertEqual((row["old_status"], row["new_status"]), ("PROVEN", "UNVERIFIED"))
+            self.assertIn("NO_EVIDENCE_STORE", row["reason"])
+            self.assertEqual(unbound.claims_for_target("t", status="PROVEN")["results"], [])
+
+    def test_replay_after_the_evidence_vanished_loads_unverified(self):
+        with TemporaryDirectory() as tmp:
+            root, evidence_index, claims, claim_uid, _ = self._proven(Path(tmp))
+            (root / "s_1111111111_report_222222.json").unlink()
+            evidence_index.refresh()
+            result = claims.rebuild_from_events()
+            self.assertEqual(result["demotions"][0]["reason"], "SUPPORTING_EVIDENCE_UNRESOLVED")
+            self.assertEqual(claims._current_status(claim_uid), "UNVERIFIED")
+
+    def test_forged_proven_events_are_not_restored(self):
+        with TemporaryDirectory() as tmp:
+            _, _, claims = _make_indices(Path(tmp))
+            base = {
+                "event": "claim_created", "at": "2020-01-01T00:00:00+00:00", "target_raw": "t",
+                "target_identity": "name:t", "target_identity_kind": "name", "subject_kind": "function",
+                "subject_value": "fun_1", "predicate": "root_cause", "predicate_norm": "root_cause",
+                "asserted_value": "x", "asserted_value_norm": "x", "statement": "", "status": "PROVEN",
+                "inferred": False, "source": "",
+            }
+            _write_json(claims.events_root / "20200101T000000000001__CLM-nolink__claim_created.json", {**base, "claim_uid": "CLM-nolink"})
+            _write_json(claims.events_root / "20200101T000000000002__CLM-fake__claim_created.json", {**base, "claim_uid": "CLM-fake"})
+            _write_json(
+                claims.events_root / "20200101T000000000003__CLM-fake__evidence_linked.json",
+                {"event": "evidence_linked", "at": "2020-01-01T00:00:00+00:00", "claim_uid": "CLM-fake",
+                 "evidence_uid": "EVX-made-up", "relation": "SUPPORTS", "note": ""},
+            )
+            result = claims.rebuild_from_events()
+            self.assertEqual(
+                {d["claim_uid"]: d["reason"] for d in result["demotions"]},
+                {"CLM-nolink": "NO_SUPPORTING_EVIDENCE_LINK", "CLM-fake": "SUPPORTING_EVIDENCE_UNRESOLVED"},
+            )
+            self.assertEqual(claims._current_status("CLM-nolink"), "UNVERIFIED")
+            self.assertEqual(claims._current_status("CLM-fake"), "UNVERIFIED")
+
+
+class EventLogMatchesRolledBackWritesTests(unittest.TestCase):
+    """A mutation that fails and rolls the DB back must not leave events on disk."""
+
+    @staticmethod
+    def _event_names(claims):
+        return sorted(p.name for p in claims.events_root.glob("*.json"))
+
+    @staticmethod
+    def _setup(tmp):
+        _, _, claims = _make_indices(tmp)
+        first = claims.create_claim("t", "function", "FUN_1", "root_cause", "a")["claim_uid"]
+        return claims, first
+
+    def test_failure_after_the_claim_event_leaves_no_event(self):
+        with TemporaryDirectory() as tmp:
+            claims, first = self._setup(Path(tmp))
+            before = self._event_names(claims)
+            with mock.patch.object(claims, "_apply_edge", side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError):
+                    claims.create_claim("t", "function", "FUN_1", "root_cause", "b")
+            self.assertEqual(self._event_names(claims), before)
+            claims.rebuild_from_events()
+            self.assertEqual(claims.status()["claims"], 1)
+            self.assertEqual(claims._current_status(first), "CANDIDATE")
+
+    def test_failure_while_writing_events_removes_the_ones_already_written(self):
+        with TemporaryDirectory() as tmp:
+            claims, _first = self._setup(Path(tmp))
+            before = self._event_names(claims)
+            real = claims._persist_event
+            calls = []
+
+            def flaky(record):
+                calls.append(record["event"])
+                if len(calls) == 2:
+                    raise OSError("disk full")
+                return real(record)
+
+            with mock.patch.object(claims, "_persist_event", flaky):
+                with self.assertRaises(OSError):
+                    claims.create_claim("t", "function", "FUN_1", "root_cause", "b")
+            self.assertGreaterEqual(len(calls), 2)
+            self.assertEqual(self._event_names(claims), before)
+            self.assertEqual(claims.status()["claims"], 1)
+
+    def test_events_are_on_disk_and_replayable_after_a_successful_mutation(self):
+        with TemporaryDirectory() as tmp:
+            claims, first = self._setup(Path(tmp))
+            second = claims.create_claim("t", "function", "FUN_1", "root_cause", "b")["claim_uid"]
+            self.assertEqual(claims._current_status(first), "CONTRADICTED")
+            claims.rebuild_from_events()
+            self.assertEqual(claims._current_status(first), "CONTRADICTED")
+            self.assertEqual(claims._current_status(second), "CANDIDATE")
+
+    def test_event_file_order_follows_write_order(self):
+        with TemporaryDirectory() as tmp:
+            claims, _first = self._setup(Path(tmp))
+            claims.create_claim("t", "function", "FUN_1", "root_cause", "b")
+            kinds = [n.split("__")[2].removesuffix(".json") for n in self._event_names(claims)]
+            self.assertEqual(kinds, ["claim_created", "claim_created", "edge", "status_changed"])
+
+
 class RebuildRaceAndAtomicityTests(unittest.TestCase):
     """K2: rebuild_from_events must list the event log under the same lock it
     rebuilds with, and must swap the projection inside one explicit SQLite

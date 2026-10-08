@@ -10,6 +10,8 @@ import hashlib
 import json
 from typing import Any, Iterable
 
+from liebert_re.evidence.index import EvidenceIndex
+
 
 # UNVERIFIED: evidence IDs are cited but were never resolved against an evidence index, so
 # SUPPORTED (which means "the cited evidence exists") cannot be claimed.
@@ -31,16 +33,40 @@ def _id(prefix: str, *parts: object) -> str:
     return prefix + hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
 
 
-def _evidence_binding(support: Iterable[str], known_evidence_ids: Iterable[str] | None) -> tuple[str, list[str]]:
-    """``(binding, unresolved)``: NONE (nothing cited), UNCHECKED (no index to check
-    against), UNRESOLVED (some cited ID is not in the index) or VERIFIED."""
+def _store_resolves(store: EvidenceIndex, evidence_id: str) -> bool:
+    """True only when ``evidence_id`` is an ``EVX-`` identity the store itself returns a
+    readable record for, under that same identity. A lookup that raises is not a hit."""
+    if not evidence_id.startswith("EVX-"):
+        return False
+    try:
+        record = store.record(record_id=evidence_id)
+    except Exception:  # noqa: BLE001 - an unreadable store resolves nothing
+        return False
+    return isinstance(record, dict) and record.get("ok") is True and record.get("evidence_uid") == evidence_id
+
+
+def _evidence_binding(
+    support: Iterable[str], known_evidence_ids: Iterable[str] | None = None,
+    evidence_store: EvidenceIndex | None = None,
+) -> tuple[str, list[str]]:
+    """``(binding, unresolved)``: NONE (nothing cited), UNCHECKED (no evidence store to check
+    against), UNRESOLVED (some cited ID is not in the store, or not in the caller's list) or
+    VERIFIED.
+
+    Only the store can verify. ``known_evidence_ids`` is the caller's own assertion of what
+    exists and cannot stand in for it: it may narrow what is accepted (an ID outside it is
+    unresolved) but never widen it, and with no store the binding is UNCHECKED whatever the
+    list says. A store that is not an :class:`EvidenceIndex` is no store."""
     cited = sorted({str(item) for item in support if str(item)})
     if not cited:
         return "NONE", []
-    if known_evidence_ids is None:
+    if not isinstance(evidence_store, EvidenceIndex):
         return "UNCHECKED", []
-    known = {str(item) for item in known_evidence_ids}
-    unresolved = [item for item in cited if item not in known]
+    allowed = None if known_evidence_ids is None else {str(item) for item in known_evidence_ids}
+    unresolved = [
+        item for item in cited
+        if (allowed is not None and item not in allowed) or not _store_resolves(evidence_store, item)
+    ]
     return ("UNRESOLVED", unresolved) if unresolved else ("VERIFIED", [])
 
 
@@ -52,12 +78,16 @@ def build_security_hypothesis(
     severity: str = "UNKNOWN", remediation: str = "",
     claim_type: str = "", claim_target: str = "", claim_address: Any = None,
     claim_address_kind: str = "va", claim_constant_value: Any = None,
-    known_evidence_ids: Iterable[str] | None = None,
+    known_evidence_ids: Iterable[str] | None = None, evidence_store: EvidenceIndex | None = None,
 ) -> dict[str, Any]:
-    """``known_evidence_ids`` is the evidence index the cited ``supporting_evidence`` is
-    resolved against. ``SUPPORTED`` requires every cited ID to be in it; with no index
-    (``None``) the status is ``UNVERIFIED``, and an ID missing from the index leaves the
-    hypothesis at ``NEEDS_MORE_ANALYSIS``.
+    """``evidence_store`` (an :class:`~liebert_re.evidence.index.EvidenceIndex`) is what the
+    cited ``supporting_evidence`` is resolved against. ``SUPPORTED`` requires every cited ID
+    to resolve in it; with no store the status is ``UNVERIFIED``, and an ID the store does not
+    know leaves the hypothesis at ``NEEDS_MORE_ANALYSIS``.
+
+    ``known_evidence_ids`` is kept for backward compatibility but is a caller-supplied list and
+    proves nothing: it can only narrow what the store accepts. Passing it without a store
+    yields ``UNVERIFIED``, never ``SUPPORTED``.
 
     ``claim_type``/``claim_target``/``claim_address``/``claim_address_kind``/
     ``claim_constant_value`` are additive, opt-in (GAP-061 step 4): passing
@@ -79,7 +109,7 @@ def build_security_hypothesis(
     severity_norm = str(severity or "UNKNOWN").upper()
     if severity_norm not in FINDING_SEVERITIES:
         severity_norm = "UNKNOWN"
-    binding, _unresolved = _evidence_binding(support, known_evidence_ids)
+    binding, _unresolved = _evidence_binding(support, known_evidence_ids, evidence_store)
     if missing or binding in {"NONE", "UNRESOLVED"}:
         status, confidence = "NEEDS_MORE_ANALYSIS", "LOW"
     elif binding == "UNCHECKED":
@@ -116,10 +146,14 @@ def build_security_hypothesis(
 
 def verify_counter_evidence(
     hypothesis: dict[str, Any], candidates: Iterable[dict[str, Any]],
-    *, known_evidence_ids: Iterable[str], searched_scope: Iterable[str] = (),
+    *, known_evidence_ids: Iterable[str] | None = None, searched_scope: Iterable[str] = (),
+    evidence_store: EvidenceIndex | None = None,
 ) -> dict[str, Any]:
-    """Bind only known evidence; unproved counter claims cannot refute."""
-    known = {str(item) for item in known_evidence_ids}
+    """Bind only evidence the ``evidence_store`` resolves; unproved counter claims cannot refute
+    and, with no store, nothing is bound. ``known_evidence_ids`` can only narrow (see
+    :func:`_evidence_binding`)."""
+    if known_evidence_ids is not None:
+        known_evidence_ids = frozenset(str(item) for item in known_evidence_ids)  # a generator is read once
     accepted = []
     rejected = []
     for raw in candidates:
@@ -129,7 +163,7 @@ def verify_counter_evidence(
         if kind not in COUNTER_KINDS:
             rejected.append({"reason": "UNSUPPORTED_COUNTER_KIND", "kind": kind})
             continue
-        if not evidence_ids or any(item not in known for item in evidence_ids):
+        if _evidence_binding(evidence_ids, known_evidence_ids, evidence_store)[0] != "VERIFIED":
             rejected.append({"reason": "UNBOUND_COUNTER_EVIDENCE", "kind": kind, "evidence_ids": evidence_ids})
             continue
         accepted.append({
@@ -150,7 +184,7 @@ def verify_counter_evidence(
         result["confidence"] = "HIGH" if len(accepted) > 1 else "MEDIUM"
     elif (
         result.get("supporting_evidence") and not result.get("missing_evidence")
-        and _evidence_binding(result["supporting_evidence"], known)[0] == "VERIFIED"
+        and _evidence_binding(result["supporting_evidence"], known_evidence_ids, evidence_store)[0] == "VERIFIED"
     ):
         result["status"] = "SUPPORTED"
         result["confidence"] = "MEDIUM"
@@ -161,7 +195,10 @@ def verify_counter_evidence(
     return result
 
 
-def validate_finding(hypothesis: dict[str, Any], *, known_evidence_ids: Iterable[str] | None = None) -> dict[str, Any]:
+def validate_finding(
+    hypothesis: dict[str, Any], *, known_evidence_ids: Iterable[str] | None = None,
+    evidence_store: EvidenceIndex | None = None,
+) -> dict[str, Any]:
     issues = []
     status = str(hypothesis.get("status") or "").upper()
     if status not in HYPOTHESIS_STATUSES:
@@ -171,9 +208,12 @@ def validate_finding(hypothesis: dict[str, Any], *, known_evidence_ids: Iterable
             issues.append(f"MISSING_{field.upper()}")
     if status == "SUPPORTED" and not hypothesis.get("supporting_evidence"):
         issues.append("SUPPORTED_WITHOUT_EVIDENCE")
-    binding, unresolved = _evidence_binding(hypothesis.get("supporting_evidence") or [], known_evidence_ids)
+    binding, unresolved = _evidence_binding(hypothesis.get("supporting_evidence") or [], known_evidence_ids, evidence_store)
     if status == "SUPPORTED" and binding == "UNRESOLVED":
         issues.append("SUPPORTED_WITH_UNKNOWN_EVIDENCE")
+    elif status == "SUPPORTED" and binding == "UNCHECKED":
+        # SUPPORTED asserts the cited evidence exists. PASS needs that checked against a store.
+        issues.append("SUPPORTED_EVIDENCE_NOT_VERIFIED")
     if status == "REFUTED" and not hypothesis.get("counter_evidence"):
         issues.append("REFUTED_WITHOUT_COUNTER_EVIDENCE")
     if hypothesis.get("confirmed_vulnerability"):
@@ -182,6 +222,12 @@ def validate_finding(hypothesis: dict[str, Any], *, known_evidence_ids: Iterable
         "ok": not issues, "status": "PASS" if not issues else "FAIL", "issues": issues,
         "evidence_binding": binding, "unresolved_evidence": unresolved,
     }
+
+
+def _bool_or_unknown(value: Any) -> bool | str:
+    """A real bool as is; anything else (``"false"``, ``0``, ``None``) is ``"UNKNOWN"``, since
+    ``bool("false")`` is True and a text flag must not decide whether validation is required."""
+    return value if isinstance(value, bool) else "UNKNOWN"
 
 
 def _reproduction_verdict(hypothesis: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
@@ -213,11 +259,12 @@ def _reproduction_verdict(hypothesis: dict[str, Any]) -> tuple[str, dict[str, An
 def render_finding_report(
     findings: Iterable[dict[str, Any]], *, artifact_hashes: dict[str, str] | None = None,
     scope_notes: Iterable[str] = (), known_evidence_ids: Iterable[str] | None = None,
+    evidence_store: EvidenceIndex | None = None,
 ) -> dict[str, Any]:
     known = None if known_evidence_ids is None else {str(item) for item in known_evidence_ids}
     rows = []
     for hypothesis in findings:
-        validation = validate_finding(hypothesis, known_evidence_ids=known)
+        validation = validate_finding(hypothesis, known_evidence_ids=known, evidence_store=evidence_store)
         status = hypothesis.get("status")
         confidence = hypothesis.get("confidence", "LOW")
         if str(status or "").upper() == "SUPPORTED" and validation["evidence_binding"] != "VERIFIED":
@@ -247,7 +294,7 @@ def render_finding_report(
             "missing_validation": list(hypothesis.get("missing_evidence") or []),
             "confidence": confidence,
             "status": status,
-            "validation_required": bool(hypothesis.get("validation_required", True)),
+            "validation_required": _bool_or_unknown(hypothesis.get("validation_required", True)),
             "facet": facet,
             "attacker_goal": str(hypothesis.get("attacker_goal") or ""),
             "attacker_effort": str(hypothesis.get("attacker_effort") or "UNKNOWN"),
@@ -293,7 +340,21 @@ def render_finding_report(
     }
 
 
-def counter_evidence_verify(hypothesis_json: str, candidates_json: str, known_evidence_ids: list[str], searched_scope: list[str] | None = None) -> str:
+def _store_from_paths(evidence_root: str | None, evidence_db_path: str | None) -> EvidenceIndex | None:
+    """The evidence store a JSON tool call names, or None when it names neither path."""
+    if not (evidence_root or evidence_db_path):
+        return None
+    return EvidenceIndex(root=evidence_root, db_path=evidence_db_path)
+
+
+def counter_evidence_verify(
+    hypothesis_json: str, candidates_json: str, known_evidence_ids: list[str] | None = None,
+    searched_scope: list[str] | None = None, evidence_root: str | None = None,
+    evidence_db_path: str | None = None,
+) -> str:
+    """Counter evidence is bound only when the evidence index at ``evidence_root`` /
+    ``evidence_db_path`` resolves it; with neither given nothing is bound and nothing refutes.
+    ``known_evidence_ids`` can only narrow what that index accepts."""
     try:
         hypothesis = json.loads(hypothesis_json)
         candidates = json.loads(candidates_json)
@@ -303,7 +364,7 @@ def counter_evidence_verify(hypothesis_json: str, candidates_json: str, known_ev
         return json.dumps({"ok": False, "status": "INVALID_SCHEMA"})
     result = verify_counter_evidence(
         hypothesis, candidates, known_evidence_ids=known_evidence_ids,
-        searched_scope=searched_scope or (),
+        searched_scope=searched_scope or (), evidence_store=_store_from_paths(evidence_root, evidence_db_path),
     )
     return json.dumps({"ok": True, "status": result.get("status"), "hypothesis": result}, ensure_ascii=False, indent=2, sort_keys=True)
 
@@ -311,8 +372,13 @@ def counter_evidence_verify(hypothesis_json: str, candidates_json: str, known_ev
 def finding_report_generate(
     findings_json: str, artifact_hashes_json: str = "{}", scope_notes: list[str] | None = None,
     evidence: str | None = None, known_evidence_ids: list[str] | None = None,
+    evidence_root: str | None = None, evidence_db_path: str | None = None,
 ) -> str:
     """Render the finding report and, when ``evidence`` is supplied, audit its claims.
+
+    ``SUPPORTED`` findings are kept only when the evidence index named by ``evidence_root`` /
+    ``evidence_db_path`` resolves every cited ID; with neither given they are reported
+    ``UNVERIFIED``. ``known_evidence_ids`` is a caller-supplied list that can only narrow that.
 
     The added ``claim_guard`` field has three distinguishable states:
     ``CHECKED_CLEAN`` (guard ran, no issues), ``CHECKED_ISSUES`` (guard ran and
@@ -331,6 +397,7 @@ def finding_report_generate(
         return json.dumps({"ok": False, "status": "INVALID_SCHEMA"})
     report = render_finding_report(
         findings, artifact_hashes=artifact_hashes, scope_notes=scope_notes or (), known_evidence_ids=known_evidence_ids,
+        evidence_store=_store_from_paths(evidence_root, evidence_db_path),
     )
     guard: dict[str, Any] = {
         "checked": False, "state": "NOT_CHECKED", "issues": None, "contains_unproven_claims": None,

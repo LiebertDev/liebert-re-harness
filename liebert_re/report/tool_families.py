@@ -577,16 +577,31 @@ def _known_count(state: dict[str, Any], key: str) -> int | None:
     return None
 
 
+_ROUTING_FLAGS = ("relationship_needed", "conflicting_evidence", "claim_verification_needed")
+
+
+def _malformed_routing_flags(state: dict[str, Any]) -> list[str]:
+    """Routing flags present in ``state`` whose value is not a real bool. ``"false"``, ``0``,
+    ``"no"`` and ``None`` are truthy or falsy by accident of Python, not statements about the
+    artifacts, so they are never read as True or False."""
+    return [key for key in _ROUTING_FLAGS if key in state and not isinstance(state[key], bool)]
+
+
 def relationship_routing(state: dict[str, Any], corpus_text: str = "") -> str:
     """``NEEDED``, ``NOT_NEEDED`` or ``UNKNOWN`` for the correlation family.
+
+    The three routing flags (``relationship_needed``, ``conflicting_evidence``,
+    ``claim_verification_needed``) count only as real bools: a real ``True`` selects
+    ``NEEDED``; a flag that is present but not a bool (text, a number, ``None``) makes the
+    answer ``UNKNOWN`` unless another flag is a real ``True``. An absent flag is simply unset.
 
     ``UNKNOWN``: the text asks about relationships but neither artifact count is a known
     value reaching 2, and at least one is unknown, so "single artifact" cannot be claimed.
     """
-    if state.get("relationship_needed") or state.get("conflicting_evidence"):
+    if any(state.get(key) is True for key in _ROUTING_FLAGS):
         return "NEEDED"
-    if state.get("claim_verification_needed"):
-        return "NEEDED"
+    if _malformed_routing_flags(state):
+        return "UNKNOWN"
     text = str(corpus_text or "").casefold()
     if not any(word in text for word in RELATIONSHIP_SIGNAL_WORDS):
         return "NOT_NEEDED"
@@ -598,9 +613,13 @@ def relationship_routing(state: dict[str, Any], corpus_text: str = "") -> str:
 
 def routing_uncertainties_for_state(artifact_state: dict[str, Any] | None = None, *, corpus_text: str = "") -> list[str]:
     """Reasons the family/tool selection for this state is uncertain (empty when none)."""
-    if relationship_routing(dict(artifact_state or {}), corpus_text) == "UNKNOWN":
-        return ["RELATIONSHIP_ROUTING_UNKNOWN: artifact counts missing or invalid, correlation family not selected"]
-    return []
+    state = dict(artifact_state or {})
+    if relationship_routing(state, corpus_text) != "UNKNOWN":
+        return []
+    bad = _malformed_routing_flags(state)
+    if bad and not any(state.get(key) is True for key in _ROUTING_FLAGS):
+        return [f"RELATIONSHIP_ROUTING_UNKNOWN: routing flag(s) {', '.join(bad)} not a bool, correlation family not selected"]
+    return ["RELATIONSHIP_ROUTING_UNKNOWN: artifact counts missing or invalid, correlation family not selected"]
 
 
 def _relationship_needed(state: dict[str, Any], corpus_text: str = "") -> bool:

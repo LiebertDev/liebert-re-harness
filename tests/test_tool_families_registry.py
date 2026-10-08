@@ -209,6 +209,25 @@ class ArtifactCountTests(unittest.TestCase):
         self.assertEqual(tf.relationship_routing({"artifacts_analyzed": 0, "artifacts_discovered": 3}, _RELATIONSHIP_TEXT), "NEEDED")
         self.assertEqual(tf.relationship_routing({"artifacts_analyzed": "2"}, _RELATIONSHIP_TEXT), "NEEDED")
 
+    def test_routing_flags_count_only_as_real_bools(self):
+        for key in ("relationship_needed", "conflicting_evidence", "claim_verification_needed"):
+            self.assertEqual(tf.relationship_routing({key: True}), "NEEDED", key)
+            self.assertEqual(tf.relationship_routing({key: False}), "NOT_NEEDED", key)
+            for bad in ("false", "no", "0", 0, 1, None, [], "yes"):
+                self.assertEqual(tf.relationship_routing({key: bad}), "UNKNOWN", f"{key}={bad!r}")
+                reasons = tf.routing_uncertainties_for_state({key: bad})
+                self.assertEqual(len(reasons), 1, f"{key}={bad!r}")
+                self.assertIn(key, reasons[0])
+
+    def test_a_real_true_flag_wins_over_a_malformed_one(self):
+        state = {"relationship_needed": "false", "conflicting_evidence": True}
+        self.assertEqual(tf.relationship_routing(state), "NEEDED")
+        self.assertEqual(tf.routing_uncertainties_for_state(state), [])
+
+    def test_malformed_flag_does_not_select_correlation(self):
+        self.assertNotIn("correlation", tf.families_for_state({"relationship_needed": "false"}))
+        self.assertIn("correlation", tf.families_for_state({"relationship_needed": True}))
+
     def test_no_relationship_text_needs_no_counts(self):
         self.assertEqual(tf.relationship_routing({}, "unpack the sample"), "NOT_NEEDED")
         self.assertEqual(tf.routing_uncertainties_for_state({}, corpus_text="unpack the sample"), [])
