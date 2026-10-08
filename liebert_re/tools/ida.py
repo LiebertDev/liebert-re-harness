@@ -157,6 +157,7 @@ import time
 import uuid
 from pathlib import Path
 
+from liebert_re import strict_json
 from liebert_re.bounded_subprocess import run_bounded_process
 from liebert_re.workspace import safe_path, relative
 
@@ -419,7 +420,7 @@ def _read_bytes_request_problem(query):
     try:
         text = (query or "").strip()
         if text.startswith("{"):
-            request = json.loads(text)
+            request = strict_json.loads(text)
             address, size = request.get("address"), request.get("size")
         else:
             parts = text.replace(",", " ").split()
@@ -462,7 +463,7 @@ def _to_int(value):
 def _json_fields(text, allowed):
     """The dict when `text` is a JSON object whose keys are all in `allowed`, else None."""
     try:
-        request = json.loads(text)
+        request = strict_json.loads(text)
     except Exception:  # noqa: BLE001
         return None
     return request if isinstance(request, dict) and set(request) <= set(allowed) else None
@@ -1092,7 +1093,7 @@ def _touch_meta(slot, sha256, *, created=False):
     meta = slot / "meta.json"
     record = {}
     try:
-        record = json.loads(meta.read_text(encoding="utf-8"))
+        record = strict_json.loads(meta.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         pass
     now = time.time()
@@ -1447,7 +1448,7 @@ def _verdict(cp, work, db_path, *, expect_database, expect_operation=None, requi
     operation_matches = expect_operation is None
     if result_present:
         try:
-            data = json.loads(result_path.read_text(encoding="utf-8"))
+            data = strict_json.loads(result_path.read_text(encoding="utf-8"))
             completed = isinstance(data, dict) and data.get("script_completed") is True
             if expect_operation is not None:
                 operation_matches = completed and data.get("operation") == expect_operation
@@ -2275,7 +2276,7 @@ def ida_annotations(path, max_results=_ANNOTATION_DEFAULT_MAXIMUM, max_chars=600
                 if not line.strip():
                     continue
                 try:
-                    record = json.loads(line.decode("utf-8"))
+                    record = strict_json.loads(line.decode("utf-8"))
                 except (ValueError, RecursionError):   # ValueError covers UnicodeDecodeError and json's decode error
                     unreadable += 1
                     continue
@@ -2772,7 +2773,7 @@ def _idalib_probe(*, use_cache=True):
             public.update(status="PROBE_TIMEOUT", reason=f"`import idapro` did not finish in {_IDALIB_PROBE_TIMEOUT_SECONDS} s")
             return public, {}
         try:
-            data = json.loads(out.read_text(encoding="utf-8"))
+            data = strict_json.loads(out.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             data = None
         if not isinstance(data, dict):
@@ -2939,7 +2940,7 @@ def _verdict_idalib(cp, work, *, creating, operations):
         too_large = True
     elif result_present:
         try:
-            envelope = json.loads(result_path.read_text(encoding="utf-8"))
+            envelope = strict_json.loads(result_path.read_text(encoding="utf-8"))
             completed = isinstance(envelope, dict) and envelope.get("script_completed") is True
         except (OSError, ValueError) as exc:
             parse_error = f"{type(exc).__name__}: {exc}"
@@ -3871,7 +3872,7 @@ def _journal_records(sha256):
                 if not line.strip():
                     continue
                 try:
-                    record = json.loads(line.decode("utf-8"))
+                    record = strict_json.loads(line.decode("utf-8"))
                 except (ValueError, RecursionError):
                     unreadable += 1
                     continue
@@ -3908,7 +3909,7 @@ def _manifest_read(label_dir):
     except OSError:
         return None, "MANIFEST_UNREADABLE"
     try:
-        record = json.loads(text)
+        record = strict_json.loads(text)
     except ValueError:
         return None, "MANIFEST_MALFORMED"
     required = (("version", int), ("db_sha256", str), ("write_id", str), ("sha256", str), ("label", str))
@@ -4738,9 +4739,9 @@ def ida_annotations_apply(path, plan=None, allow_partial=False, timeout_seconds=
     tool = "ida_annotations_apply"
     if isinstance(plan, str):
         try:
-            plan = json.loads(plan)
-        except ValueError:
-            return _refuse(tool, "INVALID_PLAN", "PLAN_NOT_JSON", fixable=True, field="plan",
+            plan = strict_json.loads(plan)
+        except ValueError as exc:
+            return _refuse(tool, "INVALID_PLAN", "PLAN_NOT_JSON", fixable=True, field="plan", json_reason=getattr(exc, "reason", None),
                            fix="`plan` is the object `ida_rename_plan` returned under `plan`, or its JSON text.")
     if plan is None:
         return _refuse(tool, "INVALID_PLAN", "PLAN_REQUIRED", fixable=True, field="plan",
