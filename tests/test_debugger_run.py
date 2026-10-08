@@ -503,6 +503,31 @@ def test_the_result_says_what_is_not_verified():
     assert any("no real guest launcher" in line for line in result["not_verified"])
 
 
+def test_the_result_labels_every_guest_report_and_names_the_termination_path_only_when_the_launcher_does():
+    refused = go(build(_decision(ok=False))[0])
+    assert refused["provenance"] == {"exit_code": "GUEST_REPORTED", "output": "GUEST_REPORTED",
+                                     "job_confirmations": "GUEST_REPORTED", "termination_path": None,
+                                     "termination_reason": None}
+    assert any("same account" in line for line in refused["not_verified"])
+    plain = go(build()[0])                                        # a launcher that says nothing about how it ended it
+    assert plain["status"] == "COMPLETED" and plain["provenance"]["termination_path"] is None
+    for path in ("AGENT", "HOST_JOB_KILL", "VM_TURNED_OFF"):
+        reply = {"ok": True, **IDENT, "terminated": True, "termination_path": path, "termination_reason": "SOME_REASON"}
+        result = go(build(terminate_job=reply)[0])
+        assert result["provenance"]["termination_path"] == path
+        assert result["provenance"]["termination_reason"] == "SOME_REASON"
+    for junk in ("elsewhere", 7, None, "agent"):                  # unknown values are not passed on
+        reply = {"ok": True, **IDENT, "terminated": True, "termination_path": junk, "termination_reason": "not a code"}
+        result = go(build(terminate_job=reply)[0])
+        assert result["provenance"]["termination_path"] is None and result["provenance"]["termination_reason"] is None
+    unconfirmed = go(build(terminate_job={"ok": True, **IDENT, "terminated": False, "termination_path": "AGENT"})[0])
+    assert unconfirmed["provenance"]["termination_path"] is None  # only a confirmed end has a path
+    runner = build(terminate_job={"ok": True, **IDENT, "terminated": True, "termination_path": "HOST_JOB_KILL"})[0]
+    assert go(runner)["provenance"]["termination_path"] == "HOST_JOB_KILL"
+    runner._launcher.over["terminate_job"] = {"ok": False}        # the same runner, next run: nothing carries over
+    assert go(runner)["provenance"]["termination_path"] is None
+
+
 # ------------------------------------------------------------------ adversarial review fixes
 
 

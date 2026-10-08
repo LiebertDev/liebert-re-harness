@@ -56,6 +56,12 @@ Identities and counts in launcher replies must be built-in ``int`` / ``str`` / `
 (subclasses can redefine comparison), and a termination is never confirmed for a process whose pid
 ``create_suspended`` did not give.
 
+Provenance. The result carries ``provenance``: the exit code, the output and the job confirmations are
+``GUEST_REPORTED`` (a process in the guest under the target's own account says so), and
+``termination_path`` says how the end of the job was confirmed when the launcher says: ``AGENT``,
+``HOST_JOB_KILL`` (read from outside the agent) or ``VM_TURNED_OFF`` (with ``termination_reason``). A launcher
+that gives no path leaves it ``None``.
+
 Limits stated plainly. The gate's pid, ownership and image-hash checks are shaped for a process on
 THIS host; a guest run has no host pid. This slice passes the caller's ``gate_args`` through
 unchanged and does not decide which host process the authorization should scope. A launcher's
@@ -78,6 +84,8 @@ from liebert_re.dynamic.hyperv_transport import ERROR_CLASSES
 __all__ = ["OPERATION", "SCHEMA", "STATUSES", "DebuggerRun", "GuestLauncher"]
 
 SCHEMA = "liebert-re.debugger-run/1"
+_TERMINATION_PATHS = frozenset({"AGENT", "HOST_JOB_KILL", "VM_TURNED_OFF"})
+_REASON_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 OPERATION = "debugger_run"
 
 STATUSES = (
@@ -152,6 +160,7 @@ class DebuggerRun:
         self._launcher = launcher
         self._gate = gate
         self._clock = clock
+        self._termination: tuple[str | None, str | None] = (None, None)   # (path, reason) of the last confirmed end
 
     # ---- time
 
@@ -184,9 +193,19 @@ class DebuggerRun:
             "gate": None, "transport": None, "exit_code": None, "output": None,
             "job": {"assignment_confirmed": False, "terminated": None},
             "primary_status": None, "primary_reason": None,
+            "provenance": {
+                # Where the facts in this result come from. Everything below is reported by a process inside
+                # the guest; none of it is measured from outside except the termination path when it is
+                # HOST_JOB_KILL (the job accounting was read from a new session) or VM_TURNED_OFF.
+                "exit_code": "GUEST_REPORTED", "output": "GUEST_REPORTED", "job_confirmations": "GUEST_REPORTED",
+                "termination_path": self._termination[0], "termination_reason": self._termination[1],
+            },
             "not_verified": [
                 "the launcher's confirmations are taken as given; no real guest launcher exists in this slice",
                 "network use by the target inside the guest is not limited by the job object",
+                "the guest agent and the target run under the same account, so a target with that account's rights "
+                "could forge what the guest reports (exit code, job confirmation, output); running the target under a "
+                "separate non-administrator account is recommended and is not done here",
             ],
         }
         body.update(more)
@@ -230,6 +249,7 @@ class DebuggerRun:
             memory_bytes: int = DEFAULT_MEMORY_BYTES) -> dict[str, Any]:
         started = self._now()
         steps: list[str] = []
+        self._termination = (None, None)
 
         def refuse(reason: str, **more: Any) -> dict[str, Any]:
             return self._result(started, "REFUSED", reason, steps, **more)
@@ -415,7 +435,13 @@ class DebuggerRun:
         reply = self._call("terminate_job", vm, run_id)
         if ident[1] is None:   # the process this run created was never identified: nothing can be confirmed
             return False
-        return self._about(reply, ident) and reply.get("ok") is True and reply.get("terminated") is True
+        confirmed = self._about(reply, ident) and reply.get("ok") is True and reply.get("terminated") is True
+        if confirmed:
+            path, reason = reply.get("termination_path"), reply.get("termination_reason")
+            self._termination = (
+                path if type(path) is str and path in _TERMINATION_PATHS else None,
+                reason if type(reason) is str and _REASON_CODE.fullmatch(reason) else None)
+        return confirmed
 
     def _collect(self, vm: str, run_id: str, cap: int, ident: tuple[str, int | None]) -> dict[str, Any] | None:
         reply = self._call("collect_output", vm, run_id, cap)
