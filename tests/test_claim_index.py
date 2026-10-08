@@ -856,5 +856,87 @@ class RebuildRaceAndAtomicityTests(unittest.TestCase):
             self.assertEqual([first], self._claim_uids(claims))
 
 
+class EvidenceRound3ReplayAndPersistenceTests(unittest.TestCase):
+    """Round 3: replay derives contradiction from the replayed links, an event file is written
+    atomically, and only a real EvidenceIndex's own answer can back PROVEN."""
+
+    @staticmethod
+    def _proven(tmp):
+        root, evidence_index, claims = _make_indices(tmp)
+        _write_json(root / "s_1111111111_report_222222.json", {"ok": True})
+        _write_json(root / "s_3333333333_report_444444.json", {"ok": True})
+        evidence_index.refresh()
+        support = evidence_index.record(path="s_1111111111_report_222222.json")["evidence_uid"]
+        refute = evidence_index.record(path="s_3333333333_report_444444.json")["evidence_uid"]
+        made = claims.create_claim(
+            "t", "function", "FUN_1", "root_cause", "v1", status="PROVEN",
+            initial_evidence=[{"evidence_uid": support, "relation": "SUPPORTS"}],
+        )
+        return evidence_index, claims, made["claim_uid"], refute
+
+    def test_replay_keeps_a_refuted_claim_contradicted_when_the_status_event_is_missing(self):
+        with TemporaryDirectory() as tmp:
+            _, claims, claim_uid, refute = self._proven(Path(tmp))
+            claims.add_evidence(claim_uid, refute, "REFUTES")
+            self.assertEqual(claims._current_status(claim_uid), "CONTRADICTED")
+            for path in claims.events_root.glob("*__status_changed.json"):
+                path.unlink()  # the log is cut: only the REFUTES link survives
+            claims.rebuild_from_events()
+            self.assertEqual(claims._current_status(claim_uid), "CONTRADICTED")
+            self.assertEqual(claims.claims_for_target("t", status="PROVEN")["results"], [])
+
+    def test_replay_keeps_a_conflicted_claim_contradicted_when_the_status_event_is_missing(self):
+        with TemporaryDirectory() as tmp:
+            _, claims, claim_uid, _refute = self._proven(Path(tmp))
+            claims.create_claim("t", "function", "FUN_1", "root_cause", "other")
+            for path in claims.events_root.glob("*__status_changed.json"):
+                path.unlink()
+            claims.rebuild_from_events()
+            self.assertEqual(claims._current_status(claim_uid), "CONTRADICTED")
+
+    def test_event_that_fails_while_closing_leaves_no_file_for_replay(self):
+        with TemporaryDirectory() as tmp:
+            _, _, claims = _make_indices(Path(tmp))
+            real = Path.write_text
+
+            def full_write_then_fail(path, *args, **kwargs):
+                real(path, *args, **kwargs)
+                if Path(path).parent == claims.events_root:
+                    raise OSError("close failed")
+
+            with mock.patch.object(Path, "write_text", full_write_then_fail):
+                with self.assertRaises(OSError):
+                    claims.create_claim("t", "function", "FUN_1", "root_cause", "a")
+            self.assertEqual(list(claims.events_root.iterdir()), [])
+            claims.rebuild_from_events()
+            self.assertEqual(claims.status()["claims"], 0)
+
+    def test_a_lookalike_store_cannot_back_proven(self):
+        with TemporaryDirectory() as tmp:
+            class Lookalike:
+                def record(self, record_id=None, path=None):
+                    return {"ok": "false", "path": "nonexistent", "evidence_uid": "EVX-other"}
+
+            claims = ClaimIndex(
+                db_path=Path(tmp) / "c.sqlite", events_root=Path(tmp) / "ev", evidence_index=Lookalike(),
+            )
+            with self.assertRaises(ClaimError) as caught:
+                claims.create_claim(
+                    "t", "function", "FUN_1", "root_cause", "v", status="PROVEN",
+                    initial_evidence=[{"evidence_uid": "EVX-real", "relation": "SUPPORTS"}],
+                )
+            self.assertEqual(caught.exception.code, "EVIDENCE_NOT_FOUND")
+            self.assertEqual(claims.status()["claims"], 0)
+
+    def test_a_real_index_answering_for_another_uid_does_not_resolve(self):
+        with TemporaryDirectory() as tmp:
+            evidence_index, claims, _claim_uid, refute = self._proven(Path(tmp))
+            with mock.patch.object(
+                evidence_index, "record",
+                return_value={"ok": True, "path": "x.json", "evidence_uid": "EVX-someone-else"},
+            ):
+                self.assertIsNone(claims._evidence_summary(refute))
+
+
 if __name__ == "__main__":
     unittest.main()

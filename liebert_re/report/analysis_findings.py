@@ -35,14 +35,26 @@ def _id(prefix: str, *parts: object) -> str:
 
 def _store_resolves(store: EvidenceIndex, evidence_id: str) -> bool:
     """True only when ``evidence_id`` is an ``EVX-`` identity the store itself returns a
-    readable record for, under that same identity. A lookup that raises is not a hit."""
+    readable record for, under that same identity, whose bytes on disk NOW were read completely
+    and, for a ``.json`` record, parse. The store's cached metadata is not what is checked: a
+    record that was good when indexed but is truncated or corrupt today resolves nothing. A
+    lookup that raises is not a hit."""
     if not evidence_id.startswith("EVX-"):
         return False
     try:
         record = store.record(record_id=evidence_id)
     except Exception:  # noqa: BLE001 - an unreadable store resolves nothing
         return False
-    return isinstance(record, dict) and record.get("ok") is True and record.get("evidence_uid") == evidence_id
+    if not (isinstance(record, dict) and record.get("ok") is True and record.get("evidence_uid") == evidence_id):
+        return False
+    if record.get("read_error") is not None or not isinstance(record.get("content"), str):
+        return False  # TRUNCATED (or any read error): the current content was not fully read
+    if str(record.get("path") or "").lower().endswith(".json"):
+        try:
+            json.loads(record["content"])
+        except ValueError:
+            return False
+    return True
 
 
 def _evidence_binding(
@@ -230,12 +242,16 @@ def _bool_or_unknown(value: Any) -> bool | str:
     return value if isinstance(value, bool) else "UNKNOWN"
 
 
-def _reproduction_verdict(hypothesis: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+def _reproduction_verdict(
+    hypothesis: dict[str, Any], artifact_sha256: str = "UNKNOWN", evidence_store: EvidenceIndex | None = None,
+) -> tuple[str, dict[str, Any] | None]:
     """The reproduction status a report may state, plus a record of any claim it refused.
 
     ``CONFIRMED`` is accepted only when the hypothesis carries a ``validation_plan`` and
     ``validation_result`` for this very hypothesis and
-    :func:`exploit_validation.verify_validation_result` confirms them. A bare
+    :func:`exploit_validation.verify_validation_result` confirms them against ``evidence_store``,
+    and the plan's target hash is the artifact hash the report itself states for this finding
+    (``artifact_sha256``; "UNKNOWN" confirms nothing). A bare
     ``reproduction_status: "CONFIRMED"`` in free JSON is a claim, not a result: it is
     reported as ``CONFIRMATION_UNVERIFIED`` and never counts as dynamic validation.
     """
@@ -247,9 +263,14 @@ def _reproduction_verdict(hypothesis: dict[str, Any]) -> tuple[str, dict[str, An
         return "CONFIRMATION_UNVERIFIED", {"claimed": claimed, "verified": False, "reason": "NO_VALIDATION_PLAN_AND_RESULT"}
     if not hypothesis.get("hypothesis_id") or plan.get("hypothesis_id") != hypothesis.get("hypothesis_id"):
         return "CONFIRMATION_UNVERIFIED", {"claimed": claimed, "verified": False, "reason": "PLAN_NOT_FOR_THIS_HYPOTHESIS"}
+    reported = str(artifact_sha256 or "").strip().lower()
+    if len(reported) != 64 or any(ch not in "0123456789abcdef" for ch in reported):
+        return "CONFIRMATION_UNVERIFIED", {"claimed": claimed, "verified": False, "reason": "ARTIFACT_HASH_UNKNOWN"}
+    if str(plan.get("target_sha256") or "").strip().lower() != reported:
+        return "CONFIRMATION_UNVERIFIED", {"claimed": claimed, "verified": False, "reason": "PLAN_TARGET_NOT_REPORTED_ARTIFACT"}
     from liebert_re.report.exploit_validation import verify_validation_result
 
-    verdict = verify_validation_result(plan, result)
+    verdict = verify_validation_result(plan, result, evidence_store=evidence_store)
     if verdict.get("status") != "CONFIRMED":
         codes = sorted({str(issue.get("code")) for issue in verdict.get("issues") or [] if issue.get("severity") == "REJECT"})
         return "CONFIRMATION_UNVERIFIED", {"claimed": claimed, "verified": False, "reason": "VERIFIER_REJECTED", "issues": codes}
@@ -272,7 +293,8 @@ def render_finding_report(
             # it against that is unverified; with an index that lacks an ID it is unproven.
             status = "UNVERIFIED" if validation["evidence_binding"] == "UNCHECKED" else "NEEDS_MORE_ANALYSIS"
             confidence = "LOW"
-        reproduction_status, reproduction_claim = _reproduction_verdict(hypothesis)
+        artifact_sha256 = (artifact_hashes or {}).get(str(hypothesis.get("artifact_id")), "UNKNOWN")
+        reproduction_status, reproduction_claim = _reproduction_verdict(hypothesis, artifact_sha256, evidence_store)
         if reproduction_claim is not None:
             validation = {**validation, "reproduction_claim": reproduction_claim}
         facet = str(hypothesis.get("facet") or "UNSPECIFIED").upper()
@@ -284,7 +306,7 @@ def render_finding_report(
         rows.append({
             "finding_id": _id("FND-", hypothesis.get("hypothesis_id")),
             "artifact_id": hypothesis.get("artifact_id"),
-            "artifact_sha256": (artifact_hashes or {}).get(str(hypothesis.get("artifact_id")), "UNKNOWN"),
+            "artifact_sha256": artifact_sha256,
             "function_id": hypothesis.get("function_id", "UNKNOWN"),
             "location": hypothesis.get("location", "UNKNOWN"),
             "observed_behavior": hypothesis.get("observed_pattern"),

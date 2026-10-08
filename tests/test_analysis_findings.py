@@ -2,6 +2,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from liebert_re.evidence.index import EvidenceIndex
 from liebert_re.report.exploit_validation import build_validation_plan
@@ -294,21 +295,27 @@ class ReproductionClaimTests(EvidenceStoreCase):
         row.update(extra)
         return row
 
-    def plan_and_result(self, hypothesis):
+    def plan_and_result(self, hypothesis, sha=None):
+        sha = sha or self.SHA
         plan = build_validation_plan(
-            hypothesis, self.SHA, backend="vm-backend",
+            hypothesis, sha, backend="vm-backend",
             isolation_descriptor={"isolation_kind": "VIRTUAL_MACHINE", "not_the_analysis_host": True, "asserted_by": "test-operator"},
         )
         result = {
-            "plan_id": plan["plan_id"], "test_case_id": plan["test_case_id"], "target_sha256": self.SHA,
+            "plan_id": plan["plan_id"], "test_case_id": plan["test_case_id"], "target_sha256": sha,
             "backend": "vm-backend", "vm_id": "vm-1", "snapshot_id": "snap-1",
             "started_at": "2026-01-01T00:00:00Z", "finished_at": "2026-01-01T00:01:00Z",
             "exit_status": "0", "watchdog_status": "PASS", "revert_status": "PASS",
             "observations": {key: True for key in plan["required_validation_links"]},
-            "artifacts": ["log"], "evidence_ids": ["E-1"],
+            "artifacts": ["log"], "evidence_ids": [self.ids["OTHER"]],
             "environment": {"isolated_vm": True, "target_hash_reverified": True, "os_build": "build-1", "architecture": "x64"},
         }
         return plan, result
+
+    def render(self, hypothesis, sha=None):
+        return render_finding_report(
+            [hypothesis], artifact_hashes={"artifact:one": sha or self.SHA}, evidence_store=self.store,
+        )
 
     def test_bare_confirmed_claim_is_not_dynamic_validation(self):
         report = render_finding_report([self.hypothesis(reproduction_status="CONFIRMED")])
@@ -323,16 +330,57 @@ class ReproductionClaimTests(EvidenceStoreCase):
         hypothesis = self.hypothesis()
         plan, result = self.plan_and_result(hypothesis)
         hypothesis.update(reproduction_status="CONFIRMED", validation_plan=plan, validation_result=result)
-        report = render_finding_report([hypothesis])
+        report = self.render(hypothesis)
         self.assertEqual(report["findings"][0]["reproduction_status"], "CONFIRMED")
         self.assertTrue(report["dynamic_validation_performed"])
+        self.assertEqual(report["coverage"]["UNSPECIFIED"], "RESOLVED")
+
+    def test_plan_validated_against_another_binary_than_the_reported_artifact_is_not_accepted(self):
+        """The plan, result and hypothesis agree with each other, but on a target hash that is
+        not the artifact the report names."""
+        hypothesis = self.hypothesis()
+        plan, result = self.plan_and_result(hypothesis, sha="b" * 64)
+        hypothesis.update(reproduction_status="CONFIRMED", validation_plan=plan, validation_result=result)
+        report = self.render(hypothesis)  # reports artifact hash "a" * 64
+        row = report["findings"][0]
+        self.assertEqual(row["reproduction_status"], "CONFIRMATION_UNVERIFIED")
+        self.assertEqual(row["contract_validation"]["reproduction_claim"]["reason"], "PLAN_TARGET_NOT_REPORTED_ARTIFACT")
+        self.assertFalse(report["dynamic_validation_performed"])
+        self.assertEqual(report["coverage"]["UNSPECIFIED"], "UNKNOWN")
+
+    def test_confirmation_with_no_reported_artifact_hash_is_not_accepted(self):
+        hypothesis = self.hypothesis()
+        plan, result = self.plan_and_result(hypothesis)
+        hypothesis.update(reproduction_status="CONFIRMED", validation_plan=plan, validation_result=result)
+        report = render_finding_report([hypothesis], evidence_store=self.store)
+        row = report["findings"][0]
+        self.assertEqual(row["reproduction_status"], "CONFIRMATION_UNVERIFIED")
+        self.assertEqual(row["contract_validation"]["reproduction_claim"]["reason"], "ARTIFACT_HASH_UNKNOWN")
+
+    def test_dynamic_evidence_that_the_store_does_not_know_is_not_accepted(self):
+        hypothesis = self.hypothesis()
+        plan, result = self.plan_and_result(hypothesis)
+        result["evidence_ids"] = ["E-does-not-exist"]
+        hypothesis.update(reproduction_status="CONFIRMED", validation_plan=plan, validation_result=result)
+        report = self.render(hypothesis)
+        row = report["findings"][0]
+        self.assertEqual(row["reproduction_status"], "CONFIRMATION_UNVERIFIED")
+        self.assertIn("DYNAMIC_EVIDENCE_UNRESOLVED", row["contract_validation"]["reproduction_claim"]["issues"])
+        self.assertEqual(report["coverage"]["UNSPECIFIED"], "UNKNOWN")
+
+    def test_confirmation_with_no_evidence_store_is_not_accepted(self):
+        hypothesis = self.hypothesis()
+        plan, result = self.plan_and_result(hypothesis)
+        hypothesis.update(reproduction_status="CONFIRMED", validation_plan=plan, validation_result=result)
+        report = render_finding_report([hypothesis], artifact_hashes={"artifact:one": self.SHA})
+        self.assertEqual(report["findings"][0]["reproduction_status"], "CONFIRMATION_UNVERIFIED")
 
     def test_result_the_verifier_rejects_is_not_accepted(self):
         hypothesis = self.hypothesis()
         plan, result = self.plan_and_result(hypothesis)
         result["revert_status"] = "NOT_APPLICABLE"
         hypothesis.update(reproduction_status="CONFIRMED", validation_plan=plan, validation_result=result)
-        report = render_finding_report([hypothesis])
+        report = self.render(hypothesis)
         self.assertEqual(report["findings"][0]["reproduction_status"], "CONFIRMATION_UNVERIFIED")
         self.assertFalse(report["dynamic_validation_performed"])
         self.assertIn("AUTOMATIC_REVERT_NOT_VERIFIED", report["findings"][0]["contract_validation"]["reproduction_claim"]["issues"])
@@ -342,9 +390,57 @@ class ReproductionClaimTests(EvidenceStoreCase):
         other = dict(hypothesis, hypothesis_id="HYP-IR-other")
         plan, result = self.plan_and_result(other)
         hypothesis.update(reproduction_status="CONFIRMED", validation_plan=plan, validation_result=result)
-        report = render_finding_report([hypothesis])
+        report = self.render(hypothesis)
         self.assertEqual(report["findings"][0]["reproduction_status"], "CONFIRMATION_UNVERIFIED")
         self.assertFalse(report["dynamic_validation_performed"])
+
+
+class EvidenceReadFreshnessTests(unittest.TestCase):
+    """A store that cached a good record must not keep a finding SUPPORTED once the bytes on
+    disk are no longer a complete, parseable record."""
+
+    NAME = "flow_1111111111_report_222222.json"
+
+    def supported(self, tmp):
+        root = Path(tmp) / "evidence"
+        root.mkdir()
+        (root / self.NAME).write_text(json.dumps({"ok": True, "pad": "x" * 64}), encoding="utf-8")
+        store = EvidenceIndex(root, db_path=Path(tmp) / "evidence.sqlite")
+        store.refresh()
+        uid = store.record(path=self.NAME)["evidence_uid"]
+        row = build_security_hypothesis(
+            artifact_id="a", category="c", observed_pattern="p", supporting_evidence=[uid], evidence_store=store,
+        )
+        self.assertEqual(row["status"], "SUPPORTED")
+        return root, store, row
+
+    def test_bytes_corrupted_after_indexing_are_not_supported(self):
+        with TemporaryDirectory() as tmp:
+            root, store, row = self.supported(tmp)
+            (root / self.NAME).write_bytes(b'{"ok": tru\xff\xfe')
+            report = render_finding_report([row], evidence_store=store)
+            self.assertNotEqual(report["findings"][0]["status"], "SUPPORTED")
+            self.assertEqual(report["findings"][0]["contract_validation"]["evidence_binding"], "UNRESOLVED")
+            rebuilt = build_security_hypothesis(
+                artifact_id="a", category="c", observed_pattern="p",
+                supporting_evidence=row["supporting_evidence"], evidence_store=store,
+            )
+            self.assertEqual(rebuilt["status"], "NEEDS_MORE_ANALYSIS")
+
+    def test_a_truncated_read_is_not_supported(self):
+        with TemporaryDirectory() as tmp:
+            _root, store, row = self.supported(tmp)
+            with mock.patch("liebert_re.evidence.index.MAX_RECORD_BYTES", 16):
+                self.assertEqual(store.record(record_id=row["supporting_evidence"][0])["read_error"], "TRUNCATED")
+                report = render_finding_report([row], evidence_store=store)
+            self.assertNotEqual(report["findings"][0]["status"], "SUPPORTED")
+            self.assertEqual(report["findings"][0]["contract_validation"]["evidence_binding"], "UNRESOLVED")
+
+    def test_intact_bytes_stay_supported(self):
+        with TemporaryDirectory() as tmp:
+            _root, store, row = self.supported(tmp)
+            report = render_finding_report([row], evidence_store=store)
+            self.assertEqual(report["findings"][0]["status"], "SUPPORTED")
 
 
 if __name__ == "__main__":

@@ -387,7 +387,20 @@ class ClaimIndex:
         while path.exists():
             suffix += 1
             path = self.events_root / f"{_ts_compact()}__{claim_uid}__{event_type}__{suffix}.json"
-        path.write_text(json.dumps(record, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        # Written under a name replay does not list, then renamed into place: a write that
+        # fails part-way or while closing never leaves a ``*.json`` event behind, and the temp
+        # file is removed on any failure. The rename is the last step, so a caller that sees
+        # an exception can rely on there being no event for this record.
+        temp = path.with_name(path.name + ".tmp")
+        try:
+            temp.write_text(json.dumps(record, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+            temp.replace(path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                temp.unlink()
+            with contextlib.suppress(OSError):
+                path.unlink()
+            raise
         return path
 
     @contextlib.contextmanager
@@ -501,12 +514,52 @@ class ClaimIndex:
             # The log is only a record of what a writer asserted, possibly under an older
             # version of the rules or with no evidence store bound. PROVEN is a claim about
             # evidence, so it is re-earned here rather than restored on the log's word.
+            # Contradiction is likewise derived from the replayed links and edges, not from the
+            # presence of a ``status_changed`` event: a log with that event cut out must not
+            # turn a refuted claim back into a proven one.
+            contradicted = self._enforce_contradictions(db)
             demoted = self._demote_unproven_claims(db)
         return {
             "ok": True, "tool": "claim_index", "operation": "rebuild_from_events",
             "events_scanned": len(files), "events_applied": applied, "malformed": malformed,
             "demoted_unverified": len(demoted), "demotions": demoted,
+            "contradictions_derived": len(contradicted), "contradictions": contradicted,
         }
+
+    def _enforce_contradictions(self, db):
+        """Replay-time rule: a claim with a REFUTES evidence link, the target of a CONFLICTS_WITH
+        edge, or the target of a SUPERSEDES edge is CONTRADICTED whatever the replayed
+        ``status_changed`` events say (``_link_evidence_locked``, ``create_claim`` and
+        ``supersede_claim`` make the same transition live). Applied before the PROVEN re-check so
+        a refuted claim is never re-earned as PROVEN from its SUPPORTS links."""
+        derived = []
+        rows = db.execute(
+            "SELECT c.claim_uid AS claim_uid, c.status AS status, "
+            "(SELECT e.evidence_uid FROM claim_evidence e WHERE e.claim_uid=c.claim_uid AND e.relation='REFUTES' "
+            " ORDER BY e.id LIMIT 1) AS refuting, "
+            "(SELECT g.from_claim_uid || ' ' || g.relation FROM claim_edges g WHERE g.to_claim_uid=c.claim_uid "
+            " AND g.relation IN ('CONFLICTS_WITH','SUPERSEDES') ORDER BY g.id LIMIT 1) AS edge "
+            "FROM claims c WHERE c.status != 'CONTRADICTED' ORDER BY c.id"
+        ).fetchall()
+        for row in rows:
+            if row["refuting"] is not None:
+                reason = f"replay: refuting evidence {row['refuting']} is linked"
+                caused_by = row["refuting"]
+            elif row["edge"] is not None:
+                other, relation = row["edge"].split(" ", 1)
+                reason = f"replay: {relation} edge from claim {other}"
+                caused_by = other
+            else:
+                continue
+            at = _now_iso()
+            db.execute("UPDATE claims SET status='CONTRADICTED', updated_at=? WHERE claim_uid=?", (at, row["claim_uid"]))
+            db.execute(
+                "INSERT INTO claim_status_history(claim_uid,old_status,new_status,reason,caused_by,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (row["claim_uid"], row["status"], "CONTRADICTED", reason, caused_by, at),
+            )
+            derived.append({"claim_uid": row["claim_uid"], "reason": reason})
+        return derived
 
     def _demote_unproven_claims(self, db):
         """Replay-time evidence check for every claim the log left PROVEN: it keeps PROVEN only
@@ -545,15 +598,20 @@ class ClaimIndex:
 
     # -- evidence validation --------------------------------------------
     def _evidence_summary(self, evidence_uid):
-        if not self.evidence_index:
+        # Only a real EvidenceIndex can resolve evidence: a duck-typed object answers in its own
+        # words. The answer must be a literal ``ok: True`` for the very UID asked about, with a
+        # path -- a truthy string, or a record for another UID, is not a resolution.
+        if not isinstance(self.evidence_index, EvidenceIndex):
             return None
         try:
             record = self.evidence_index.record(record_id=evidence_uid)
         except Exception:  # noqa: BLE001 - a broken lookup must not break claim provenance
             return None
-        if not record.get("ok") and record.get("error") != "NOT_INDEXED":
+        if not isinstance(record, dict) or record.get("ok") is not True:
             return None
-        if record.get("error") == "NOT_INDEXED" or not record.get("path"):
+        if record.get("evidence_uid") != evidence_uid:
+            return None
+        if not isinstance(record.get("path"), str) or not record.get("path"):
             return None
         return {
             "evidence_uid": evidence_uid, "path": record.get("path"), "target": record.get("target"),
