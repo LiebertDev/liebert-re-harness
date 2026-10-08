@@ -43,11 +43,19 @@ What the result never carries: a host path, a user name, the gate decision's env
 or the credential. Output bytes are guest-controlled and untrusted; they are reported as base64
 with their SHA-256 and the counts, and the result says so.
 
+Cleanup outranks the cause. Once a process exists, a run whose job termination is not confirmed
+(a reply that says so, no reply, or a reply about another process) is ``TRANSPORT_ERROR`` /
+``JOB_TERMINATION_NOT_CONFIRMED`` whatever else happened; the status it would otherwise have had is
+kept in ``primary_status`` / ``primary_reason``. The deadline is checked by this module's own clock
+as well: an exit reported after ``timeout_s`` has passed since resume is ``TIMED_OUT``
+(``EXIT_NOT_PROVEN_WITHIN_DEADLINE``), because nothing shows when it happened.
+
 Limits stated plainly. The gate's pid, ownership and image-hash checks are shaped for a process on
 THIS host; a guest run has no host pid. This slice passes the caller's ``gate_args`` through
-unchanged and does not decide which host process the authorization should scope. Whether the
-launcher's confirmations are true is the launcher's business: this module checks that they were
-made, not that they are honest. Job limits do not stop a target from using the network inside the
+unchanged and does not decide which host process the authorization should scope. A launcher's
+confirmations are checked for shape, for being about the process this run created (``run_id`` and
+``pid``) and against the host's own deadline; they are not checked for honesty. The launcher is
+trusted to tell the truth about the guest. Job limits do not stop a target from using the network inside the
 guest (that is the attestation's job, and the attestation is a spoofable file).
 """
 from __future__ import annotations
@@ -86,14 +94,17 @@ _CODE = re.compile(r"[A-Z][A-Z0-9_:]{0,63}")
 class GuestLauncher(Protocol):
     """What a guest-side launcher must offer. Every method returns a dict and must not raise.
 
-    ``create_suspended(vm, guest_path)`` -> ``{"ok": True, "run_id": str, "suspended": True}``.
-    ``assign_to_job(vm, run_id, limits)`` -> ``{"ok": True}``; ``limits`` has ``memory_bytes``.
-    ``verify_job_assignment(vm, run_id)`` -> ``{"ok": True, "in_job": True, "limits_applied": True}``.
-    ``resume(vm, run_id)`` -> ``{"ok": True, "resumed": True}``.
-    ``wait(vm, run_id, timeout_s)`` -> ``{"ok": True, "exited": bool, "exit_code": int | None}``.
-    ``terminate_job(vm, run_id)`` -> ``{"ok": True, "terminated": True}``; it must also kill a
+    ``create_suspended(vm, guest_path)`` -> ``{"ok": True, "run_id": str, "pid": int > 0, "suspended": True}``.
+    Every later reply must repeat that ``run_id`` and ``pid`` (the process and job the call is about);
+    a missing, mismatched or non-integer identity means the reply is about something else and
+    confirms nothing.
+    ``assign_to_job(vm, run_id, limits)`` -> ``{"ok": True, <identity>}``; ``limits`` has ``memory_bytes``.
+    ``verify_job_assignment(vm, run_id)`` -> ``{"ok": True, <identity>, "in_job": True, "limits_applied": True}``.
+    ``resume(vm, run_id)`` -> ``{"ok": True, <identity>, "resumed": True}``.
+    ``wait(vm, run_id, timeout_s)`` -> ``{"ok": True, <identity>, "exited": bool, "exit_code": int | None}``.
+    ``terminate_job(vm, run_id)`` -> ``{"ok": True, <identity>, "terminated": True}``; it must also kill a
     process that was never assigned to the job.
-    ``collect_output(vm, run_id, max_bytes)`` -> ``{"ok": True, "data": bytes, "total_bytes": int}``
+    ``collect_output(vm, run_id, max_bytes)`` -> ``{"ok": True, <identity>, "data": bytes, "total_bytes": int}``
     with ``len(data) <= max_bytes``; ``total_bytes`` is how much the target produced.
     Any key that is missing, or any value of another type, means "not confirmed".
     """
@@ -144,6 +155,7 @@ class DebuggerRun:
             "reason": reason, "steps": list(steps), "elapsed_s": round(self._clock() - started, 3),
             "gate": None, "transport": None, "exit_code": None, "output": None,
             "job": {"assignment_confirmed": False, "terminated": None},
+            "primary_status": None, "primary_reason": None,
             "not_verified": [
                 "the launcher's confirmations are taken as given; no real guest launcher exists in this slice",
                 "network use by the target inside the guest is not limited by the job object",
@@ -265,63 +277,88 @@ class DebuggerRun:
         steps.append("create_suspended")
         created = self._call("create_suspended", vm, guest_path)
         run_id = created.get("run_id") if isinstance(created, dict) else None
-        if not (isinstance(created, dict) and created.get("ok") is True and isinstance(run_id, str)
-                and _RUN_ID.fullmatch(run_id) and created.get("suspended") is True):
+        pid = created.get("pid") if isinstance(created, dict) else None
+        named = isinstance(run_id, str) and _RUN_ID.fullmatch(run_id) is not None
+        if not (isinstance(created, dict) and created.get("ok") is True and named
+                and _is_int(pid) and pid > 0 and created.get("suspended") is True):
             # An id we can name is a process that may exist; make sure it does not run.
-            cleaned = None
-            if isinstance(run_id, str) and _RUN_ID.fullmatch(run_id):
+            if named:
                 steps.append("terminate_job")
-                cleaned = self._terminated(vm, run_id)
-            return transport_error("CREATE_SUSPENDED_NOT_CONFIRMED", job={"assignment_confirmed": False, "terminated": cleaned})
+                done = self._terminated(vm, run_id, (run_id, pid if _is_int(pid) and pid > 0 else None))
+                return self._finish(started, steps, "TRANSPORT_ERROR", "CREATE_SUSPENDED_NOT_CONFIRMED",
+                                    done, gate=summary, job={"assignment_confirmed": False, "terminated": done})
+            return transport_error("CREATE_SUSPENDED_NOT_CONFIRMED",
+                                   job={"assignment_confirmed": False, "terminated": None})
+        ident = (run_id, pid)
 
         # 5. job assignment, confirmed before anything runs
         def unconfirmed(reason: str) -> dict[str, Any]:
             steps.append("terminate_job")
-            return self._result(started, "JOB_ASSIGNMENT_UNCONFIRMED", reason, steps, gate=summary,
-                                job={"assignment_confirmed": False, "terminated": self._terminated(vm, run_id)})
+            done = self._terminated(vm, run_id, ident)
+            return self._finish(started, steps, "JOB_ASSIGNMENT_UNCONFIRMED", reason, done, gate=summary,
+                                job={"assignment_confirmed": False, "terminated": done})
 
         steps.append("assign_to_job")
         assigned = self._call("assign_to_job", vm, run_id, {"memory_bytes": memory_bytes})
-        if not (isinstance(assigned, dict) and assigned.get("ok") is True):
+        if not (self._about(assigned, ident) and assigned.get("ok") is True):
             return unconfirmed("ASSIGN_TO_JOB_FAILED")
         steps.append("verify_job_assignment")
         verified = self._call("verify_job_assignment", vm, run_id)
-        if not (isinstance(verified, dict) and verified.get("ok") is True and verified.get("in_job") is True
+        if not (self._about(verified, ident) and verified.get("ok") is True and verified.get("in_job") is True
                 and verified.get("limits_applied") is True):
             return unconfirmed("JOB_ASSIGNMENT_NOT_VERIFIED")
 
         # 6. resume and wait; from here the target runs
         steps.append("resume")
+        resumed_at = self._clock()
         resumed = self._call("resume", vm, run_id)
-        if not (isinstance(resumed, dict) and resumed.get("ok") is True and resumed.get("resumed") is True):
+        if not (self._about(resumed, ident) and resumed.get("ok") is True and resumed.get("resumed") is True):
             steps.append("terminate_job")
-            return transport_error("RESUME_NOT_CONFIRMED", job={"assignment_confirmed": True,
-                                                                "terminated": self._terminated(vm, run_id)})
+            done = self._terminated(vm, run_id, ident)
+            return self._finish(started, steps, "TRANSPORT_ERROR", "RESUME_NOT_CONFIRMED", done, gate=summary,
+                                job={"assignment_confirmed": True, "terminated": done})
         steps.append("wait")
         waited = self._call("wait", vm, run_id, float(timeout_s))
-        exited = isinstance(waited, dict) and waited.get("ok") is True and waited.get("exited") is True
-        code = waited.get("exit_code") if isinstance(waited, dict) else None
-        wait_valid = (isinstance(waited, dict) and waited.get("ok") is True
-                      and isinstance(waited.get("exited"), bool)
+        within_deadline = self._clock() - resumed_at <= timeout_s
+        about = self._about(waited, ident)
+        exited = about and waited.get("ok") is True and waited.get("exited") is True
+        code = waited.get("exit_code") if about else None
+        wait_valid = (about and waited.get("ok") is True and isinstance(waited.get("exited"), bool)
                       and (waited["exited"] is False or _is_int(code)))
         steps.append("terminate_job")
-        terminated = self._terminated(vm, run_id)
+        terminated = self._terminated(vm, run_id, ident)
         steps.append("collect_output")
-        output = self._collect(vm, run_id, output_cap_bytes)
-        job = {"assignment_confirmed": True, "terminated": terminated}
-        common = {"gate": summary, "job": job, "output": output}
+        output = self._collect(vm, run_id, output_cap_bytes, ident)
+        common = {"gate": summary, "job": {"assignment_confirmed": True, "terminated": terminated}, "output": output}
         if not wait_valid:
-            return self._result(started, "TRANSPORT_ERROR", "WAIT_REPLY_INVALID", steps, **common)
+            return self._finish(started, steps, "TRANSPORT_ERROR", "WAIT_REPLY_INVALID", terminated, **common)
         if not exited:
-            return self._result(started, "TIMED_OUT", "DEADLINE_REACHED_BEFORE_EXIT", steps, **common)
+            return self._finish(started, steps, "TIMED_OUT", "DEADLINE_REACHED_BEFORE_EXIT", terminated, **common)
+        if not within_deadline:
+            return self._finish(started, steps, "TIMED_OUT", "EXIT_NOT_PROVEN_WITHIN_DEADLINE", terminated, **common)
         common["exit_code"] = code
         if output is None:
-            return self._result(started, "TRANSPORT_ERROR", "OUTPUT_REPLY_INVALID", steps, **common)
+            return self._finish(started, steps, "TRANSPORT_ERROR", "OUTPUT_REPLY_INVALID", terminated, **common)
         if output["truncated"]:
-            return self._result(started, "OUTPUT_TRUNCATED", output["truncated_reason"], steps, **common)
-        if terminated is not True:
-            return self._result(started, "TRANSPORT_ERROR", "JOB_TERMINATION_NOT_CONFIRMED", steps, **common)
-        return self._result(started, "COMPLETED", None, steps, **common)
+            return self._finish(started, steps, "OUTPUT_TRUNCATED", output["truncated_reason"], terminated, **common)
+        return self._finish(started, steps, "COMPLETED", None, terminated, **common)
+
+    def _finish(self, started: float, steps: list[str], status: str, reason: str | None, terminated: object,
+                **more: Any) -> dict[str, Any]:
+        """Unconfirmed job termination outranks every other status; the cause is kept beside it."""
+        if terminated is True:
+            return self._result(started, status, reason, steps, **more)
+        return self._result(started, "TRANSPORT_ERROR", "JOB_TERMINATION_NOT_CONFIRMED", steps,
+                            primary_status=status, primary_reason=reason, **more)
+
+    @staticmethod
+    def _about(reply: object, ident: tuple[str, int | None]) -> bool:
+        """True only for a dict that names the process this run created (a pid is compared when known)."""
+        if not isinstance(reply, dict) or not isinstance(reply.get("run_id"), str) or reply["run_id"] != ident[0]:
+            return False
+        if ident[1] is None:
+            return True
+        return _is_int(reply.get("pid")) and reply["pid"] == ident[1]
 
     # ---- launcher calls
 
@@ -331,13 +368,13 @@ class DebuggerRun:
         except Exception:  # noqa: BLE001 - a launcher that raises has confirmed nothing
             return None
 
-    def _terminated(self, vm: str, run_id: str) -> bool:
+    def _terminated(self, vm: str, run_id: str, ident: tuple[str, int | None]) -> bool:
         reply = self._call("terminate_job", vm, run_id)
-        return isinstance(reply, dict) and reply.get("ok") is True and reply.get("terminated") is True
+        return self._about(reply, ident) and reply.get("ok") is True and reply.get("terminated") is True
 
-    def _collect(self, vm: str, run_id: str, cap: int) -> dict[str, Any] | None:
+    def _collect(self, vm: str, run_id: str, cap: int, ident: tuple[str, int | None]) -> dict[str, Any] | None:
         reply = self._call("collect_output", vm, run_id, cap)
-        if not (isinstance(reply, dict) and reply.get("ok") is True and isinstance(reply.get("data"), (bytes, bytearray))
+        if not (self._about(reply, ident) and reply.get("ok") is True and isinstance(reply.get("data"), (bytes, bytearray))
                 and _is_int(reply.get("total_bytes"))):
             return None
         data, total = bytes(reply["data"]), reply["total_bytes"]

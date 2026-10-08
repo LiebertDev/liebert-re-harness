@@ -33,6 +33,9 @@ GUEST_DIR = "C:\\Lab\\in"
 GUEST_PATH = GUEST_DIR + "\\sample.bin"
 
 
+IDENT = {"run_id": "run-1", "pid": 4321}
+
+
 def good_decision() -> dict[str, Any]:
     return {"ok": True, "decision": "ALLOW", "status": "GATE_PASSED", "operation": dr.OPERATION,
             "isolation_verified": True, "error": None,
@@ -65,10 +68,19 @@ class FakeTransport:
         return self.reply
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
 class FakeLauncher:
     def __init__(self, calls: Calls, **over: Any) -> None:
         self.calls, self.over, self.seen_limits = calls, over, None
         self.output = over.pop("output", (b"hello\n", 6))
+        self.clock, self.advance_in_wait = over.pop("clock", None), over.pop("advance_in_wait", 0.0)
 
     def _do(self, name: str, default: Any) -> Any:
         self.calls.log.append(name)
@@ -78,29 +90,31 @@ class FakeLauncher:
         return reply
 
     def create_suspended(self, vm, guest_path):
-        return self._do("create_suspended", {"ok": True, "run_id": "run-1", "suspended": True})
+        return self._do("create_suspended", {"ok": True, **IDENT, "suspended": True})
 
     def assign_to_job(self, vm, run_id, limits):
         self.seen_limits = dict(limits)
-        return self._do("assign_to_job", {"ok": True})
+        return self._do("assign_to_job", {"ok": True, **IDENT})
 
     def verify_job_assignment(self, vm, run_id):
-        return self._do("verify_job_assignment", {"ok": True, "in_job": True, "limits_applied": True})
+        return self._do("verify_job_assignment", {"ok": True, **IDENT, "in_job": True, "limits_applied": True})
 
     def resume(self, vm, run_id):
-        return self._do("resume", {"ok": True, "resumed": True})
+        return self._do("resume", {"ok": True, **IDENT, "resumed": True})
 
     def wait(self, vm, run_id, timeout_s):
         self.waited_for = timeout_s
-        return self._do("wait", {"ok": True, "exited": True, "exit_code": 0})
+        if self.clock is not None:
+            self.clock.now += self.advance_in_wait
+        return self._do("wait", {"ok": True, **IDENT, "exited": True, "exit_code": 0})
 
     def terminate_job(self, vm, run_id):
-        return self._do("terminate_job", {"ok": True, "terminated": True})
+        return self._do("terminate_job", {"ok": True, **IDENT, "terminated": True})
 
     def collect_output(self, vm, run_id, max_bytes):
         self.cap_seen = max_bytes
         data, total = self.output
-        return self._do("collect_output", {"ok": True, "data": data, "total_bytes": total})
+        return self._do("collect_output", {"ok": True, **IDENT, "data": data, "total_bytes": total})
 
 
 _UNSET = object()
@@ -117,7 +131,9 @@ def build(decision=_UNSET, *, transport_reply=None, transport_raises=False, gate
         return good_decision() if decision is _UNSET else decision
 
     transport = FakeTransport(calls, transport_reply, transport_raises)
-    return DebuggerRun(transport, FakeLauncher(calls, **launcher_over), gate=gate), calls
+    clock = launcher_over.get("clock")
+    extra = {"clock": clock} if clock is not None else {}
+    return DebuggerRun(transport, FakeLauncher(calls, **launcher_over), gate=gate, **extra), calls
 
 
 def go(runner, **kw):
@@ -238,7 +254,7 @@ def test_completed_run_follows_the_exact_order_and_records_bounded_output():
 
 
 def test_a_non_zero_exit_code_is_reported_not_judged():
-    runner, _ = build(wait={"ok": True, "exited": True, "exit_code": 3})
+    runner, _ = build(wait={"ok": True, **IDENT, "exited": True, "exit_code": 3})
     result = go(runner)
     assert result["status"] == "COMPLETED" and result["exit_code"] == 3
 
@@ -276,9 +292,10 @@ def test_unconfirmed_job_assignment_never_resumes(over):
 
 
 def test_unconfirmed_assignment_with_a_failed_cleanup_says_the_cleanup_is_unconfirmed():
-    runner, _ = build(assign_to_job={"ok": False}, terminate_job={"ok": True})
+    runner, _ = build(assign_to_job={"ok": False}, terminate_job={"ok": True, **IDENT})
     result = go(runner)
-    assert result["status"] == "JOB_ASSIGNMENT_UNCONFIRMED" and result["job"]["terminated"] is False
+    assert result["status"] == "TRANSPORT_ERROR" and result["reason"] == "JOB_TERMINATION_NOT_CONFIRMED"
+    assert result["primary_status"] == "JOB_ASSIGNMENT_UNCONFIRMED" and result["job"]["terminated"] is False
 
 
 @pytest.mark.parametrize("over", [
@@ -309,7 +326,7 @@ def test_an_unresumable_process_is_terminated_and_not_completed():
 
 
 def test_deadline_returns_timed_out():
-    runner, calls = build(wait={"ok": True, "exited": False, "exit_code": None})
+    runner, calls = build(wait={"ok": True, **IDENT, "exited": False, "exit_code": None})
     result = go(runner, timeout_s=2.5)
     assert result["status"] == "TIMED_OUT" and result["ok"] is False and result["exit_code"] is None
     assert runner._launcher.waited_for == 2.5
@@ -350,10 +367,10 @@ def test_an_output_reply_that_cannot_be_trusted_is_never_completed(over):
 
 
 @pytest.mark.parametrize("over", [
-    {"wait": {"ok": True, "exited": True}},
-    {"wait": {"ok": True, "exited": True, "exit_code": True}},
-    {"wait": {"ok": True, "exited": 1, "exit_code": 0}},
-    {"wait": {"ok": True, "exit_code": 0}},
+    {"wait": {"ok": True, **IDENT, "exited": True}},
+    {"wait": {"ok": True, **IDENT, "exited": True, "exit_code": True}},
+    {"wait": {"ok": True, **IDENT, "exited": 1, "exit_code": 0}},
+    {"wait": {"ok": True, **IDENT, "exit_code": 0}},
     {"wait": {"ok": False}},
     {"wait": None},
     {"wait": RuntimeError("boom")},
@@ -445,7 +462,7 @@ def test_the_real_transport_with_a_matching_hash_reaches_the_launcher(tmp_path):
 
 def test_result_carries_no_host_path():
     host_path = "D:\\hostmark\\work\\sample.bin"
-    for kw in ({}, {"wait": {"ok": True, "exited": False, "exit_code": None}}, {"assign_to_job": {"ok": False}},
+    for kw in ({}, {"wait": {"ok": True, **IDENT, "exited": False, "exit_code": None}}, {"assign_to_job": {"ok": False}},
                {"output": (b"z" * 8, 99)}):
         runner, _ = build(**kw)
         result = runner.run(VM, host_path, SHA, GUEST_DIR)
@@ -460,7 +477,7 @@ def test_result_carries_no_host_path():
 def test_every_status_is_a_member_of_the_enum_and_only_completed_is_ok():
     seen = set()
     scenarios = [
-        {}, {"wait": {"ok": True, "exited": False, "exit_code": None}}, {"output": (b"x", 2)},
+        {}, {"wait": {"ok": True, **IDENT, "exited": False, "exit_code": None}}, {"output": (b"x", 2)},
         {"assign_to_job": {"ok": False}}, {"resume": {"ok": False}},
     ]
     for kw in scenarios:
@@ -475,3 +492,73 @@ def test_every_status_is_a_member_of_the_enum_and_only_completed_is_ok():
 def test_the_result_says_what_is_not_verified():
     result = go(build()[0])
     assert any("no real guest launcher" in line for line in result["not_verified"])
+
+
+# ------------------------------------------------------------------ adversarial review fixes
+
+
+@pytest.mark.parametrize("over, primary", [
+    ({"assign_to_job": {"ok": False}}, "JOB_ASSIGNMENT_UNCONFIRMED"),
+    ({"wait": {"ok": True, **IDENT, "exited": False, "exit_code": None}}, "TIMED_OUT"),
+    ({"output": (b"x" * 4, 99)}, "OUTPUT_TRUNCATED"),
+    ({"resume": {"ok": False}}, "TRANSPORT_ERROR"),
+    ({"create_suspended": {"ok": True, **IDENT, "suspended": False}}, "TRANSPORT_ERROR"),
+])
+def test_an_unconfirmed_termination_outranks_every_other_status(over, primary):
+    for term in ({"ok": True, **IDENT, "terminated": False}, None, {"ok": True, **IDENT}):
+        runner, _ = build(terminate_job=term, **over)
+        result = go(runner)
+        assert result["status"] == "TRANSPORT_ERROR" and result["reason"] == "JOB_TERMINATION_NOT_CONFIRMED", over
+        assert result["primary_status"] == primary and result["primary_reason"]
+        assert result["job"]["terminated"] is False and result["ok"] is False
+
+
+def test_a_confirmed_cleanup_leaves_the_primary_fields_empty():
+    result = go(build(wait={"ok": True, **IDENT, "exited": False, "exit_code": None})[0])
+    assert result["status"] == "TIMED_OUT" and result["primary_status"] is None and result["primary_reason"] is None
+
+
+def test_an_exit_reported_after_the_deadline_is_timed_out_even_if_the_process_exited():
+    clock = FakeClock()
+    runner, _ = build(clock=clock, advance_in_wait=2.0)
+    result = go(runner, timeout_s=1)
+    assert result["status"] == "TIMED_OUT" and result["reason"] == "EXIT_NOT_PROVEN_WITHIN_DEADLINE"
+    assert result["ok"] is False and result["elapsed_s"] == 2.0
+
+
+def test_an_exit_reported_inside_the_deadline_still_completes():
+    clock = FakeClock()
+    runner, _ = build(clock=clock, advance_in_wait=0.9)
+    assert go(runner, timeout_s=1)["status"] == "COMPLETED"
+
+
+WRONG = [{"run_id": "other", "pid": 4321}, {"run_id": "run-1", "pid": 999}, {"pid": 4321}, {"run_id": "run-1"},
+         {}, {"run_id": "run-1", "pid": True}, {"run_id": "run-1", "pid": "4321"}, {"run_id": 1, "pid": 4321}]
+
+
+@pytest.mark.parametrize("ident", WRONG)
+@pytest.mark.parametrize("step", ["assign_to_job", "verify_job_assignment", "resume", "wait", "terminate_job",
+                                  "collect_output"])
+def test_a_confirmation_about_another_process_is_never_completed(step, ident):
+    good = {
+        "assign_to_job": {"ok": True}, "resume": {"ok": True, "resumed": True},
+        "verify_job_assignment": {"ok": True, "in_job": True, "limits_applied": True},
+        "wait": {"ok": True, "exited": True, "exit_code": 0}, "terminate_job": {"ok": True, "terminated": True},
+        "collect_output": {"ok": True, "data": b"hi", "total_bytes": 2},
+    }[step]
+    reply = dict(good)
+    reply.update(ident)
+    runner, calls = build(**{step: reply})
+    result = go(runner)
+    assert result["status"] != "COMPLETED" and result["ok"] is False, (step, ident)
+    if step in ("assign_to_job", "verify_job_assignment"):
+        assert result["status"] == "JOB_ASSIGNMENT_UNCONFIRMED" and "resume" not in calls.log
+
+
+def test_create_suspended_must_name_a_process_id():
+    for created in ({"ok": True, "run_id": "run-1", "suspended": True},
+                    {"ok": True, "run_id": "run-1", "pid": 0, "suspended": True},
+                    {"ok": True, "run_id": "run-1", "pid": True, "suspended": True}):
+        runner, calls = build(create_suspended=created)
+        assert go(runner)["status"] == "TRANSPORT_ERROR"
+        assert "assign_to_job" not in calls.log
