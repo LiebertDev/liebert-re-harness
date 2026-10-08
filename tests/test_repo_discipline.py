@@ -45,9 +45,7 @@ _END = "# END-" + "PRIVATE-NAMES"
 
 # Modules with no test import today. New modules must ship with a test instead
 # of being added here.
-KNOWN_UNREFERENCED = {
-    "liebert_re.tools.asar_parser": "only reached indirectly via tools_formats.detect_asar; no direct test yet",
-}
+KNOWN_UNREFERENCED = {}
 
 # Tracked files that contain a machine-specific user path today. Empty = none.
 # Both are generic placeholders surfaced when the scan widened to the home and root dirs (not real users).
@@ -362,7 +360,7 @@ def test_allowlists_have_not_grown():
     # an entry would otherwise blind the scan while every test stays green.
     assert len(PRIVATE_IDS) == 17
     assert hashlib.sha256(repr(PRIVATE_IDS).encode()).hexdigest().startswith("d51a752750a0f2a7")
-    assert set(KNOWN_UNREFERENCED) == {"liebert_re.tools.asar_parser"}
+    assert set(KNOWN_UNREFERENCED) == set()  # asar_parser gained tests/test_asar_parser.py and left the list
     assert set(KNOWN_USER_PATHS) == {"tests/test_public_provenance_and_fixtures.py", "liebert_re/workspace.py"}
     # 23 -> 18 entries, 34 -> 21 identifiers: dead mentions of the upstream project's earlier name
     # removed (five files dropped; four more lost identifiers). Live compatibility env variables untouched.

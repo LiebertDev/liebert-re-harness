@@ -14,8 +14,7 @@ Each rule names how it is checked. A rule with no machine check is stated as a d
    `package` job measures the module count and the docs gate pins it; there is no
    hand-maintained constant to update. Checked by `tests/test_repo_discipline.py`
    (`test_layout_matches_packaging`, `test_every_module_is_referenced_by_a_test`) and CI.
-   One module, `liebert_re.tools.asar_parser`, is allowlisted in `KNOWN_UNREFERENCED` and
-   excluded from that check; the list is pinned by tests and may only shrink.
+   `KNOWN_UNREFERENCED` is now empty and pinned empty by tests; it may not grow.
 2. **Done means green.** `pytest -q` and `ruff check .` both pass before a commit.
    Never add an entry to a `KNOWN_*` table in `tests/test_repo_discipline.py`;
    entries may only be removed. Checked by `test_allowlists_have_not_grown`.

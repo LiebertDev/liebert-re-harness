@@ -78,15 +78,22 @@ def _walk_files(node: dict, prefix: str, *, depth: int, entries: list, errors: l
             })
             _walk_files(child, rel, depth=depth + 1, entries=entries, errors=errors)
             continue
-        size = child.get("size", 0)
-        offset = child.get("offset", "0")
+        size = child.get("size")
+        offset = child.get("offset")
+        is_unpacked = bool(child.get("unpacked"))
+        # A file without a size, or a packed file without an offset, is malformed: a missing
+        # field is unknown, never a valid 0. (Unpacked files live outside the archive and carry no offset.)
+        if size is None or (offset is None and not is_unpacked):
+            errors.append({"error": "MISSING_OFFSET_OR_SIZE", "path": rel,
+                           "missing": [k for k, v in (("size", size), ("offset", offset)) if v is None and (k == "size" or not is_unpacked)]})
+            continue
         try:
             size_i = int(size)
-            offset_i = int(offset)
+            offset_i = None if offset is None else int(offset)
         except (TypeError, ValueError):
             errors.append({"error": "MALFORMED_OFFSET_OR_SIZE", "path": rel, "offset": offset, "size": size})
             continue
-        if size_i < 0 or offset_i < 0:
+        if size_i < 0 or (offset_i is not None and offset_i < 0):
             errors.append({"error": "NEGATIVE_OFFSET_OR_SIZE", "path": rel})
             continue
         entries.append({
@@ -154,7 +161,7 @@ def parse_asar(path: str | Path | None = None, *, data: bytes | None = None) -> 
             row["oob"] = True
     ok = not any(e.get("error") in {
         "TREE_TOO_DEEP", "TOO_MANY_ENTRIES", "FILE_OFFSET_OR_SIZE_OOB", "MALFORMED_OFFSET_OR_SIZE",
-        "UNEXPECTED_FIELD_TYPE", "INVALID_ENTRY_NAME", "NEGATIVE_OFFSET_OR_SIZE",
+        "UNEXPECTED_FIELD_TYPE", "INVALID_ENTRY_NAME", "NEGATIVE_OFFSET_OR_SIZE", "MISSING_OFFSET_OR_SIZE",
     } for e in errors)
     report = {
         "ok": ok,
