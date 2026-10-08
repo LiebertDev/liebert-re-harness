@@ -49,6 +49,7 @@ import uuid
 import zlib
 from pathlib import Path
 
+from liebert_re import strict_json
 from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.recover.pe_address import AddressForm, normalize_address, resolve_address_form
 from liebert_re.workspace import safe_path, relative
@@ -144,16 +145,21 @@ def _extract_json_array(text: str):
     ``[`` appears at all, or ``(None, None, "MALFORMED")`` when one appears
     but no complete array can be decoded from it. Those two failure reasons
     are kept apart deliberately: "rizin printed no JSON" and "rizin printed
-    broken JSON" are different diagnoses.
+    broken JSON" are different diagnoses. A candidate that IS well-formed JSON
+    but not strict (repeated key, NaN/Infinity, overflowing number, absurd
+    nesting) stops the scan: ``(None, None, "NOT_STRICT_<strict_json reason>")``.
+    Scanning on to a later ``[`` would hand back a fragment of that untrusted
+    document as though it were the answer.
     """
-    decoder = json.JSONDecoder()
     pos = text.find("[")
     if pos == -1:
         return None, None, "ABSENT"
     while pos != -1:
         try:
-            value, end = decoder.raw_decode(text, pos)
-        except ValueError:
+            value, end = strict_json.raw_decode(text, pos)
+        except strict_json.StrictJSONError as exc:
+            if exc.reason != strict_json.MALFORMED:
+                return None, None, "NOT_STRICT_" + exc.reason
             pos = text.find("[", pos + 1)
             continue
         if isinstance(value, list):
@@ -181,9 +187,11 @@ def _rizin_load_probe(text: str) -> dict:
     if start == -1:
         return {"status": "PROBE_UNAVAILABLE", "reason": "RIZIN_IIJ_NO_JSON_OBJECT"}
     try:
-        info, _end = json.JSONDecoder().raw_decode(text, start)
-    except ValueError as exc:
-        return {"status": "PROBE_UNAVAILABLE", "reason": f"RIZIN_IIJ_UNPARSEABLE: {type(exc).__name__}"}
+        info, _end = strict_json.raw_decode(text, start)
+    except strict_json.StrictJSONError as exc:
+        if exc.reason != strict_json.MALFORMED:
+            return {"status": "PROBE_UNAVAILABLE", "reason": f"RIZIN_IIJ_NOT_STRICT_JSON: {exc.reason}"}
+        return {"status": "PROBE_UNAVAILABLE", "reason": "RIZIN_IIJ_UNPARSEABLE: JSONDecodeError"}
     if not isinstance(info, dict):
         return {"status": "PROBE_UNAVAILABLE", "reason": "RIZIN_IIJ_NOT_AN_OBJECT"}
     loaded = bool(info.get("havecode")) or (bool(info.get("arch")) and bool(info.get("bintype")))
@@ -314,6 +322,10 @@ def _pdj(exe: str, path: str, resolved: dict, count: int, timeout_seconds, cance
     raw, _end, extraction = _extract_json_array(stdout)
     if extraction == "ABSENT":
         return None, {"ok": False, "status": "ANALYSIS_LIMITED", "error": "RIZIN_NO_JSON_OUTPUT", "stdout_tail": stdout[-2000:], "stderr_tail": (cp.stderr or "")[-2000:]}
+    if extraction.startswith("NOT_STRICT_"):
+        return None, {"ok": False, "status": "RESULT_PARSE_FAILED", "error": "NON_STRICT_JSON_RESULT",
+                      "reason": extraction[len("NOT_STRICT_"):],
+                      "stdout_tail": stdout[-2000:], "stderr_tail": (cp.stderr or "")[-2000:]}
     if extraction == "MALFORMED":
         return None, {"ok": False, "status": "RESULT_PARSE_FAILED", "error": "RIZIN_PDJ_JSON_MALFORMED",
                       "stdout_tail": stdout[-2000:], "stderr_tail": (cp.stderr or "")[-2000:]}
@@ -1739,6 +1751,13 @@ def rizin_functions(
             "stdout_tail": stdout[-2000:],
             "stderr_tail": (cp.stderr or "")[-2000:],
         })
+    if extraction.startswith("NOT_STRICT_"):
+        return _j({
+            "ok": False, "tool": "rizin_functions", "status": "RESULT_PARSE_FAILED",
+            "error": "NON_STRICT_JSON_RESULT", "reason": extraction[len("NOT_STRICT_"):],
+            "output_truncated": cp.output_truncated,
+            "stdout_tail": stdout[-2000:],
+        })
     if extraction == "MALFORMED":
         return _j({
             "ok": False, "tool": "rizin_functions", "status": "RESULT_PARSE_FAILED",
@@ -1962,11 +1981,13 @@ class _RzBin:
                        "error": "RZ_BIN_OUTPUT_TRUNCATED_AT_CAP", "output_truncated": True,
                        "max_output_chars": _MAX_OUTPUT_CHARS})
         try:
-            raw = json.loads(stdout)
+            raw = strict_json.loads(stdout)
             items = raw[key] if isinstance(raw, dict) else None
-        except (ValueError, KeyError) as exc:
+        except (ValueError, KeyError) as exc:  # StrictJSONError is a ValueError
             return _j({"ok": False, "tool": tool, "status": "RESULT_PARSE_FAILED",
-                       "error": f"{type(exc).__name__}: {exc}", "stdout_tail": stdout[-500:]})
+                       "error": f"{type(exc).__name__}: {exc}",
+                       **({"reason": exc.reason} if isinstance(exc, strict_json.StrictJSONError) else {}),
+                       "stdout_tail": stdout[-500:]})
         if not isinstance(items, list):
             return _j({"ok": False, "tool": tool, "status": "RESULT_PARSE_FAILED",
                        "error": f"RZ_BIN_OUTPUT_MISSING_{key.upper()}_LIST"})
@@ -1977,7 +1998,7 @@ class _RzBin:
             load_probe = "PROBE_UNAVAILABLE"
             try:
                 info = run_once(["-j", "-I"])
-                parsed = json.loads(info.stdout or "")["info"] if info.returncode in (0, None) else None
+                parsed = strict_json.loads(info.stdout or "")["info"] if info.returncode in (0, None) else None
                 if isinstance(parsed, dict):
                     load_probe = "BINARY_LOADED" if parsed.get("bintype") else "NO_BINARY_LOADED"
             except Exception:  # noqa: BLE001 - an unanswered probe stays PROBE_UNAVAILABLE
