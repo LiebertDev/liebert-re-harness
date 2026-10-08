@@ -1737,3 +1737,92 @@ def test_the_emulate_subcommand_refuses_unusable_input_flags(sandbox, capsys):
         code, out = run_cli(capsys, *base, *argv)
         assert code != 0 and out["ok"] is False and out["status"] in ("TOOL_USAGE", "PATH_REFUSED"), argv
         assert out.get("stop_reason") is None
+
+
+# -- findings from an outside review of the engine: each pinned on a clock the test moves ------------------------------------------
+
+def test_a_deadline_that_passes_while_the_code_runs_is_a_timeout_even_when_the_code_returned(sandbox, monkeypatch):
+    """The final instruction takes longer than the budget (a slow step of the VEX layer, on a clock the test moves)
+    and the run then lands on the sentinel. The return is real but it was not inside the time bound, so the stop is
+    a TIMEOUT: a bound that was exceeded is never reported as a finished run."""
+    from liebert_re.recover import vex
+    path = build(sandbox, asm("ret"))
+    skew, real = [0.0], time.monotonic
+    original = vex.VexLayer.step
+
+    def slow_step(self, address, size):
+        skew[0] = 1e6
+        return original(self, address, size)
+
+    monkeypatch.setattr(time, "monotonic", lambda: real() + skew[0])
+    monkeypatch.setattr(vex.VexLayer, "step", slow_step)
+    result = run_in_process(path)
+    assert result["stop_reason"] == "TIMEOUT" and result["completion"] == "TIMEOUT"
+    assert result["stop_detail"]["enforced_by"] == "deadline after run"
+    skew[0] = 0.0
+    monkeypatch.setattr(vex.VexLayer, "step", original)
+    assert run_in_process(path)["stop_reason"] == "RETURNED"        # the same program inside its time is a return
+
+
+def test_the_stub_heap_is_zero_when_an_allocation_says_zero_filled(sandbox):
+    """Bytes already in the stub heap (injected there before the first instruction) are not handed out as a
+    zero-filled block."""
+    heap = hex(emulate.STUB_HEAP_VA)
+    for name in ("HeapAlloc", "VirtualAlloc"):
+        steps = ["mov edx, 8", "mov r8d, 20"] if name == "HeapAlloc" else \
+            ["xor ecx, ecx", "mov edx, 0x10", "mov r8d, 0x1000", "mov r9d, 4"]
+        path = program(sandbox, *steps, "@" + name, "mov rsi, qword ptr [rax]", "ret")
+        result = emulate_json(path, allow_stubs=[name], input_data="41" * 64, input_at=heap)
+        assert result["completion"] == "RETURNED", (name, result["stop_detail"])
+        assert result["stubs"]["calls"][0]["effects"][0]["zero_filled"] is True
+        assert result["registers"]["rsi"] == "0x0", name
+
+
+def test_a_variant_that_the_total_budget_cut_short_says_the_total_budget_was_exhausted(sandbox, monkeypatch):
+    """One variant, 1 s of its own and 0.2 s in total: the total ended it, so the request says the total was spent
+    although every variant started."""
+    path = build(sandbox, SPIN)
+    real, ticks = time.monotonic, [0.0]
+
+    def clock():
+        ticks[0] += 0.001
+        return real() * 0 + ticks[0]
+
+    monkeypatch.setattr(time, "monotonic", clock)
+    result = run_in_process(path, input_variants=["01"], input_at="reg:rcx", max_instructions=50_000_000,
+                            timeout_s=1, total_timeout_s=0.2)
+    row = result["variants"][0]
+    assert row["ran"] is True and row["stop_reason"] == "TIMEOUT" and row["budget_limited_by_total"] is True
+    assert result["variants_not_run"] == 0 and result["total_budget_exhausted"] is True
+
+
+def test_a_variant_that_ends_inside_its_own_bound_does_not_exhaust_the_total(sandbox):
+    path = build(sandbox, SPIN)
+    result = run_in_process(path, input_variants=["00"], input_at="reg:rcx", timeout_s=10, total_timeout_s=50)
+    assert result["variants"][0]["stop_reason"] == "RETURNED" and result["total_budget_exhausted"] is False
+
+
+def test_a_variant_source_that_is_longer_than_the_limit_is_refused_without_being_drained(sandbox):
+    """A generator of 33 buffers that then raises: the 33rd already proves the request is too long, so the refusal is
+    BAD_INPUT and the generator is not read to its end."""
+    pulled = []
+
+    def source():
+        for n in range(1000):
+            pulled.append(n)
+            if n >= 33:
+                raise RuntimeError("the source was drained")
+            yield b"\x00"
+
+    result = emulate_json(check_image(sandbox), input_variants=source(), input_at="reg:rcx")
+    assert result["status"] == "TOOL_USAGE" and result["error"] == "BAD_INPUT"
+    assert len(pulled) <= emulate.MAX_VARIANTS + 1
+
+
+def test_a_decimal_string_too_long_for_an_int_is_a_usage_error_not_an_unexpected_failure(sandbox):
+    huge = "9" * 4301
+    path = build(sandbox, asm("ret"))
+    result = emulate_json(path, memory_watch=[{"start": huge, "end": huge + "9"}])
+    assert result["status"] == "TOOL_USAGE" and result["error"] == "BAD_MEMORY_WATCH"
+    assert emulate._int_value(huge) is None
+    assert emulate._int_value("0x" + "f" * 5000) == int("f" * 5000, 16)       # hex has no such limit

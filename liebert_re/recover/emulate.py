@@ -73,6 +73,7 @@ exceptions and SEH, threads, any OS state, ``cpuid``/``rdtsc`` values (Unicorn's
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -293,7 +294,10 @@ def _int_value(value):
         if re.fullmatch(r"0[xX][0-9a-fA-F]+", text):
             return int(text, 16)
         if re.fullmatch(r"[0-9]+", text):
-            return int(text, 10)         # a leading zero is not octal
+            try:
+                return int(text, 10)     # a leading zero is not octal
+            except ValueError:           # more digits than the interpreter converts (sys.set_int_max_str_digits)
+                return None
     return None
 
 
@@ -531,7 +535,7 @@ class _Runner:
         if variant_mode:
             if isinstance(input_variants, (str, bytes, bytearray, dict)) or not hasattr(input_variants, "__iter__"):
                 return None, bad("BAD_INPUT", "input_variants must be a list of buffers")
-            items = list(input_variants)
+            items = list(itertools.islice(input_variants, MAX_VARIANTS + 1))   # one past the limit proves "too many"
             if not 1 <= len(items) <= MAX_VARIANTS:
                 return None, bad("BAD_INPUT", "input_variants holds 1 to %d buffers" % MAX_VARIANTS)
         else:
@@ -1040,6 +1044,14 @@ class _StubBook:
                             % (self.heap_bytes, self.used, size))
         return start
 
+    def _zero(self, start, span):
+        """Make the block the effect list calls ``zero_filled`` actually zero: the heap is writable memory the
+        program (or an injected input) may have written before the block was handed out."""
+        try:
+            self.uc.mem_write(STUB_HEAP_VA + start, bytes(span))
+        except Exception:  # noqa: BLE001 - UcError; a block that cannot be zeroed is not handed out as zeroed
+            raise _StubStop("the engine refused to zero the allocated block") from None
+
     def _virtual_alloc(self, address, size, kind, protect):
         if address:
             raise _StubStop("VirtualAlloc with a non-NULL lpAddress is not modelled")
@@ -1052,6 +1064,7 @@ class _StubBook:
             raise _StubStop("VirtualAlloc dwSize %d is zero or larger than the stub heap" % size)
         span = _align_up(size, PAGE)
         start = self._carve(span, STUB_VA_GRANULARITY)
+        self._zero(start, span)
         from unicorn import UC_PROT_EXEC, UC_PROT_READ, UC_PROT_WRITE
         wanted = {"r": UC_PROT_READ, "rw": UC_PROT_READ | UC_PROT_WRITE, "rx": UC_PROT_READ | UC_PROT_EXEC,
                   "rwx": UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC}[self.PROTECTIONS[protect]]
@@ -1070,6 +1083,7 @@ class _StubBook:
             raise _StubStop("HeapAlloc dwBytes %d is larger than the stub heap" % size)
         take = _align_up(max(size, 1), 16)
         start = self._carve(take, 16)
+        self._zero(start, take)
         self.used = start + take
         return STUB_HEAP_VA + start, [{"kind": "alloc", "va": _hx(STUB_HEAP_VA + start), "size": take,
                                        "zero_filled": True}]
@@ -1379,7 +1393,10 @@ class _Engine:
             **(frame or {}), "limitations": limitations, "dump_files": files, "input_injection": injection,
             "variants": rows, "variants_total": len(rows), "variants_run": len(ran),
             "variants_not_run": len(rows) - len(ran), "total_budget_s": total,
-            "total_budget_exhausted": len(ran) < len(rows),
+            # the total ran out when a variant was left unrun, or when it was the total (not the variant bound)
+            # that ended a variant that had started
+            "total_budget_exhausted": len(ran) < len(rows) or any(
+                r["budget_limited_by_total"] and r["stop_reason"] == "TIMEOUT" for r in ran),
             "total_elapsed_s": round(time.monotonic() - began, 3), "variants_basis": _VARIANTS_BASIS}
 
     def _run_one(self, data, run_dir, payload, target, budget, prefix, region_cap, total_deadline=None, granted=None):
@@ -1733,7 +1750,12 @@ class _Engine:
                         last_code = b""
                 detail = {"sentinel": _hx(SENTINEL_VA), "rax": _hx(uc.reg_read(UX.UC_X86_REG_RAX))}
                 why = _ret_check(last_code, uc.reg_read(UX.UC_X86_REG_RSP), regs["rsp"])
-                if why is None:
+                if why is None and time.monotonic() >= deadline:
+                    # The ret was real, but the bound had already passed: an exceeded bound is not a finished run.
+                    # (The in-run check only looks every 1024 instructions, and a slow step can outlast it.)
+                    reason = "TIMEOUT"
+                    detail = {"bound_s": budget, "enforced_by": "deadline after run", "sentinel_reached": True}
+                elif why is None:
                     reason = "RETURNED"
                 else:
                     reason = "SENTINEL_REACHED"
