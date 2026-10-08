@@ -37,6 +37,7 @@ import unittest
 from contextlib import ExitStack
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+import tempfile
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
@@ -2340,7 +2341,12 @@ class ShortPathSessionTests(IdaCase):
     """idat.exe cannot open a file whose full path is 260 characters or longer (measured; `_IDA_PATH_LIMIT`).
     The limit is lowered here so the work directory of the fake run is "too deep" without a deep tree."""
 
-    LIMIT = 120   # a scratch work directory below the cache is ~150 characters; the short stage is ~70
+    def setUp(self):
+        super().setUp()
+        # The limit is derived from this machine's paths so the premise holds on any platform: the longest file in
+        # a short stage (mkdtemp "lre-" + 8 random characters under the temp directory) just fits, and the work
+        # directory below the cache (much deeper than the temp directory itself) does not.
+        self.LIMIT = len(tempfile.gettempdir()) + 13 + 2 + 1 + ti._IDA_LONGEST_NAME
 
     def deep(self, limit=None):
         stack = ExitStack()
@@ -2375,7 +2381,7 @@ class ShortPathSessionTests(IdaCase):
         staged = data["signals"]["short_path_session"]
         self.assertIs(staged["staged"], True)
         self.assertEqual(staged["limit_chars"], self.LIMIT)
-        self.assertGreater(staged["work_directory_chars"], self.LIMIT)
+        self.assertGreater(staged["work_directory_chars"] + 1 + ti._IDA_LONGEST_NAME, self.LIMIT)
         self.assertLess(staged["short_directory_chars"], staged["work_directory_chars"])
         self.assertFalse(any(isinstance(v, str) for v in staged.values()), staged)
 
@@ -2392,12 +2398,12 @@ class ShortPathSessionTests(IdaCase):
         self.assertEqual(slot_db.read_bytes(), before)
 
     def test_when_even_the_short_directory_does_not_fit_the_answer_is_a_classed_refusal(self):
-        self.deep(limit=40)
+        self.deep(limit=ti._IDA_LONGEST_NAME)       # a file name alone does not fit, so no directory can
         data = self.q()
         self.assertEqual((data["ok"], data["status"], data["error"]), (False, "ANALYSIS_LIMITED", "IDA_PATH_TOO_LONG"))
         measured = data["path_measurement"]
-        self.assertEqual(measured["limit_chars"], 40)
-        self.assertGreater(measured["work_directory_chars"], 40)
+        self.assertEqual(measured["limit_chars"], ti._IDA_LONGEST_NAME)
+        self.assertGreater(measured["work_directory_chars"], ti._IDA_LONGEST_NAME)
         self.assertGreater(measured["short_directory_chars"], 0)
         self.assertEqual(self.fake.calls, [], "idat must not be started")
         self.assertEqual(self.slots(), [])
