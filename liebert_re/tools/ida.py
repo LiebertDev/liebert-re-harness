@@ -948,6 +948,9 @@ class _ProcessProbe:
             return None
 
 
+_INVALID_SLOT_LOCK_RECORD = object()
+
+
 class _SlotLock:
     """Ownership of one slot lock: a file holding {pid, token, started,
     create_time}. The token is unique to the acquiring call, and `release`
@@ -967,14 +970,16 @@ class _SlotLock:
 
     @staticmethod
     def read(path):
-        """The owner record, or None when absent, unreadable or not ours to
-        parse (an older or half-written lock then falls back to its age)."""
+        """The owner record, None when absent/unreadable, or a sentinel when
+        present content is malformed (which remains held to the owner ceiling)."""
         text = _SlotLock.raw(path)
-        try:
-            record = json.loads(text) if text else None
-        except ValueError:
+        if text is None:
             return None
-        return record if isinstance(record, dict) else None
+        try:
+            record = strict_json.loads(text)
+        except (TypeError, ValueError):
+            return _INVALID_SLOT_LOCK_RECORD
+        return record if isinstance(record, dict) else _INVALID_SLOT_LOCK_RECORD
 
     @staticmethod
     def create(path, token):
@@ -983,7 +988,7 @@ class _SlotLock:
         which fails with FileExistsError if a lock exists (O_EXCL semantics)
         and never exposes a half-written file. A file system without hard
         links falls back to O_EXCL; a reader that catches that file mid-write
-        sees an unparseable record and judges the lock by its age."""
+        treats its owner as unknown until the owner ceiling."""
         create_time = None
         try:
             import psutil
@@ -1011,7 +1016,7 @@ class _SlotLock:
 
     def release(self):
         owner = self.read(self.path)
-        if owner is None or owner.get("token") != self.token:
+        if not isinstance(owner, dict) or owner.get("token") != self.token:
             return False  # taken over, or already gone: not ours to delete
         try:
             self.path.unlink()
@@ -1021,15 +1026,16 @@ class _SlotLock:
 
 
 def _lock_is_live(lock):
-    """Whether the lock still excludes others. By age alone for a lock with no
-    readable owner; otherwise the owner process decides: one that is gone
-    leaves a lock that goes stale after `_LOCK_STALE_SECONDS`, one that is
-    still running keeps it until `_LOCK_OWNER_ALIVE_CEILING_SECONDS`."""
+    """Whether the lock still excludes others. Malformed content is treated
+    as an unknown owner until the owner ceiling; otherwise the owner process
+    decides whether its lock is stale or live."""
     try:
         age = time.time() - lock.stat().st_mtime
     except OSError:
         return False
     owner = _SlotLock.read(lock)
+    if owner is _INVALID_SLOT_LOCK_RECORD:
+        return age < _LOCK_OWNER_ALIVE_CEILING_SECONDS
     if owner is not None and owner.get("pid") is not None:
         alive = _ProcessProbe.alive(owner.get("pid"), owner.get("create_time"))
         if alive is True:

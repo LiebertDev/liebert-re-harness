@@ -214,19 +214,51 @@ def test_exploit_validation_plan_with_a_bad_json_argument_is_blocked_and_says_wh
         assert f"isolation_descriptor_json_not_strict_json:{reason}" in plan["blocking_reasons"]
 
 
-def test_exploit_validation_result_verify_with_a_bad_json_argument_rejects_and_names_the_input():
-    from liebert_re.report.exploit_validation import exploit_validation_result_verify
+def test_exploit_validation_result_verify_with_a_bad_json_argument_rejects_and_names_the_input(tmp_path):
+    from liebert_re.report.exploit_validation import exploit_validation_plan, exploit_validation_result_verify
+    from liebert_re.evidence.index import EvidenceIndex
 
-    clean = json.loads(exploit_validation_result_verify("{}", "{}"))
-    assert not any(i["code"] == "INPUT_NOT_STRICT_JSON" for i in clean["issues"])
-    for text, reason in ((DUP, strict_json.DUPLICATE_KEY), (NAN, strict_json.NON_FINITE)):
-        verdict = json.loads(exploit_validation_result_verify(text, "{}"))
+    target_sha256 = "a" * 64
+    descriptor = {"isolation_kind": "VIRTUAL_MACHINE", "not_the_analysis_host": True,
+                  "asserted_by": "test-operator"}
+    plan = json.loads(exploit_validation_plan(json.dumps({"hypothesis_id": "H1"}), target_sha256,
+                                              "ISOLATED_VM", 60, json.dumps(descriptor)))
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    evidence_name = "dyn_1111111111_report_222222.json"
+    (evidence_root / evidence_name).write_text(json.dumps({"ok": True, "target_sha256": target_sha256}),
+                                               encoding="utf-8")
+    store = EvidenceIndex(evidence_root, db_path=tmp_path / "evidence.sqlite")
+    store.refresh()
+    evidence_id = store.record(path=evidence_name)["evidence_uid"]
+    result = {
+        "plan_id": plan["plan_id"], "test_case_id": plan["test_case_id"],
+        "target_sha256": target_sha256, "backend": "ISOLATED_VM", "vm_id": "vm-1",
+        "snapshot_id": "snap-1", "started_at": "t1", "finished_at": "t2",
+        "exit_status": "PASS", "watchdog_status": "PASS", "revert_status": "PASS",
+        "observations": {key: True for key in plan["required_validation_links"]},
+        "artifacts": ["trace"], "environment": {
+            "isolated_vm": True, "os_build": "test", "architecture": "x64",
+            "target_hash_reverified": True,
+        },
+        "evidence_ids": [evidence_id],
+    }
+    plan_text = json.dumps(plan)
+    result_text = json.dumps(result)
+
+    accepted = json.loads(exploit_validation_result_verify(plan_text, result_text, evidence_root=str(evidence_root),
+                                                           evidence_db_path=str(tmp_path / "evidence.sqlite")))
+    assert accepted["status"] == "CONFIRMED" and accepted["eligible_for_confirmed"] is True, accepted
+
+    bad_plan = plan_text[:-1] + f',"plan_id":"{plan["plan_id"]}"}}'
+    bad_result = result_text[:-1] + f',"plan_id":"{result["plan_id"]}"}}'
+    for field, first, second in (("plan_json", bad_plan, result_text),
+                                 ("result_json", plan_text, bad_result)):
+        verdict = json.loads(exploit_validation_result_verify(
+            first, second, evidence_root=str(evidence_root), evidence_db_path=str(tmp_path / "evidence.sqlite")))
         assert verdict["status"] == "INCONCLUSIVE" and verdict["eligible_for_confirmed"] is False
-        assert verdict["issues"][0] == {"code": "INPUT_NOT_STRICT_JSON", "severity": "REJECT",
-                                        "field": "plan_json", "reason": reason}
-        verdict = json.loads(exploit_validation_result_verify("{}", text))
-        assert {"code": "INPUT_NOT_STRICT_JSON", "severity": "REJECT", "field": "result_json",
-                "reason": reason} in verdict["issues"]
+        assert {"code": "INPUT_NOT_STRICT_JSON", "severity": "REJECT", "field": field,
+                "reason": strict_json.DUPLICATE_KEY} in verdict["issues"]
 
 
 def test_exploit_validation_result_verify_a_bad_result_does_not_empty_the_other_input():

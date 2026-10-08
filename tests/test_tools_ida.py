@@ -1733,6 +1733,32 @@ class SlotOwnershipTests(IdaCase):
         self.assertEqual(self.fake.calls, [])
         self.assertEqual(json.loads(ti._lock_path(slot).read_text(encoding="utf-8"))["token"], "a" * 32)
 
+    def test_a_duplicate_pid_lock_cannot_hide_a_running_owner(self):
+        slot = self._slot()
+        lock = ti._lock_path(slot)
+        dead_pid = 999999999
+        text = f'{{"pid": {os.getpid()}, "pid": {dead_pid}, "token": "a"}}'
+        lock.write_text(text, encoding="utf-8")
+        old = time.time() - ti._LOCK_STALE_SECONDS - 10
+        os.utime(lock, (old, old))
+        with mock.patch.object(ti._ProcessProbe, "alive", side_effect=lambda pid, _create_time=None: pid != dead_pid), \
+                mock.patch.object(ti, "_LOCK_WAIT_SECONDS", 0.3):
+            self.assertIsNone(ti._acquire_slot_lock(slot, None))
+        self.assertEqual(lock.read_text(encoding="utf-8"), text)
+
+    def test_a_malformed_lock_younger_than_the_owner_ceiling_stays_held(self):
+        slot = self._slot()
+        lock = ti._lock_path(slot)
+        text = "{malformed lock"
+        lock.write_text(text, encoding="utf-8")
+        age = ti._LOCK_STALE_SECONDS + 10
+        self.assertLess(age, ti._LOCK_OWNER_ALIVE_CEILING_SECONDS)
+        old = time.time() - age
+        os.utime(lock, (old, old))
+        with mock.patch.object(ti, "_LOCK_WAIT_SECONDS", 0.3):
+            self.assertIsNone(ti._acquire_slot_lock(slot, None))
+        self.assertEqual(lock.read_text(encoding="utf-8"), text)
+
     def test_a_running_owner_is_not_trusted_forever(self):
         slot = self._slot()
         lock = self._plant(slot, {"pid": os.getpid(), "token": "a" * 32, "started": 0, "create_time": None},
@@ -1758,15 +1784,21 @@ class SlotOwnershipTests(IdaCase):
                            age=ti._LOCK_STALE_SECONDS + 10)
         self.assertFalse(ti._lock_is_live(lock))
 
-    def test_a_lock_without_an_owner_record_is_judged_by_age_as_before(self):
+    def test_a_wellformed_empty_lock_uses_stale_age_but_malformed_content_uses_owner_ceiling(self):
         slot = self._slot()
         lock = ti._lock_path(slot)
         lock.write_text("{}")
         self.assertTrue(ti._lock_is_live(lock))
+        old = time.time() - ti._LOCK_STALE_SECONDS - 10
+        os.utime(lock, (old, old))
+        self.assertFalse(ti._lock_is_live(lock))
         lock.write_text("{half-written")
         self.assertTrue(ti._lock_is_live(lock))
         old = time.time() - ti._LOCK_STALE_SECONDS - 10
         os.utime(lock, (old, old))
+        self.assertTrue(ti._lock_is_live(lock))
+        older = time.time() - ti._LOCK_OWNER_ALIVE_CEILING_SECONDS - 10
+        os.utime(lock, (older, older))
         self.assertFalse(ti._lock_is_live(lock))
 
     def test_a_lock_that_changed_after_it_was_judged_stale_is_not_removed(self):
@@ -2425,4 +2457,3 @@ class ShortPathSessionTests(IdaCase):
 
 if __name__ == "__main__":
     unittest.main()
-
