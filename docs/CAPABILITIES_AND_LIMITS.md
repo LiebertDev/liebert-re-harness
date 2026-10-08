@@ -471,7 +471,9 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
     integers into their fields. It does not find the integers itself; the
     caller supplies them, by hand or from `ioctl_candidate_scan` (below).
 - Two further operations in `tools/binary.py`, neither with a dedicated
-  subcommand: both are reached through `liebert-re tool run <name> --args '{...}'`.
+  subcommand: both are reached through `liebert-re tool run <name> --args '{...}'`
+  (the answer carries `schema_version: "liebert-re.tool-run/1"`; plain text the CLI cannot
+  classify is `UNKNOWN` with exit 1, see the README section on reaching every published tool).
   - `ioctl_candidate_scan`: the feeder for `ioctl_control_code_decode`. It
     disassembles a code region linearly from a start RVA and lists immediates
     that are compared, each split by the decoder. It lists compared

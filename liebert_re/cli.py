@@ -15,7 +15,12 @@ Exit codes
      (TOOL_MISSING, UNSUPPORTED, ANALYSIS_LIMITED, PATH_REFUSED, TIMEOUT, or a
      module's own NOT_FOUND / UPX_UNPACK_FAILED)
   2  bad invocation (argparse, a module's RULES_MISSING, or TOOL_USAGE from `tool`)
-  1  unexpected internal failure; still JSON with status FAILED, never a traceback
+  1  unexpected internal failure; still JSON with status FAILED, never a traceback. Also `tool run`
+     text the CLI cannot classify (status UNKNOWN): never exit 0 for an unverified answer
+
+`tool run` answers additionally carry ``schema_version`` ``liebert-re.tool-run/1`` and ``tool``,
+``outcome`` (OK|FAILED|REFUSED|UNKNOWN), ``exit_code``, ``duration_ms``, ``payload``, ``truncated``,
+``fallback_taken`` (None = not known); ``tool list`` carries ``liebert-re.tool-list/1``.
 
 Each command imports its module lazily inside its handler, so ``identify`` does
 not pay for pefile/capstone and a missing optional dependency is reported as a
@@ -30,6 +35,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_REFUSED = 0, 1, 2, 3
@@ -89,14 +95,57 @@ _IDA_MATURITIES = ("MMAT_GENERATED", "MMAT_PREOPTIMIZED", "MMAT_LOCOPT", "MMAT_C
                    "MMAT_GLBOPT1", "MMAT_GLBOPT2", "MMAT_GLBOPT3", "MMAT_LVARS")
 
 
-def _envelope(command, payload, workspace=None):
-    """Add ``command`` (and the chosen ``workspace``); never touch a key the module returned."""
+RUN_SCHEMA = "liebert-re.tool-run/1"
+LIST_SCHEMA = "liebert-re.tool-list/1"
+
+
+def _outcome(payload, code):
+    """Coarse, closed vocabulary for ``tool run``: OK | FAILED | REFUSED | UNKNOWN. The module's own ``status`` is
+    left untouched next to it. UNKNOWN is "could not be classified", which is neither an answer nor a failure."""
+    if isinstance(payload, dict) and (payload.get("error") == "UNCLASSIFIED_OUTPUT"
+                                      or str(payload.get("status") or "").upper() == "UNKNOWN"):
+        return "UNKNOWN"
+    if code == EXIT_OK:
+        return "OK"
+    return "REFUSED" if code in (EXIT_REFUSED, EXIT_USAGE) else "FAILED"
+
+
+def _run_fields(run, payload, code):
+    """The versioned `tool run` fields. Nothing host-specific goes in: no argv, no paths, only the tool name.
+
+    ``truncated`` and ``fallback_taken`` are True/False only when the result states them (the listing's own
+    truncation marker, or a boolean the module returned under that key); otherwise None, i.e. not known."""
+    is_dict = isinstance(payload, dict)
+    is_text = is_dict and payload.get("result_format") == "text"
+    truncation = payload.get("truncation") if is_text else None
+    if isinstance(truncation, dict):
+        truncated = True
+    elif is_dict and isinstance(payload.get("truncated"), bool):
+        truncated = payload["truncated"]
+    else:
+        truncated = None
+    fallback = payload.get("fallback_taken") if is_dict and isinstance(payload.get("fallback_taken"), bool) else None
+    fields = {"schema_version": RUN_SCHEMA, "tool": run["tool"], "outcome": _outcome(payload, code), "exit_code": code,
+              "duration_ms": int((time.monotonic() - run["t0"]) * 1000),
+              "payload": payload if run.get("structured") and not is_text else None,
+              "truncated": truncated, "fallback_taken": fallback}
+    if is_text:
+        fields["text"] = payload.get("text")
+    return fields
+
+
+def _envelope(command, payload, workspace=None, run=None, code=None):
+    """Add ``command`` (and the chosen ``workspace``); never touch a key the module returned.
+
+    For `tool run` (``run`` given) the versioned fields are added too; when the module returned a key of the same
+    name with a different value, the module's whole result goes under ``module_result`` instead."""
     extra = {"workspace": workspace} if workspace else {}
+    fields = _run_fields(run, payload, code) if run else {}
     if isinstance(payload, dict):
-        if "command" in payload or "workspace" in payload:
-            return {"command": command, **extra, "module_result": payload}
-        return {"command": command, **extra, **payload}
-    return {"command": command, **extra, "result": payload}
+        if "command" in payload or "workspace" in payload or any(k in payload and payload[k] != v for k, v in fields.items()):
+            return {"command": command, **fields, **extra, "module_result": payload}
+        return {"command": command, **fields, **extra, **payload}
+    return {"command": command, **fields, **extra, "result": payload}
 
 
 def _decode(raw, shape=None, tool=None):
@@ -104,11 +153,12 @@ def _decode(raw, shape=None, tool=None):
 
     ``tool`` is set by ``tool run`` only: the text is then the answer of a registry tool, wrapped
     in the generic envelope ``{"tool": name, "text": ...}`` with no per-tool shape. Such a text has
-    no listing grammar the CLI knows, so it is NOT classified: ``classified: false`` says so, and
-    ``ok: true`` then means only "the tool returned and no known failure code or broken truncation
-    marker was found", never "the prose is a success". A failure is recognised only by a status
-    prefix (``_TEXT_UNSUPPORTED_PREFIXES``, ``_TEXT_LIMITED_PREFIXES``); a tool that reports failure
-    in unprefixed prose is indistinguishable here, so read ``text``.
+    no listing grammar the CLI knows. It is a success only on a tool-authored structural signal: the
+    empty-result sentence or a consistent truncation marker (``classified: true``). A failure is
+    recognised only by a status prefix (``_TEXT_UNSUPPORTED_PREFIXES``, ``_TEXT_LIMITED_PREFIXES``).
+    Any other text cannot be told from a failure written as prose, so it is ``ok: false``,
+    ``status: "UNKNOWN"``, ``error: "UNCLASSIFIED_OUTPUT"``, ``classified: false`` (exit 1), with the
+    text still carried verbatim: never a silent success.
 
     Empty result rule: a text that starts with ``_TEXT_EMPTY_PREFIX`` (``"EMPTY_RESULT: "`` followed
     by the tool's own sentence, e.g. ``EMPTY_RESULT: No strings found.``) is a genuine "nothing
@@ -155,9 +205,17 @@ def _decode(raw, shape=None, tool=None):
         if out["ok"] and raw.startswith(_TEXT_EMPTY_PREFIX):
             out["empty"] = True
         if tool is not None:
-            out["classified"] = False
-            out["note"] = ("ok:true here means only that the tool returned without a known failure code; "
-                           "the text was not classified as a success, read it")
+            if out["ok"] and ("empty" in out or "truncation" in out):
+                out["classified"] = True  # a tool-authored structural signal: the empty sentence or a consistent cap marker
+            elif out["ok"]:
+                out.update(ok=False, status="UNKNOWN", error="UNCLASSIFIED_OUTPUT", classified=False,
+                           message="The tool returned text with no known failure code and no structural signal of "
+                                   "success (empty-result sentence, consistent truncation marker). The CLI cannot tell "
+                                   "an answer from a failure written as prose, so it does not call it a success; read text.")
+            else:
+                out["classified"] = False
+    if tool is not None and out.get("status") in ("UNSUPPORTED", "ANALYSIS_LIMITED"):
+        out["classified"] = True  # a recognised failure code
     return out
 
 
@@ -190,16 +248,21 @@ def _exit_code(payload):
     return EXIT_OK
 
 
-def _emit(command, payload, workspace=None):
-    sys.stdout.write(json.dumps(_envelope(command, payload, workspace), indent=2, default=str) + "\n")
-    return _exit_code(payload)
+def _emit(command, payload, workspace=None, run=None):
+    code = _exit_code(payload)
+    sys.stdout.write(json.dumps(_envelope(command, payload, workspace, run, code), indent=2, default=str) + "\n")
+    return code
 
 
-def _fail(command, status, exc, workspace=None):
-    body = {"command": command, **({"workspace": workspace} if workspace else {}), "ok": False, "status": status,
-            "error_type": type(exc).__name__, "error": str(exc)}
-    sys.stdout.write(json.dumps(body, indent=2, default=str) + "\n")
-    return EXIT_REFUSED if status in REFUSAL_STATUSES else EXIT_FAILED
+def _fail(command, status, exc, workspace=None, run=None):
+    code = EXIT_REFUSED if status in REFUSAL_STATUSES else EXIT_FAILED
+    body = {"ok": False, "status": status, "error_type": type(exc).__name__, "error": str(exc)}
+    # `error` here is an exception's message and may carry a host path: it stays in the legacy keys only, never in
+    # the versioned fields (which carry no payload for a CLI-made failure).
+    head = {"command": command, **(_run_fields(run, body, code) if run else {}),
+            **({"workspace": workspace} if workspace else {})}
+    sys.stdout.write(json.dumps({**head, **body}, indent=2, default=str) + "\n")
+    return code
 
 
 def _load(module, name):
@@ -756,7 +819,7 @@ class _TextAnswer(str):
 def _tool(a):
     modules, declared = _tool_registry()
     if a.tool_command == "list":
-        return {"ok": True, "status": "OK", "count": len(modules),
+        return {"schema_version": LIST_SCHEMA, "ok": True, "status": "OK", "count": len(modules),
                 "tools": [{"name": n, "module": m, "python_only": declared.get(n)} for n, m in sorted(modules.items())]}
     if a.tool_command == "describe":
         node = _tool_node(modules[a.name], a.name)
@@ -1024,12 +1087,14 @@ def main(argv=None):
     args = _build_parser().parse_args(argv)
     command = args.command
     info = None
+    run = ({"tool": args.name, "t0": time.monotonic()}
+           if command == "tool" and args.tool_command == "run" else None)  # versioned fields for `tool run` only
     try:
         refusal = _tool_prepare(args) if command == "tool" else None
         if refusal:
-            return _emit(command, refusal)
+            return _emit(command, refusal, run=run)
         if args.needs_file and not os.path.exists(args.path):
-            return _emit(command, {"ok": False, "status": "PATH_REFUSED", "error": "FILE_NOT_FOUND", "path": args.path})
+            return _emit(command, {"ok": False, "status": "PATH_REFUSED", "error": "FILE_NOT_FOUND", "path": args.path}, run=run)
         undo = (lambda: None)
         if args.needs_file:
             root, source, new_path = _select_workspace(args)
@@ -1040,14 +1105,14 @@ def main(argv=None):
         try:
             raw = args.handler(args)
             tool = args.name if isinstance(raw, _TextAnswer) else None
-            return _emit(command, _decode(raw, _shape(args), tool), info)
+            return _emit(command, _decode(raw, _shape(args), tool), info, run and {**run, "structured": True})
         finally:
             undo()
     except PermissionError as exc:
-        return _fail(command, "PATH_REFUSED", exc, info)
+        return _fail(command, "PATH_REFUSED", exc, info, run)
     except ImportError as exc:
-        return _fail(command, "TOOL_MISSING", exc, info)
+        return _fail(command, "TOOL_MISSING", exc, info, run)
     except Exception as exc:  # noqa: BLE001 - a CLI must answer in JSON, never a traceback
         if type(exc).__name__ == "PEFormatError":
-            return _fail(command, "ANALYSIS_LIMITED", exc, info)
-        return _fail(command, "FAILED", exc, info)
+            return _fail(command, "ANALYSIS_LIMITED", exc, info, run)
+        return _fail(command, "FAILED", exc, info, run)

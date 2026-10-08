@@ -137,7 +137,10 @@ def test_run_binary_strings_on_a_small_byte_string_file(capsys, workspace):
     (workspace / "blob.bin").write_bytes(b"\x00\x01needle-string-here\x00\xff\xfe" + "wide!".encode("utf-16le"))
     code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "binary_strings",
                     "--args", json.dumps({"path": str(workspace / "blob.bin"), "contains": "needle", "min_length": 4}))
-    assert code == 0 and out["tool"] == "binary_strings" and out["ok"] is True and out["classified"] is False
+    # A plain listing has no structural signal of success the CLI can verify, so it is UNKNOWN (exit 1), with the
+    # text still carried for the reader; it is not reported as a success.
+    assert code == 1 and out["tool"] == "binary_strings" and out["ok"] is False and out["classified"] is False
+    assert out["status"] == "UNKNOWN" and out["outcome"] == "UNKNOWN" and out["error"] == "UNCLASSIFIED_OUTPUT"
     assert "needle-string-here" in out["text"]
 
 
@@ -167,15 +170,14 @@ def test_missing_target_file_is_the_usual_file_not_found_refusal(capsys, workspa
 
 def test_text_answer_is_wrapped_in_the_generic_envelope_and_says_it_is_unclassified(capsys, workspace):
     # read_file answers in prose; the generic path carries it as {"tool", "text"} and does not pretend
-    # to have classified it (a prose "File not found" from another tool looks the same).
+    # to have classified it (a prose "File not found" from another tool looks the same): UNKNOWN, exit 1.
     (workspace / "t.txt").write_text("hello\n", encoding="utf-8")
     code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "read_file",
                     "--args", json.dumps({"path": str(workspace / "t.txt")}))
-    assert code == 0 and out["command"] == "tool" and out["tool"] == "read_file"
+    assert code == 1 and out["command"] == "tool" and out["tool"] == "read_file"
     assert out["result_format"] == "text" and "hello" in out["text"]
-    assert out["ok"] is True and out["status"] == "OK" and out["classified"] is False
-
-    assert "not classified as a success" in out["note"]
+    assert out["ok"] is False and out["status"] == "UNKNOWN" and out["classified"] is False
+    assert "cannot tell" in out["message"]
 
 
 def _str_annotated_tools():
@@ -212,7 +214,7 @@ def test_plain_text_from_a_str_tool_is_enveloped_and_bytes_are_decoded_or_refuse
     answers["v"] = "plain prose answer\n[limit:5; truncated=true; returned=5; total=9]"
     code, out = run(capsys, *argv)
     assert code == 0 and out["tool"] == "hash_file" and out["text"] == answers["v"]
-    assert out["truncation"]["omitted"] == 4 and out["classified"] is False
+    assert out["truncation"]["omitted"] == 4 and out["classified"] is True and out["truncated"] is True
     answers["v"] = "plain\n[limit:5; truncated=true; returned=9; total=9]"
     code, out = run(capsys, *argv)
     assert code == 1 and out["error"] == "UNCLASSIFIED_OUTPUT"
@@ -221,7 +223,7 @@ def test_plain_text_from_a_str_tool_is_enveloped_and_bytes_are_decoded_or_refuse
     assert code == 3 and out["status"] == "UNSUPPORTED" and out["tool"] == "hash_file"
     answers["v"] = "bytes answer".encode()
     code, out = run(capsys, *argv)
-    assert code == 0 and out["text"] == "bytes answer" and out["tool"] == "hash_file"
+    assert code == 1 and out["text"] == "bytes answer" and out["tool"] == "hash_file" and out["status"] == "UNKNOWN"
     answers["v"] = b"\xff\xfe\x00"
     code, out = run(capsys, *argv)
     assert code == 1 and out["error"] == "BINARY_OUTPUT"
@@ -258,10 +260,10 @@ def test_empty_text_result_through_the_envelope_is_ok_true_and_marked_empty(caps
     code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "binary_strings",
                     "--args", json.dumps({"path": str(workspace / "blob.bin"), "contains": "absent-needle"}))
     assert code == 0 and out["ok"] is True and out["status"] == "OK" and out["empty"] is True
-    assert out["text"] == "EMPTY_RESULT: No strings found." and out["classified"] is False
+    assert out["text"] == "EMPTY_RESULT: No strings found." and out["classified"] is True
     code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "binary_strings",
                     "--args", json.dumps({"path": str(workspace / "blob.bin"), "contains": "needle"}))
-    assert code == 0 and out["ok"] is True and "empty" not in out  # a real listing is not marked empty
+    assert "empty" not in out  # a real listing is not marked empty (and is UNKNOWN, see the unclassified tests)
 
 
 def test_empty_prefix_and_failure_codes_are_pinned_between_cli_and_tools():
@@ -378,3 +380,156 @@ def test_authenticode_off_windows_is_a_structured_unsupported_failure(capsys, wo
                     "--args", json.dumps({"path": str(workspace / "s.exe")}))
     assert code == 3 and out["ok"] is False and out["status"] == "UNSUPPORTED"
     assert out["error"] == "AUTHENTICODE_REQUIRES_WINDOWS" and "Windows" in out["message"] and "text" not in out
+
+
+# ---- unclassified text from `tool run` is UNKNOWN, never a success --------------------------------------
+
+def test_unclassified_failure_prose_is_not_reported_as_success(capsys, workspace, monkeypatch):
+    # A tool that reports failure in unprefixed prose is indistinguishable from an answer by prefix. The CLI
+    # must not turn that into ok:true / exit 0 (CONTRIBUTING: never a confidently wrong answer).
+    (workspace / "s.bin").write_bytes(b"x" * 8)
+    real_load = cli._load
+    monkeypatch.setattr(cli, "_load", lambda m, n: (lambda **kw: "Error: could not parse the input file.")
+                        if (m, n) == ("liebert_re.tools.binary", "hash_file") else real_load(m, n))
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "hash_file",
+                    "--args", json.dumps({"path": str(workspace / "s.bin")}))
+    assert out["ok"] is False and code != 0
+    assert out["status"] == "UNKNOWN" and out["outcome"] == "UNKNOWN" and out["exit_code"] == code == 1
+    assert out["error"] == "UNCLASSIFIED_OUTPUT" and out["text"] == "Error: could not parse the input file."
+    assert out["payload"] is None
+
+
+# ---- the versioned `tool run` / `tool list` envelope -----------------------------------------------------
+
+RUN_KEYS = {"schema_version", "tool", "outcome", "exit_code", "duration_ms", "payload", "truncated", "fallback_taken"}
+
+
+def _assert_run_envelope(out, code, tool, outcome):
+    assert RUN_KEYS <= set(out)
+    assert out["schema_version"] == "liebert-re.tool-run/1" == cli.RUN_SCHEMA
+    assert out["tool"] == tool and out["outcome"] == outcome and out["exit_code"] == code
+    assert isinstance(out["duration_ms"], int) and not isinstance(out["duration_ms"], bool) and out["duration_ms"] >= 0
+    assert out["truncated"] in (True, False, None) and out["fallback_taken"] in (True, False, None)
+
+
+def _stub_tool(monkeypatch, value):
+    real_load = cli._load
+    monkeypatch.setattr(cli, "_load", lambda m, n: (lambda **kw: value)
+                        if (m, n) == ("liebert_re.tools.binary", "hash_file") else real_load(m, n))
+
+
+def _stub_run(capsys, workspace, monkeypatch, value):
+    (workspace / "s.bin").write_bytes(b"x" * 8)
+    _stub_tool(monkeypatch, value)
+    return run(capsys, "--workspace", str(workspace), "tool", "run", "hash_file",
+               "--args", json.dumps({"path": str(workspace / "s.bin")}))
+
+
+def test_structured_result_carries_payload_and_duration_and_keeps_legacy_keys(capsys, workspace):
+    target = workspace / "sample.bin"
+    target.write_bytes(b"liebert dispatch fixture")
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "hash_file",
+                    "--args", json.dumps({"path": str(target)}))
+    assert code == 0
+    _assert_run_envelope(out, 0, "hash_file", "OK")
+    assert out["payload"]["sha256"] == hashlib.sha256(b"liebert dispatch fixture").hexdigest()
+    assert out["sha256"] == out["payload"]["sha256"] and "text" not in out  # legacy flat keys unchanged
+    assert out["truncated"] is None and out["fallback_taken"] is None  # not stated by the tool: unknown, not False
+
+
+def test_envelope_carries_no_host_path_argv_or_user_name(capsys, workspace, monkeypatch):
+    target = workspace / "sample.bin"
+    target.write_bytes(b"abc")
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "hash_file",
+                    "--args", json.dumps({"path": str(target)}))
+    versioned = {k: out[k] for k in RUN_KEYS - {"payload"}}
+    blob = json.dumps(versioned)
+    for needle in (str(workspace), str(target), os.path.expanduser("~"), os.environ.get("USERNAME", "\0"), "--args"):
+        assert needle not in blob
+    # an exception message may carry a path; it stays out of the versioned fields
+    (workspace / "s.bin").write_bytes(b"x")
+
+    def boom(**kw):
+        raise RuntimeError(f"cannot open {target}")
+    real_load = cli._load
+    monkeypatch.setattr(cli, "_load", lambda m, n: boom if (m, n) == ("liebert_re.tools.binary", "hash_file") else real_load(m, n))
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "hash_file",
+                    "--args", json.dumps({"path": str(workspace / "s.bin")}))
+    assert code == 1
+    _assert_run_envelope(out, 1, "hash_file", "FAILED")
+    assert out["payload"] is None
+    assert str(target) not in json.dumps({k: out[k] for k in RUN_KEYS})
+
+
+def test_text_results_carry_text_truncated_and_a_null_payload(capsys, workspace, monkeypatch):
+    code, out = _stub_run(capsys, workspace, monkeypatch, "rows\n[limit:5; truncated=true; returned=5; total=9]")
+    _assert_run_envelope(out, 0, "hash_file", "OK")
+    assert out["truncated"] is True and out["payload"] is None and out["text"].startswith("rows")
+    code, out = _stub_run(capsys, workspace, monkeypatch, "EMPTY_RESULT: No strings found.")
+    _assert_run_envelope(out, 0, "hash_file", "OK")
+    assert out["truncated"] is None and out["text"] == "EMPTY_RESULT: No strings found." and out["empty"] is True
+
+
+def test_known_failure_text_is_refused_and_inconsistent_marker_is_unknown(capsys, workspace, monkeypatch):
+    code, out = _stub_run(capsys, workspace, monkeypatch, "DISASSEMBLY_FAILED: No instruction could be decoded.")
+    _assert_run_envelope(out, 3, "hash_file", "REFUSED")
+    assert out["status"] == "ANALYSIS_LIMITED" and out["ok"] is False
+    code, out = _stub_run(capsys, workspace, monkeypatch, "x\n[limit:5; truncated=true; returned=9; total=9]")
+    _assert_run_envelope(out, 1, "hash_file", "UNKNOWN")
+
+
+def test_module_booleans_are_passed_through_and_a_clashing_key_is_nested(capsys, workspace, monkeypatch):
+    code, out = _stub_run(capsys, workspace, monkeypatch, {"ok": True, "truncated": True, "fallback_taken": False})
+    _assert_run_envelope(out, 0, "hash_file", "OK")
+    assert out["truncated"] is True and out["fallback_taken"] is False
+    # a module key that clashes with a versioned field with a different value is never overwritten
+    code, out = _stub_run(capsys, workspace, monkeypatch, {"ok": True, "duration_ms": "module-says-this", "tool": "other"})
+    assert code == 0 and out["module_result"]["duration_ms"] == "module-says-this" and out["duration_ms"] != "module-says-this"
+    assert out["tool"] == "hash_file" and out["module_result"]["tool"] == "other"
+
+
+@pytest.mark.parametrize("argv, code, outcome, tool", [
+    (("tool", "run", "no_such_tool"), 2, "REFUSED", "no_such_tool"),
+    (("tool", "run", "hash_file", "--args", "{not json"), 2, "REFUSED", "hash_file"),
+    (("tool", "run", "hash_file", "--args", "{}"), 2, "REFUSED", "hash_file"),
+    (("tool", "run", "hash_file", "--args", '{"path": "absent.bin"}'), 3, "REFUSED", "hash_file"),
+])
+def test_refusals_are_nonzero_and_keep_the_schema(capsys, workspace, argv, code, outcome, tool):
+    got, out = run(capsys, "--workspace", str(workspace), *argv)
+    assert got == code != 0
+    _assert_run_envelope(out, code, tool, outcome)
+    assert out["payload"] is None and out["ok"] is False
+
+
+def test_python_only_tool_and_path_refusal_keep_the_schema(capsys, workspace, tmp_path):
+    name = sorted(python_only_declarations())[0]
+    code, out = run(capsys, "tool", "run", name, "--args", "{}")
+    assert code == 3
+    _assert_run_envelope(out, 3, name, "REFUSED")
+    assert out["error"] == "PYTHON_ONLY" and out["payload"] is None
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"x")
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "hash_file", "--args", json.dumps({"path": str(outside)}))
+    assert code == 3 and out["status"] == "PATH_REFUSED"
+    _assert_run_envelope(out, 3, "hash_file", "REFUSED")
+    assert str(outside) not in json.dumps({k: out[k] for k in RUN_KEYS})
+
+
+def test_binary_output_failure_keeps_the_schema(capsys, workspace, monkeypatch):
+    code, out = _stub_run(capsys, workspace, monkeypatch, b"\xff\xfe\x00")
+    assert code == 1 and out["error"] == "BINARY_OUTPUT"
+    _assert_run_envelope(out, 1, "hash_file", "FAILED")
+
+
+def test_tool_list_and_describe_versioning(capsys):
+    code, out = run(capsys, "tool", "list")
+    assert code == 0 and out["schema_version"] == "liebert-re.tool-list/1" == cli.LIST_SCHEMA
+    assert {"ok", "status", "count", "tools"} <= set(out) and out["status"] == "OK"
+    assert all({"name", "module", "python_only"} == set(row) for row in out["tools"])
+    code, out = run(capsys, "tool", "describe", "hash_file")
+    assert code == 0 and "schema_version" not in out  # describe is not versioned in this slice
+
+
+def test_the_run_schema_is_added_to_tool_run_only(capsys):
+    code, out = run(capsys, "capabilities")
+    assert code == 0 and "schema_version" not in out and "outcome" not in out

@@ -456,13 +456,26 @@ liebert-re tool run <name> --args '{"path": "sample.bin"}'
 
 `tool list` and `tool describe` read names, modules and signatures from source. `tool run` takes the
 tool's keyword arguments as one JSON object, keeps path arguments inside the workspace root like every
-other subcommand, and answers in the same JSON envelope with the same exit codes. A tool that answers
-in plain text comes back as `{"tool": <name>, "text": ...}` with `classified: false`: the CLI has no
-grammar for that prose, so it does not claim to have judged it. It does recognise one thing: a text
-that starts with a status code (`ANALYSIS_LIMITED`-class codes such as `IMPORT_DIRECTORY_UNREADABLE`,
-`DOTNET_METADATA_UNREADABLE`, `DISASSEMBLY_FAILED`) is `ok: false` with that status, and one that starts
-with `EMPTY_RESULT: ` is `ok: true` with `empty: true`; failure in unprefixed prose is still not told
-apart from an answer. `authenticode_signature` answers in JSON (`signature_status`, `signer`, `issuer`, `raw`).
+other subcommand, and answers in the same JSON envelope with the same exit codes. Every `tool run`
+answer, success or refusal, carries a versioned set of fields (`schema_version: "liebert-re.tool-run/1"`):
+`tool` (the name only; no argv, no host path), `outcome` (`OK`, `FAILED`, `REFUSED` or `UNKNOWN`),
+`exit_code`, `duration_ms`, `payload` (the tool's structured result, or `null` for text and for
+refusals), `text` (text results only), `truncated` and `fallback_taken` (`true`/`false` only when the
+result states it, otherwise `null`, meaning not known). The earlier flat keys (`ok`, `status`, the
+tool's own fields) are unchanged next to them; `status` stays the module's own value, and `outcome`
+is the coarse reading. A module key that clashes with a versioned field is never overwritten: the
+module's whole result then sits under `module_result`. `tool list` carries
+`schema_version: "liebert-re.tool-list/1"` on top of its existing fields.
+
+A tool that answers in plain text comes back as `{"tool": <name>, "text": ...}`. The CLI has no
+grammar for that prose, and a failure written as prose looks like an answer, so plain text is **not**
+called a success: it is `ok: false`, `status: "UNKNOWN"`, `outcome: "UNKNOWN"`, `classified: false` and
+exits 1, with the text still carried for you to read. A text is a success (`classified: true`, exit 0)
+only on a structural signal the tool itself writes: it starts with `EMPTY_RESULT: ` (`empty: true`) or it
+ends in a consistent truncation marker (`truncation`, `truncated: true`). A text that starts with a
+status code (`ANALYSIS_LIMITED`-class codes such as `IMPORT_DIRECTORY_UNREADABLE`,
+`DOTNET_METADATA_UNREADABLE`, `DISASSEMBLY_FAILED`) is `ok: false` with that status (exit 3). So a plain
+listing such as `binary_strings` with matches exits 1 through `tool run` today, by design: read `text`. `authenticode_signature` answers in JSON (`signature_status`, `signer`, `issuer`, `raw`).
 
 55<!-- count:cli_direct_commands --> published tools also have a dedicated subcommand (`cli.py` names
 them by string literal). `tool run` reaches the rest, except the tools that write to disk or need a
