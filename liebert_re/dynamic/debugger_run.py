@@ -39,6 +39,18 @@ ORDER (each step runs only if every earlier one succeeded and was confirmed):
 output reply was complete and within the cap, and job termination was confirmed. A non-zero exit
 code is still ``COMPLETED`` (the run finished; the code is reported, not judged).
 
+WHAT ``COMPLETED`` MEANS, AND WHAT IT DOES NOT. It means the target process and its job ended, and
+nothing more. It does NOT mean that all activity the target caused in the guest has ended: a target
+that asks a guest service to start an independent process OUTSIDE the job leaves that process behind
+a ``COMPLETED`` run, and nothing inside the guest can prove "all execution has finished" (a process
+the target started elsewhere is by definition not in the job that is being counted). This is not
+closed by code; it is stated. The result therefore carries ``guest_residual_activity``: ``NONE_VM_RESET``
+only when the VM was powered off after the run and the launcher read it back as ``Off`` (the
+``VM_TURNED_OFF`` termination path, or a collect reply that says ``vm_reset`` is exactly ``True`` for
+this run), otherwise ``NOT_VERIFIED``. ``NONE_VM_RESET`` means no guest process is still running; it says
+nothing about what the target left on disk (a service it installed starts again with the guest), so the
+guest still has to be reverted to its checkpoint before reuse.
+
 What the result never carries: a host path, a user name, the gate decision's environment block,
 or the credential. Output bytes are guest-controlled and untrusted; they are reported as base64
 with their SHA-256 and the counts, and the result says so.
@@ -59,8 +71,13 @@ Identities and counts in launcher replies must be built-in ``int`` / ``str`` / `
 Provenance. The result carries ``provenance``: the exit code, the output and the job confirmations are
 ``GUEST_REPORTED`` (a process in the guest under the target's own account says so), and
 ``termination_path`` says how the end of the job was confirmed when the launcher says: ``AGENT``,
-``HOST_JOB_KILL`` (read from outside the agent) or ``VM_TURNED_OFF`` (with ``termination_reason``). A launcher
-that gives no path leaves it ``None``.
+``HOST_JOB_KILL`` or ``VM_TURNED_OFF`` (with ``termination_reason``). A launcher that gives no path leaves it
+``None``. ``termination_confirmation`` says where that confirmation was read: ``AGENT`` is the agent's own
+reply and ``HOST_JOB_KILL`` is read from a NEW PowerShell Direct session, independent of the agent process
+but still run INSIDE the guest (an operating-system call made by a process in the guest), so both are
+``GUEST_REPORTED``; only ``VM_TURNED_OFF`` is ``HOST_MEASURED`` (the Hyper-V host read the VM state). When the
+job end is not confirmed there is no numeric ``exit_code`` and no ``COMPLETED``: what the guest said is kept
+apart as ``exit_code_unconfirmed``.
 
 Limits stated plainly. The gate's pid, ownership and image-hash checks are shaped for a process on
 THIS host; a guest run has no host pid. This slice passes the caller's ``gate_args`` through
@@ -81,11 +98,14 @@ from typing import Any, Callable, Mapping, Protocol
 
 from liebert_re.dynamic.hyperv_transport import ERROR_CLASSES
 
-__all__ = ["OPERATION", "SCHEMA", "STATUSES", "DebuggerRun", "GuestLauncher"]
+__all__ = ["OPERATION", "SCHEMA", "STATUSES", "RESIDUAL_ACTIVITY", "DebuggerRun", "GuestLauncher"]
 
 SCHEMA = "liebert-re.debugger-run/1"
 _TERMINATION_PATHS = frozenset({"AGENT", "HOST_JOB_KILL", "VM_TURNED_OFF"})
 _REASON_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+# Where each termination path was read. HOST_JOB_KILL runs in a new session but INSIDE the guest.
+_CONFIRMATION_SOURCE = {"AGENT": "GUEST_REPORTED", "HOST_JOB_KILL": "GUEST_REPORTED", "VM_TURNED_OFF": "HOST_MEASURED"}
+RESIDUAL_ACTIVITY = ("NOT_VERIFIED", "NONE_VM_RESET")
 OPERATION = "debugger_run"
 
 STATUSES = (
@@ -119,7 +139,10 @@ class GuestLauncher(Protocol):
     ``terminate_job(vm, run_id)`` -> ``{"ok": True, <identity>, "terminated": True}``; it must also kill a
     process that was never assigned to the job.
     ``collect_output(vm, run_id, max_bytes)`` -> ``{"ok": True, <identity>, "data": bytes, "total_bytes": int}``
-    with ``len(data) <= max_bytes``; ``total_bytes`` is how much the target produced.
+    with ``len(data) <= max_bytes``; ``total_bytes`` is how much the target produced. A launcher that powered
+    the guest off after the run and read it back as ``Off`` adds ``"vm_reset": True`` (an exact ``True``, on
+    any reply about this run, also a failed one); that is the only thing that makes
+    ``guest_residual_activity`` ``NONE_VM_RESET`` besides the ``VM_TURNED_OFF`` termination path.
     Any key that is missing, or any value of another type, means "not confirmed".
     """
 
@@ -161,6 +184,7 @@ class DebuggerRun:
         self._gate = gate
         self._clock = clock
         self._termination: tuple[str | None, str | None] = (None, None)   # (path, reason) of the last confirmed end
+        self._residual = "NOT_VERIFIED"                                      # guest_residual_activity of the last run
 
     # ---- time
 
@@ -190,19 +214,25 @@ class DebuggerRun:
         body: dict[str, Any] = {
             "schema": SCHEMA, "operation": OPERATION, "ok": status == "COMPLETED", "status": status,
             "reason": reason, "steps": list(steps), "elapsed_s": None if elapsed is None else round(elapsed, 3),
-            "gate": None, "transport": None, "exit_code": None, "output": None,
+            "gate": None, "transport": None, "exit_code": None, "exit_code_unconfirmed": None, "output": None,
+            "guest_residual_activity": self._residual,
             "job": {"assignment_confirmed": False, "terminated": None},
             "primary_status": None, "primary_reason": None,
             "provenance": {
                 # Where the facts in this result come from. Everything below is reported by a process inside
-                # the guest; none of it is measured from outside except the termination path when it is
-                # HOST_JOB_KILL (the job accounting was read from a new session) or VM_TURNED_OFF.
+                # the guest. That includes HOST_JOB_KILL: the job accounting is read by a new PowerShell
+                # Direct session, independent of the agent process but still executed inside the guest. Only
+                # VM_TURNED_OFF is read from outside it (the Hyper-V host reads the VM state).
                 "exit_code": "GUEST_REPORTED", "output": "GUEST_REPORTED", "job_confirmations": "GUEST_REPORTED",
                 "termination_path": self._termination[0], "termination_reason": self._termination[1],
+                "termination_confirmation": _CONFIRMATION_SOURCE.get(self._termination[0]),
             },
             "not_verified": [
                 "the launcher's confirmations are taken as given; no real guest launcher exists in this slice",
                 "network use by the target inside the guest is not limited by the job object",
+                "COMPLETED means the target process and its job ended, not that all guest activity ended: a process the "
+                "target had a guest service start outside the job is not reached by the job (see guest_residual_activity; "
+                "NONE_VM_RESET only after the VM was powered off and read back Off)",
                 "the guest agent and the target run under the same account, so a target with that account's rights "
                 "could forge what the guest reports (exit code, job confirmation, output); running the target under a "
                 "separate non-administrator account is recommended and is not done here",
@@ -250,6 +280,7 @@ class DebuggerRun:
         started = self._now()
         steps: list[str] = []
         self._termination = (None, None)
+        self._residual = "NOT_VERIFIED"
 
         def refuse(reason: str, **more: Any) -> dict[str, Any]:
             return self._result(started, "REFUSED", reason, steps, **more)
@@ -410,6 +441,10 @@ class DebuggerRun:
         """Unconfirmed job termination outranks every other status; the cause is kept beside it."""
         if terminated is True:
             return self._result(started, status, reason, steps, **more)
+        if "exit_code" in more:       # a run whose end is not proven has no exit code of its own: keep the claim apart
+            more["exit_code_unconfirmed"] = more.pop("exit_code")
+        if status == "COMPLETED":     # the label itself must not survive: nothing proved the run completed
+            status, reason = None, "EXIT_REPORTED_JOB_END_NOT_CONFIRMED"
         return self._result(started, "TRANSPORT_ERROR", "JOB_TERMINATION_NOT_CONFIRMED", steps,
                             primary_status=status, primary_reason=reason, **more)
 
@@ -441,10 +476,14 @@ class DebuggerRun:
             self._termination = (
                 path if type(path) is str and path in _TERMINATION_PATHS else None,
                 reason if type(reason) is str and _REASON_CODE.fullmatch(reason) else None)
+            if self._termination[0] == "VM_TURNED_OFF":   # the guest was powered off and read back Off
+                self._residual = "NONE_VM_RESET"
         return confirmed
 
     def _collect(self, vm: str, run_id: str, cap: int, ident: tuple[str, int | None]) -> dict[str, Any] | None:
         reply = self._call("collect_output", vm, run_id, cap)
+        if self._about(reply, ident) and reply.get("vm_reset") is True:   # read even when the output is not usable
+            self._residual = "NONE_VM_RESET"
         if not (self._about(reply, ident) and reply.get("ok") is True and isinstance(reply.get("data"), (bytes, bytearray))
                 and _is_int(reply.get("total_bytes"))):
             return None

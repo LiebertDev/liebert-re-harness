@@ -397,6 +397,8 @@ def test_unconfirmed_job_termination_is_not_completed(term):
     result = go(runner)
     assert result["status"] == "TRANSPORT_ERROR" and result["reason"] == "JOB_TERMINATION_NOT_CONFIRMED"
     assert result["job"]["terminated"] is False and result["output"]["bytes_kept"] == 6
+    assert result["exit_code"] is None                       # an exit code of a run whose end is not proven is not a result
+    assert result["primary_status"] != "COMPLETED" and result["ok"] is False
 
 
 # ------------------------------------------------------------------ transport
@@ -507,7 +509,7 @@ def test_the_result_labels_every_guest_report_and_names_the_termination_path_onl
     refused = go(build(_decision(ok=False))[0])
     assert refused["provenance"] == {"exit_code": "GUEST_REPORTED", "output": "GUEST_REPORTED",
                                      "job_confirmations": "GUEST_REPORTED", "termination_path": None,
-                                     "termination_reason": None}
+                                     "termination_reason": None, "termination_confirmation": None}
     assert any("same account" in line for line in refused["not_verified"])
     plain = go(build()[0])                                        # a launcher that says nothing about how it ended it
     assert plain["status"] == "COMPLETED" and plain["provenance"]["termination_path"] is None
@@ -702,3 +704,96 @@ def test_a_launcher_reply_that_is_a_dict_subclass_confirms_nothing():
     runner, calls = build(verify_job_assignment=Lying(ok=True, **IDENT, in_job=True, limits_applied=True))
     result = go(runner)
     assert result["status"] == "JOB_ASSIGNMENT_UNCONFIRMED" and "resume" not in calls.log
+
+
+# ------------------------------------------------------------------ final static-review fixes
+
+
+@pytest.mark.parametrize("term", [{"ok": True, **IDENT, "terminated": False}, None, {"ok": True, **IDENT}, {"ok": False},
+                                  RuntimeError("x")])
+def test_a_run_whose_end_is_not_proven_has_no_exit_code_and_no_completed_anywhere(term):
+    runner, _ = build(terminate_job=term)
+    result = go(runner)
+    assert result["status"] == "TRANSPORT_ERROR" and result["reason"] == "JOB_TERMINATION_NOT_CONFIRMED"
+    assert result["exit_code"] is None and result["ok"] is False
+    assert result["primary_status"] != "COMPLETED"            # nothing in the result says the run completed
+    assert result["primary_status"] is None and result["primary_reason"] == "EXIT_REPORTED_JOB_END_NOT_CONFIRMED"
+    assert result["exit_code_unconfirmed"] == 0               # what the guest said stays visible, and says what it is
+    assert "COMPLETED" not in {result["status"], result["primary_status"]}
+
+
+def test_a_confirmed_end_keeps_the_exit_code_in_the_result_and_has_no_unconfirmed_one():
+    result = go(build(wait={"ok": True, **IDENT, "exited": True, "exit_code": 7})[0])
+    assert result["status"] == "COMPLETED" and result["exit_code"] == 7 and result["exit_code_unconfirmed"] is None
+
+
+def test_completed_is_documented_in_the_module_as_the_target_and_its_job_only():
+    doc = dr.__doc__
+    assert "guest_residual_activity" in doc and "NONE_VM_RESET" in doc and "NOT_VERIFIED" in doc
+    assert "target process and its job" in " ".join(doc.split())
+
+
+def test_every_result_says_that_other_guest_activity_is_not_verified_unless_the_vm_was_reset():
+    for runner in (build()[0], build(_decision(ok=False))[0], build(terminate_job=None)[0]):
+        result = go(runner)
+        assert result["guest_residual_activity"] == "NOT_VERIFIED", result["status"]
+        assert any("outside the job" in line for line in result["not_verified"])
+
+
+def test_a_vm_turned_off_to_end_the_run_reads_as_no_residual_activity():
+    reply = {"ok": True, **IDENT, "terminated": True, "termination_path": "VM_TURNED_OFF", "termination_reason": "SOME_REASON"}
+    assert go(build(terminate_job=reply)[0])["guest_residual_activity"] == "NONE_VM_RESET"
+    for path in ("AGENT", "HOST_JOB_KILL"):
+        reply = {"ok": True, **IDENT, "terminated": True, "termination_path": path}
+        assert go(build(terminate_job=reply)[0])["guest_residual_activity"] == "NOT_VERIFIED", path
+    unconfirmed = {"ok": True, **IDENT, "terminated": False, "termination_path": "VM_TURNED_OFF"}
+    assert go(build(terminate_job=unconfirmed)[0])["guest_residual_activity"] == "NOT_VERIFIED"
+
+
+def test_a_vm_reset_after_collect_reads_as_no_residual_activity_only_when_the_reply_is_about_this_run_and_exactly_true():
+    def with_reset(value, ident=IDENT):
+        return {"ok": True, **ident, "data": b"hello\n", "total_bytes": 6, "vm_reset": value}
+
+    class Resetting(FakeLauncher):
+        def collect_output(self, vm, run_id, max_bytes):
+            self.calls.log.append("collect_output")
+            return self.over["collect_reply"]
+
+    def run_with(reply):
+        calls = Calls()
+        runner = DebuggerRun(FakeTransport(calls), Resetting(calls, collect_reply=reply),
+                             gate=lambda op, **kw: good_decision())
+        return go(runner)
+
+    ok = run_with(with_reset(True))
+    assert ok["status"] == "COMPLETED" and ok["guest_residual_activity"] == "NONE_VM_RESET"
+    for junk in (1, "True", None, False, [], {"x": 1}):
+        assert run_with(with_reset(junk))["guest_residual_activity"] == "NOT_VERIFIED", junk
+    other = run_with(with_reset(True, {"run_id": "run-2", "pid": 4321}))
+    assert other["guest_residual_activity"] == "NOT_VERIFIED"           # a reply about another run proves nothing
+    refused = run_with({"ok": False, **IDENT, "vm_reset": True})        # the reset can be read even when the output is not
+    assert refused["guest_residual_activity"] == "NONE_VM_RESET" and refused["status"] != "COMPLETED"
+
+
+def test_the_termination_confirmation_label_says_where_each_path_was_read():
+    labels = {"AGENT": "GUEST_REPORTED", "HOST_JOB_KILL": "GUEST_REPORTED", "VM_TURNED_OFF": "HOST_MEASURED"}
+    for path, label in labels.items():
+        reply = {"ok": True, **IDENT, "terminated": True, "termination_path": path}
+        assert go(build(terminate_job=reply)[0])["provenance"]["termination_confirmation"] == label, path
+    assert go(build()[0])["provenance"]["termination_confirmation"] is None      # no path named: no label
+    assert go(build(terminate_job={"ok": True, **IDENT, "terminated": False})[0])["provenance"][
+        "termination_confirmation"] is None
+
+
+def test_no_comment_in_the_module_calls_the_job_kill_measured_from_outside():
+    import inspect
+    text = inspect.getsource(dr)
+    assert "none of it is measured from outside" not in text and "read from outside the agent" not in text
+
+
+def test_the_residual_activity_of_one_run_does_not_carry_into_the_next_run_of_the_same_runner():
+    reply = {"ok": True, **IDENT, "terminated": True, "termination_path": "VM_TURNED_OFF", "termination_reason": "SOME_REASON"}
+    runner = build(terminate_job=reply)[0]
+    assert go(runner)["guest_residual_activity"] == "NONE_VM_RESET"
+    runner._launcher.over["terminate_job"] = {"ok": True, **IDENT, "terminated": True, "termination_path": "AGENT"}
+    assert go(runner)["guest_residual_activity"] == "NOT_VERIFIED"
