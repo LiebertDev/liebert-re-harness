@@ -938,5 +938,80 @@ class EvidenceRound3ReplayAndPersistenceTests(unittest.TestCase):
                 self.assertIsNone(claims._evidence_summary(refute))
 
 
+class EvidenceRound3bReplayTests(unittest.TestCase):
+    """Round 3b: contradiction survives a damaged or reordered log, and a log that lost events
+    cannot re-earn PROVEN."""
+
+    @staticmethod
+    def _proven(tmp):
+        return EvidenceRound3ReplayAndPersistenceTests._proven(tmp)
+
+    def test_surviving_contradicted_event_ordered_before_the_claim_still_contradicts(self):
+        with TemporaryDirectory() as tmp:
+            _, claims, claim_uid, refute = self._proven(Path(tmp))
+            claims.add_evidence(claim_uid, refute, "REFUTES")
+            for path in claims.events_root.glob("*__evidence_linked.json"):
+                if json.loads(path.read_text(encoding="utf-8"))["relation"] == "REFUTES":
+                    path.write_text('{"event": "evidence_li', encoding="utf-8")  # truncated
+            for path in claims.events_root.glob("*__status_changed.json"):
+                path.rename(path.with_name("00000000T000000000000__" + path.name.split("__", 1)[1]))
+            result = claims.rebuild_from_events()
+            self.assertEqual(result["malformed"], 1)
+            self.assertEqual(claims._current_status(claim_uid), "CONTRADICTED")
+            self.assertEqual(claims.claims_for_target("t", status="PROVEN")["results"], [])
+
+    def test_a_log_with_a_malformed_event_re_earns_no_proven(self):
+        with TemporaryDirectory() as tmp:
+            _, claims, claim_uid, _refute = self._proven(Path(tmp))
+            (claims.events_root / "99990101T000000000000__CLM-x__evidence_linked.json").write_text("{", encoding="utf-8")
+            result = claims.rebuild_from_events()
+            self.assertEqual(result["malformed"], 1)
+            self.assertEqual(claims._current_status(claim_uid), "UNVERIFIED")
+            self.assertEqual(result["demotions"], [{"claim_uid": claim_uid, "reason": "EVENT_LOG_INCOMPLETE"}])
+
+    def test_an_intact_log_still_re_earns_proven(self):
+        with TemporaryDirectory() as tmp:
+            _, claims, claim_uid, _refute = self._proven(Path(tmp))
+            self.assertEqual(claims.rebuild_from_events()["malformed"], 0)
+            self.assertEqual(claims._current_status(claim_uid), "PROVEN")
+
+
+class EvidenceRound3bResolutionTests(unittest.TestCase):
+    """A claim's evidence resolves with the same freshness rule findings use."""
+
+    def _claims_with(self, tmp, body):
+        root, evidence_index, claims = _make_indices(tmp)
+        (root / "s_1111111111_report_222222.json").write_text(body, encoding="utf-8")
+        evidence_index.refresh()
+        return claims, evidence_index.record(path="s_1111111111_report_222222.json")["evidence_uid"]
+
+    def _prove(self, claims, uid):
+        return claims.create_claim(
+            "t", "function", "FUN_1", "root_cause", "v", status="PROVEN",
+            initial_evidence=[{"evidence_uid": uid, "relation": "SUPPORTS"}],
+        )
+
+    def test_unparseable_json_record_cannot_back_proven(self):
+        with TemporaryDirectory() as tmp:
+            claims, uid = self._claims_with(Path(tmp), "{")
+            with self.assertRaises(ClaimError) as caught:
+                self._prove(claims, uid)
+            self.assertEqual(caught.exception.code, "EVIDENCE_NOT_FOUND")
+            self.assertEqual(claims.status()["claims"], 0)
+
+    def test_truncated_record_cannot_back_proven(self):
+        with TemporaryDirectory() as tmp:
+            claims, uid = self._claims_with(Path(tmp), json.dumps({"ok": True, "pad": "x" * 64}))
+            with mock.patch("liebert_re.evidence.index.MAX_RECORD_BYTES", 16):
+                with self.assertRaises(ClaimError) as caught:
+                    self._prove(claims, uid)
+            self.assertEqual(caught.exception.code, "EVIDENCE_NOT_FOUND")
+
+    def test_intact_record_still_backs_proven(self):
+        with TemporaryDirectory() as tmp:
+            claims, uid = self._claims_with(Path(tmp), json.dumps({"ok": True}))
+            self.assertEqual(self._prove(claims, uid)["status"], "PROVEN")
+
+
 if __name__ == "__main__":
     unittest.main()

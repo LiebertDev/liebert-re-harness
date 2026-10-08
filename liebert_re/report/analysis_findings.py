@@ -10,7 +10,8 @@ import hashlib
 import json
 from typing import Any, Iterable
 
-from liebert_re.evidence.index import EvidenceIndex
+from liebert_re.evidence.index import EvidenceIndex, _record_resolves
+from liebert_re.report.exploit_validation import _normalize_sha256
 
 
 # UNVERIFIED: evidence IDs are cited but were never resolved against an evidence index, so
@@ -45,16 +46,7 @@ def _store_resolves(store: EvidenceIndex, evidence_id: str) -> bool:
         record = store.record(record_id=evidence_id)
     except Exception:  # noqa: BLE001 - an unreadable store resolves nothing
         return False
-    if not (isinstance(record, dict) and record.get("ok") is True and record.get("evidence_uid") == evidence_id):
-        return False
-    if record.get("read_error") is not None or not isinstance(record.get("content"), str):
-        return False  # TRUNCATED (or any read error): the current content was not fully read
-    if str(record.get("path") or "").lower().endswith(".json"):
-        try:
-            json.loads(record["content"])
-        except ValueError:
-            return False
-    return True
+    return _record_resolves(record, evidence_id)  # shared rule: ok, same UID, fully read, .json parses now
 
 
 def _evidence_binding(
@@ -263,10 +255,10 @@ def _reproduction_verdict(
         return "CONFIRMATION_UNVERIFIED", {"claimed": claimed, "verified": False, "reason": "NO_VALIDATION_PLAN_AND_RESULT"}
     if not hypothesis.get("hypothesis_id") or plan.get("hypothesis_id") != hypothesis.get("hypothesis_id"):
         return "CONFIRMATION_UNVERIFIED", {"claimed": claimed, "verified": False, "reason": "PLAN_NOT_FOR_THIS_HYPOTHESIS"}
-    reported = str(artifact_sha256 or "").strip().lower()
-    if len(reported) != 64 or any(ch not in "0123456789abcdef" for ch in reported):
+    reported = _normalize_sha256(artifact_sha256)
+    if reported is None:
         return "CONFIRMATION_UNVERIFIED", {"claimed": claimed, "verified": False, "reason": "ARTIFACT_HASH_UNKNOWN"}
-    if str(plan.get("target_sha256") or "").strip().lower() != reported:
+    if _normalize_sha256(plan.get("target_sha256")) != reported:
         return "CONFIRMATION_UNVERIFIED", {"claimed": claimed, "verified": False, "reason": "PLAN_TARGET_NOT_REPORTED_ARTIFACT"}
     from liebert_re.report.exploit_validation import verify_validation_result
 

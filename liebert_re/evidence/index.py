@@ -298,6 +298,37 @@ def _read_bounded(path: Path, limit: int):
     return raw.decode("utf-8", errors="replace"), None if not truncated else "TRUNCATED"
 
 
+def _record_resolves(record, evidence_id) -> bool:
+    """The one rule for "this ``EvidenceIndex.record()`` answer resolves ``evidence_id``", shared by
+    every consumer that cites evidence (claims, findings, dynamic validation). True only when the
+    answer is a dict with a literal ``ok: True`` under that same ``evidence_uid``, the bytes on
+    disk were read completely (no ``read_error``, so not TRUNCATED), the content is text and, for
+    a ``.json`` record, parses as JSON NOW. The index's cached metadata proves none of that."""
+    if not (isinstance(record, dict) and record.get("ok") is True and record.get("evidence_uid") == evidence_id):
+        return False
+    if record.get("read_error") is not None or not isinstance(record.get("content"), str):
+        return False
+    if str(record.get("path") or "").lower().endswith(".json"):
+        try:
+            json.loads(record["content"])
+        except ValueError:
+            return False
+    return True
+
+
+def _record_target_hash(record):
+    """The target SHA-256 the record's CURRENT JSON content states (lower case), or None. Read
+    from the content just fetched, never from the cached ``target_hash`` column; None when the
+    record is not parseable JSON or carries no real hash."""
+    if not (isinstance(record, dict) and isinstance(record.get("content"), str)):
+        return None
+    try:
+        payload = json.loads(record["content"])
+    except ValueError:
+        return None
+    return _extract_target_hash(payload)
+
+
 def _parse_filename(stem: str):
     match = _FILENAME_RE.match(stem)
     if match:

@@ -60,9 +60,10 @@ STATUS AND ITS TRANSITIONS (PROVEN / CANDIDATE / CONTRADICTED / INSUFFICIENT)
     ``EVIDENCE_NOT_FOUND`` when it does not resolve), checked before anything
     is written: an unchecked string is not evidence.
   - REPLAY re-earns PROVEN: ``rebuild_from_events()`` keeps a claim PROVEN only
-    when an evidence store is bound and at least one SUPPORTS link still
-    resolves in it. Otherwise the claim is loaded as UNVERIFIED, with the
-    reason (``NO_EVIDENCE_STORE``, ``NO_SUPPORTING_EVIDENCE_LINK`` or
+    when the whole log replayed (no unreadable event file), an evidence store is
+    bound and at least one SUPPORTS link still resolves in it. Otherwise the
+    claim is loaded as UNVERIFIED, with the reason (``EVENT_LOG_INCOMPLETE``,
+    ``NO_EVIDENCE_STORE``, ``NO_SUPPORTING_EVIDENCE_LINK`` or
     ``SUPPORTING_EVIDENCE_UNRESOLVED``) in its status history and in the
     rebuild result. This is the one place the projection is not byte-for-byte
     the log: the log records what a writer asserted, not what was verified.
@@ -158,7 +159,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from liebert_re.evidence.index import EvidenceIndex, _normalize_anchor_value
+from liebert_re.evidence.index import EvidenceIndex, _normalize_anchor_value, _record_resolves
 from liebert_re.evidence.process_lock import DurableLock
 
 from liebert_re.workspace import PROJECT_ROOT as APP
@@ -489,6 +490,7 @@ class ClaimIndex:
         with self._write_guard(), self._session() as db:
             files = sorted(self.events_root.glob("*.json"))
             events = []
+            logged_contradictions = {}
             for path in files:
                 try:
                     ev = json.loads(path.read_text(encoding="utf-8"))
@@ -500,6 +502,10 @@ class ClaimIndex:
                     malformed += 1
                     continue
                 events.append((method_name, ev))
+                if ev.get("event") == "status_changed" and ev.get("new_status") == "CONTRADICTED":
+                    logged_contradictions.setdefault(
+                        str(ev.get("claim_uid")), str(ev.get("reason") or "logged status change"),
+                    )
             # One explicit transaction: executescript() would COMMIT any pending
             # transaction first and run each DELETE in autocommit, so a failed
             # replay (or a reader on another connection) would see an empty or
@@ -517,8 +523,12 @@ class ClaimIndex:
             # Contradiction is likewise derived from the replayed links and edges, not from the
             # presence of a ``status_changed`` event: a log with that event cut out must not
             # turn a refuted claim back into a proven one.
-            contradicted = self._enforce_contradictions(db)
-            demoted = self._demote_unproven_claims(db)
+            # A CONTRADICTED status event that survives is honoured whatever its position in the
+            # replay order: applied before its claim_created it touches no row, so it is
+            # re-applied here from the surviving events. And a log that lost events (malformed > 0)
+            # cannot vouch for PROVEN: the lost event may have been the refutation.
+            contradicted = self._enforce_contradictions(db, logged_contradictions)
+            demoted = self._demote_unproven_claims(db, log_incomplete=malformed > 0)
         return {
             "ok": True, "tool": "claim_index", "operation": "rebuild_from_events",
             "events_scanned": len(files), "events_applied": applied, "malformed": malformed,
@@ -526,12 +536,14 @@ class ClaimIndex:
             "contradictions_derived": len(contradicted), "contradictions": contradicted,
         }
 
-    def _enforce_contradictions(self, db):
+    def _enforce_contradictions(self, db, logged=None):
         """Replay-time rule: a claim with a REFUTES evidence link, the target of a CONFLICTS_WITH
         edge, or the target of a SUPERSEDES edge is CONTRADICTED whatever the replayed
         ``status_changed`` events say (``_link_evidence_locked``, ``create_claim`` and
-        ``supersede_claim`` make the same transition live). Applied before the PROVEN re-check so
-        a refuted claim is never re-earned as PROVEN from its SUPPORTS links."""
+        ``supersede_claim`` make the same transition live). ``logged`` maps claim_uid to the
+        reason of a surviving ``status_changed -> CONTRADICTED`` event, honoured even when it was
+        replayed before its claim existed. Applied before the PROVEN re-check so a refuted claim
+        is never re-earned as PROVEN from its SUPPORTS links."""
         derived = []
         rows = db.execute(
             "SELECT c.claim_uid AS claim_uid, c.status AS status, "
@@ -549,6 +561,9 @@ class ClaimIndex:
                 other, relation = row["edge"].split(" ", 1)
                 reason = f"replay: {relation} edge from claim {other}"
                 caused_by = other
+            elif (logged or {}).get(row["claim_uid"]) is not None:
+                reason = f"replay: surviving CONTRADICTED status event: {logged[row['claim_uid']]}"
+                caused_by = "status_changed"
             else:
                 continue
             at = _now_iso()
@@ -561,16 +576,20 @@ class ClaimIndex:
             derived.append({"claim_uid": row["claim_uid"], "reason": reason})
         return derived
 
-    def _demote_unproven_claims(self, db):
+    def _demote_unproven_claims(self, db, log_incomplete=False):
         """Replay-time evidence check for every claim the log left PROVEN: it keeps PROVEN only
-        with an evidence store bound and at least one SUPPORTS link that still resolves in it.
-        Anything else is loaded as UNVERIFIED with the reason in the status history. A PROVEN
-        event is never trusted, and never silently dropped either."""
+        with an evidence store bound and at least one SUPPORTS link that still resolves in it,
+        and only from a log that replayed completely (``log_incomplete``: some event file was
+        unreadable or unknown, so a lost refutation cannot be ruled out). Anything else is
+        loaded as UNVERIFIED with the reason in the status history. A PROVEN event is never
+        trusted, and never silently dropped either."""
         demoted = []
         proven = db.execute("SELECT claim_uid FROM claims WHERE status='PROVEN' ORDER BY id").fetchall()
         for row in proven:
             claim_uid = row["claim_uid"]
-            if self.evidence_index is None:
+            if log_incomplete:
+                reason = "EVENT_LOG_INCOMPLETE"
+            elif self.evidence_index is None:
                 reason = "NO_EVIDENCE_STORE"
             else:
                 supports = [
@@ -607,10 +626,8 @@ class ClaimIndex:
             record = self.evidence_index.record(record_id=evidence_uid)
         except Exception:  # noqa: BLE001 - a broken lookup must not break claim provenance
             return None
-        if not isinstance(record, dict) or record.get("ok") is not True:
-            return None
-        if record.get("evidence_uid") != evidence_uid:
-            return None
+        if not _record_resolves(record, evidence_uid):
+            return None  # same rule findings use: ok, same UID, fully read, .json parses now
         if not isinstance(record.get("path"), str) or not record.get("path"):
             return None
         return {

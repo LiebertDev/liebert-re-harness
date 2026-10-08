@@ -28,7 +28,7 @@ class EvidenceStoreCase(unittest.TestCase):
         root = Path(tmp.name) / "evidence"
         root.mkdir()
         for name in cls.FILES.values():
-            (root / name).write_text(json.dumps({"ok": True}), encoding="utf-8")
+            (root / name).write_text(json.dumps({"ok": True, "target_sha256": "a" * 64}), encoding="utf-8")
         cls.root, cls.db_path = root, Path(tmp.name) / "evidence.sqlite"
         cls.store = EvidenceIndex(root, db_path=cls.db_path)
         cls.store.refresh()
@@ -347,6 +347,13 @@ class ReproductionClaimTests(EvidenceStoreCase):
         self.assertEqual(row["contract_validation"]["reproduction_claim"]["reason"], "PLAN_TARGET_NOT_REPORTED_ARTIFACT")
         self.assertFalse(report["dynamic_validation_performed"])
         self.assertEqual(report["coverage"]["UNSPECIFIED"], "UNKNOWN")
+
+    def test_reported_artifact_hash_is_compared_case_insensitively(self):
+        hypothesis = self.hypothesis()
+        plan, result = self.plan_and_result(hypothesis)
+        hypothesis.update(reproduction_status="CONFIRMED", validation_plan=plan, validation_result=result)
+        report = self.render(hypothesis, sha=self.SHA.upper())
+        self.assertEqual(report["findings"][0]["reproduction_status"], "CONFIRMED")
 
     def test_confirmation_with_no_reported_artifact_hash_is_not_accepted(self):
         hypothesis = self.hypothesis()
