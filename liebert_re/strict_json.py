@@ -35,7 +35,7 @@ MALFORMED = "MALFORMED"
 DEFAULT_MAX_DEPTH = 256
 REASONS = (DUPLICATE_KEY, NON_FINITE, TOO_LARGE, TOO_DEEP, MALFORMED)
 
-__all__ = ["StrictJSONError", "loads", "REASONS", "DEFAULT_MAX_DEPTH", *REASONS]
+__all__ = ["StrictJSONError", "loads", "raw_decode", "REASONS", "DEFAULT_MAX_DEPTH", *REASONS]
 
 
 class StrictJSONError(ValueError):
@@ -119,6 +119,28 @@ def loads(data: str | bytes | bytearray, *, max_bytes: int | None = None, max_de
         _check_depth(text, max_depth)
         return json.loads(text, object_pairs_hook=_no_duplicate_keys, parse_constant=_refuse_constant,
                           parse_float=_finite_float)
+    except StrictJSONError:
+        raise
+    except RecursionError:
+        raise StrictJSONError(TOO_DEEP, "JSON nesting is too deep") from None
+    except ValueError as exc:  # JSONDecodeError, or an over-long integer literal
+        raise StrictJSONError(MALFORMED, str(exc)) from None
+
+
+def raw_decode(text: str, pos: int = 0, *, max_depth: int = DEFAULT_MAX_DEPTH) -> tuple[Any, int]:
+    """Strict counterpart of ``json.JSONDecoder.raw_decode``: ``(value, end_index)`` for the ONE JSON
+    value that starts exactly at ``pos`` of ``text``; whatever follows ``end_index`` is not read and
+    not checked. The same refusals as :func:`loads` apply to that value (DUPLICATE_KEY, NON_FINITE,
+    TOO_DEEP counted over the consumed span only, anything else unparsable MALFORMED); nothing is
+    accepted that ``loads`` would refuse. ``text`` must be a ``str``."""
+    if not isinstance(text, str):
+        raise TypeError(f"strict_json.raw_decode wants str, not {type(text).__name__}")
+    decoder = json.JSONDecoder(object_pairs_hook=_no_duplicate_keys, parse_constant=_refuse_constant,
+                               parse_float=_finite_float)
+    try:
+        value, end = decoder.raw_decode(text, pos)
+        _check_depth(text[pos:end], max_depth)
+        return value, end
     except StrictJSONError:
         raise
     except RecursionError:

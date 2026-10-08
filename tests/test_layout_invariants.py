@@ -63,7 +63,7 @@ def test_published_tool_name_set_is_unchanged():
         n for n in tool_families._locally_defined_tool_names() if not n.startswith("_")
     )
     digest = hashlib.sha256(repr(public).encode()).hexdigest()
-    assert digest == "672707a79389a9a2d4a9c22516ea191b036e9a3c6f01b41f7ed05e15e04fd1fb"
+    assert digest == "63380b40b3d47b6be331752486e995b855bd7099bb825dda7cb93e5977bb7207"
 
 
 def test_the_imported_package_is_this_checkout():
