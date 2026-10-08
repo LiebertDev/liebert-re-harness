@@ -146,11 +146,13 @@ def test_access_denied_on_a_delete_pending_lock_file_is_waited_out_on_windows(tm
     """The other process just released the lock; Windows still answers the exclusive create with access denied."""
     real_open, calls = os.open, []
 
-    def flaky_open(path, flags, *args):
+    def flaky_open(path, flags, *args, **kw):
+        if not str(path).endswith("x.lock"):  # tmp_path cleanup (rmtree uses dir_fd on Linux) must reach the real call
+            return real_open(path, flags, *args, **kw)
         calls.append(path)
         if len(calls) <= 2:
             raise PermissionError(13, "Permission denied")
-        return real_open(path, flags, *args)
+        return real_open(path, flags, *args, **kw)
 
     monkeypatch.setattr(pl, "_IS_WINDOWS", True)
     monkeypatch.setattr(pl.os, "open", flaky_open)
@@ -159,7 +161,11 @@ def test_access_denied_on_a_delete_pending_lock_file_is_waited_out_on_windows(tm
 
 
 def test_lasting_access_denied_is_raised_as_itself_not_as_contention(tmp_path, monkeypatch):
-    def denied(path, flags, *args):
+    real_open = os.open
+
+    def denied(path, flags, *args, **kw):
+        if not str(path).endswith("x.lock"):
+            return real_open(path, flags, *args, **kw)
         raise PermissionError(13, "Permission denied")
 
     monkeypatch.setattr(pl, "_IS_WINDOWS", True)
@@ -170,9 +176,11 @@ def test_lasting_access_denied_is_raised_as_itself_not_as_contention(tmp_path, m
 
 
 def test_access_denied_is_not_waited_out_off_windows(tmp_path, monkeypatch):
-    calls = []
+    calls, real_open = [], os.open
 
-    def denied(path, flags, *args):
+    def denied(path, flags, *args, **kw):
+        if not str(path).endswith("x.lock"):
+            return real_open(path, flags, *args, **kw)
         calls.append(path)
         raise PermissionError(13, "Permission denied")
 
