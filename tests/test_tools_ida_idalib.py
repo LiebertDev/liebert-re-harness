@@ -992,6 +992,17 @@ class IdalibSubprocessTests(IdaCase):
         public, _ = ti._idalib_probe(use_cache=False)
         self.assertEqual((public["status"], public["idapro_version"]), ("OK", None))
 
+    def test_a_decoy_distribution_listed_beside_the_owning_one_does_not_hide_it(self):
+        decoys = (("idapro-0.0.1", "0.0.1", "not_idapro.py,,"), ("idapro-9.9.9", "9.9.9", "idapro.py,,"),
+                  ("idapro-0.0.2", "0.0.2", "other.py,,"))
+        for name, version, record in decoys:
+            info = self.stubs / (name + ".dist-info")
+            info.mkdir()
+            (info / "METADATA").write_text("Metadata-Version: 2.1\nName: idapro\nVersion: " + version + "\n", encoding="utf-8")
+            (info / "RECORD").write_text(record + "\n", encoding="utf-8")
+        public, _ = ti._idalib_probe(use_cache=False)
+        self.assertEqual((public["status"], public["idapro_version"]), ("OK", "9.9.9"))
+
     def test_banners_on_stdout_do_not_reach_the_answer_or_fail_it(self):
         data = self.q("summary")
         self.assertTrue(data["ok"], data)

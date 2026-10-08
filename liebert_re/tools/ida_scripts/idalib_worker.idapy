@@ -106,10 +106,11 @@ def _versions():
         from importlib import metadata
         # The version of the distribution that OWNS the imported module; a same-named dist-info
         # elsewhere on sys.path says nothing about this module, so that case stays None.
-        dist = metadata.distribution("idapro")
         module_file = os.path.normcase(os.path.realpath(idapro.__file__))
-        if any(os.path.normcase(os.path.realpath(str(dist.locate_file(f)))) == module_file for f in (dist.files or [])):
-            found["idapro_version"] = dist.version
+        for dist in metadata.distributions(name="idapro"):
+            if any(os.path.normcase(os.path.realpath(str(dist.locate_file(f)))) == module_file for f in (dist.files or [])):
+                found["idapro_version"] = dist.version
+                break
     except Exception:  # noqa: BLE001
         pass
     try:

@@ -2452,12 +2452,15 @@ try:
         import os
         from importlib import metadata
         # The version of the distribution that OWNS the imported module. A same-named dist-info that
-        # merely sits on sys.path says nothing about this module, so that case is reported as None.
-        dist = metadata.distribution("idapro")
+        # merely sits on sys.path says nothing about this module, so every distribution is scanned and
+        # none owning it is reported as None.
         module_file = os.path.normcase(os.path.realpath(idapro.__file__))
-        owned = any(os.path.normcase(os.path.realpath(str(dist.locate_file(f)))) == module_file
-                    for f in (dist.files or []))
-        info["idapro_version"] = dist.version if owned else None
+        info["idapro_version"] = None
+        for dist in metadata.distributions(name="idapro"):
+            if any(os.path.normcase(os.path.realpath(str(dist.locate_file(f)))) == module_file
+                   for f in (dist.files or [])):
+                info["idapro_version"] = dist.version
+                break
     except Exception:
         info["idapro_version"] = None
     try:

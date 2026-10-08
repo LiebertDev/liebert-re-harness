@@ -207,6 +207,11 @@ class TestRefusals:
             data = _gate(child.pid, sample_sha256=image_sha)
         assert data["status"] == "RESOURCE_LIMIT_UNAVAILABLE"
 
+    def test_an_int_too_large_for_a_float_is_a_structured_refusal(self, child, image_sha, lab_open):
+        for huge in (10**10000, -(10**10000)):
+            data = _gate(child.pid, sample_sha256=image_sha, timeout_seconds=huge)
+            assert data["ok"] is False and data["status"] == "BOUNDS_REQUIRED", huge
+
     def test_a_gate_that_cannot_write_evidence_refuses_with_an_environment_error(self, child, image_sha, lab_open, tmp_path):
         blocker = tmp_path / "file"
         blocker.write_text("x")

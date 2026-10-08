@@ -319,7 +319,7 @@ def test_device_guard_null_or_invalid_is_an_error_and_null_not_zero(tmp_path):
         assert proc.returncode == 0, f"{Path(shell).name}: {proc.stderr.strip()[:300]}"
         out = json.loads(proc.stdout)
         assert out[0]["status"] == 2 and out[0]["services"] == [1, 2] and out[0]["errors"] == []
-        assert out[1]["status"] == 1 and out[1]["services"] in ([], None) and out[1]["errors"] == []
+        assert out[1]["status"] == 1 and out[1]["services"] == [] and out[1]["errors"] == []
         for bad in out[2:]:
             assert bad["status"] is None and bad["services"] is None, bad
             assert bad["errors"] == ["vbs:System.InvalidOperationException"], bad

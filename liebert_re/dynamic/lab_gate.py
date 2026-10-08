@@ -115,6 +115,24 @@ def _j(payload):
     return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
 
 
+def _finite_positive(value):
+    """True only for a finite number above zero. An int too large for a float is not finite enough
+    to bound anything, so the OverflowError from ``math.isfinite`` is a refusal, not a crash."""
+    try:
+        return math.isfinite(value) and value > 0
+    except (OverflowError, ValueError, TypeError):
+        return False
+
+
+def _echo_bound(value):
+    """The caller's bound as recorded in the decision. An int beyond 64 bits cannot be serialised
+    under Python's int-to-str limit and would make the evidence record unwritable, so it is
+    recorded as the marker string instead of being echoed."""
+    if isinstance(value, int) and not isinstance(value, bool) and value.bit_length() > 64:
+        return "OUT_OF_RANGE_INTEGER"
+    return value
+
+
 class LabGate:
     """Kept as a class so the layout pin counts no extra top-level function."""
 
@@ -345,7 +363,7 @@ class LabGate:
                 "unmet_prerequisites": [{"prerequisite": k, "verified": False, "reason": v} for k, v in _UNVERIFIED.items()],
             },
             "environment": LabGate.environment(), "checks": [], "target": None, "authorization": None,
-            "bounds": {"timeout_seconds": timeout_seconds, "max_memory_bytes": max_memory_bytes},
+            "bounds": {"timeout_seconds": _echo_bound(timeout_seconds), "max_memory_bytes": _echo_bound(max_memory_bytes)},
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
         }
         checks = decision["checks"]
@@ -435,7 +453,7 @@ class LabGate:
                           "the declared sha256 does not match the image the process was started from")
         passed("sample_hash", "declared sha256 equals the sha256 of the process image on disk")
         timeout_ok = (not isinstance(timeout_seconds, bool) and isinstance(timeout_seconds, (int, float))
-                      and math.isfinite(timeout_seconds) and timeout_seconds > 0)
+                      and _finite_positive(timeout_seconds))
         memory_ok = (not isinstance(max_memory_bytes, bool) and isinstance(max_memory_bytes, int)
                      and max_memory_bytes > 0)
         if not (timeout_ok and memory_ok):
