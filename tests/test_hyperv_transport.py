@@ -774,6 +774,203 @@ def test_pull_rejects_a_symlinked_host_directory(cred, outdir, tmp_path):
     assert fake.calls == []
 
 
+def _make_dir_link(link, target):
+    """A symlink, or on Windows a junction (needs no privilege); skips the test when neither works."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return
+    except (OSError, NotImplementedError):
+        pass
+    if os.name == "nt":
+        done = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True)
+        if done.returncode == 0:
+            return
+    pytest.skip("neither symlinks nor junctions are available to this user")
+
+
+@contract
+def test_pull_rejects_a_host_dir_whose_parent_is_a_link_not_only_the_last_component(cred, outdir, tmp_path):
+    real = outdir / "real"
+    (real / "inner").mkdir(parents=True)
+    link = tmp_path / "linkparent"
+    _make_dir_link(link, real)
+    transport, fake = make(cred, probe_ok)
+    # the last component (inner) is an ordinary directory; its parent is the link
+    for target in (link / "inner", link):
+        result = transport.pull_files(VM, ["C:\\Lab\\a"], target)
+        assert (result["error_class"], result["reason"]) == ("PATH_REJECTED", "HOST_DIR_MISSING_OR_REPARSE")
+    assert fake.calls == []
+    assert hvt._chain_problem(str(link / "inner")) == "REPARSE"
+    assert hvt._chain_problem(str(real / "inner")) is None
+    assert hvt._chain_problem(str(real / "missing")) == "UNREADABLE"
+    assert hvt._chain_problem(str(real / "inner" / ".." / "inner")) == "DOTDOT"
+
+
+@contract
+def test_pull_rejects_a_dotdot_host_dir_even_when_it_would_fold_to_a_plain_directory(cred, outdir):
+    transport, fake = make(cred, probe_ok)
+    (outdir / "sub").mkdir()
+    sneaky = str(outdir / "sub" / "..")
+    assert transport.pull_files(VM, ["C:\\Lab\\a"], sneaky)["error_class"] == "PATH_REJECTED"
+    assert fake.calls == []
+
+
+# ---- what "verified" means: transfer integrity, and a source check only when the caller brings a hash
+
+
+@contract
+def test_pull_result_says_transfer_integrity_and_does_not_claim_a_source_check(cred, outdir):
+    transport, _ = make(cred, _pull_handler([b"alpha", b"beta"]))
+    result = transport.pull_files(VM, ["C:\\Lab\\a", "C:\\Lab\\b"], outdir)
+    assert result["ok"] is True and result["measured"]["source_verified"] is False
+    for entry in result["measured"]["files"]:
+        assert entry["status"] == "VERIFIED"  # kept for compatibility; it means transfer integrity only
+        assert entry["transfer_integrity"] is True and entry["source_verified"] is False
+        assert entry["integrity_basis"] == "HOST_MATCHES_GUEST_REPORT"
+
+
+@contract
+def test_pull_a_guest_that_lies_consistently_passes_transfer_integrity_but_fails_a_caller_hash(cred, outdir):
+    # the guest serves b"planted" and reports the hash of b"planted": host and guest agree, content is wrong
+    real_digest = hashlib.sha256(b"expected content").hexdigest()
+    transport, _ = make(cred, _pull_handler([b"planted"]))
+    plain = transport.pull_files(VM, ["C:\\Lab\\a"], outdir)
+    assert plain["ok"] is True and plain["measured"]["files"][0]["source_verified"] is False
+    for leftover in outdir.iterdir():
+        leftover.unlink()
+    transport, _ = make(cred, _pull_handler([b"planted"]))
+    checked = transport.pull_files(VM, ["C:\\Lab\\a"], outdir, expected_sha256=[real_digest])
+    assert (checked["error_class"], checked["reason"]) == ("HASH_MISMATCH", "EXPECTED_SHA256_MISMATCH")
+    entry = checked["measured"]["files"][0]
+    assert entry["status"] == "REJECTED" and entry["transfer_integrity"] is False and entry["host_path"] is None
+    assert checked["measured"]["verified"] == 0 and list(outdir.iterdir()) == []
+
+
+@contract
+def test_pull_expected_sha256_match_marks_the_file_source_verified(cred, outdir):
+    digest = hashlib.sha256(b"known").hexdigest()
+    transport, _ = make(cred, _pull_handler([b"known", b"other"]))
+    result = transport.pull_files(VM, ["C:\\Lab\\a", "C:\\Lab\\b"], outdir, expected_sha256=[digest.upper(), None])
+    assert result["ok"] is True
+    first, second = result["measured"]["files"]
+    assert first["source_verified"] is True and first["integrity_basis"].endswith("CALLER_EXPECTED_SHA256")
+    assert second["source_verified"] is False and second["transfer_integrity"] is True
+    assert result["measured"]["source_verified"] is False  # not every file had an expected hash
+
+
+@contract
+@pytest.mark.parametrize("bad", [
+    ["x" * 64], ["a" * 63], ["a" * 65], [5], "a" * 64, [], ["a" * 64, "a" * 64], {"0": "a" * 64}, [b"a" * 64],
+])
+def test_pull_malformed_expected_sha256_is_rejected_before_any_process(cred, outdir, bad):
+    transport, fake = make(cred, probe_ok)
+    result = transport.pull_files(VM, ["C:\\Lab\\a"], outdir, expected_sha256=bad)
+    assert (result["error_class"], result["reason"]) == ("PATH_REJECTED", "EXPECTED_SHA256_INVALID")
+    assert fake.calls == []
+
+
+# ---- the copy is bounded while it runs, not measured afterwards
+
+
+@contract
+def test_pull_copy_is_a_bounded_chunked_read_not_an_unbounded_copy_item():
+    code = _code(hvt._SCRIPT)
+    pull = code[code.index("elseif ($script:Op -eq 'pull')"):code.index("else { Fail 'UNKNOWN_OPERATION' }")]
+    assert "-FromSession" not in pull and "Copy-Item" not in pull
+    copy_section = pull[pull.index("Mark 'copy'"):]
+    assert "[System.IO.FileMode]::CreateNew" in copy_section        # never opens an existing host file
+    assert "$limit = [int64] $files[$i]['size']" in copy_section    # bound = the measured size
+    assert "Fail 'COPY_OVER_QUOTA'" in copy_section                  # the quotas are enforced before writing
+    assert "$limit - $written" in copy_section                       # no read request goes past the bound
+    assert "-ne $want" in copy_section                               # a long or short answer stops the copy
+    assert "Fail 'GUEST_FILE_CHANGED'" in copy_section              # growth beyond the measurement stops it
+    assert "Remove-Item -LiteralPath $partial" in copy_section       # and its own partial is deleted
+    assert "if ($created)" in copy_section                           # only a file this run created
+
+
+@contract
+def test_pull_script_reported_copy_over_quota_is_a_quota_class_with_nothing_left(cred, outdir):
+    def handler(req, argv):
+        Path(req["host_dir"], req["partial_names"][0]).write_bytes(b"x" * 5)  # what a stopped copy might leave
+        rows = [{"index": 0, "status": "COPY_FAILED", "code": "COPY_OVER_QUOTA", "size": 5}]
+        return proc(phases_to("copy") + [result_line("pull", False, "copy", {"files": rows},
+                                                     failure(code="COPY_OVER_QUOTA"))], 1)
+    transport, _ = make(cred, handler)
+    result = transport.pull_files(VM, ["C:\\Lab\\a"], outdir)
+    assert (result["error_class"], result["reason"]) == ("QUOTA_EXCEEDED", "COPY_OVER_QUOTA")
+    assert result["measured"]["files"][0]["error_class"] == "QUOTA_EXCEEDED"
+    assert list(outdir.iterdir()) == []
+
+
+@contract
+def test_pull_a_file_that_grew_after_the_script_measured_it_never_survives_on_the_host(cred, outdir):
+    # the script would have stopped; even if it wrongly reports success the host size check still decides
+    transport, _ = make(cred, _pull_handler([b"x" * 400], claim={0: b"x" * 4}), max_pull_file_bytes=64)
+    result = transport.pull_files(VM, ["C:\\Lab\\a"], outdir)
+    assert (result["error_class"], result["reason"]) == ("QUOTA_EXCEEDED", "HOST_SIZE_OVER_QUOTA")
+    assert list(outdir.iterdir()) == []
+
+
+# ---- the final name is created exclusively; an existing file is never replaced
+
+
+def _plant_final(handler, existing: bytes):
+    def wrapped(req, argv):
+        done = handler(req, argv)
+        final = req["partial_names"][0][: -len(".partial")]
+        Path(req["host_dir"], final).write_bytes(existing)
+        return done
+    return wrapped
+
+
+@contract
+def test_pull_never_replaces_an_existing_file_at_the_final_name(cred, outdir):
+    transport, _ = make(cred, _plant_final(_pull_handler([b"new content", b"second"]), b"precious"))
+    result = transport.pull_files(VM, ["C:\\Lab\\a", "C:\\Lab\\b"], outdir)
+    assert (result["error_class"], result["reason"]) == ("TRANSFER_FAILED", "HOST_FINAL_NAME_EXISTS")
+    first, second = result["measured"]["files"]
+    assert first["status"] == "REJECTED" and first["host_path"] is None and first["transfer_integrity"] is False
+    assert second["status"] == "VERIFIED" and result["measured"]["verified"] == 1
+    names = sorted(p.name for p in outdir.iterdir())
+    assert len(names) == 2 and not any(n.endswith(".partial") for n in names)
+    planted = next(p for p in outdir.iterdir() if p.name.endswith("-000.guestfile"))
+    assert planted.read_bytes() == b"precious"
+
+
+@contract
+def test_pull_publishes_by_hard_link_and_reports_the_method(cred, outdir):
+    transport, _ = make(cred, _pull_handler([b"abc"]))
+    result = transport.pull_files(VM, ["C:\\Lab\\a"], outdir)
+    assert result["ok"] is True
+    assert result["measured"]["files"][0]["publish_method"] in ("HARDLINK", "EXCLUSIVE_COPY")
+
+
+@contract
+def test_pull_fallback_without_hard_links_is_exclusive_copy_and_says_so(cred, outdir, monkeypatch):
+    def no_links(src, dst, **kw):
+        raise OSError("hard links are not supported on this volume")
+    monkeypatch.setattr(os, "link", no_links)
+    transport, _ = make(cred, _pull_handler([b"abc" * 50]))
+    result = transport.pull_files(VM, ["C:\\Lab\\a"], outdir)
+    assert result["ok"] is True
+    entry = result["measured"]["files"][0]
+    assert entry["publish_method"] == "EXCLUSIVE_COPY"
+    assert Path(entry["host_path"]).read_bytes() == b"abc" * 50
+    assert [p.name for p in outdir.iterdir()] == [Path(entry["host_path"]).name]
+
+
+@contract
+def test_pull_fallback_also_refuses_an_existing_final_name(cred, outdir, monkeypatch):
+    def no_links(src, dst, **kw):
+        raise OSError("hard links are not supported on this volume")
+    monkeypatch.setattr(os, "link", no_links)
+    transport, _ = make(cred, _plant_final(_pull_handler([b"new"]), b"precious"))
+    result = transport.pull_files(VM, ["C:\\Lab\\a"], outdir)
+    assert (result["error_class"], result["reason"]) == ("TRANSFER_FAILED", "HOST_FINAL_NAME_EXISTS")
+    only = list(outdir.iterdir())
+    assert len(only) == 1 and only[0].read_bytes() == b"precious"
+
+
 @contract
 def test_a_request_too_large_for_the_command_line_is_quota_exceeded(cred, outdir, monkeypatch):
     monkeypatch.setattr(hvt, "_MAX_REQUEST_B64", 200)

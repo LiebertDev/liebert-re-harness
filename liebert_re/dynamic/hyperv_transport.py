@@ -18,8 +18,26 @@ Three operations, each returns a dict and never raises:
   file name. A path with ``..``, a stream (``:``), a wildcard, a device name, a reparse point (the
   file or any parent), a directory, a missing file or a size over quota is rejected before anything
   is copied. Every file is copied to a ``.partial`` name, then measured on the host (size and SHA-256
-  against what the guest measured) before it is renamed. Files that verify are kept even when a later
-  one fails; ``measured.files`` says which is which.
+  against what the guest measured) before it is published under its final name. Files that verify
+  are kept even when a later one fails; ``measured.files`` says which is which.
+
+  What "verified" means. The guest measures the hash, and the host compares its own copy with that
+  report: this is TRANSFER INTEGRITY (``transfer_integrity``: the bytes that arrived are the bytes
+  the guest hashed) and nothing more. It does not show the content is the content the caller
+  expected, because the guest chose both the bytes and the hash. The per-file ``status`` value
+  ``VERIFIED`` is kept for compatibility and means exactly that. Content is checked against a source
+  only when the caller passes ``expected_sha256`` (one hex digest or ``None`` per path): then the
+  host's own hash must equal it (``source_verified`` true, ``EXPECTED_SHA256_MISMATCH`` otherwise).
+
+  Bounded copy. The copy does not trust ``Copy-Item -FromSession``, which cannot be limited while it
+  runs and would let a guest that grows a file between the measurement and the copy fill the host
+  disk before any check. The script instead pulls the file in 1 MiB reads at host-chosen offsets
+  into a ``CreateNew`` host file and never requests or writes more than the measured size (itself
+  already checked against both quotas); a short read, a long answer, or any bytes beyond the measured
+  size stop the copy, delete the partial and fail with ``GUEST_FILE_CHANGED``. The host re-measures
+  size and hash afterwards. The final name is created exclusively (hard link, or an ``O_EXCL``
+  copy where the volume has no hard links, reported as ``publish_method``): an existing file is
+  never replaced. Every component of ``host_dir`` up to the drive root must be a real directory.
 
 Result shape (``schema`` ``liebert-re.hyperv-transport/1``): ``ok``; ``status`` (``OK``, ``FAILED``
 or ``UNKNOWN``); ``error_class`` (``None`` or one of ``ERROR_CLASSES``); ``reason`` (a short fixed
@@ -57,8 +75,8 @@ the default is ``liebert_re.bounded_subprocess.run_bounded_process`` on ``powers
 (Windows PowerShell 5.1: the Hyper-V module lives there). Elevation (Hyper-V Administrators) is the
 operator's business; without it the VM query fails and the result is ``UNKNOWN``.
 
-Limits of this layer. A hash proves the copy equals what the guest read, not that the guest is
-honest. Short (8.3) names are not expanded. A killed PowerShell does not prove the guest-side copy
+Limits of this layer. A hash proves the copy equals what the guest read (transfer integrity), not
+that the guest is honest and not that the content is the expected one. Short (8.3) names are not expanded. A killed PowerShell does not prove the guest-side copy
 stopped.
 """
 from __future__ import annotations
@@ -301,14 +319,58 @@ try {
         $script:Data['files'] = $files
 
         Mark 'copy'
+        $copiedTotal = [int64] 0
         for ($i = 0; $i -lt $paths.Count; $i++) {
-            $target = [System.IO.Path]::Combine([string] $req.host_dir, [string] $req.partial_names[$i])
+            $partial = [System.IO.Path]::Combine([string] $req.host_dir, [string] $req.partial_names[$i])
+            $limit = [int64] $files[$i]['size']
+            $out = $null
+            $created = $false
             try {
-                Copy-Item -LiteralPath $paths[$i] -Destination $target -FromSession $session -ErrorAction Stop
+                if (($limit -gt [int64] $req.max_file_bytes) -or (($copiedTotal + $limit) -gt [int64] $req.max_total_bytes)) { Fail 'COPY_OVER_QUOTA' }
+                $out = New-Object System.IO.FileStream ($partial, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                $created = $true
+                $written = [int64] 0
+                while ($written -lt $limit) {
+                    $want = [int] [Math]::Min([int64] 1048576, $limit - $written)
+                    $chunk = Invoke-Command -Session $session -ErrorAction Stop -ArgumentList @($paths[$i], $written, $want) -ScriptBlock {
+                        param($p, $offset, $count)
+                        $fs = New-Object System.IO.FileStream ($p, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                        try {
+                            [void] $fs.Seek([int64] $offset, [System.IO.SeekOrigin]::Begin)
+                            $buf = New-Object byte[] ([int] $count)
+                            $n = 0
+                            while ($n -lt $count) {
+                                $r = $fs.Read($buf, $n, $count - $n)
+                                if ($r -le 0) { break }
+                                $n += $r
+                            }
+                            if ($n -lt $count) { $short = New-Object byte[] $n; [System.Array]::Copy($buf, $short, $n); $buf = $short }
+                            return , $buf
+                        }
+                        finally { $fs.Dispose() }
+                    }
+                    if ($null -eq $chunk) { $bytes = New-Object byte[] 0 } else { $bytes = [byte[]] @($chunk) }
+                    if ($bytes.Length -ne $want) { Fail 'GUEST_FILE_CHANGED' }
+                    $out.Write($bytes, 0, $bytes.Length)
+                    $written += $bytes.Length
+                }
+                $out.Dispose()
+                $out = $null
+                $extra = Invoke-Command -Session $session -ErrorAction Stop -ArgumentList @($paths[$i], $limit) -ScriptBlock {
+                    param($p, $offset)
+                    $fs = New-Object System.IO.FileStream ($p, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                    try { return [int64] ($fs.Length - $offset) } finally { $fs.Dispose() }
+                }
+                if ([int64] $extra -ne 0) { Fail 'GUEST_FILE_CHANGED' }
+                $copiedTotal += $written
                 $files[$i]['status'] = 'COPIED'
             }
             catch {
-                $files[$i]['status'] = 'COPY_FAILED'; $files[$i]['code'] = 'COPY_FAILED'
+                $copyCode = 'COPY_FAILED'
+                if (([string] $_.Exception.Message) -cmatch '^lr:([A-Z0-9_]{1,48})$') { $copyCode = $Matches[1] }
+                if ($null -ne $out) { try { $out.Dispose() } catch { } }
+                if ($created) { try { Remove-Item -LiteralPath $partial -Force -ErrorAction Stop } catch { } }
+                $files[$i]['status'] = 'COPY_FAILED'; $files[$i]['code'] = $copyCode
                 $script:Data['files'] = $files
                 throw
             }
@@ -388,6 +450,63 @@ def _is_link_or_reparse(path: str | Path) -> bool | None:
     except OSError:
         return None
     return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & _REPARSE_ATTRIBUTE)
+
+
+def _chain_problem(path: str) -> str | None:
+    """Every component of ``path`` below the drive root must be a real directory.
+
+    ``None`` when the whole chain is a plain directory chain; ``"REPARSE"`` when any component is a
+    symlink or reparse point (junction, mount point); ``"UNREADABLE"`` when a component cannot be
+    examined. ``..`` is refused rather than folded, because folding would skip the link it follows.
+    """
+    if ".." in re.split(r"[\\/]", os.path.splitdrive(path)[1]):
+        return "DOTDOT"
+    current = os.path.normpath(path)
+    while os.path.dirname(current) != current:  # the root itself (drive or share) is not examined
+        link = _is_link_or_reparse(current)
+        if link is None:
+            return "UNREADABLE"
+        if link:
+            return "REPARSE"
+        current = os.path.dirname(current)
+    return None
+
+
+def _publish_exclusive(partial: str, final: str, claimed_sha: str, claimed_size: int,
+                       ) -> tuple[str | None, str | None, str | None]:
+    """``(method, error_class, reason)``: give ``partial`` its final name without replacing anything.
+
+    A hard link fails with ``FileExistsError`` when ``final`` exists. On a volume with no hard links the
+    fallback creates ``final`` with ``O_EXCL``, copies into it and re-measures it; that is reported as
+    ``EXCLUSIVE_COPY``. The partial is removed by the caller's cleanup.
+    """
+    try:
+        os.link(partial, final)
+        return "HARDLINK", None, None
+    except FileExistsError:
+        return None, "TRANSFER_FAILED", "HOST_FINAL_NAME_EXISTS"
+    except OSError:
+        pass  # no hard links here: a fallback, taken and reported
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(final, flags, 0o600)
+    except FileExistsError:
+        return None, "TRANSFER_FAILED", "HOST_FINAL_NAME_EXISTS"
+    except OSError:
+        return None, "TRANSFER_FAILED", "HOST_RENAME_FAILED"
+    try:
+        with os.fdopen(descriptor, "wb") as out, open(partial, "rb") as source:
+            shutil.copyfileobj(source, out, 1 << 20)
+        again = _sha256_file(final)
+        if again == (claimed_sha, claimed_size):
+            return "EXCLUSIVE_COPY", None, None
+    except OSError:
+        pass
+    try:  # the file at ``final`` is ours (O_EXCL created it), so it is ours to remove
+        os.unlink(final)
+    except OSError:
+        pass
+    return None, "TRANSFER_FAILED", "HOST_RENAME_FAILED"
 
 
 def _sha256_file(path: str | Path) -> tuple[str, int] | None:
@@ -495,6 +614,7 @@ _CODE_CLASS = {
     "COPY_FAILED": "TRANSFER_FAILED",
     "GUEST_HASH_MISMATCH": "HASH_MISMATCH",
     "GUEST_FILE_CHANGED": "HASH_MISMATCH",
+    "COPY_OVER_QUOTA": "QUOTA_EXCEEDED",
     "HOST_FILE_CHANGED": "HASH_MISMATCH",
     "VM_NOT_FOUND": "UNKNOWN",
     "VM_NOT_UNIQUE": "UNKNOWN",
@@ -773,8 +893,15 @@ class HypervTransport:
         return self._result("push", started, None, None, last, **measured)
 
     def pull_files(self, vm: str, guest_paths: Sequence[str], host_dir: str | os.PathLike[str], *,
-                   timeout_s: float | None = None) -> dict[str, Any]:
-        """Copy the listed guest files into ``host_dir`` under host-generated names, hash-verified."""
+                   timeout_s: float | None = None,
+                   expected_sha256: Sequence[str | None] | None = None) -> dict[str, Any]:
+        """Copy the listed guest files into ``host_dir`` under host-generated names.
+
+        Each file's ``transfer_integrity`` says the host copy equals what the guest reported; that is
+        not a check against the expected content. ``expected_sha256`` (one 64-digit hex string or
+        ``None`` per path, same order) makes the host's own hash be compared with a value the caller
+        brought; only then ``source_verified`` is true.
+        """
         started = time.monotonic()
 
         def early(cls: str, reason: str, **more: Any) -> dict[str, Any]:
@@ -799,6 +926,13 @@ class HypervTransport:
             rejected.append({"index": None, "reason": "DUPLICATE_GUEST_PATH"})
         if rejected:
             return early("PATH_REJECTED", rejected[0]["reason"], rejected=rejected)
+        expected: list[str | None] = [None] * len(normalised)
+        if expected_sha256 is not None:
+            if (not isinstance(expected_sha256, (list, tuple)) or len(expected_sha256) != len(normalised)
+                    or not all(e is None or (isinstance(e, str) and re.fullmatch(r"[0-9a-fA-F]{64}", e))
+                               for e in expected_sha256)):
+                return early("PATH_REJECTED", "EXPECTED_SHA256_INVALID")
+            expected = [e.lower() if e is not None else None for e in expected_sha256]
         try:
             target_dir = os.fspath(host_dir)
         except TypeError:
@@ -808,7 +942,7 @@ class HypervTransport:
             return early("PATH_REJECTED", "HOST_DIR_NOT_ABSOLUTE")
         if ":" in os.path.splitdrive(target_dir)[1]:
             return early("PATH_REJECTED", "HOST_DIR_STREAM")
-        if _is_link_or_reparse(target_dir) is not False or not os.path.isdir(target_dir):
+        if _chain_problem(target_dir) is not None or not os.path.isdir(target_dir):
             return early("PATH_REJECTED", "HOST_DIR_MISSING_OR_REPARSE")
         timeout = self._timeout(timeout_s, self._transfer_timeout_s)
         if timeout is None:
@@ -827,7 +961,8 @@ class HypervTransport:
         last = phases[-1] if phases else None
         files: list[dict[str, Any]] = [
             {"index": i, "guest_path": p, "status": "NOT_ATTEMPTED", "error_class": None, "reason": None,
-             "host_path": None, "size": None, "sha256": None}
+             "host_path": None, "size": None, "sha256": None, "transfer_integrity": False,
+             "source_verified": False, "integrity_basis": None, "publish_method": None}
             for i, p in enumerate(normalised)
         ]
         verified = 0
@@ -865,20 +1000,22 @@ class HypervTransport:
                 row = row_by_index[index]
                 claimed_sha, claimed_size = row.get("sha256"), row.get("size")
                 partial = partial_paths[index]
-                outcome = self._verify_pulled(partial, claimed_sha, claimed_size, total)
+                outcome = self._verify_pulled(partial, claimed_sha, claimed_size, total, expected[index])
                 if outcome[0] is not None:
                     entry["error_class"], entry["reason"], entry["status"] = outcome[0], outcome[1], "REJECTED"
                     first_error = first_error or (outcome[0], outcome[1])
                     continue
                 total += claimed_size
-                try:
-                    os.replace(partial, finals[index])
-                except OSError:
-                    entry["error_class"], entry["reason"], entry["status"] = (
-                        "TRANSFER_FAILED", "HOST_RENAME_FAILED", "REJECTED")
-                    first_error = first_error or ("TRANSFER_FAILED", "HOST_RENAME_FAILED")
+                method, pub_class, pub_reason = _publish_exclusive(partial, finals[index], claimed_sha, claimed_size)
+                if method is None:
+                    entry["error_class"], entry["reason"], entry["status"] = pub_class, pub_reason, "REJECTED"
+                    first_error = first_error or (pub_class or "UNKNOWN", pub_reason or "HOST_RENAME_FAILED")
                     continue
-                entry.update(status="VERIFIED", host_path=finals[index], size=claimed_size, sha256=claimed_sha)
+                entry.update(status="VERIFIED", host_path=finals[index], size=claimed_size, sha256=claimed_sha,
+                             transfer_integrity=True, publish_method=method,
+                             source_verified=expected[index] is not None,
+                             integrity_basis=("HOST_MATCHES_GUEST_REPORT_AND_CALLER_EXPECTED_SHA256"
+                                              if expected[index] is not None else "HOST_MATCHES_GUEST_REPORT"))
                 verified += 1
             if first_error is not None:
                 return self._pull_result(started, first_error[0], first_error[1], last, files, verified)
@@ -892,7 +1029,7 @@ class HypervTransport:
                     pass
 
     def _verify_pulled(self, partial: str, claimed_sha: object, claimed_size: object, total: int,
-                       ) -> tuple[str | None, str | None]:
+                       expected: str | None = None) -> tuple[str | None, str | None]:
         if not (isinstance(claimed_sha, str) and _HEX64.fullmatch(claimed_sha)
                 and isinstance(claimed_size, int) and not isinstance(claimed_size, bool) and claimed_size >= 0):
             return "UNKNOWN", "PULL_FILE_DATA_INVALID"
@@ -911,13 +1048,17 @@ class HypervTransport:
             return "HASH_MISMATCH", "SIZE_MISMATCH"
         if measured[0] != claimed_sha:
             return "HASH_MISMATCH", "SHA256_MISMATCH"
+        if expected is not None and measured[0] != expected:
+            return "HASH_MISMATCH", "EXPECTED_SHA256_MISMATCH"
         return None, None
 
     def _pull_result(self, started: float, error_class: str | None, reason: str | None, last: str | None,
                      files: list[dict[str, Any]], verified: int, **more: Any) -> dict[str, Any]:
         total = sum(f["size"] for f in files if f["status"] == "VERIFIED")
+        source_verified = bool(files) and all(f["source_verified"] for f in files)
         return self._result("pull", started, error_class, reason, last, requested=len(files),
-                            verified=verified, verified_bytes=total, files=files, **more)
+                            verified=verified, verified_bytes=total, files=files,
+                            source_verified=source_verified, **more)
 
 
 def _default_runner(argv: Sequence[str], timeout_seconds: float) -> BoundedProcessResult:
