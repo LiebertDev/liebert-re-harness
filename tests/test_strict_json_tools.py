@@ -123,6 +123,16 @@ def test_rizin_extract_json_array_keeps_its_old_behaviour_on_strict_input():
     assert rizin._extract_json_array("[{not json,,,]")[2] == "MALFORMED"
 
 
+def test_rizin_extract_json_array_does_not_return_a_nested_fragment_of_malformed_array():
+    from liebert_re.tools import rizin
+    assert rizin._extract_json_array('[{"x":[1,2]}, BROKEN ]') == (None, None, "MALFORMED")
+
+
+def test_rizin_extract_json_array_skips_bracketed_preamble_line():
+    from liebert_re.tools import rizin
+    assert rizin._extract_json_array("[x] rizin preamble\n[1, 2]") == ([1, 2], 25, "OK")
+
+
 @pytest.mark.parametrize("text,reason", [
     ('{"havecode": true, "havecode": false}', "DUPLICATE_KEY"), ('{"bits": NaN}', "NON_FINITE")])
 def test_rizin_load_probe_with_non_strict_info_is_unavailable_with_the_reason(text, reason):

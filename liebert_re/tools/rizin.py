@@ -160,7 +160,35 @@ def _extract_json_array(text: str):
         except strict_json.StrictJSONError as exc:
             if exc.reason != strict_json.MALFORMED:
                 return None, None, "NOT_STRICT_" + exc.reason
-            pos = text.find("[", pos + 1)
+            # A later '[' may belong to the malformed candidate, not to a
+            # separate result. Find its lexical closing bracket while
+            # respecting JSON strings, then resume only beyond that span.
+            depth = 0
+            in_string = False
+            escaped = False
+            end = None
+            for index in range(pos, len(text)):
+                char = text[index]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        in_string = False
+                    continue
+                if char == '"':
+                    in_string = True
+                elif char == "[":
+                    depth += 1
+                elif char == "]":
+                    depth -= 1
+                    if depth == 0:
+                        end = index
+                        break
+            if end is None:
+                return None, None, "MALFORMED"
+            pos = text.find("[", end + 1)
             continue
         if isinstance(value, list):
             return value, end, "OK"
