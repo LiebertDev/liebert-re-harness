@@ -49,7 +49,9 @@ _MODULE_REFUSALS = frozenset({"NOT_FOUND", "UPX_UNPACK_FAILED", "PID_REQUIRED", 
                               "ISOLATION_REQUIRED", "AUTHORIZATION_REQUIRED", "UNKNOWN_OPERATION",
                               "PROCESS_NOT_OWNED", "OWNERSHIP_UNVERIFIABLE", "SAMPLE_HASH_REQUIRED",
                               "SAMPLE_HASH_MISMATCH", "SAMPLE_HASH_UNVERIFIABLE", "BOUNDS_REQUIRED",
-                              "RESOURCE_LIMIT_UNAVAILABLE"})
+                              "RESOURCE_LIMIT_UNAVAILABLE",
+                              # the emulation gate (liebert_re.recover.emulate): a refusal to run, never a finding
+                              "TARGET_CLASS_REQUIRED", "CLASS_CONFLICT"})
 _MODULE_USAGE = frozenset({"RULES_MISSING", "TOOL_USAGE"})
 _REFUSAL_ERRORS = frozenset({"FILE_NOT_FOUND", "FILE_NOT_ACCESSIBLE"})
 
@@ -294,6 +296,23 @@ def _labgate(a):
 
 def _labregister(a):
     return _load("liebert_re.dynamic.lab_gate", "dynamic_lab_register_owned_process")(a.pid)
+
+
+def _reg_assignment(text):
+    name, sep, value = text.partition("=")
+    if not sep or not name.strip() or not value.strip():
+        raise argparse.ArgumentTypeError("expected NAME=VALUE, for example rcx=0x10")
+    return name.strip(), value.strip()
+
+
+def _emulate(a):
+    authorization = None
+    if a.authorized_by or a.purpose:
+        authorization = {"authorized_by": a.authorized_by, "purpose": a.purpose, "sample_sha256": a.sha256}
+    return _load("liebert_re.recover.emulate", "emulate_range")(
+        a.path, a.start, stop_at=a.stop_at or (), max_instructions=a.max_instructions, timeout_s=a.timeout,
+        watch_writes=a.watch_writes, registers=dict(a.reg) or None, perm_mode=a.perm_mode,
+        target_class=a.target_class, authorization=authorization, sample_sha256=a.sha256)
 
 
 def _sieve_status(a):
@@ -849,6 +868,20 @@ def _build_parser():
     sp.add_argument("--function", required=True, nargs="+", metavar="FUNCTION", help="one or more function addresses written 0x... or function names, at most 16; a string not written 0x... is a name")
     sp.add_argument("--function-timeout", dest="function_timeout", type=int, default=30, help="seconds for one function's decompilation (5-120)")
     sp.add_argument("--timeout", type=int, default=None, help="seconds for the whole headless run (default: 300 plus the per-function bound for each function)")
+    sp = add("emulate", _emulate, "emulate a bounded range of an x86-64 PE with Unicorn in a separate process (a process boundary, not a sandbox): imports and syscalls stop the run, memory written by the code is dumped as raw bytes. Refused unless --target-class declares a public crackme or a target you own")
+    sp.add_argument("--start", required=True, metavar="VA", help="address to start at, decimal or 0x-hex")
+    sp.add_argument("--target-class", dest="target_class", default=None,
+                    help="required: public_crackme or owned_target (anything else, or nothing, is refused). owned_target also needs --authorized-by, --purpose and --sha256")
+    sp.add_argument("--authorized-by", dest="authorized_by", default=None, help="owned_target: who authorised the run")
+    sp.add_argument("--purpose", default=None, help="owned_target: why")
+    sp.add_argument("--sha256", default=None, help="the file's SHA-256 (required for owned_target, optional for public_crackme)")
+    sp.add_argument("--stop-at", dest="stop_at", nargs="+", default=None, metavar="VA", help="stop before executing any of these addresses (at most 64)")
+    sp.add_argument("--max-instructions", dest="max_instructions", type=int, default=5_000_000, help="instruction bound (1-50000000)")
+    sp.add_argument("--timeout", type=float, default=120, help="seconds the emulation may run (above 0, at most 600)")
+    sp.add_argument("--watch-writes", dest="watch_writes", choices=("image", "all"), default="image", help="which writes are recorded")
+    sp.add_argument("--perm-mode", dest="perm_mode", choices=("as_declared", "rwx"), default="as_declared",
+                    help="section permissions as declared, or all read-write-execute (an approximation, reported as one)")
+    sp.add_argument("--reg", action="append", type=_reg_assignment, default=[], metavar="NAME=VALUE", help="initial register value; repeatable")
     add("unpack", _unpack, "statically unpack a UPX-packed PE (output goes to the evidence cache)").add_argument("--timeout", type=int, default=60)
     add("scan", _scan, "scan with YARA-X rules").add_argument("--rules", required=True, help="rules file")
     sp = add("minidump", _minidump, "analyse a Windows minidump")

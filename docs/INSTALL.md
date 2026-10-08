@@ -4,8 +4,8 @@
 
 Only what you need to run and develop the analysis code. Concretely:
 
-- **74<!-- count:modules --> Python modules** in the `liebert_re/` package — the analysis code itself.
-- **117<!-- count:test_files --> test files** in `tests/` (`tests/test_*.py`), plus `conftest.py` and an empty `__init__.py`
+- **75<!-- count:modules --> Python modules** in the `liebert_re/` package — the analysis code itself.
+- **118<!-- count:test_files --> test files** in `tests/` (`tests/test_*.py`), plus `conftest.py` and an empty `__init__.py`
   (the latter is required so the flat top-level modules resolve on `sys.path`).
 - No challenge-solution scripts: they are not distributed in this public package (see [SOLVED_INDEX.md](../SOLVED_INDEX.md) for the record of what was solved).
 - Documentation, licence, CI configuration, and issue templates.
@@ -102,9 +102,10 @@ fallback on older interpreters, and the zstd path of `rar_7z` returns `TOOL_MISS
 
 **None of these are required.** The core analysis (PE parsing,
 entropy, .NET IL, the crypto attacks) runs on the
-Python dependencies alone. Function inventory (`rizin_functions`) needs rizin, and no
-range emulation ships — Unicorn is imported only by the VEX self-check in
-`liebert_re/recover/vex.py`. Each external tool unlocks additional operations, and
+Python dependencies alone. Function inventory (`rizin_functions`) needs rizin. Range
+emulation (`emulate_range`, CLI `emulate`) needs no external tool: Unicorn is a core
+dependency, and the engine runs in a separate interpreter started by `liebert_re/recover/emulate.py`
+(`liebert_re/recover/vex.py` corrects its AVX instructions). Each external tool unlocks additional operations, and
 when one is absent the relevant call returns an explicit "tool missing" result
 naming it — it does not silently degrade or guess.
 

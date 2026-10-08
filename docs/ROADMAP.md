@@ -21,10 +21,11 @@ files.
    [SOLVED_INDEX.md](../SOLVED_INDEX.md)); its emulation step depended on a
    bounded-emulation module from the upstream tree that was never published here
    (see the README's "deliberately not in this repository" list). The write-up
-   and the recovered algorithm are correct and worth keeping. A useful
-   contribution is a minimal emulation path built from what is already in this
-   repository (Capstone for decode, Unicorn is already a dependency — see
-   `pyproject.toml`), or a documented manual trace of that step.
+   and the recovered algorithm are correct and worth keeping. `emulate_range`
+   (`recover/emulate.py`) now runs a bounded range of a PE, but it stops at the
+   first import or syscall, so this solver's step is only reachable once the API
+   stubs in the bounded-emulation item below exist. A useful contribution is the
+   stubs, or a documented manual trace of that step.
 2. ~~`liebert_re/tools/vb6_pcode.py`'s `program_strings` operation raises `ImportError`.~~
    **No longer true — verified closed.** `liebert_re/tools/vb6_pcode.py` is fully published
    in this package; `program_strings` only imports `pefile` and `capstone`
@@ -68,15 +69,18 @@ large enough to need their own design discussion. Each is a real gap here, not a
 hidden feature.
 
 - **Bounded emulation** (Unicorn-based range emulation, execution traces, a
-  backward slicer, per-instruction snapshots and register capture). **Still
-  open.** `liebert_re/recover/vex.py` ships, but it only corrects how AVX (VEX-encoded)
-  instructions execute inside an emulation session; it is not range emulation,
-  tracing or slicing. This is the
-  single most useful missing piece, because several things in this repository
-  currently degrade to "documentation only" without it — see item 1 above. Start
-  by defining the narrowest useful surface: emulate a bounded instruction range
-  starting from a known register state and return a trace, before attempting
-  anything like slicing.
+  backward slicer, per-instruction snapshots and register capture). **Partly
+  done (stage 1).** `emulate_range` (`liebert_re/recover/emulate.py`, CLI `emulate`)
+  emulates a bounded range of an x86-64 PE in a separate process behind a
+  declared-target-class gate, with a minimal TEB/PEB, and stops at every import,
+  syscall, interrupt, unmapped access and bound. `liebert_re/recover/vex.py` corrects
+  its AVX instructions. **Still open (stage 2):** API stubs (today an import call
+  simply stops the run), a trace richer than the last 64 instruction addresses,
+  TLS callbacks and loader initialisers, delay-load imports, 32-bit images, and
+  anything like slicing. Stubs are the next useful piece, because a routine that
+  calls the operating system cannot be run past that call today; they need their
+  own design discussion, since each stub is a claim about what the operating system
+  would have done.
 - **IDA and Ghidra wrappers** (headless decompilation, cross-references,
   callers/callees, answers normalised across engines so a caller does not need to
   know which one ran). **Partly done.** The read-only half of an IDA wrapper

@@ -23,6 +23,7 @@ PKG = Path(liebert_re.__file__).parent
 SHARED = {
     "tools/binary.py", "tools/capa.py", "tools/dex.py", "tools/die.py", "tools/il2cpp.py",
     "tools/jvm.py", "tools/pe_sieve.py", "tools/rizin.py", "tools/upx.py", "tools/yara_x.py",
+    "recover/emulate.py",
 }
 OWN_CODE = {
     "tools/ida.py": ["IDA_LAUNCH_FAILED"],
@@ -56,9 +57,9 @@ def _scan():
     return callers, importers
 
 
-def test_thirteen_modules_call_run_bounded_process():
+def test_fourteen_modules_call_run_bounded_process():
     callers, _ = _scan()
-    assert len(callers) == 13, sorted(callers)
+    assert len(callers) == 14, sorted(callers)
     assert callers == SHARED | set(OWN_CODE) | {LAB_GATE}
 
 

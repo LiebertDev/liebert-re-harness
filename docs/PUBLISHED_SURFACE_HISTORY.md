@@ -261,3 +261,10 @@ needs a script, so a bare path call cannot run it); the CLI reaches it as `idasc
 Public names: one (ida_script). Its helpers are private and not part of the pin. The worker is a mode (`script`)
 of the existing data file ida_scripts/idalib_worker.idapy and adds no names and no module. Digest recomputed from
 the source.
+Updated again: the published tool set gained emulate_range (liebert_re/recover/emulate.py), the bounded
+Unicorn emulation of a code range inside an x86-64 PE, reached from the CLI as `emulate`. It was already a
+FAMILIES["emulation"] name with no implementation here. One new module, and one public name
+(emulate_range): the gate (EmulationGate), the parent-side runner and the emulator-process engine are classes,
+and the only other top-level functions are underscore-private, so they are not part of the pin. The module
+owns an EVIDENCE directory (dataset/evidence/emulate_range), which is why EVIDENCE_OWNERS in
+tests/test_layout_invariants.py gained it. Digest recomputed from the source.
