@@ -26,6 +26,7 @@ import tempfile
 import unittest
 from decimal import Decimal, getcontext
 from pathlib import Path
+from unittest import mock
 
 import liebert_re.tools.crypto_id as tools_crypto_id
 from liebert_re.tools.crypto_id import _SIGNATURES, crypto_constant_scan
@@ -433,6 +434,33 @@ class HitLimitReportingTests(unittest.TestCase):
         self.assertFalse(result["hit_output_truncated"])
         self.assertEqual(result["hit_limits_reached"], [])
         self.assertFalse(match["hits_truncated"])
+
+
+class VirtualAddressReasonTests(unittest.TestCase):
+    """No virtual addresses is a state with a reason, not one bare ``None``."""
+
+    @staticmethod
+    def _reason(data):
+        result = _scan_bytes(data)
+        return result["virtual_addresses_available"], result["virtual_addresses_unavailable_reason"]
+
+    def test_raw_blob_is_not_pe(self):
+        self.assertEqual(self._reason(_words_le(_group("SHA-256", "K_table_head"))), (False, "NOT_PE"))
+
+    def test_mz_that_pefile_rejects_is_pe_parse_failed(self):
+        self.assertEqual(self._reason(b"MZ" + _words_le(_group("SHA-256", "K_table_head"))), (False, "PE_PARSE_FAILED"))
+
+    def test_missing_pefile_is_tool_missing_for_an_mz_file(self):
+        with mock.patch.dict("sys.modules", {"pefile": None}):
+            self.assertEqual(self._reason(b"MZ" + bytes(64)), (False, "TOOL_MISSING"))
+
+    def test_missing_pefile_does_not_relabel_a_raw_blob(self):
+        with mock.patch.dict("sys.modules", {"pefile": None}):
+            self.assertEqual(self._reason(bytes(64)), (False, "NOT_PE"))
+
+    def test_mapped_pe_has_no_reason(self):
+        from tests._pe_fixtures import build_pe
+        self.assertEqual(self._reason(build_pe()), (True, None))
 
 
 if __name__ == "__main__":

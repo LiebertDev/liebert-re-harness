@@ -250,16 +250,26 @@ def _find_all(data, needle, limit):
 
 
 def _pe_offset_to_va(path):
-    """Best-effort file-offset -> virtual-address mapper. Returns None when the
-    input is not a PE, which is the normal case for a raw decrypted blob."""
+    """Best-effort file-offset -> virtual-address mapper, as ``(mapper, reason)``.
+    ``reason`` is None when a mapper was built; otherwise ``mapper`` is None and
+    ``reason`` says why: NOT_PE (no MZ signature, the normal case for a raw
+    decrypted blob), TOOL_MISSING (pefile is not installed, so a PE could not be
+    mapped) or PE_PARSE_FAILED (MZ signature, but pefile rejected the file)."""
+    try:
+        with open(path, "rb") as stream:
+            signature = stream.read(2)
+    except OSError:
+        return None, "PE_PARSE_FAILED"
+    if signature != b"MZ":
+        return None, "NOT_PE"
     try:
         import pefile
     except ImportError:
-        return None
+        return None, "TOOL_MISSING"
     try:
         pe = pefile.PE(str(path), fast_load=True)
     except Exception:
-        return None
+        return None, "PE_PARSE_FAILED"
     try:
         base = pe.OPTIONAL_HEADER.ImageBase
         spans = []
@@ -278,7 +288,7 @@ def _pe_offset_to_va(path):
                 return {"virtual_address": hex(va + (off - raw)), "section": name}
         return {"virtual_address": None, "section": None}
 
-    return mapper
+    return mapper, None
 
 
 def _shared_index():
@@ -360,7 +370,7 @@ def _scan(path, offset, length, only_algorithms):
         end = start + _MAX_SCAN_BYTES
     data = raw[start:end]
 
-    mapper = _pe_offset_to_va(path)
+    mapper, mapper_unavailable = _pe_offset_to_va(path)
     owners = _shared_index()
     selected = set(only_algorithms or [])
 
@@ -457,6 +467,7 @@ def _scan(path, offset, length, only_algorithms):
                     "range_end": hex(end), "bytes_scanned": end - start,
                     "truncated_to_max_scan_bytes": (end - start) >= _MAX_SCAN_BYTES},
         "virtual_addresses_available": mapper is not None,
+        "virtual_addresses_unavailable_reason": mapper_unavailable,
         "signatures_in_table": sum(len(g["values"])
                                    for a in _SIGNATURES.values() for g in a.values()),
         "algorithms_in_table": len(_SIGNATURES),

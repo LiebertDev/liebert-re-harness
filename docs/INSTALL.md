@@ -5,7 +5,7 @@
 Only what you need to run and develop the analysis code. Concretely:
 
 - **76<!-- count:modules --> Python modules** in the `liebert_re/` package — the analysis code itself.
-- **120<!-- count:test_files --> test files** in `tests/` (`tests/test_*.py`), plus `conftest.py` and an empty `__init__.py`
+- **122<!-- count:test_files --> test files** in `tests/` (`tests/test_*.py`), plus `conftest.py` and an empty `__init__.py`
   (the latter is required so the flat top-level modules resolve on `sys.path`).
 - No challenge-solution scripts: they are not distributed in this public package (see [SOLVED_INDEX.md](../SOLVED_INDEX.md) for the record of what was solved).
 - Documentation, licence, CI configuration, and issue templates.

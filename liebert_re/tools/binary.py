@@ -479,9 +479,12 @@ def _save_resource_bytes(p,item,data):
     key=hashlib.sha256((str(p)+label).encode()).hexdigest()[:12]
     out=EVIDENCE/f'{p.stem}_{key}_{re.sub(r"[^A-Za-z0-9_-]","_",str(label))[:60]}.bin'
     out.write_bytes(data)
-    try:_evidence_index_record_write(out)
-    except Exception:pass
-    return out
+    # The bytes are on disk at this point; whether the evidence index recorded them is a separate fact.
+    # Returned as (path, None) when indexed, (path, reason) when not -- never dropped.
+    try:res=_evidence_index_record_write(out)
+    except Exception as exc:return out,f"{type(exc).__name__}: {exc}"
+    if isinstance(res,dict) and res.get("ok") is True:return out,None
+    return out,(str(res.get("error")) if isinstance(res,dict) and res.get("error") else "INDEX_RESULT_UNKNOWN")
 
 def pe_resources(path,operation='list',resource_type='',resource_name='',language=None,offset=0,max_results=300,max_preview_bytes=2000):
     """List or extract a PE's embedded resources (RT_RCDATA/RT_ICON/RT_
@@ -557,7 +560,7 @@ def pe_resources(path,operation='list',resource_type='',resource_name='',languag
         except _ResourceMalformed as e:
             return json.dumps({'ok':False,'path':relative(p),'error':'RESOURCE_DATA_MALFORMED','detail':str(e)},indent=2)
         digest=hashlib.sha256(raw).hexdigest()
-        out_path=_save_resource_bytes(p,it,raw)
+        out_path,index_error=_save_resource_bytes(p,it,raw)
         prev_n=max(0,min(int(max_preview_bytes or 2000),4096))
         preview=raw[:prev_n]
         return json.dumps({
@@ -566,6 +569,7 @@ def pe_resources(path,operation='list',resource_type='',resource_name='',languag
             'name_id':it['name_id'],'name':it['name'],'language_id':it['language_id'],'codepage':it['codepage'],
             'rva':hex(it['rva']),'file_offset':(hex(file_off) if file_off is not None else None),
             'size':it['size'],'sha256':digest,'evidence_file':str(out_path),
+            'evidence_indexed':index_error is None,'evidence_index_error':index_error,
             'preview_hex':preview.hex(),'preview_returned_bytes':len(preview),'preview_truncated':it['size']>len(preview),
         },indent=2,ensure_ascii=False)
 
@@ -1519,7 +1523,7 @@ def kernel_callback_registrations(path):
         dll,api,fam=hit;called.add((dll,api))
         regs.append({"api":api,"dll":dll,"family":fam,"call_rva":f["call_rva"],"encoding":f["encoding"],"kind":f["kind"],
                      "slot_rva":f["slot_rva"],"proves_call":False,"confidence":"heuristic"})
-    unref=[]
+    unref=[];unref_error=None
     try:
         pe=_pe(safe_path(path))
         names,_=_ria_slots(pe,int(pe.OPTIONAL_HEADER.ImageBase))
@@ -1528,9 +1532,10 @@ def kernel_callback_registrations(path):
             hit=_kcr_lookup(imp)
             if hit and (hit[0],hit[1]) not in called and (hit[0],hit[1]) not in seen:
                 seen.add((hit[0],hit[1]));unref.append({"api":hit[1],"dll":hit[0],"family":hit[2]})
-    except Exception:
-        pass
-    unref.sort(key=lambda u:(u["dll"],u["api"]))
+    except Exception as exc:
+        # The import inventory could not be re-read: the list is unknown (null), not empty.
+        unref=None;unref_error=type(exc).__name__
+    if unref is not None:unref.sort(key=lambda u:(u["dll"],u["api"]))
     trunc=scan["truncation"];state=scan["entry"]["imports_state"]
     rationale=[];reason=scan.get("reason")
     if reason=="NO_REFERENCE_MATCHED_THE_FILTER":reason=None
@@ -1549,10 +1554,12 @@ def kernel_callback_registrations(path):
         rationale.append(f"no direct call through the import table to any of the {len(_KCR_APIS)} API names this tool knows "
                          "(listed in names_checked) was seen; this says nothing about names outside that list")
         rationale.append("indirect calls and run-time name resolution (MmGetSystemRoutineAddress and the like) are not visible to this scan")
+    if unref is None:rationale.append(f"the import table could not be re-read ({unref_error}), so imported_without_reference is unknown (null), not empty")
     if unref:rationale.append(f"{len(unref)} listed API(s) are imported but no call site was found for them; not a finding")
     body={"ok":True,"tool":"kernel_callback_registrations","status":"OK","path":scan["path"],"outcome":outcome,
           "proves_call":False,"registrations":regs,"imported_without_reference":unref,"names_checked":{"count":len(_KCR_APIS),"names":sorted(f"{d}!{n}" for d,n in _KCR_APIS),"truncated":False},"callback_address":"NOT_RECOVERED",
           "scan_truncation":trunc,"entry":scan["entry"],"rationale":rationale,
           "caveats":list(scan["caveats"])+list(_KCR_EXTRA_CAVEATS),"statement":KCR_STATEMENT}
+    if unref_error:body["imported_without_reference_error"]=unref_error
     if reason:body["reason"]=reason
     return json.dumps(body,ensure_ascii=False,indent=2)

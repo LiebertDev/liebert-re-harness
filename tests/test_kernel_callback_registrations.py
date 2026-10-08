@@ -188,6 +188,30 @@ class KernelCallbackRegistrationsTests(unittest.TestCase):
         self.assertEqual(body["outcome"], "NOT_FOUND")
         self.assertEqual(body["reason"], "NO_IMPORT_DIRECTORY")
 
+    def test_unreadable_reinventory_is_null_with_a_reason_not_an_empty_list(self):
+        p = build("reinv.sys", {"ntoskrnl.exe": ["IoCreateDevice", "PsSetCreateProcessNotifyRoutineEx"]}, [(0x10, 1)])
+        real = binary._pe
+        state = {"calls": 0}
+
+        def flaky(path):
+            state["calls"] += 1
+            if state["calls"] > 1:
+                raise RuntimeError("second read failed")
+            return real(path)
+
+        with mock.patch.object(binary, "_pe", flaky):
+            body = run(p)
+        self.assertEqual(body["outcome"], "FOUND")
+        self.assertIsNone(body["imported_without_reference"])
+        self.assertEqual(body["imported_without_reference_error"], "RuntimeError")
+        self.assertTrue(any("could not be re-read" in line for line in body["rationale"]))
+
+    def test_readable_reinventory_has_a_list_and_no_error_field(self):
+        p = build("reinv_ok.sys", {"ntoskrnl.exe": ["PsSetCreateProcessNotifyRoutineEx"]}, [(0x10, 0)])
+        body = run(p)
+        self.assertEqual(body["imported_without_reference"], [])
+        self.assertNotIn("imported_without_reference_error", body)
+
     def test_unreadable_import_directory_is_not_looked_and_not_not_found(self):
         body = run(make("badimp.sys", bad_import_rva=True))
         self.assertFalse(body["ok"])

@@ -40,6 +40,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import liebert_re.workspace as tools_workspace
 from liebert_re.tools.binary import pe_resources
@@ -158,6 +159,25 @@ class PeResourcesExtractHashTests(unittest.TestCase):
         self.assertLess(result["preview_returned_bytes"], len(PAYLOAD))
         self.assertTrue(result["preview_truncated"])
         self.assertEqual(bytes.fromhex(result["preview_hex"]), payload[: result["preview_returned_bytes"]])
+
+    def test_extract_reports_whether_the_evidence_index_recorded_the_bytes(self):
+        ok = json.loads(pe_resources(PAYLOAD_PE, operation="extract", resource_type="RT_RCDATA", resource_name="__"))
+        self.assertIn("evidence_indexed", ok)
+        with mock.patch("liebert_re.tools.binary._evidence_index_record_write",
+                        return_value={"ok": False, "error": "INDEX_LOCKED"}):
+            failed = json.loads(pe_resources(PAYLOAD_PE, operation="extract", resource_type="RT_RCDATA", resource_name="__"))
+        self.assertTrue(failed["ok"])
+        self.assertTrue(Path(failed["evidence_file"]).exists())
+        self.assertIs(failed["evidence_indexed"], False)
+        self.assertEqual(failed["evidence_index_error"], "INDEX_LOCKED")
+        with mock.patch("liebert_re.tools.binary._evidence_index_record_write", side_effect=RuntimeError("boom")):
+            raised = json.loads(pe_resources(PAYLOAD_PE, operation="extract", resource_type="RT_RCDATA", resource_name="__"))
+        self.assertIs(raised["evidence_indexed"], False)
+        self.assertIn("RuntimeError", raised["evidence_index_error"])
+        with mock.patch("liebert_re.tools.binary._evidence_index_record_write", return_value={"ok": True}):
+            good = json.loads(pe_resources(PAYLOAD_PE, operation="extract", resource_type="RT_RCDATA", resource_name="__"))
+        self.assertIs(good["evidence_indexed"], True)
+        self.assertIsNone(good["evidence_index_error"])
 
     def test_extract_by_numeric_type_id_matches_rt_constant(self):
         result = json.loads(pe_resources(PAYLOAD_PE, operation="extract", resource_type=str(RT_RCDATA), resource_name="__"))
