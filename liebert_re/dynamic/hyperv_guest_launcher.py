@@ -56,8 +56,12 @@ do not depend on the agent being alive or honest:
   the agent does not confirm a termination (no reply, a reply that is not valid, a negative answer, or a
   server that is not the agent), the host opens a NEW PowerShell Direct session, opens the job by name
   with terminate and query rights only (``LrHostNative.KillJob``), ends it, and reads the job's own
-  accounting until no process is active. That, or an absent job together with a target whose process id AND
-  creation time are seen to be gone, is a confirmation (``termination_path`` ``HOST_JOB_KILL``).
+  accounting until no process is active. That, TOGETHER with the target's process id and creation time being
+  seen gone, is a confirmation (``termination_path`` ``HOST_JOB_KILL``); so is an absent job with the target
+  seen gone. "Seen gone" is a positive reading: the process id no longer exists, or exists with another creation
+  time. A process that cannot be opened or whose times cannot be read is UNKNOWN (``Created`` returns -2, the
+  script's ``target_alive`` is ``null``), and unknown is never a confirmation, with or without the job
+  accounting: the run then falls to the power-off below, or stays unconfirmed.
 * If that does not confirm either, and the target may have run (a ``resume`` was sent), the last resort is
   ``Stop-VM -TurnOff`` from the host (a separate constant script, ``_VM_OFF_SCRIPT``; the transport and the
   host script carry no cmdlet that changes VM state). It counts only when the VM then reads ``Off``, and the
@@ -65,6 +69,12 @@ do not depend on the agent being alive or honest:
   off (``power_off_fallback=False``). A target that was never resumed (or whose job cannot exist yet) is
   never the reason to power a VM off. When nothing is proven, the run stays unconfirmed
   (``JOB_TERMINATION_NOT_CONFIRMED``).
+* Optionally, and off by default, ``reset_vm_after_run=True`` powers the VM off AFTER the output was collected,
+  through the same ``_VM_OFF_SCRIPT``, and the ``collect_output`` reply then carries ``vm_reset: True`` only when
+  the VM read ``Off`` afterwards (a run that was already ended by the power-off is not powered off twice). This
+  is the only thing that lets ``debugger_run`` report ``guest_residual_activity`` as ``NONE_VM_RESET``; without
+  it the field stays ``NOT_VERIFIED`` (see LIMITS). It leaves the guest off: bringing it back from its
+  checkpoint is the caller's job, and a powered-off VM is not a reverted one.
 * Who answers on the pipe is checked before anything is sent. The first call records the agent's process id
   AND creation time the moment it is started; every later call carries them, and the client script in the
   guest asks ``GetNamedPipeServerProcessId`` for the connected pipe and the creation time of that process
@@ -111,10 +121,18 @@ LIMITS, stated plainly. The target and the operator share one account in the gue
 other accounts out, nothing more, and everything the guest agent reports (exit code, job confirmation,
 output) is reported by a process the target could in principle forge or silence; the result labels it
 ``GUEST_REPORTED`` (``provenance``). Running the target under a separate, non-administrator account is
-recommended and is NOT done here (it would change the target's behaviour). The job's name can be opened by
-the target, so the limits read back at ``resume`` are the limits only up to ``resume``. The kill rights the
+recommended and is NOT done here (it would change the target's behaviour). The host-side job kill
+(``HOST_JOB_KILL``) is independent of the agent process but is still executed by a PowerShell Direct session
+INSIDE the guest, so the result labels it ``GUEST_REPORTED`` too; only the power-off is read from the host. The
+job's name can be opened by the target, so the limits read back at ``resume`` are the limits only up to ``resume``. The kill rights the
 host asks for are terminate and query only; the job-membership refusal stops the target and its children, not a
-process the target gets another service to start outside the job. Such a client can occupy the single
+process the target gets another service to start outside the job. THAT IS THE BOUNDARY OF ``COMPLETED``: the
+job and the target process are what this module can prove ended, and a process started outside the job through
+a guest service is neither in the job nor waited for, so a run can be ``COMPLETED`` while it is still going.
+Nothing run inside the guest can prove "all execution has finished", so this is stated, not closed:
+``debugger_run`` reports ``guest_residual_activity`` ``NOT_VERIFIED`` unless the VM was powered off after the
+run and read back ``Off`` (``reset_vm_after_run`` or the ``VM_TURNED_OFF`` path), then ``NONE_VM_RESET``. Such a
+client can occupy the single
 pipe instance and delay the host's ``terminate_job`` and ``collect_output`` until the watchdog kills the
 job; the host then sees a failed or unconfirmed step (``TRANSPORT_ERROR``), never a success. The gate's
 host-pid model for a guest run is still undecided (see ``debugger_run``); this module does not change it.
@@ -309,9 +327,12 @@ try {
         param($jobName, $targetPid, $targetCreated, $nativeText)
         if (-not ('LrHostNative' -as [type])) { Add-Type -TypeDefinition $nativeText -Language CSharp }
         $state = [string] [LrHostNative]::KillJob([string] $jobName)
+        # alive: $true / $false only for a reading; $null (unknown) when the identity cannot be read
         $alive = $null
         if (([int64] $targetPid -gt 0) -and ([int64] $targetCreated -gt 0)) {
-            $alive = ([int64] [LrHostNative]::Created([uint32] $targetPid) -eq [int64] $targetCreated)
+            $now = [int64] [LrHostNative]::Created([uint32] $targetPid)
+            if ($now -eq -1) { $alive = $false }
+            elseif ($now -gt 0) { $alive = ($now -eq [int64] $targetCreated) }
         }
         return @{ state = $state; alive = $alive }
     }
@@ -401,15 +422,17 @@ public static class LrHostNative
         return (long)pid;
     }
 
-    // The creation time (FILETIME ticks) of a process, or -1 when it cannot be read or does not exist.
+    // The creation time (FILETIME ticks) of a process; -1 when there is no such process (OpenProcess says the id
+    // is invalid), -2 when it cannot be read for any other reason (access denied, the times are refused). An
+    // identity that cannot be read is UNKNOWN: it is never reported as "gone".
     public static long Created(uint pid)
     {
         IntPtr handle = OpenProcess(0x1000, false, pid);
-        if (handle == IntPtr.Zero) { return -1; }
+        if (handle == IntPtr.Zero) { return Marshal.GetLastWin32Error() == 87 ? -1 : -2; }
         try
         {
             long created, exited, kernel, user;
-            if (!GetProcessTimes(handle, out created, out exited, out kernel, out user)) { return -1; }
+            if (!GetProcessTimes(handle, out created, out exited, out kernel, out user)) { return -2; }
             return created;
         }
         finally { CloseHandle(handle); }
@@ -1446,7 +1469,7 @@ def _parse_agent_reply(text: object, op: str, run_id: str, pid: int | None, max_
 
 class _Run:
     __slots__ = ("vm", "pid", "state", "memory_bytes", "in_job", "limits_applied", "terminated", "agent_pid",
-                 "agent_created", "target_created", "job_name", "assign_attempted", "resume_attempted")
+                 "agent_created", "target_created", "job_name", "assign_attempted", "resume_attempted", "vm_off")
 
     def __init__(self, vm: str) -> None:
         self.vm = vm
@@ -1456,6 +1479,7 @@ class _Run:
         self.job_name = f"Global\\liebert-job-{uuid.uuid4().hex}"
         self.assign_attempted = False              # a job may exist (the reply to assign may have been lost)
         self.resume_attempted = False              # the target may be running (the reply to resume may have been lost)
+        self.vm_off = False                        # the VM was powered off and read back Off while ending this run
         self.pid: int | None = None
         self.state = "creating"
         self.memory_bytes: int | None = None
@@ -1479,11 +1503,14 @@ class HypervGuestLauncher:
     """
 
     def __init__(self, transport: HypervTransport, *, step_timeout_s: float | None = None,
-                 idle_seconds: int = _DEFAULT_IDLE_S, power_off_fallback: bool = True) -> None:
+                 idle_seconds: int = _DEFAULT_IDLE_S, power_off_fallback: bool = True,
+                 reset_vm_after_run: bool = False) -> None:
         if not isinstance(transport, HypervTransport):
             raise TypeError("transport must be a HypervTransport")
         if type(power_off_fallback) is not bool:
             raise ValueError("power_off_fallback must be a bool")
+        if type(reset_vm_after_run) is not bool:
+            raise ValueError("reset_vm_after_run must be a bool")
         if type(idle_seconds) is not int or not 10 <= idle_seconds <= 3600:
             raise ValueError("idle_seconds must be an int in [10, 3600]")
         default_step = max(float(getattr(transport, "_probe_timeout_s", 90.0)), 120.0)
@@ -1494,6 +1521,7 @@ class HypervGuestLauncher:
         self._step_timeout_s = float(step)
         self._idle_seconds = idle_seconds
         self._power_off_fallback = power_off_fallback
+        self._reset_vm_after_run = reset_vm_after_run
         self._runs: OrderedDict[str, _Run] = OrderedDict()
 
     def __repr__(self) -> str:  # the credential path is not printed
@@ -1619,7 +1647,26 @@ class HypervGuestLauncher:
         return self._guard("_terminate", vm, run_id)
 
     def collect_output(self, vm: str, run_id: str, max_bytes: int) -> dict[str, Any]:
-        return self._guard("_collect", vm, run_id, max_bytes)
+        run = self._runs.get(run_id) if type(run_id) is str else None   # _collect forgets a finished run
+        reply = self._guard("_collect", vm, run_id, max_bytes)
+        if self._reset_vm_after_run and run is not None and vm == run.vm:
+            reply = self._reset_after_run(reply, run_id, run)
+        return reply
+
+    def _reset_after_run(self, reply: dict[str, Any], run_id: str, run: _Run) -> dict[str, Any]:
+        """``reset_vm_after_run``: power the VM off once the output is in, and say so only if it reads ``Off``."""
+        off = run.vm_off
+        if not off:
+            try:
+                off = self._vm_off(run.vm)
+            except Exception:  # noqa: BLE001 - a failed power-off is a missing confirmation, nothing else
+                off = False
+        if not off:
+            return reply
+        identity: dict[str, Any] = {"run_id": run_id}
+        if run.pid is not None:
+            identity["pid"] = run.pid
+        return {**reply, **identity, "vm_reset": True}
 
     # ---- steps
 
@@ -1756,8 +1803,9 @@ class HypervGuestLauncher:
         if not run.assign_attempted:
             return None                                # no job exists yet; the target was never resumed
         state, alive = self._job_kill(vm, run)
-        proven = (state == "TERMINATED" and alive is not True) or (
-            state == "ABSENT" and alive is False)      # an absent job proves nothing unless the target is seen gone
+        # Both need the target SEEN gone (alive is False). Unknown (None: the identity could not be read) and alive
+        # (True) are no confirmation, with or without a job that reads empty or absent.
+        proven = state in ("TERMINATED", "ABSENT") and alive is False
         if proven:
             path, reason = "HOST_JOB_KILL", None
         elif run.resume_attempted and self._power_off_fallback and self._vm_off(vm):
@@ -1765,6 +1813,7 @@ class HypervGuestLauncher:
         else:
             return None
         run.terminated, run.state = True, "terminated"
+        run.vm_off = path == "VM_TURNED_OFF"
         done: dict[str, Any] = {"ok": True, "run_id": run_id, "pid": run.pid, "terminated": True,
                                 "termination_path": path}
         if reason is not None:
@@ -1772,7 +1821,8 @@ class HypervGuestLauncher:
         return done
 
     def _job_kill(self, vm: str, run: _Run) -> tuple[str | None, bool | None]:
-        """``(job state, target still alive)`` read from a session of its own, or ``(None, None)``."""
+        """``(job state, target still alive)`` read from a session of its own, or ``(None, None)``. ``alive`` is
+        ``None`` when the target's identity could not be read: unknown, and never a confirmation."""
         extra = {"job_name": run.job_name, "target_pid": run.pid or 0, "target_created": run.target_created or 0}
         _, body, failure = self._transport._run_script(
             "job_kill", vm, extra, self._step_timeout_s, script=_HOST_SCRIPT, script_name="launcher.ps1",

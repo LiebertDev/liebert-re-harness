@@ -11,7 +11,9 @@ cannot show:
   behind the job verification, the cmdlet lists are short, nothing from the host leaks into them.
 * On a Windows host with ``powershell.exe`` they parse both scripts and compile the C# class, and
   compare the P/Invoke struct sizes with the documented x64 sizes. That compiles code and starts
-  nothing: no target, no job object, no process is created.
+  nothing: no target, no job object, no process is created. One further test starts a harmless local
+  ``ping`` process of its own, puts it into a real job built by the agent's real ``AssignToJob`` and closes
+  the job's last handle, to measure that the process dies; it kills only the process it started.
 * They do NOT show that the agent works in a real guest. The one live test is marked ``heavy`` and
   skips unless ``LIEBERT_LIVE_GUEST_RUN=1``, a guest is named in the environment and the lab gate says
   VERIFIED. Nothing here has been run against a real guest.
@@ -696,7 +698,12 @@ def test_a_termination_reply_about_another_process_is_not_a_confirmation(cred):
 
 def run_debugger(cred, guest, **over):
     calls = tdr.Calls()
-    launcher, guest, fake = build(cred, guest, **({"power_off_fallback": over.pop("power_off")} if "power_off" in over else {}))
+    options = {}
+    if "power_off" in over:
+        options["power_off_fallback"] = over.pop("power_off")
+    if "reset" in over:
+        options["reset_vm_after_run"] = over.pop("reset")
+    launcher, guest, fake = build(cred, guest, **options)
     clock = over.pop("clock", None)
     extra = {} if clock is None else {"clock": clock}
     runner = DebuggerRun(tdr.FakeTransport(calls), launcher, gate=lambda op, **kw: tdr.good_decision(), **extra)
@@ -895,7 +902,7 @@ def test_each_job_gets_a_name_of_its_own_that_only_the_host_and_the_agent_know(c
 
 
 @pytest.mark.parametrize("state,alive,confirmed", [
-    ("TERMINATED", False, True), ("TERMINATED", True, False), ("TERMINATED", None, True),
+    ("TERMINATED", False, True), ("TERMINATED", True, False), ("TERMINATED", None, False),
     ("ABSENT", False, True), ("ABSENT", None, False), ("ABSENT", True, False),
     ("ACTIVE_REMAIN", False, False), ("OPEN_FAILED", False, False), ("TERMINATE_FAILED", False, False),
     ("QUERY_FAILED", False, False), ("something else", False, False),
@@ -908,6 +915,21 @@ def test_the_host_kill_confirms_only_what_the_job_accounting_or_the_target_ident
     if not confirmed:
         assert result["status"] == "TRANSPORT_ERROR" and result["reason"] == "JOB_TERMINATION_NOT_CONFIRMED"
         assert result["provenance"]["termination_path"] is None
+
+
+def test_a_target_whose_identity_cannot_be_read_is_unknown_and_falls_to_the_power_off_not_to_a_confirmation(cred):
+    guest = frozen(FakeGuest())
+    guest.job_state, guest.target_alive = "TERMINATED", None                  # the job reads empty, the target is UNKNOWN
+    guest.vm_off = True
+    result, guest, fake = run_debugger(cred, guest)
+    assert len(guest.kill_requests) == 1 and len(guest.off_requests) == 1     # the host kill did not confirm
+    assert result["provenance"]["termination_path"] == "VM_TURNED_OFF"
+    assert result["status"] != "COMPLETED"
+    guest = frozen(FakeGuest())
+    guest.job_state, guest.target_alive = "TERMINATED", None
+    result, guest, fake = run_debugger(cred, guest, power_off=False)           # no power-off allowed: not confirmed
+    assert result["job"]["terminated"] is False and result["reason"] == "JOB_TERMINATION_NOT_CONFIRMED"
+    assert result["exit_code"] is None and result["provenance"]["termination_path"] is None
 
 
 def test_the_last_resort_is_to_turn_the_vm_off_and_the_result_says_so(cred):
@@ -982,12 +1004,15 @@ def test_an_agent_that_says_not_terminated_is_checked_from_outside_too(cred):
 
 def test_the_identity_of_the_agent_is_recorded_at_start_and_sent_with_every_later_step(cred):
     launcher, guest, fake, run_id = started(cred)
-    launcher.assign_to_job(VM, run_id, {"memory_bytes": 1 << 28})
-    launcher.verify_job_assignment(VM, run_id)
+    run = launcher._runs[run_id]                                               # the record outlives its run in the map
+    advance(launcher, run_id, "terminate")                                     # assign, verify, resume, wait, terminate
+    assert launcher.collect_output(VM, run_id, 64)["ok"] is True
+    assert guest.ops() == ["create", "assign", "verify", "resume", "wait", "terminate", "collect"]
     assert "agent_pid" not in fake.calls[0]["request"]                         # the first call learns it
-    for call in fake.calls[1:]:
+    later = fake.calls[1:]
+    assert len(later) == 6                                                     # every one of the six later steps
+    for call in later:
         assert call["request"]["agent_pid"] == AGENT_PID and call["request"]["agent_created"] == AGENT_CREATED
-    run = launcher._runs[run_id]
     assert (run.agent_pid, run.agent_created, run.target_created) == (AGENT_PID, AGENT_CREATED, TARGET_CREATED)
 
 
@@ -1171,7 +1196,9 @@ def test_here_strings_cannot_be_ended_early():
 
 
 @contract
-def test_the_process_is_created_suspended_and_the_job_kills_on_close():
+def test_the_agent_source_creates_the_process_suspended_and_sets_the_kill_on_close_flag_on_the_job():
+    """TEXT of the C# only. That a closed job really kills its process is measured by
+    ``test_a_real_job_built_by_the_agents_assign_to_job_kills_its_process_when_the_last_handle_closes``."""
     cs = _csharp()
     assert re.search(r"CREATE_SUSPENDED\s*=\s*0x00000004;", cs)
     create = _method(cs, "public static LrRun Create(")
@@ -1309,7 +1336,8 @@ def test_the_guest_side_client_checks_who_answers_before_it_sends_anything():
     start = _block(hvl._HOST_SCRIPT, "startBlock")
     assert "[LrHostNative]::Created([uint32] $agentPid)" in start and "AGENT_IDENTITY_UNKNOWN" in start
     kill = _block(hvl._HOST_SCRIPT, "killBlock")
-    assert "KillJob([string] $jobName)" in kill and "Created([uint32] $targetPid) -eq [int64] $targetCreated" in kill
+    assert "KillJob([string] $jobName)" in kill and "$now = [int64] [LrHostNative]::Created([uint32] $targetPid)" in kill
+    assert "if ($now -eq -1) { $alive = $false }" in kill and "elseif ($now -gt 0) { $alive = ($now -eq [int64] $targetCreated) }" in kill
     host = hvl._HOST_SCRIPT
     assert host.index("Mark 'job_kill'") < host.index("exit 0") and "job_name" in host
 
@@ -1722,11 +1750,12 @@ public static class LrServeProbe
 """
 
 _IDENT_DRIVER = r"""
-param([string]$Agent, [string]$Probe, [string]$Native, [string]$BlockPath)
+param([string]$Agent, [string]$Probe, [string]$Native, [string]$BlockPath, [string]$KillPath)
 $text = [System.IO.File]::ReadAllText($Agent) + "`n" + [System.IO.File]::ReadAllText($Probe)
 Add-Type -TypeDefinition $text -Language CSharp
 $nativeText = [System.IO.File]::ReadAllText($Native)
 $block = [scriptblock]::Create([System.IO.File]::ReadAllText($BlockPath))
+$kill = [scriptblock]::Create([System.IO.File]::ReadAllText($KillPath))
 $myPid = [int64] [System.Diagnostics.Process]::GetCurrentProcess().Id
 $request = '{"op":"x"}'
 
@@ -1750,11 +1779,27 @@ Case 'identity_matching_pid_and_creation_time_is_served' $myPid $created $true $
 Case 'identity_other_pid_with_the_right_creation_time_is_refused_and_nothing_is_sent' ($myPid + 1) $created $false 'AGENT_IDENTITY_MISMATCH'
 Case 'identity_same_pid_other_creation_time_is_refused_and_nothing_is_sent' $myPid ($created + 10000000) $false 'AGENT_IDENTITY_MISMATCH'
 Case 'identity_unknown_expectation_is_refused_and_nothing_is_sent' 0 0 $false 'AGENT_IDENTITY_MISMATCH'
-Case 'identity_unreadable_creation_time_never_matches' $myPid -1 $false 'AGENT_IDENTITY_MISMATCH'
+Case 'identity_non_positive_expected_creation_time_never_matches' $myPid -1 $false 'AGENT_IDENTITY_MISMATCH'
+Case 'identity_unreadable_expected_creation_time_never_matches' $myPid -2 $false 'AGENT_IDENTITY_MISMATCH'
 
 $started = [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToFileTimeUtc()
 Report 'created_is_the_process_start_time' ([Math]::Abs($created - $started) -lt 200000) ('created=' + $created + ' start=' + $started)
 Report 'created_of_a_missing_process_is_minus_one' (([LrHostNative]::Created([uint32] 2147483646)) -eq -1) ''
+$system = [int64] [LrHostNative]::Created([uint32] 4)
+Report 'created_of_a_process_that_exists_is_never_minus_one' ($system -ne -1) ('created(4)=' + $system)
+Report 'created_of_a_process_that_exists_is_a_time_or_unreadable' (($system -gt 0) -or ($system -eq -2)) ('created(4)=' + $system)
+
+function KillCase($name, $targetPid, $targetCreated, $want) {
+    $r = & $kill ('Local\lr-probe-kill-' + [guid]::NewGuid().ToString('N')) $targetPid $targetCreated $nativeText
+    $got = $r.alive
+    if ($null -eq $want) { $good = ($null -eq $got) } else { $good = ($got -is [bool]) -and ($got -eq $want) }
+    Report $name $good ('state=' + $r.state + ' alive=' + $got)
+}
+KillCase 'target_with_its_recorded_creation_time_is_alive' $myPid $created $true
+KillCase 'target_pid_with_another_creation_time_is_gone' $myPid ($created + 10000000) $false
+KillCase 'target_pid_that_does_not_exist_is_gone' 2147483646 $created $false
+KillCase 'target_without_a_recorded_pid_is_unknown' 0 $created $null
+KillCase 'target_without_a_recorded_creation_time_is_unknown' $myPid 0 $null
 
 $name = 'Local\lr-probe-job-' + [guid]::NewGuid().ToString('N')
 Report 'job_that_does_not_exist_is_absent' (([LrHostNative]::KillJob($name)) -ceq 'ABSENT') ''
@@ -1769,8 +1814,13 @@ _IDENT_PROBES = (
     "identity_wrong_pid_is_refused_and_nothing_is_sent", "identity_matching_pid_and_creation_time_is_served",
     "identity_other_pid_with_the_right_creation_time_is_refused_and_nothing_is_sent",
     "identity_same_pid_other_creation_time_is_refused_and_nothing_is_sent",
-    "identity_unknown_expectation_is_refused_and_nothing_is_sent", "identity_unreadable_creation_time_never_matches",
+    "identity_unknown_expectation_is_refused_and_nothing_is_sent",
+    "identity_non_positive_expected_creation_time_never_matches", "identity_unreadable_expected_creation_time_never_matches",
     "created_is_the_process_start_time", "created_of_a_missing_process_is_minus_one",
+    "created_of_a_process_that_exists_is_never_minus_one", "created_of_a_process_that_exists_is_a_time_or_unreadable",
+    "target_with_its_recorded_creation_time_is_alive", "target_pid_with_another_creation_time_is_gone",
+    "target_pid_that_does_not_exist_is_gone", "target_without_a_recorded_pid_is_unknown",
+    "target_without_a_recorded_creation_time_is_unknown",
     "job_that_does_not_exist_is_absent", "job_that_exists_and_is_empty_is_terminated_with_zero_active",
     "job_that_lost_its_last_handle_is_absent_again",
 )
@@ -1779,8 +1829,12 @@ _IDENT_PROBES = (
 def test_the_guest_side_client_and_the_native_helper_do_what_they_claim_when_run_for_real(tmp_path):
     """Runs the REAL guest-side client script block from the host script against a real LrServer on a real
     pipe: a server whose process id or creation time is not the expected one is never sent the request, and
-    an unknown or unreadable expectation refuses too. Also reads creation times and ends an (empty) named job.
-    No target, no agent process, no guest: the 'agent' is a thread of the test's own PowerShell process."""
+    an unknown or non-positive EXPECTATION refuses too (a server whose OWN creation time cannot be read is not
+    produced here: the stub server is in the probe's own process, which can always be read). Also reads creation
+    times (a missing process is -1, an existing one that cannot be opened is never -1), runs the REAL host-side
+    kill block's liveness reading (gone, alive, and unknown when the identity is not recorded or not readable)
+    and ends an (empty) named job. No target, no agent process, no guest: the 'agent' is a thread of the test's
+    own PowerShell process."""
     shell = _powershell()
     if shell is None:
         pytest.skip("powershell.exe is not available: the probe cannot run here")
@@ -1790,11 +1844,13 @@ def test_the_guest_side_client_and_the_native_helper_do_what_they_claim_when_run
     (tmp_path / "probe.cs").write_text(_IDENT_CS, encoding="ascii")
     (tmp_path / "native.cs").write_text(hvl._HOST_NATIVE_CS, encoding="ascii")
     (tmp_path / "block.ps1").write_text(_block(hvl._HOST_SCRIPT, "callBlock")[1:-1], encoding="ascii")   # the body
+    (tmp_path / "kill.ps1").write_text(_block(hvl._HOST_SCRIPT, "killBlock")[1:-1], encoding="ascii")
     driver = tmp_path / "ident.ps1"
     driver.write_text(_IDENT_DRIVER, encoding="ascii")
     done = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(driver),
                            "-Agent", str(tmp_path / "agent.cs"), "-Probe", str(tmp_path / "probe.cs"),
-                           "-Native", str(tmp_path / "native.cs"), "-BlockPath", str(tmp_path / "block.ps1")],
+                           "-Native", str(tmp_path / "native.cs"), "-BlockPath", str(tmp_path / "block.ps1"),
+                           "-KillPath", str(tmp_path / "kill.ps1")],
                           capture_output=True, text=True, timeout=300, check=False)
     seen = {}
     for line in done.stdout.splitlines():
@@ -1805,6 +1861,229 @@ def test_the_guest_side_client_and_the_native_helper_do_what_they_claim_when_run
     failed = {n: v for n, v in seen.items() if v[0] != "PASS"}
     assert not failed, failed
     assert set(seen) == set(_IDENT_PROBES) | {"END"}, sorted(set(_IDENT_PROBES) ^ set(seen))
+
+
+_CLOSE_DRIVER = r"""
+param([string]$Agent)
+Add-Type -TypeDefinition ([System.IO.File]::ReadAllText($Agent)) -Language CSharp
+function Report($name, $ok, $detail) { 'PROBE3:' + $name + ':' + $(if ($ok) { 'PASS' } else { 'FAIL' }) + ':' + $detail }
+$ping = Join-Path $env:SystemRoot 'System32\PING.EXE'
+$child = $null
+try {
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $ping
+    $info.Arguments = '-n 30 127.0.0.1'
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $child = [System.Diagnostics.Process]::Start($info)
+    $childPid = [int] $child.Id
+    # the agent class itself builds the job and assigns the process; only the process handle is supplied
+    $handle = [LrNative]::OpenProcess(0x1FFFFF, $false, [uint32] $childPid)
+    $run = New-Object LrRun
+    $run.Pid = $childPid
+    [LrRun].GetField('_process', [System.Reflection.BindingFlags] 'NonPublic,Instance').SetValue($run, $handle)
+    $run.AssignToJob(268435456, 'Local\lr-probe-close-' + [guid]::NewGuid().ToString('N'))
+    $run.Verify()
+    Report 'the_process_is_in_the_job_with_the_limits_applied' ($run.InJob -and $run.LimitsApplied) ('in_job=' + $run.InJob + ' limits=' + $run.LimitsApplied)
+    Start-Sleep -Milliseconds 300
+    Report 'the_process_is_alive_while_the_job_handle_is_open' (-not $child.HasExited) ('pid=' + $childPid)
+    $run.Dispose()
+    $gone = $child.WaitForExit(10000)
+    Report 'the_process_is_gone_after_the_last_job_handle_closed' $gone ('exited=' + $gone)
+}
+catch { Report 'driver' $false ($_.Exception.Message) }
+finally {
+    if (($null -ne $child) -and (-not $child.HasExited)) { try { $child.Kill() } catch { } }   # only the process started above
+}
+'PROBE3:END:PASS:done'
+"""
+
+_CLOSE_PROBES = ("the_process_is_in_the_job_with_the_limits_applied", "the_process_is_alive_while_the_job_handle_is_open",
+                 "the_process_is_gone_after_the_last_job_handle_closed")
+
+
+def test_a_real_job_built_by_the_agents_assign_to_job_kills_its_process_when_the_last_handle_closes(tmp_path):
+    """Measured, not read from text: the agent's own ``AssignToJob`` builds a real job (the process handle is the
+    only thing supplied from outside), the process is a harmless local ``ping -n 30 127.0.0.1`` this test starts
+    itself, it is alive while the job handle is open and gone within 10 s of the last handle closing. The probe
+    ends only the process it started, in a ``finally``. Not a guest, not the agent process, not a target."""
+    shell = _powershell()
+    if shell is None:
+        pytest.skip("powershell.exe is not available: the probe cannot run here")
+    if not sys.maxsize > 2 ** 32:
+        pytest.skip("a 64-bit host is needed: the agent itself refuses anything else")
+    (tmp_path / "agent.cs").write_text(_csharp(), encoding="ascii")
+    driver = tmp_path / "close.ps1"
+    driver.write_text(_CLOSE_DRIVER, encoding="ascii")
+    done = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(driver),
+                           "-Agent", str(tmp_path / "agent.cs")], capture_output=True, text=True, timeout=300, check=False)
+    seen = {}
+    for line in done.stdout.splitlines():
+        if line.startswith("PROBE3:"):
+            _, name, verdict, detail = line.strip().split(":", 3)
+            seen[name] = (verdict, detail)
+    assert "END" in seen, (done.stdout[-800:], done.stderr[-800:])
+    failed = {n: v for n, v in seen.items() if v[0] != "PASS"}
+    assert not failed, failed
+    assert set(seen) == set(_CLOSE_PROBES) | {"END"}, sorted(set(_CLOSE_PROBES) ^ set(seen))
+
+
+_UNREADABLE_DRIVER = r"""
+param([string]$Native, [string]$KillPath)
+$nativeText = [System.IO.File]::ReadAllText($Native)
+Add-Type -TypeDefinition $nativeText -Language CSharp
+Add-Type -Namespace Lr -Name Acl -MemberDefinition @'
+[DllImport("advapi32.dll", SetLastError = true)] public static extern bool SetKernelObjectSecurity(System.IntPtr handle, uint information, byte[] descriptor);
+[DllImport("advapi32.dll", SetLastError = true)] public static extern bool OpenProcessToken(System.IntPtr process, uint access, out System.IntPtr token);
+[DllImport("advapi32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)] public static extern bool LookupPrivilegeValueW(string system, string name, out long luid);
+[DllImport("advapi32.dll", SetLastError = true)] public static extern bool AdjustTokenPrivileges(System.IntPtr token, bool disableAll, byte[] state, uint length, System.IntPtr previous, System.IntPtr returned);
+[DllImport("kernel32.dll")] public static extern System.IntPtr GetCurrentProcess();
+[DllImport("kernel32.dll")] public static extern bool CloseHandle(System.IntPtr h);
+'@
+$kill = [scriptblock]::Create([System.IO.File]::ReadAllText($KillPath))
+function Report($name, $ok, $detail) { 'PROBE4:' + $name + ':' + $(if ($ok) { 'PASS' } else { 'FAIL' }) + ':' + $detail }
+
+# This probe process must not bypass access checks: SeDebugPrivilege (present, and enabled in an elevated
+# session) is switched off in THIS process's token, so a denied OpenProcess is really denied.
+$token = [IntPtr]::Zero
+$luid = 0L
+$off = [Lr.Acl]::OpenProcessToken([Lr.Acl]::GetCurrentProcess(), 0x28, [ref] $token) -and [Lr.Acl]::LookupPrivilegeValueW($null, 'SeDebugPrivilege', [ref] $luid)
+if ($off) {
+    $state = New-Object byte[] 16
+    [BitConverter]::GetBytes([uint32] 1).CopyTo($state, 0)
+    [BitConverter]::GetBytes([int64] $luid).CopyTo($state, 4)
+    [BitConverter]::GetBytes([uint32] 0).CopyTo($state, 12)
+    $off = [Lr.Acl]::AdjustTokenPrivileges($token, $false, $state, 16, [IntPtr]::Zero, [IntPtr]::Zero)
+}
+if ($token -ne [IntPtr]::Zero) { [void] [Lr.Acl]::CloseHandle($token) }
+Report 'the_debug_privilege_is_not_in_use' $off ''
+
+$child = $null
+try {
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = Join-Path $env:SystemRoot 'System32\PING.EXE'
+    $info.Arguments = '-n 30 127.0.0.1'
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $child = [System.Diagnostics.Process]::Start($info)
+    $childPid = [uint32] $child.Id
+    $created = [int64] [LrHostNative]::Created($childPid)
+    Report 'a_process_that_exists_reads_as_a_creation_time' ($created -gt 0) ('created=' + $created)
+    # a process of our own that nobody may open any more: a DACL with one deny entry for query-limited-information
+    $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor 'D:(D;;0x1000;;;WD)'
+    $bytes = New-Object byte[] $descriptor.BinaryLength
+    $descriptor.GetBinaryForm($bytes, 0)
+    Report 'the_process_was_made_unopenable' ([Lr.Acl]::SetKernelObjectSecurity($child.Handle, 4, $bytes)) ''
+    $now = [int64] [LrHostNative]::Created($childPid)
+    Report 'created_of_a_process_that_exists_but_cannot_be_opened_is_minus_two_not_gone' ($now -eq -2) ('created=' + $now)
+    $r = & $kill ('Local\lr-probe-kill-' + [guid]::NewGuid().ToString('N')) ([int64] $childPid) $created $nativeText
+    Report 'the_host_kill_reading_of_it_is_unknown_not_gone' (($null -eq $r.alive) -and ($r.state -ceq 'ABSENT')) ('alive=' + $r.alive + ' state=' + $r.state)
+}
+catch { Report 'driver' $false ($_.Exception.Message) }
+finally {
+    if (($null -ne $child) -and (-not $child.HasExited)) { try { $child.Kill() } catch { } }   # only the process started above
+}
+'PROBE4:END:PASS:done'
+"""
+
+_UNREADABLE_PROBES = (
+    "the_debug_privilege_is_not_in_use", "a_process_that_exists_reads_as_a_creation_time", "the_process_was_made_unopenable",
+    "created_of_a_process_that_exists_but_cannot_be_opened_is_minus_two_not_gone",
+    "the_host_kill_reading_of_it_is_unknown_not_gone",
+)
+
+
+def test_a_process_that_exists_but_cannot_be_opened_is_unknown_to_the_host_kill_and_never_gone(tmp_path):
+    """Measured: a local ``ping`` process this test starts is made unopenable (a deny entry in its own DACL, with the
+    probe process's debug privilege switched off so the denial holds), so ``Created`` fails with access denied while
+    the process plainly exists. That must read -2 (unknown), never -1 (no such process), and the real host-side kill
+    block must then report ``target_alive`` as ``null``. Only the process this test started is ended."""
+    shell = _powershell()
+    if shell is None:
+        pytest.skip("powershell.exe is not available: the probe cannot run here")
+    if not sys.maxsize > 2 ** 32:
+        pytest.skip("a 64-bit host is needed: the agent itself refuses anything else")
+    (tmp_path / "native.cs").write_text(hvl._HOST_NATIVE_CS, encoding="ascii")
+    (tmp_path / "kill.ps1").write_text(_block(hvl._HOST_SCRIPT, "killBlock")[1:-1], encoding="ascii")
+    driver = tmp_path / "unreadable.ps1"
+    driver.write_text(_UNREADABLE_DRIVER, encoding="ascii")
+    done = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(driver),
+                           "-Native", str(tmp_path / "native.cs"), "-KillPath", str(tmp_path / "kill.ps1")],
+                          capture_output=True, text=True, timeout=300, check=False)
+    seen = {}
+    for line in done.stdout.splitlines():
+        if line.startswith("PROBE4:"):
+            _, name, verdict, detail = line.strip().split(":", 3)
+            seen[name] = (verdict, detail)
+    assert "END" in seen, (done.stdout[-800:], done.stderr[-800:])
+    failed = {n: v for n, v in seen.items() if v[0] != "PASS"}
+    assert not failed, failed
+    assert set(seen) == set(_UNREADABLE_PROBES) | {"END"}, sorted(set(_UNREADABLE_PROBES) ^ set(seen))
+
+
+# ---- reset_vm_after_run (the guest is powered off once the output is in; off by default)
+
+
+def _op_order(fake):
+    return [c["request"]["op"] for c in fake.calls]
+
+
+def test_the_vm_is_not_reset_after_a_run_unless_asked_and_the_result_says_not_verified(cred):
+    guest = FakeGuest()
+    guest.vm_off = True
+    result, guest, fake = run_debugger(cred, guest)
+    assert result["status"] == "COMPLETED" and guest.off_requests == []
+    assert result["guest_residual_activity"] == "NOT_VERIFIED"
+    assert HypervGuestLauncher(HypervTransport(cred))._reset_vm_after_run is False
+
+
+def test_a_vm_reset_after_the_run_comes_after_the_output_and_is_reported_only_when_it_reads_off(cred):
+    guest = FakeGuest()
+    guest.vm_off = True
+    result, guest, fake = run_debugger(cred, guest, reset=True)
+    assert result["status"] == "COMPLETED" and base64.b64decode(result["output"]["data_b64"]) == b"hello\n"
+    assert len(guest.off_requests) == 1 and guest.off_requests[0]["vm"] == VM
+    assert _op_order(fake)[-2:] == ["agent_step", "vm_off"]                    # the output was collected first
+    assert result["guest_residual_activity"] == "NONE_VM_RESET"
+    assert result["provenance"]["termination_path"] == "AGENT"                  # the end itself was not the power-off
+
+
+@pytest.mark.parametrize("state", [None, "Running", "Paused", "Saved"])
+def test_a_vm_that_does_not_read_off_after_the_reset_is_not_reported_as_reset(cred, state):
+    guest = FakeGuest()
+    guest.vm_off = state
+    result, guest, fake = run_debugger(cred, guest, reset=True)
+    assert len(guest.off_requests) == 1
+    assert result["status"] == "COMPLETED" and result["guest_residual_activity"] == "NOT_VERIFIED"
+
+
+def test_a_run_ended_by_the_power_off_is_not_powered_off_twice_and_reads_as_reset(cred):
+    guest = frozen(FakeGuest())
+    guest.vm_off = True                                                         # the host kill cannot reach the job either
+    result, guest, fake = run_debugger(cred, guest, reset=True)
+    assert result["provenance"]["termination_path"] == "VM_TURNED_OFF"
+    assert len(guest.off_requests) == 1
+    assert result["guest_residual_activity"] == "NONE_VM_RESET"
+    assert result["status"] != "COMPLETED"
+
+
+def test_a_reset_only_ever_touches_the_vm_of_a_run_this_launcher_knows(cred):
+    launcher, guest, fake, run_id = started(cred, reset_vm_after_run=True)
+    guest.vm_off = True
+    assert launcher.collect_output(VM, "nosuchrun", 64)["ok"] is False
+    assert launcher.collect_output(VM, 12345, 64)["ok"] is False                # type: ignore[arg-type]
+    other = launcher.collect_output("Another VM", run_id, 64)
+    assert other["ok"] is False and other["reason"] == "VM_MISMATCH"
+    assert guest.off_requests == []
+    assert "vm_reset" not in other
+
+
+@pytest.mark.parametrize("bad", [1, "yes", None, 0])
+def test_reset_vm_after_run_must_be_a_bool(cred, bad):
+    with pytest.raises(ValueError):
+        HypervGuestLauncher(HypervTransport(cred), reset_vm_after_run=bad)  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------------- real Hyper-V (skipped by default)
@@ -1838,3 +2117,14 @@ def test_real_guest_run_of_a_benign_host_binary(tmp_path):
     result = DebuggerRun(transport, HypervGuestLauncher(transport)).run(
         vm, str(sample), digest, guest_dir, gate_args={**gate_args, "sample_sha256": digest}, timeout_s=60.0)
     assert result["status"] == "COMPLETED", result
+
+
+@contract
+def test_created_returns_minus_one_only_for_a_process_that_is_not_there_and_minus_two_for_every_other_failure():
+    """TEXT of the C# only: the GetProcessTimes failure after a successful open cannot be provoked on demand, so
+    this pins that it is not mapped to "gone". The access-denied case is measured by
+    ``test_a_process_that_exists_but_cannot_be_opened_is_unknown_to_the_host_kill_and_never_gone``."""
+    created = _method(hvl._HOST_NATIVE_CS, "public static long Created(")
+    assert created.count("return -1;") + created.count("? -1 : -2") == 1
+    assert "GetLastWin32Error() == 87 ? -1 : -2" in created
+    assert "out user)) { return -2; }" in created and "return -1; }" not in created
