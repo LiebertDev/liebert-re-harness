@@ -291,7 +291,8 @@ def _sieve(a):
 
 def _labgate(a):
     return _load("liebert_re.dynamic.lab_gate", "dynamic_lab_gate")(
-        a.operation, a.pid, authorization=a.authorization, sample_sha256=a.sample_sha256)
+        a.operation, a.pid, authorization=a.authorization, sample_sha256=a.sample_sha256,
+        guest_measurement_path=a.guest_measurement, local_vm_id=a.local_vm_id, max_age_s=a.max_age_s)
 
 
 def _labregister(a):
@@ -793,9 +794,17 @@ def _build_parser():
     sp.add_argument("--threads", action="store_true", help="also scan thread call stacks")
     _gate_args(sp)
     sp = add("labgate", _labgate, "evaluate the dynamic-lab gate for one operation on one process and record the decision "
-                                  "(reports what it verified and what it could not: isolation is never verified)", path=False)
+                                  "(reports what it verified and what it could not: isolation is verified only from a "
+                                  "fresh guest measurement named with --guest-measurement)", path=False)
     sp.add_argument("--operation", default=None, help="the operation to gate, e.g. pe_sieve_scan")
     sp.add_argument("--pid", default=None, help="process id the operation would touch")
+    sp.add_argument("--guest-measurement", dest="guest_measurement", default=None, metavar="FILE",
+                    help="measurement JSON written by scripts/measure_guest.ps1; read only for operations that "
+                         "need isolation. No environment variable or default location is used")
+    sp.add_argument("--local-vm-id", dest="local_vm_id", default=None, metavar="GUID",
+                    help="VM id of the machine this gate runs on; the measurement must be about that VM")
+    sp.add_argument("--max-age-s", dest="max_age_s", type=float, default=900.0, metavar="SECONDS",
+                    help="oldest measurement that still counts (default 900)")
     _gate_args(sp)
     sp = add("labregister", _labregister, "record that a process is a direct child of this process (harness-owned)", path=False)
     sp.add_argument("--pid", default=None, help="process id of a direct child of this process")

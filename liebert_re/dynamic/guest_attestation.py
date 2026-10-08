@@ -52,6 +52,19 @@ Error messages are never read.
 Evidence holds counts, booleans and switch types only; no VM names, GUIDs or host identity are
 copied into the result (AGENTS.md rule 9).
 
+ADMISSION (``GuestAttestation.admit``). The lab gate needs one answer, not three. ``admit`` folds
+the three capabilities and two more facts into ``VERIFIED`` / ``UNKNOWN`` / ``FAILED`` with a reason
+list: Memory Integrity is running in the guest (service code 2 in ``security_services_running``; the
+same unmeasured assumption as ``informational.guest_hvci_running``), and at least one Standard
+checkpoint of this VM is measured. The guest being reached over PowerShell Direct is already part of
+``isolated_guest`` (the ``guest`` section must be ``ok``). ``VERIFIED`` needs every condition true.
+``FAILED`` is a measured violation (a switch that is not Private or is shared with the host, a peer
+VM, an enabled Guest Service Interface, a VM that is not running, Memory Integrity measured off, no
+Standard checkpoint measured) in a file that is otherwise trustworthy. A stale, superseded,
+contradictory or malformed file is ``UNKNOWN``, never ``FAILED``: it proves nothing either way. A
+missing or unreadable fact is ``UNKNOWN``. Both non-VERIFIED answers refuse at the gate; the split
+only tells the operator whether to fix the lab or to measure again.
+
 Public surface is the class ``GuestAttestation``; module helpers are underscore-private on purpose.
 """
 from __future__ import annotations
@@ -481,6 +494,52 @@ def _guest_hvci(m: Any) -> bool | None:
     return _HVCI_SERVICE_CODE in running
 
 
+# Reason prefixes that make the file itself untrustworthy: nothing it says may be read as a
+# measured violation, so the verdict stays UNKNOWN.
+_UNTRUSTED = ("CONTRADICTION:", "INVALID:", "EVALUATION_ERROR", "TOO_MANY_ITEMS", "SCHEMA_",
+              "MEASUREMENT_NOT_AN_OBJECT", "STALE_MEASUREMENT", "NOW_UTC_INVALID", "MAX_AGE_INVALID")
+# Measured facts that break a condition (as opposed to facts that are merely absent).
+_VIOLATIONS = frozenset({"SWITCH_NOT_PRIVATE", "SWITCH_SHARED_WITH_HOST", "PEER_VM_ON_SWITCH", "VM_NOT_RUNNING",
+                         "GUEST_SERVICE_INTERFACE_ENABLED", "HVCI_NOT_RUNNING", "NO_STANDARD_CHECKPOINT"})
+_STANDARD_CHECKPOINT = "Standard"
+
+
+def _hvci_reasons(m: Any) -> list[str]:
+    """Reasons Memory Integrity in the guest is not established; empty when it is measured running."""
+    guest = m.get("guest") if isinstance(m, dict) else None
+    if guest is None:
+        return ["MISSING:guest"]
+    if not isinstance(guest, dict) or guest.get("ok") is not True:
+        return ["HVCI_NOT_MEASURED"]
+    if guest.get("security_services_running") is None:
+        return ["MISSING:guest.security_services_running"]
+    hvci = _guest_hvci(m)
+    if hvci is None:
+        return ["INVALID:guest.security_services_running"]
+    return [] if hvci else ["HVCI_NOT_RUNNING"]
+
+
+def _standard_checkpoint_reasons(m: Any, vm_id: str | None) -> list[str]:
+    """Reasons no Standard checkpoint of this VM is established; empty when at least one is measured."""
+    r: list[str] = []
+    if not isinstance(m, dict) or vm_id is None:
+        return ["MISSING:checkpoints"]
+    items = _items(m, "checkpoints", r)
+    if items is None:
+        return r
+    standard = 0
+    unreadable = 0
+    for c in items:
+        kind = c.get("type")
+        if not isinstance(kind, str):
+            unreadable += 1
+        elif kind == _STANDARD_CHECKPOINT and _guid(c.get("vm_id")) == vm_id:
+            standard += 1
+    if standard:
+        return []
+    return ["MISSING:checkpoints.type" if unreadable else "NO_STANDARD_CHECKPOINT"]
+
+
 class GuestAttestation:
     """Evaluate a ``liebert-re.guest-measurement/2`` document; see the module docstring."""
 
@@ -550,4 +609,72 @@ class GuestAttestation:
             "isolation_basis": basis,
             "isolation_asserted_by_operator": asserted,
             "informational": {"guest_hvci_running": hvci, "guest_hvci_note": _HVCI_NOTE},
+        }
+
+    @classmethod
+    def admit(cls, measurement: Any, *, now_utc: Any, local_vm_id: Any, max_age_s: Any = DEFAULT_MAX_AGE_S) -> dict:
+        """The lab gate's question: may an isolation-requiring operation proceed? Never raises.
+
+        ``verdict`` is ``VERIFIED`` only when the schema, freshness (``max_age_s``), the three
+        capabilities, Memory Integrity running in the reached guest and a Standard checkpoint all
+        hold. ``FAILED`` is a measured violation in a trustworthy file; everything else that is
+        missing, stale, contradictory or malformed is ``UNKNOWN``. ``conditions`` maps each required
+        fact to True, False or None (not established). The result copies counts, booleans and
+        reason codes only; it carries no VM name, id or host identity.
+        """
+        conditions: dict[str, bool | None] = dict.fromkeys(
+            ("measurement_fresh", "network_private_only", "no_host_adapter_on_switch", "standard_checkpoint",
+             "guest_memory_integrity"))
+        base: dict | None = None
+        notes: list[str] = []
+        try:
+            base = cls.evaluate(measurement, now_utc=now_utc, local_vm_id=local_vm_id, max_age_s=max_age_s)
+            ctx = _precheck(measurement, now_utc, local_vm_id, max_age_s)
+            hvci_r = _hvci_reasons(measurement)
+            std_r = _standard_checkpoint_reasons(measurement, ctx.vm_id)
+            caps = base["capabilities"]
+            reasons = list(dict.fromkeys(
+                [x for c in caps.values() if c["status"] != "VERIFIED" for x in c["reasons"]] + hvci_r + std_r))
+            notes = [x for c in caps.values() if c["status"] == "VERIFIED" for x in c["reasons"]]
+            if "STALE_MEASUREMENT" in reasons:
+                conditions["measurement_fresh"] = False
+            elif ctx.age_s is not None and not any(x.startswith(_UNTRUSTED) for x in ctx.reasons):
+                conditions["measurement_fresh"] = True
+            if caps["network_control"]["status"] == "VERIFIED":
+                conditions["network_private_only"] = conditions["no_host_adapter_on_switch"] = True
+            if "SWITCH_NOT_PRIVATE" in reasons:
+                conditions["network_private_only"] = False
+            if "SWITCH_SHARED_WITH_HOST" in reasons:
+                conditions["no_host_adapter_on_switch"] = False
+            conditions["standard_checkpoint"] = (
+                True if not std_r else False if "NO_STANDARD_CHECKPOINT" in std_r else None)
+            conditions["guest_memory_integrity"] = (
+                True if not hvci_r else False if "HVCI_NOT_RUNNING" in hvci_r else None)
+        except Exception as exc:  # noqa: BLE001 - hostile input must degrade to UNKNOWN, announced
+            base = None
+            conditions = dict.fromkeys(conditions)
+            reasons = [f"EVALUATION_ERROR:{type(exc).__name__}"]
+        if not reasons:
+            verdict = "VERIFIED"
+        elif any(x.startswith(_UNTRUSTED) for x in reasons):
+            verdict = "UNKNOWN"
+        elif any(x in _VIOLATIONS for x in reasons):
+            verdict = "FAILED"
+        else:
+            verdict = "UNKNOWN"
+        if verdict == "VERIFIED":
+            conditions = dict.fromkeys(conditions, True)
+        return {
+            "schema_version": cls.SCHEMA,
+            "verdict": verdict,
+            "reasons": reasons,
+            "notes": notes,
+            "conditions": conditions,
+            "max_age_s": max_age_s if isinstance(max_age_s, (int, float)) and not isinstance(max_age_s, bool) else None,
+            "capabilities": {k: {"status": v["status"], "evidence": v["evidence"]}
+                             for k, v in (base["capabilities"] if base else {}).items()},
+            "not_covered": sorted({n for k in _CAPABILITIES for n in _NOT_COVERED[k]}) + [
+                "that Memory Integrity stays on after the measurement"],
+            "spoofable": True,
+            "informational": base["informational"] if base else None,
         }
