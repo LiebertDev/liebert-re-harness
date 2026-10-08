@@ -364,7 +364,7 @@ return a named tool-missing status when absent. Function inventory
   other byte is zero, which is the absence of a model, not a Windows value. Every run stops with a named `stop_reason`:
   `RETURNED`, `STOP_ADDRESS`, `IMPORT_CALL`, `SYSCALL` (a `syscall` or `sysenter`; RAX is reported), `INTERRUPT`, `INT3`,
   `UD2`, `HLT`, `PORT_IO`, `UNMAPPED_READ`/`WRITE`/`FETCH`, `WRITE_PROTECT`, `READ_PROTECT`, `FETCH_PROTECT`,
-  `INVALID_INSTRUCTION`, `INSN_LIMIT`, `TIMEOUT`, `UNMODELLED_VEX`, `ENGINE_ERROR`, `ENGINE_CRASH` and `UNKNOWN_STOP`. It reports
+  `INVALID_INSTRUCTION`, `INSN_LIMIT`, `TIMEOUT`, `UNMODELLED_VEX`, `ENGINE_ERROR`, `ENGINE_CRASH` and `UNKNOWN_STOP`. `ok` only says a result record exists; `completion` says whether the routine finished: `RETURNED`, `STOPPED_AT_IMPORT`, `STOPPED_AT_SYSCALL`, `INSN_LIMIT`, `TIMEOUT`, `FAULT` (memory or protection fault, `UD2`, invalid encoding) or `UNKNOWN` (every other stop, including `STOP_ADDRESS`), and `null` when nothing ran. `limitations` lists what weakens that run; an unreadable import directory is one (no slot is trapped, so the `IMPORT_CALL` guarantee is gone). The instruction bound is checked before each instruction: a routine of exactly N instructions finishes under `max_instructions=N`, and under N-1 its last instruction is refused, not run. It reports
   the instruction count, the stop-time registers, the last 64 instruction addresses, every region the code wrote (merged where
   bytes touch, with its SHA-256 and whether any instruction was executed from it after it was written, the signature of a
   self-decoding image), and per-section differences from the loaded image with the changed sections dumped as raw bytes (not a
