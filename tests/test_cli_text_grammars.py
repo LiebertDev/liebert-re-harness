@@ -11,7 +11,6 @@ import importlib
 import json
 import sys
 import types
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -374,24 +373,7 @@ def test_read_file_row_count_must_match_the_header():
     assert cli._decode("File not found", None, "read_file")["status"] == "UNKNOWN"  # near-miss spelling is not a code
 
 
-def test_read_files_all_ok_cut_and_mixed(capsys):
-    # `paths` is not a single target file, so the CLI keeps the default workspace root (the current directory)
-    # for it; the files therefore live under that root, in a scratch directory removed afterwards.
-    import shutil
-    import tempfile
-
-    from liebert_re.workspace import WORKSPACE_ROOT
-    scratch = Path(tempfile.mkdtemp(dir=WORKSPACE_ROOT))
-    try:
-        _read_files_cases(capsys, scratch)
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-
-
-def _read_files_cases(capsys, ws):
-    def tool_run(capsys, _ws, name, **kwargs):
-        return run(capsys, "tool", "run", name, "--args", json.dumps(kwargs))
-
+def test_read_files_all_ok_cut_and_mixed(capsys, ws):
     paths = []
     for i in range(12):
         p = ws / f"r{i}.txt"
@@ -405,3 +387,21 @@ def _read_files_cases(capsys, ws):
     assert out["truncation"] == {"truncated": True, "limit": 10, "returned": 10, "total": 12, "omitted": 2}
     # one unreadable path among good ones: not reported as a clean success
     assert_unknown(*tool_run(capsys, ws, "read_files", paths=[paths[0], str(ws / "missing.txt")]))
+
+
+def test_non_recursive_list_directory_says_when_it_stopped_at_the_cap(capsys, ws):
+    # 500 entries is the cap. Exactly 500 is complete; a 501st entry must show up as a visible cut, never as a
+    # complete-looking list of 500.
+    full = ws / "full"
+    full.mkdir()
+    for i in range(500):
+        (full / f"f{i:03}.txt").write_text("x", encoding="utf-8")
+    assert_success(*tool_run(capsys, ws, "list_directory", path=str(full)))
+    over = ws / "over"
+    over.mkdir()
+    for i in range(501):
+        (over / f"f{i:03}.txt").write_text("x", encoding="utf-8")
+    code, out = tool_run(capsys, ws, "list_directory", path=str(over))
+    assert_success(code, out, truncated=True)
+    assert out["truncation"]["limit"] == 500 and out["truncation"]["returned"] == 500
+    assert len([ln for ln in out["text"].splitlines() if ln.startswith("FILE: ")]) == 500

@@ -136,6 +136,8 @@ def _outcome(payload, code):
         return "UNKNOWN"
     if code == EXIT_OK:
         return "OK"
+    if isinstance(payload, list):
+        return "UNKNOWN"  # a list with a failed element: neither a clean answer nor one failure
     if code in (EXIT_REFUSED, EXIT_USAGE):
         return "REFUSED"
     if isinstance(payload, dict) and payload.get("ok") is not False \
@@ -272,17 +274,21 @@ def _dict_unreadable(payload):
 
     A dict may carry no ``ok`` and no ``status`` at all (``hash_file`` returns only its digests; that is a
     structured answer and stays one). What it may not do is say something the CLI cannot read: an ``ok`` that is
-    not a bool, ``ok: true`` next to ``failed: true``, or a bare ``failed: true`` / non-empty ``error`` with no
-    ``ok`` to say what it means."""
+    not a bool, ``ok: true`` next to ``failed: true`` or a non-empty ``error`` (a contradiction), or a bare
+    ``failed: true`` / non-empty ``error`` with no ``ok`` to say what it means."""
+    failed = payload.get("failed") is True or bool(payload.get("error"))
     if "ok" in payload:
         ok = payload["ok"]
-        return not isinstance(ok, bool) or (ok and payload.get("failed") is True)
-    return payload.get("failed") is True or bool(payload.get("error"))
+        return not isinstance(ok, bool) or (ok and failed)
+    return failed
 
 
 def _exit_code(payload):
     if payload is None:
         return EXIT_FAILED  # no result at all is not an answer (a tool that returned None, or JSON null)
+    if isinstance(payload, list):
+        # a list whose element is a failed or unreadable result is not a clean answer; a list of plain rows is
+        return EXIT_FAILED if any(isinstance(e, dict) and _exit_code(e) != EXIT_OK for e in payload) else EXIT_OK
     if not isinstance(payload, dict):
         return EXIT_OK
     status = str(payload.get("status") or "").upper()
@@ -858,6 +864,14 @@ def _tool_prepare(a):
     a.tool_primary = primary
     if primary:
         a.path, a.needs_file = paths[primary], True
+    else:
+        # No single target file (e.g. only ``paths``, or a ``*_file`` argument): the workspace is still chosen by
+        # the same rules, from the first path given, so --workspace applies and a path outside it is refused.
+        # The files themselves are not required to exist up front (the tool reports each one it cannot read).
+        given = [i for v in paths.values() for i in (v if isinstance(v, list) else [v])]
+        a.tool_paths = given or None
+        if given:
+            a.path = given[0]
     return None
 
 
@@ -1145,7 +1159,7 @@ def main(argv=None):
         if args.needs_file and not os.path.exists(args.path):
             return _emit(command, {"ok": False, "status": "PATH_REFUSED", "error": "FILE_NOT_FOUND", "path": args.path}, run=run)
         undo = (lambda: None)
-        if args.needs_file:
+        if args.needs_file or getattr(args, "tool_paths", None):
             root, source, new_path = _select_workspace(args)
             info = {"root": str(root), "source": source}
             if new_path:

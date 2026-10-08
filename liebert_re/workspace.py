@@ -230,9 +230,10 @@ def list_directory(path=".", recursive=False, max_depth=2):
                 continue
             kind = "DIR" if item.is_dir() else "FILE"
             size = "" if item.is_dir() else f" ({item.stat().st_size} bytes)"
-            result.append(f"{kind}: {relative(item)}{size}")
             if len(result) >= 500:
-                break
+                # a 501st entry exists: say the list stopped at its cap, never present 500 rows as the whole
+                return "\n".join(result) + "\n" + _limit_marker(len(result), 500)
+            result.append(f"{kind}: {relative(item)}{size}")
         return "\n".join(result) or "Directory is empty."
     base_depth = len(target.parts)
     for root, dirs, fs in os.walk(target):

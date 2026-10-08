@@ -573,3 +573,58 @@ def test_legitimate_structured_shapes_keep_their_exit_code(capsys, workspace, mo
     code, out = _stub_run(capsys, workspace, monkeypatch, json.dumps(value))
     assert code == expected
     assert out["outcome"] == ("REFUSED" if expected else "OK")
+
+
+# ---- slice 3: contradictory dicts and lists that hide a failed element --------------------------------
+
+@pytest.mark.parametrize("as_json_text", [False, True])
+@pytest.mark.parametrize("value", [
+    {"ok": True, "error": "could not read the table"},
+    {"ok": True, "status": "READY", "error": "ENGINE_ERROR"},
+    [{"name": ".text"}, {"ok": False, "error": "SECTION_UNREADABLE"}],
+    [{"status": "FAILED"}],
+    [{"failed": True}],
+    [{"ok": "yes"}],
+    [{"error": "boom"}],
+], ids=lambda v: json.dumps(v))
+def test_contradictory_dicts_and_lists_with_a_failed_element_are_unknown(capsys, workspace, monkeypatch, value, as_json_text):
+    code, out = _stub_run(capsys, workspace, monkeypatch, json.dumps(value) if as_json_text else value)
+    assert code == 1 and out["exit_code"] == 1 and out["outcome"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize("value", [
+    [{"name": ".text", "rva": "0x1000"}, {"name": ".data", "error": None}],
+    [],
+    [1, 2, 3],
+    ["a", "b"],
+    [{"ok": True}, {"ok": True, "error": None}],
+    {"ok": True, "error": None},
+    {"ok": True, "error": ""},
+])
+def test_legitimate_lists_and_clean_oks_stay_exit_zero(capsys, workspace, monkeypatch, value):
+    code, out = _stub_run(capsys, workspace, monkeypatch, json.dumps(value))
+    assert code == 0 and out["outcome"] == "OK"
+
+
+def test_real_list_returning_tool_stays_exit_zero(capsys, workspace):
+    from liebert_re.recover.owned_binary_fixtures import build_owned_pe_sections
+    exe = build_owned_pe_sections(workspace / "s.exe")
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "pe_sections", "--args", json.dumps({"path": str(exe)}))
+    assert code == 0 and out["outcome"] == "OK" and isinstance(out["result"], list) and out["result"]
+
+
+# ---- slice 3: tools taking only `paths` honour --workspace -----------------------------------------------
+
+def test_paths_only_tool_resolves_against_the_chosen_workspace(capsys, workspace, tmp_path):
+    (workspace / "a.txt").write_text("alpha\n", encoding="utf-8")
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "read_files",
+                    "--args", json.dumps({"paths": [str(workspace / "a.txt")]}))
+    assert code == 0 and out["workspace"]["source"] == "--workspace" and "alpha" in out["text"]
+    # a relative path is resolved against the workspace root, not the current directory
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "read_files", "--args", json.dumps({"paths": ["a.txt"]}))
+    assert code == 0 and "alpha" in out["text"]
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    code, out = run(capsys, "--workspace", str(workspace), "tool", "run", "read_files",
+                    "--args", json.dumps({"paths": [str(workspace / "a.txt"), str(outside)]}))
+    assert code == 3 and out["status"] == "PATH_REFUSED" and "secret" not in json.dumps(out)
