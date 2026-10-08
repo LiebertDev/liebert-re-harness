@@ -48,7 +48,13 @@ Cleanup outranks the cause. Once a process exists, a run whose job termination i
 ``JOB_TERMINATION_NOT_CONFIRMED`` whatever else happened; the status it would otherwise have had is
 kept in ``primary_status`` / ``primary_reason``. The deadline is checked by this module's own clock
 as well: an exit reported after ``timeout_s`` has passed since resume is ``TIMED_OUT``
-(``EXIT_NOT_PROVEN_WITHIN_DEADLINE``), because nothing shows when it happened.
+(``EXIT_NOT_PROVEN_WITHIN_DEADLINE``), because nothing shows when it happened. The same holds for a clock
+that raises, returns a non-finite or non-numeric value, or runs backwards: the deadline is then not
+proven, ``elapsed_s`` is ``None`` rather than a guess, and the result is still built. Once the process
+exists, any internal error ends in a termination attempt and ``TRANSPORT_ERROR``, never ``COMPLETED``.
+Identities and counts in launcher replies must be built-in ``int`` / ``str`` / ``dict`` objects
+(subclasses can redefine comparison), and a termination is never confirmed for a process whose pid
+``create_suspended`` did not give.
 
 Limits stated plainly. The gate's pid, ownership and image-hash checks are shaped for a process on
 THIS host; a guest run has no host pid. This slice passes the caller's ``gate_args`` through
@@ -124,7 +130,8 @@ def _code(value: object, fallback: str) -> str:
 
 
 def _is_int(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
+    """A built-in int only (a bool, or a subclass that can redefine ``==`` and ``<``, is not one)."""
+    return type(value) is int
 
 
 def _positive_number(value: object, ceiling: float) -> bool:
@@ -146,13 +153,34 @@ class DebuggerRun:
         self._gate = gate
         self._clock = clock
 
+    # ---- time
+
+    def _now(self) -> float | None:
+        """One clock reading, or None when the clock raised or gave anything but a finite number."""
+        try:
+            value = self._clock()
+            if type(value) not in (int, float) or not math.isfinite(value):
+                return None
+            return float(value)
+        except Exception:  # noqa: BLE001 - a broken clock proves nothing and must not break the result
+            return None
+
+    @staticmethod
+    def _since(start: float | None, end: float | None) -> float | None:
+        """Seconds from ``start`` to ``end``; None when either reading is missing or time ran backwards."""
+        if start is None or end is None or end < start:
+            return None
+        return end - start
+
     # ---- result
 
-    def _result(self, started: float, status: str, reason: str | None, steps: list[str], **more: Any) -> dict[str, Any]:
+    def _result(self, started: float | None, status: str, reason: str | None, steps: list[str],
+                **more: Any) -> dict[str, Any]:
         assert status in STATUSES
+        elapsed = self._since(started, self._now())
         body: dict[str, Any] = {
             "schema": SCHEMA, "operation": OPERATION, "ok": status == "COMPLETED", "status": status,
-            "reason": reason, "steps": list(steps), "elapsed_s": round(self._clock() - started, 3),
+            "reason": reason, "steps": list(steps), "elapsed_s": None if elapsed is None else round(elapsed, 3),
             "gate": None, "transport": None, "exit_code": None, "output": None,
             "job": {"assignment_confirmed": False, "terminated": None},
             "primary_status": None, "primary_reason": None,
@@ -200,7 +228,7 @@ class DebuggerRun:
             gate_args: Mapping[str, Any] | None = None, timeout_s: float = DEFAULT_TIMEOUT_S,
             output_cap_bytes: int = DEFAULT_OUTPUT_CAP,
             memory_bytes: int = DEFAULT_MEMORY_BYTES) -> dict[str, Any]:
-        started = self._clock()
+        started = self._now()
         steps: list[str] = []
 
         def refuse(reason: str, **more: Any) -> dict[str, Any]:
@@ -278,7 +306,7 @@ class DebuggerRun:
         created = self._call("create_suspended", vm, guest_path)
         run_id = created.get("run_id") if isinstance(created, dict) else None
         pid = created.get("pid") if isinstance(created, dict) else None
-        named = isinstance(run_id, str) and _RUN_ID.fullmatch(run_id) is not None
+        named = type(run_id) is str and _RUN_ID.fullmatch(run_id) is not None
         if not (isinstance(created, dict) and created.get("ok") is True and named
                 and _is_int(pid) and pid > 0 and created.get("suspended") is True):
             # An id we can name is a process that may exist; make sure it does not run.
@@ -290,6 +318,18 @@ class DebuggerRun:
             return transport_error("CREATE_SUSPENDED_NOT_CONFIRMED",
                                    job={"assignment_confirmed": False, "terminated": None})
         ident = (run_id, pid)
+        try:
+            return self._supervise(started, steps, summary, vm, run_id, ident, timeout_s, output_cap_bytes, memory_bytes)
+        except Exception:  # noqa: BLE001 - whatever broke, the process that exists must still be terminated
+            steps.append("terminate_job")
+            done = self._terminated(vm, run_id, ident)
+            return self._finish(started, steps, "TRANSPORT_ERROR", "RUN_INTERNAL_ERROR", done, gate=summary,
+                                job={"assignment_confirmed": None, "terminated": done})
+
+    def _supervise(self, started: float | None, steps: list[str], summary: dict[str, Any], vm: str, run_id: str,
+                   ident: tuple[str, int], timeout_s: float, output_cap_bytes: int,
+                   memory_bytes: int) -> dict[str, Any]:
+        """Everything after the suspended process exists. Raises only for a bug; ``run`` then terminates."""
 
         # 5. job assignment, confirmed before anything runs
         def unconfirmed(reason: str) -> dict[str, Any]:
@@ -310,7 +350,7 @@ class DebuggerRun:
 
         # 6. resume and wait; from here the target runs
         steps.append("resume")
-        resumed_at = self._clock()
+        resumed_at = self._now()
         resumed = self._call("resume", vm, run_id)
         if not (self._about(resumed, ident) and resumed.get("ok") is True and resumed.get("resumed") is True):
             steps.append("terminate_job")
@@ -319,7 +359,8 @@ class DebuggerRun:
                                 job={"assignment_confirmed": True, "terminated": done})
         steps.append("wait")
         waited = self._call("wait", vm, run_id, float(timeout_s))
-        within_deadline = self._clock() - resumed_at <= timeout_s
+        spent = self._since(resumed_at, self._now())
+        within_deadline = spent is not None and spent <= timeout_s   # no proof of when it exited is no proof
         about = self._about(waited, ident)
         exited = about and waited.get("ok") is True and waited.get("exited") is True
         code = waited.get("exit_code") if about else None
@@ -343,7 +384,8 @@ class DebuggerRun:
             return self._finish(started, steps, "OUTPUT_TRUNCATED", output["truncated_reason"], terminated, **common)
         return self._finish(started, steps, "COMPLETED", None, terminated, **common)
 
-    def _finish(self, started: float, steps: list[str], status: str, reason: str | None, terminated: object,
+
+    def _finish(self, started: float | None, steps: list[str], status: str, reason: str | None, terminated: object,
                 **more: Any) -> dict[str, Any]:
         """Unconfirmed job termination outranks every other status; the cause is kept beside it."""
         if terminated is True:
@@ -354,22 +396,25 @@ class DebuggerRun:
     @staticmethod
     def _about(reply: object, ident: tuple[str, int | None]) -> bool:
         """True only for a dict that names the process this run created (a pid is compared when known)."""
-        if not isinstance(reply, dict) or not isinstance(reply.get("run_id"), str) or reply["run_id"] != ident[0]:
+        if type(reply) is not dict or type(reply.get("run_id")) is not str or reply["run_id"] != ident[0]:
             return False
         if ident[1] is None:
             return True
-        return _is_int(reply.get("pid")) and reply["pid"] == ident[1]
+        return type(reply.get("pid")) is int and reply["pid"] == ident[1]
 
     # ---- launcher calls
 
     def _call(self, name: str, *args: Any) -> Any:
         try:
-            return getattr(self._launcher, name)(*args)
+            reply = getattr(self._launcher, name)(*args)
         except Exception:  # noqa: BLE001 - a launcher that raises has confirmed nothing
             return None
+        return reply if type(reply) is dict else None   # a dict subclass can run code on every lookup
 
     def _terminated(self, vm: str, run_id: str, ident: tuple[str, int | None]) -> bool:
         reply = self._call("terminate_job", vm, run_id)
+        if ident[1] is None:   # the process this run created was never identified: nothing can be confirmed
+            return False
         return self._about(reply, ident) and reply.get("ok") is True and reply.get("terminated") is True
 
     def _collect(self, vm: str, run_id: str, cap: int, ident: tuple[str, int | None]) -> dict[str, Any] | None:

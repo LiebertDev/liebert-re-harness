@@ -34,6 +34,7 @@ GUEST_PATH = GUEST_DIR + "\\sample.bin"
 
 
 IDENT = {"run_id": "run-1", "pid": 4321}
+_NO = object()
 
 
 def good_decision() -> dict[str, Any]:
@@ -71,8 +72,13 @@ class FakeTransport:
 class FakeClock:
     def __init__(self) -> None:
         self.now = 1000.0
+        self.override: Any = _NO
 
     def __call__(self) -> float:
+        if isinstance(self.override, Exception):
+            raise self.override
+        if self.override is not _NO:
+            return self.override
         return self.now
 
 
@@ -81,6 +87,7 @@ class FakeLauncher:
         self.calls, self.over, self.seen_limits = calls, over, None
         self.output = over.pop("output", (b"hello\n", 6))
         self.clock, self.advance_in_wait = over.pop("clock", None), over.pop("advance_in_wait", 0.0)
+        self.clock_after_wait = over.pop("clock_after_wait", _NO)
 
     def _do(self, name: str, default: Any) -> Any:
         self.calls.log.append(name)
@@ -106,6 +113,8 @@ class FakeLauncher:
         self.waited_for = timeout_s
         if self.clock is not None:
             self.clock.now += self.advance_in_wait
+            if self.clock_after_wait is not _NO:
+                self.clock.override = self.clock_after_wait
         return self._do("wait", {"ok": True, **IDENT, "exited": True, "exit_code": 0})
 
     def terminate_job(self, vm, run_id):
@@ -299,9 +308,9 @@ def test_unconfirmed_assignment_with_a_failed_cleanup_says_the_cleanup_is_unconf
 
 
 @pytest.mark.parametrize("over", [
-    {"create_suspended": {"ok": True, "run_id": "run-1", "suspended": False}},
-    {"create_suspended": {"ok": True, "run_id": "run-1"}},
-    {"create_suspended": {"ok": True, "run_id": "run-1", "suspended": 1}},
+    {"create_suspended": {"ok": True, **IDENT, "suspended": False}},
+    {"create_suspended": {"ok": True, **IDENT}},
+    {"create_suspended": {"ok": True, **IDENT, "suspended": 1}},
     {"create_suspended": {"ok": True, "run_id": "bad id; calc", "suspended": True}},
     {"create_suspended": {"ok": True, "suspended": True}},
     {"create_suspended": {"ok": False}},
@@ -562,3 +571,109 @@ def test_create_suspended_must_name_a_process_id():
         runner, calls = build(create_suspended=created)
         assert go(runner)["status"] == "TRANSPORT_ERROR"
         assert "assign_to_job" not in calls.log
+
+
+# ------------------------------------------------------------------ robustness round 2
+
+class EvilInt(int):
+    """An int that says yes to every comparison."""
+
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+    def __gt__(self, other):
+        return True
+
+    def __lt__(self, other):
+        return False
+
+    __hash__ = int.__hash__
+
+
+class EvilStr(str):
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+    __hash__ = str.__hash__
+
+
+@pytest.mark.parametrize("reading", ["bad", None, float("nan"), float("-inf"), float("inf"), True, [1], RuntimeError("clock")])
+def test_a_broken_clock_after_wait_still_terminates_and_never_completes(reading):
+    clock = FakeClock()
+    runner, calls = build(clock=clock, clock_after_wait=reading)
+    result = go(runner)  # no exception may escape
+    assert result["status"] != "COMPLETED" and result["ok"] is False
+    assert "terminate_job" in calls.log and calls.log.index("terminate_job") > calls.log.index("wait")
+    assert result["elapsed_s"] is None or result["elapsed_s"] >= 0
+    assert result["schema"] == dr.SCHEMA and result["status"] in STATUSES
+
+
+def test_a_broken_clock_still_yields_a_result_dict():
+    clock = FakeClock()
+    clock.override = RuntimeError("always")
+    runner, calls = build(clock=clock)
+    result = go(runner)
+    assert isinstance(result, dict) and result["status"] in STATUSES and result["status"] != "COMPLETED"
+    assert result["elapsed_s"] is None
+    if "create_suspended" in calls.log:
+        assert "terminate_job" in calls.log
+
+
+def test_a_clock_that_runs_backwards_never_proves_the_deadline():
+    clock = FakeClock()
+    runner, _ = build(clock=clock, advance_in_wait=-1.0)
+    result = go(runner, timeout_s=5)
+    assert result["status"] == "TIMED_OUT" and result["reason"] == "EXIT_NOT_PROVEN_WITHIN_DEADLINE"
+    assert result["elapsed_s"] is None or result["elapsed_s"] >= 0
+
+
+def test_an_unknown_creation_identity_leaves_termination_unconfirmed():
+    for created in ({"ok": True, "run_id": "run-1", "pid": True, "suspended": True},
+                    {"ok": True, "run_id": "run-1", "suspended": True},
+                    {"ok": True, "run_id": "run-1", "pid": 0, "suspended": True}):
+        runner, calls = build(create_suspended=created, terminate_job={"ok": True, "run_id": "run-1", "terminated": True})
+        result = go(runner)
+        assert result["status"] == "TRANSPORT_ERROR" and result["reason"] == "JOB_TERMINATION_NOT_CONFIRMED", created
+        assert result["job"]["terminated"] is False and result["primary_reason"] == "CREATE_SUSPENDED_NOT_CONFIRMED"
+        assert "terminate_job" in calls.log and "assign_to_job" not in calls.log
+
+
+def test_an_int_subclass_cannot_stand_in_for_the_created_pid():
+    runner, calls = build(create_suspended={"ok": True, "run_id": "run-1", "pid": EvilInt(-5), "suspended": True})
+    result = go(runner)
+    assert result["status"] == "TRANSPORT_ERROR" and "assign_to_job" not in calls.log
+    for step in ("assign_to_job", "verify_job_assignment", "resume", "wait", "terminate_job", "collect_output"):
+        good = {
+            "assign_to_job": {"ok": True}, "resume": {"ok": True, "resumed": True},
+            "verify_job_assignment": {"ok": True, "in_job": True, "limits_applied": True},
+            "wait": {"ok": True, "exited": True, "exit_code": 0}, "terminate_job": {"ok": True, "terminated": True},
+            "collect_output": {"ok": True, "data": b"hi", "total_bytes": 2},
+        }[step]
+        runner, _ = build(**{step: {**good, "run_id": "run-1", "pid": EvilInt(999)}})
+        result = go(runner)
+        assert result["status"] != "COMPLETED", step
+        runner, _ = build(**{step: {**good, "run_id": EvilStr("elsewhere"), "pid": 4321}})
+        assert go(runner)["status"] != "COMPLETED", step
+
+
+def test_an_int_subclass_exit_code_or_total_is_not_an_int():
+    runner, _ = build(wait={"ok": True, **IDENT, "exited": True, "exit_code": EvilInt(0)})
+    assert go(runner)["status"] == "TRANSPORT_ERROR"
+    runner, _ = build(collect_output={"ok": True, **IDENT, "data": b"a", "total_bytes": EvilInt(1)})
+    assert go(runner)["status"] == "TRANSPORT_ERROR"
+
+
+def test_a_launcher_reply_that_is_a_dict_subclass_confirms_nothing():
+    class Lying(dict):
+        def get(self, *a, **k):
+            return True
+
+    runner, calls = build(verify_job_assignment=Lying(ok=True, **IDENT, in_job=True, limits_applied=True))
+    result = go(runner)
+    assert result["status"] == "JOB_ASSIGNMENT_UNCONFIRMED" and "resume" not in calls.log
