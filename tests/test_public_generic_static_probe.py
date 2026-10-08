@@ -66,13 +66,21 @@ class NormalizeToolResultTests(unittest.TestCase):
         self.assertEqual(out["status"], "FAILED")
         self.assertEqual(out["summary"], "SOMETHING")
 
+    def test_an_unrecognised_status_is_unknown_and_the_raw_value_is_kept(self):
+        out = normalize_tool_result({"status": "NOT_RUN"}, tool="x", target="y")
+        self.assertEqual(out["status"], "UNKNOWN")
+        self.assertEqual(out["raw_status"], "NOT_RUN")
+        self.assertEqual(out["details"]["status"], "NOT_RUN")
+        self.assertTrue(any("NOT_RUN" in text for text in out["limitations"]))
+        self.assertEqual(normalize_tool_result({"status": "FAILED"}, tool="x", target="y")["status"], "FAILED")
+
     def test_pass_and_ok_strings_normalize_to_ready(self):
         self.assertEqual(normalize_tool_result({"status": "PASS"}, tool="x", target="y")["status"], "READY")
         self.assertEqual(normalize_tool_result({"status": "OK"}, tool="x", target="y")["status"], "READY")
 
-    def test_unrecognized_status_string_falls_back_to_failed(self):
+    def test_unrecognized_status_string_falls_back_to_unknown(self):
         out = normalize_tool_result({"status": "SOMETHING_MADE_UP"}, tool="x", target="y")
-        self.assertEqual(out["status"], "FAILED")
+        self.assertEqual(out["status"], "UNKNOWN")
 
     def test_known_status_vocabulary_passes_through(self):
         for status in ("TOOL_MISSING", "NOT_TESTED", "UNSUPPORTED", "TIMEOUT", "TRUNCATED"):

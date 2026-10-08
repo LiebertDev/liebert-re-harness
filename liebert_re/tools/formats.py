@@ -32,6 +32,7 @@ def _elf(head):
     ei_class=head[4] if len(head)>4 else None; ei_data=head[5] if len(head)>5 else None
     cls={1:'32-bit',2:'64-bit'}.get(ei_class,'unknown'); endian={1:'little',2:'big'}.get(ei_data,'unknown'); order='<' if ei_data==1 else '>'
     lim=[]; machine=et=None
+    if ei_class not in (1,2): lim.append('ELF header class (EI_CLASS) missing or invalid; bit width unknown')
     if ei_data not in (1,2): lim.append('ELF header byte order (EI_DATA) missing or invalid; e_type and e_machine could not be read')
     else:
         if len(head)>=18: et=struct.unpack(order+'H',head[16:18])[0]
@@ -83,8 +84,8 @@ def file_identity(path):
             with p.open('rb') as f: pe_bytes=f.read(MAX_PE_IDENTITY_PREFIX_BYTES)
             pe=pefile.PE(data=pe_bytes,fast_load=True); m=pe.FILE_HEADER.Machine; info['architecture']={0x14c:'x86',0x8664:'x86_64',0xaa64:'ARM64'}.get(m,hex(m)); info['subtype']='dll' if pe.FILE_HEADER.Characteristics&0x2000 else 'executable'; clr=len(pe.OPTIONAL_HEADER.DATA_DIRECTORY)>14 and pe.OPTIONAL_HEADER.DATA_DIRECTORY[14].VirtualAddress!=0; info['runtime']='dotnet' if clr else 'native'; info['recommended_capabilities']=['dotnet_inspect','decompile_dotnet'] if clr else ['native_inspect','ghidra_query']; info['confidence']=.98
         except Exception as e: info['limitations'].append(f'PE parse failed: {type(e).__name__}; MZ signature only, PE structure unverified')
-    elif (e:=_elf(head)): info['limitations'].extend(e.pop('limitations',[])); info.update(e,confidence=.6 if info['limitations'] else .99,recommended_capabilities=['native_inspect','ghidra_query'])
-    elif (m:=_macho(head)): info['limitations'].extend(m.pop('limitations',[])); info.update(m,confidence=.6 if info['limitations'] else .99,recommended_capabilities=['native_inspect','ghidra_query'])
+    elif (e:=_elf(head)): fmt_lim=e.pop('limitations',[]); info['limitations'].extend(fmt_lim); info.update(e,confidence=.6 if fmt_lim else .99,recommended_capabilities=['native_inspect','ghidra_query'])
+    elif (m:=_macho(head)): fmt_lim=m.pop('limitations',[]); info['limitations'].extend(fmt_lim); info.update(m,confidence=.6 if fmt_lim else .99,recommended_capabilities=['native_inspect','ghidra_query'])
     elif head[:4]==b'\x00asm': info.update(type='WASM',runtime='webassembly',confidence=.99,recommended_capabilities=['wasm_inspect']); info['limitations'].append('Structural WASM inspection only; compiler-grade semantics are unavailable')
     elif head[:4] in {b'\xd4\xc3\xb2\xa1',b'\xa1\xb2\xc3\xd4',b'\x4d\x3c\xb2\xa1',b'\xa1\xb2\x3c\x4d'}: info.update(type='PCAP',container='packet_capture',confidence=.99,recommended_capabilities=['pcap_analyzer'])
     elif head[:4]==b'\x0a\x0d\x0d\x0a': info.update(type='PCAPNG',container='packet_capture',confidence=.99,recommended_capabilities=['pcap_analyzer'])

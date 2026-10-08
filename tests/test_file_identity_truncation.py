@@ -80,6 +80,25 @@ class FileIdentityTruncationTests(unittest.TestCase):
         self.assertEqual(info["confidence"], 0.98)
         self.assertIsNotNone(info["architecture"])
 
+    @staticmethod
+    def _full_elf(ei_class: int = 2) -> bytes:
+        return b"\x7fELF" + bytes([ei_class, 1, 1]) + b"\x00" * 9 + struct.pack("<HH", 2, 62) + b"\x00" * 40
+
+    def test_a_valid_elf_over_the_hash_limit_keeps_full_confidence(self):
+        with mock.patch.object(formats, "MAX_IDENTITY_HASH_BYTES", 4):
+            info = self._identify(self._full_elf(), "big.elf")
+        self.assertIsNone(info["sha256"])
+        self.assertTrue(any("sha256 not computed" in text for text in info["limitations"]))
+        self.assertEqual(info["confidence"], 0.99)
+
+    def test_an_invalid_ei_class_is_a_limitation_and_lowers_confidence(self):
+        for bad in (0, 3):
+            info = self._identify(self._full_elf(bad), f"c{bad}.elf")
+            self.assertEqual(info["bits"], "unknown")
+            self.assertTrue(any("EI_CLASS" in text for text in info["limitations"]), info["limitations"])
+            self.assertLess(info["confidence"], 0.95)
+        self.assertEqual(self._identify(self._full_elf(2), "ok.elf")["confidence"], 0.99)
+
     def test_skipped_hash_says_why(self):
         with mock.patch.object(formats, "MAX_IDENTITY_HASH_BYTES", 4):
             info = self._identify(b"plain text, longer than four bytes\n", "t.txt")

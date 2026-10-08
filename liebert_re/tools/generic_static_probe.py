@@ -102,9 +102,13 @@ def normalize_tool_result(result, *, tool: str, target: str, file_type: str = "U
         raw_status = "UNKNOWN"
         payload = {**payload, "limitations": [*(payload.get("limitations") or []), "tool output carried neither status nor ok; success was not assumed"]}
     allowed = ALLOWED_STATUSES
-    status = raw_status if raw_status in allowed else "READY" if raw_status in {"PASS", "OK"} else "FAILED"
+    status = raw_status if raw_status in allowed else "READY" if raw_status in {"PASS", "OK"} else "UNKNOWN"
+    if status == "UNKNOWN" and raw_status != "UNKNOWN" and raw_status not in allowed:
+        # An unrecognised status is not a failure and not a success: keep the raw value, say it was not understood.
+        payload = {**payload, "limitations": [*(payload.get("limitations") or []), f"tool reported unrecognised status {raw_status!r}; success was not assumed"]}
     return {
         "status": status,
+        "raw_status": raw_status,
         "tool": tool,
         "target": target,
         "file_type": file_type,
