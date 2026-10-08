@@ -75,11 +75,15 @@ function ErrInfo($rec) {
     @{ error = $text; category = $category }
 }
 
+# Elevation is a Windows notion. Off Windows it is not known, and unknown is written as null (which the
+# attestation reads as MISSING:elevated), never as false: a measurement that cannot say is not a "no".
+$onWindows = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
+
 $result = [ordered]@{
     schema_version = 'liebert-re.guest-measurement/2'
     measured_at_utc = [DateTime]::UtcNow.ToString('o')
     script_version = '2.0.0'
-    elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    elevated = if ($onWindows) { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } else { $null }
 }
 
 if (-not $result['elevated']) { Write-Host 'not elevated: Hyper-V sections will fail' }
@@ -483,7 +487,7 @@ foreach ($sec in @('adapters', 'switches', 'host_adapters', 'switch_peers')) {
 $result | ConvertTo-Json -Depth 8 | Out-File -Encoding utf8 -FilePath $OutFile
 
 $outName = [System.IO.Path]::GetFileName($OutFile)
-$elevatedText = if ($result['elevated']) { 'yes' } else { 'no' }
+$elevatedText = if ($null -eq $result['elevated']) { 'unknown' } elseif ($result['elevated']) { 'yes' } else { 'no' }
 Write-Host 'liebert-re guest measurement summary'
 Write-Host ('elevated: ' + $elevatedText)
 foreach ($name in @($result.Keys)) {

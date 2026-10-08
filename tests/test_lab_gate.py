@@ -53,15 +53,31 @@ def _command():
     return ["sleep", "120"]
 
 
-def _confirmed_dead(pid):
+def _birth(pid):
+    """The creation time of the process `pid` names right now, or None when it is not readable. Taken while a
+    test's own process is known to be the one holding the pid, so a later reuse of the number can be told apart."""
+    import psutil
+    try:
+        return psutil.Process(pid).create_time()
+    except psutil.Error:
+        return None
+
+
+def _confirmed_dead(pid, birth=None):
     """True when `pid` is gone (or only a reaped zombie). A pid that vanishes between the existence
     probe and the status query is the very state wanted, so psutil.NoSuchProcess counts as proof of
-    death. AccessDenied and every other error are not proof of anything and propagate."""
+    death. AccessDenied and every other error are not proof of anything and propagate.
+    `birth` is the creation time `_birth` recorded for the process under test: once the pid is free the OS may
+    hand it to an unrelated new process (Windows does so quickly), and a live process with a different creation
+    time is proof that the one under test is gone, not a reason to fail. Without `birth` the pid alone is judged."""
     import psutil
     if not psutil.pid_exists(pid):
         return True
     try:
-        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+        process = psutil.Process(pid)
+        if birth is not None and process.create_time() != birth:
+            return True
+        return process.status() == psutil.STATUS_ZOMBIE
     except psutil.NoSuchProcess:
         return True
 
@@ -71,6 +87,7 @@ def child():
     """A process THIS test started: console, no window, always killed and confirmed dead."""
     proc = subprocess.Popen(_command(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    birth = _birth(proc.pid)
     try:
         deadline = time.time() + 10
         while time.time() < deadline and lg.LabGate.target(proc.pid)[0] is None:
@@ -80,7 +97,7 @@ def child():
         proc.kill()
         proc.wait(timeout=10)
         assert proc.poll() is not None
-        assert _confirmed_dead(proc.pid)
+        assert _confirmed_dead(proc.pid, birth)
 
 
 @pytest.fixture()
@@ -104,6 +121,13 @@ class TestConfirmedDead:
 
     def test_a_live_process_is_not_dead(self, child):
         assert _confirmed_dead(child.pid) is False
+        assert _confirmed_dead(child.pid, _birth(child.pid)) is False
+
+    def test_a_reused_pid_is_not_the_process_under_test(self, child):
+        """The number is held by a live process, but not the one that was recorded: the recorded one is gone."""
+        recorded = _birth(child.pid)
+        assert recorded is not None
+        assert _confirmed_dead(child.pid, recorded - 1000.0) is True
 
     def test_access_denied_is_not_proof_of_death(self):
         import psutil
@@ -160,9 +184,10 @@ class TestRefusals:
                 "print(p.pid,flush=True);time.sleep(60)")
         proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), text=True)
-        grandchild = None
+        grandchild, births = None, {proc.pid: _birth(proc.pid)}
         try:
             grandchild = int(proc.stdout.readline())
+            births[grandchild] = _birth(grandchild)
             image = lg.LabGate.target(grandchild)[0]["image"]
             data = _gate(grandchild, sample_sha256=_sha(image))
             assert data["status"] == "PROCESS_NOT_OWNED"
@@ -178,7 +203,7 @@ class TestRefusals:
             deadline = time.time() + 10
             while time.time() < deadline and any(psutil.pid_exists(p) for p in victims):
                 time.sleep(0.1)
-            assert all(_confirmed_dead(p) for p in victims)
+            assert all(_confirmed_dead(p, births.get(p)) for p in victims)
 
     def test_a_missing_or_nonexistent_process_is_refused(self, lab_open):
         assert _gate(None, authorization=_auth(1), sample_sha256="0" * 64)["status"] == "PID_REQUIRED"

@@ -220,7 +220,9 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($env:MEASURE_GU
 $fn = $ast.Find({ param($n) ($n -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and ($n.Name -eq 'ErrInfo') }, $true)
 Invoke-Expression $fn.Extent.Text
 $out = [ordered]@{}
-try { Get-Item -LiteralPath 'C:\no-such-dir-zzz\leaf-zzz.txt' -ErrorAction Stop } catch { $out['cmdlet'] = ErrInfo $_ }
+# a missing path on the filesystem provider of this platform ('C:' is not a drive off Windows)
+$missing = Join-Path ([System.IO.Path]::GetTempPath()) 'no-such-dir-zzz/leaf-zzz.txt'
+try { Get-Item -LiteralPath $missing -ErrorAction Stop } catch { $out['cmdlet'] = ErrInfo $_ }
 $cat = [System.Management.Automation.ErrorCategory]::PermissionDenied
 $out['path_id'] = ErrInfo ([System.Management.Automation.ErrorRecord]::new([System.Exception]::new('msg C:\leak-zzz'), 'C:\leak-zzz\x,Foo', $cat, $null))
 $out['vm_id'] = ErrInfo ([System.Management.Automation.ErrorRecord]::new([System.Exception]::new('msg'), 'SecretVM,Foo', $cat, $null))
