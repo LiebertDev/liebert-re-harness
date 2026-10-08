@@ -12,6 +12,7 @@ from pathlib import PurePath
 from typing import Any, Iterable
 import json
 
+from liebert_re import strict_json
 from liebert_re.recover.analysis_ir import UNKNOWN, AnalysisIR, Evidence, Export, Function, Import, Module, Reference
 
 
@@ -175,10 +176,13 @@ __all__ = ["build_cross_binary_relationships"]
 
 def cross_binary_relationship_analyze(irs_json: str, auxiliary_observations_json: str = "[]") -> str:
     try:
-        payloads = json.loads(irs_json); auxiliary = json.loads(auxiliary_observations_json or "[]")
+        payloads = strict_json.loads(irs_json); auxiliary = strict_json.loads(auxiliary_observations_json or "[]")
         irs = [AnalysisIR.from_dict(item) for item in payloads]
-    except (json.JSONDecodeError, ValueError, TypeError) as exc:
-        return json.dumps({"ok": False, "status": "INVALID_INPUT", "error_type": type(exc).__name__})
+    except (ValueError, TypeError) as exc:
+        body = {"ok": False, "status": "INVALID_INPUT", "error_type": type(exc).__name__}
+        if isinstance(exc, strict_json.StrictJSONError):
+            body["reason"] = exc.reason
+        return json.dumps(body)
     if not isinstance(payloads, list) or not isinstance(auxiliary, list):
         return json.dumps({"ok": False, "status": "INVALID_SCHEMA"})
     return json.dumps(build_cross_binary_relationships(irs, auxiliary_observations=auxiliary), ensure_ascii=False, indent=2, sort_keys=True, default=str)

@@ -15,6 +15,7 @@ import hashlib
 import json
 from typing import Any, Iterable
 
+from liebert_re import strict_json
 from liebert_re.recover.analysis_ir import UNKNOWN, stable_id
 
 
@@ -384,9 +385,9 @@ def diff_analysis_ir(
 
 def binary_version_diff(old_ir_json: str, new_ir_json: str, max_changes: int = 5000) -> str:
     try:
-        old_ir = json.loads(old_ir_json); new_ir = json.loads(new_ir_json)
-    except json.JSONDecodeError:
-        return json.dumps({"ok": False, "status": "INVALID_JSON"})
+        old_ir = strict_json.loads(old_ir_json); new_ir = strict_json.loads(new_ir_json)
+    except strict_json.StrictJSONError as exc:
+        return json.dumps({"ok": False, "status": "INVALID_JSON", "reason": exc.reason})
     return json.dumps(diff_analysis_ir(old_ir, new_ir, max_changes=max_changes), ensure_ascii=False, indent=2, sort_keys=True, default=str)
 
 

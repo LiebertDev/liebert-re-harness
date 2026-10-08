@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Iterable
 import json
 
+from liebert_re import strict_json
 from liebert_re.recover.analysis_ir import UNKNOWN, stable_id
 
 
@@ -332,9 +333,9 @@ def build_dotnet_relationships(
 
 def dotnet_relationship_analyze(canonical_json: str, max_entities: int = 10000, max_relationships: int = 20000) -> str:
     try:
-        canonical = json.loads(canonical_json)
-    except json.JSONDecodeError:
-        return json.dumps({"ok": False, "status": "INVALID_JSON"})
+        canonical = strict_json.loads(canonical_json)
+    except strict_json.StrictJSONError as exc:
+        return json.dumps({"ok": False, "status": "INVALID_JSON", "reason": exc.reason})
     if not isinstance(canonical, dict):
         return json.dumps({"ok": False, "status": "INVALID_SCHEMA"})
     return json.dumps(build_dotnet_relationships(canonical, max_entities=max_entities, max_relationships=max_relationships), ensure_ascii=False, indent=2, sort_keys=True, default=str)

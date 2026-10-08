@@ -10,6 +10,7 @@ import hashlib
 import json
 from typing import Any, Iterable
 
+from liebert_re import strict_json
 from liebert_re.evidence.index import EvidenceIndex, _record_resolves
 from liebert_re.report.exploit_validation import _normalize_sha256
 
@@ -370,10 +371,10 @@ def counter_evidence_verify(
     ``evidence_db_path`` resolves it; with neither given nothing is bound and nothing refutes.
     ``known_evidence_ids`` can only narrow what that index accepts."""
     try:
-        hypothesis = json.loads(hypothesis_json)
-        candidates = json.loads(candidates_json)
-    except json.JSONDecodeError:
-        return json.dumps({"ok": False, "status": "INVALID_JSON"})
+        hypothesis = strict_json.loads(hypothesis_json)
+        candidates = strict_json.loads(candidates_json)
+    except strict_json.StrictJSONError as exc:
+        return json.dumps({"ok": False, "status": "INVALID_JSON", "reason": exc.reason})
     if not isinstance(hypothesis, dict) or not isinstance(candidates, list):
         return json.dumps({"ok": False, "status": "INVALID_SCHEMA"})
     result = verify_counter_evidence(
@@ -403,10 +404,10 @@ def finding_report_generate(
     rejecting the report.
     """
     try:
-        findings = json.loads(findings_json)
-        artifact_hashes = json.loads(artifact_hashes_json or "{}")
-    except json.JSONDecodeError:
-        return json.dumps({"ok": False, "status": "INVALID_JSON"})
+        findings = strict_json.loads(findings_json)
+        artifact_hashes = strict_json.loads(artifact_hashes_json or "{}")
+    except strict_json.StrictJSONError as exc:
+        return json.dumps({"ok": False, "status": "INVALID_JSON", "reason": exc.reason})
     if not isinstance(findings, list) or not isinstance(artifact_hashes, dict):
         return json.dumps({"ok": False, "status": "INVALID_SCHEMA"})
     report = render_finding_report(

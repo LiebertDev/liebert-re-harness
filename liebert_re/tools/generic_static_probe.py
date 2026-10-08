@@ -10,6 +10,7 @@ import uuid
 from collections import Counter
 from pathlib import Path
 
+from liebert_re import strict_json
 from liebert_re.tools.formats import file_identity
 from liebert_re.workspace import PROJECT_ROOT as APP_DIR
 from liebert_re.workspace import relative, safe_path
@@ -84,11 +85,13 @@ def normalize_tool_result(result, *, tool: str, target: str, file_type: str = "U
     """Normalize bounded tool output without converting failure kinds into UNSUPPORTED."""
     if isinstance(result, str):
         try:
-            payload = json.loads(result)
-        except json.JSONDecodeError:
-            # Text that is not JSON carries no success field: it is summarised, never taken as READY.
+            payload = strict_json.loads(result)
+        except strict_json.StrictJSONError as exc:
+            # Text that is not strict JSON carries no trustworthy success field (a repeated key lets the last
+            # one win, NaN compares unlike a number): it is summarised, never taken as READY.
+            what = "was not JSON" if exc.reason == strict_json.MALFORMED else f"was not strict JSON ({exc.reason})"
             payload = {"summary": result[:2000], "truncated": len(result) > 2000,
-                       "limitations": ["tool output was not JSON; its status could not be determined"]}
+                       "limitations": [f"tool output {what}; its status could not be determined"]}
     else:
         payload = dict(result or {})
     if not isinstance(payload, dict):
@@ -128,7 +131,17 @@ def generic_static_probe(path: str, max_strings: int = MAX_STRINGS) -> str:
     target = safe_path(path)
     if not target.is_file():
         return json.dumps(normalize_tool_result({"ok": False, "status": "FAILED", "error": "FILE_NOT_FOUND"}, tool="generic_static_probe", target=str(path)), ensure_ascii=False, indent=2)
-    identity = json.loads(file_identity(str(target)))
+    identity_reason = "NOT_AN_OBJECT"
+    try:
+        identity = strict_json.loads(file_identity(str(target)))
+    except strict_json.StrictJSONError as exc:
+        identity, identity_reason = None, exc.reason
+    if not isinstance(identity, dict):
+        # The package's own identity result was unreadable: say so, never probe on a guessed identity.
+        return json.dumps(normalize_tool_result(
+            {"ok": False, "status": "FAILED", "error": "FILE_IDENTITY_UNREADABLE",
+             "reason": identity_reason},
+            tool="generic_static_probe", target=str(path)), ensure_ascii=False, indent=2)
     sample, bytes_read = _samples(target)
     size = target.stat().st_size
     encoding = _encoding(sample) if identity.get("text") else None

@@ -512,9 +512,9 @@ def _classification_dict(value: Any) -> dict[str, Any] | None:
     if value is None:
         return None
     if isinstance(value, str):
-        import json as _json
+        from liebert_re import strict_json
         try:
-            value = _json.loads(value)
+            value = strict_json.loads(value)
         except (ValueError, TypeError):
             return None
     return value if isinstance(value, dict) else None

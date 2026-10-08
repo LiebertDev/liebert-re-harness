@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 import json
 
+from liebert_re import strict_json
 from liebert_re.recover.analysis_ir import (
     UNKNOWN,
     AnalysisIR,
@@ -370,10 +371,13 @@ __all__ = [
 
 def native_xref_analyze(ir_json: str, observations_json: str, max_observations: int = 5000) -> str:
     try:
-        ir = AnalysisIR.from_dict(json.loads(ir_json))
-        observations = json.loads(observations_json)
-    except (json.JSONDecodeError, ValueError, TypeError) as exc:
-        return json.dumps({"ok": False, "status": "INVALID_INPUT", "error_type": type(exc).__name__})
+        ir = AnalysisIR.from_dict(strict_json.loads(ir_json))
+        observations = strict_json.loads(observations_json)
+    except (ValueError, TypeError) as exc:
+        body = {"ok": False, "status": "INVALID_INPUT", "error_type": type(exc).__name__}
+        if isinstance(exc, strict_json.StrictJSONError):
+            body["reason"] = exc.reason
+        return json.dumps(body)
     if not isinstance(observations, list):
         return json.dumps({"ok": False, "status": "INVALID_SCHEMA"})
     limit = max(1, min(int(max_observations), 20_000))
