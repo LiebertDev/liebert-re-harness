@@ -71,10 +71,30 @@ def result_line(op, ok, phase, data=None, failure=None, schema=None):
     })
 
 
-def step_proc(script_op, reply_text, **flags):
+AGENT_PID = 777
+AGENT_CREATED = 133_500_000_000_000_000
+TARGET_CREATED = 133_500_000_100_000_000
+
+
+def step_proc(script_op, reply_text, identity=True, **flags):
     phases = ["LIEBERT_PHASE " + p for p in (CREATE_PHASES if script_op == "agent_create" else STEP_PHASES)]
     data = {"vm_state": "Running", "reply": reply_text}
+    if script_op == "agent_create" and identity:
+        data.update(agent_pid=AGENT_PID, agent_created=AGENT_CREATED)
     return hvt.proc(phases + [result_line(script_op, True, "agent_call", data)], **flags)
+
+
+def identity_mismatch_proc():
+    failure = {"code": "AGENT_IDENTITY_MISMATCH", "category": None, "error_id": None, "exception_type": None,
+               "auth_hint": False, "timeout_hint": False}
+    return hvt.proc(["LIEBERT_PHASE " + p for p in STEP_PHASES]
+                    + [result_line("agent_step", False, "agent_call", failure=failure)], returncode=1)
+
+
+def side_proc(script_op, data):
+    """The result of a host-side script run that is not an agent exchange (job_kill, vm_off)."""
+    return hvt.proc(["LIEBERT_PHASE " + p for p in ("decode", "credential", "vm", "session", "session_open")]
+                    + [result_line(script_op, True, "session_open", {"vm_state": "Running", **data})])
 
 
 class Raw:
@@ -101,12 +121,19 @@ class FakeGuest:
         self.total_extra = 0
         self.terminated = True
         self.on_wait = None
+        self.server_pid = AGENT_PID               # who answers on the pipe, as the guest-side check sees it
+        self.server_created = AGENT_CREATED
+        self.job_state = None                     # None: the host-side kill cannot reach the guest at all
+        self.target_alive = False
+        self.vm_off = False                       # True: Stop-VM -TurnOff worked and the VM reads Off
+        self.kill_requests: list[dict[str, Any]] = []
+        self.off_requests: list[dict[str, Any]] = []
 
     def good(self, areq):
         op, run_id = areq["op"], areq["run_id"]
         base = {"schema": hvl._AGENT_SCHEMA, "op": op, "ok": True, "run_id": run_id, "pid": self.pid}
         if op == "create":
-            return {**base, "suspended": True}
+            return {**base, "suspended": True, "target_created": TARGET_CREATED}
         if op == "assign":
             return {**base, "assigned": True}
         if op == "verify":
@@ -125,6 +152,19 @@ class FakeGuest:
                 "stderr_total": len(self.stderr), "data_b64": base64.b64encode(data).decode("ascii")}
 
     def __call__(self, req, argv):
+        if req["op"] == "job_kill":
+            self.kill_requests.append(req)
+            if self.job_state is None:
+                return hvt.proc([], returncode=1)
+            return side_proc("job_kill", {"job_state": self.job_state, "target_alive": self.target_alive})
+        if req["op"] == "vm_off":
+            self.off_requests.append(req)
+            if not self.vm_off:
+                return hvt.proc([], returncode=1)
+            return side_proc("vm_off", {"vm_state": self.vm_off if isinstance(self.vm_off, str) else "Off"})
+        if req["op"] == "agent_step" and (req.get("agent_pid"), req.get("agent_created")) != (
+                self.server_pid, self.server_created):
+            return identity_mismatch_proc()       # the guest-side client refuses to talk to another process
         areq = json.loads(req["agent_request_json"])
         self.requests.append((req["op"], areq))
         reply = self.good(areq)
@@ -244,6 +284,7 @@ def test_the_default_runner_is_given_room_for_the_largest_reply(cred, monkeypatc
     launcher = HypervGuestLauncher(transport)
     run = hvl._Run(VM)
     run.pid, run.state = 7, "terminated"
+    run.agent_pid, run.agent_created = AGENT_PID, AGENT_CREATED
     launcher._runs["abc"] = run
     assert launcher.collect_output(VM, "abc", hvl.MAX_OUTPUT_CAP)["ok"] is False
     big = seen[-1]
@@ -603,7 +644,7 @@ def test_launcher_terminates_and_confirms_job(cred):
     launcher, guest, fake, run_id = started(cred)
     advance(launcher, run_id, "resume")
     done = launcher.terminate_job(VM, run_id)
-    assert done == {"ok": True, "run_id": run_id, "pid": 4242, "terminated": True}
+    assert done == {"ok": True, "run_id": run_id, "pid": 4242, "terminated": True, "termination_path": "AGENT"}
     again = launcher.terminate_job(VM, run_id)                    # idempotent, still confirmed by the guest
     assert again["ok"] is True and again["terminated"] is True
 
@@ -613,10 +654,9 @@ def test_a_termination_the_agent_does_not_confirm_is_not_ok_and_is_not_retried(c
     guest.terminated = False
     launcher, guest, fake, run_id = started(cred, guest)
     advance(launcher, run_id, "resume")
-    sent = len(fake.calls)
     reply = launcher.terminate_job(VM, run_id)
     assert reply["ok"] is False and reply["terminated"] is False and reply["reason"] == "AGENT_TERMINATION_NOT_CONFIRMED"
-    assert len(fake.calls) == sent + 1
+    assert guest.ops().count("terminate") == 1                    # the agent is asked once; the host then checks from outside
     assert launcher.collect_output(VM, run_id, 8)["reason"] == "STEP_OUT_OF_ORDER"   # output is not final
 
 
@@ -642,7 +682,7 @@ def test_a_failed_terminate_call_is_tried_twice(cred):
     f2.handler = lambda req, argv: hvt.proc([], returncode=1)
     before = len(f2.calls)
     failed = fresh.terminate_job(VM, rid2)
-    assert failed["ok"] is False and "terminated" not in failed and len(f2.calls) == before + 2
+    assert failed["ok"] is False and "terminated" not in failed and [c["request"]["op"] for c in f2.calls[before:]].count("agent_step") == 2
 
 
 def test_a_termination_reply_about_another_process_is_not_a_confirmation(cred):
@@ -656,7 +696,7 @@ def test_a_termination_reply_about_another_process_is_not_a_confirmation(cred):
 
 def run_debugger(cred, guest, **over):
     calls = tdr.Calls()
-    launcher, guest, fake = build(cred, guest)
+    launcher, guest, fake = build(cred, guest, **({"power_off_fallback": over.pop("power_off")} if "power_off" in over else {}))
     clock = over.pop("clock", None)
     extra = {} if clock is None else {"clock": clock}
     runner = DebuggerRun(tdr.FakeTransport(calls), launcher, gate=lambda op, **kw: tdr.good_decision(), **extra)
@@ -813,6 +853,208 @@ def test_a_lost_create_reply_is_still_followed_by_a_terminate(cred):
     assert guest.ops() == ["create", "terminate"]
 
 
+# --------------------------------------------------------------------------------- the agent is not the only way to end a run
+
+
+def frozen(guest):
+    """An agent that took the run and then answers nothing (its threads are suspended, or it is gone)."""
+    silent = hvt.proc([], returncode=1)
+    guest.faults.update(wait=silent, terminate=silent, collect=silent)
+    return guest
+
+
+def kill_requests_of(guest):
+    return [json.loads(json.dumps(r)) for r in guest.kill_requests]
+
+
+def test_a_frozen_agent_does_not_keep_the_target_alive_the_host_kills_the_named_job_from_a_new_session(cred):
+    guest = frozen(FakeGuest())
+    guest.job_state, guest.target_alive = "TERMINATED", False
+    result, guest, fake = run_debugger(cred, guest)
+    assert guest.ops().count("terminate") == hvl._TERMINATE_ATTEMPTS         # the agent was asked first
+    assert len(guest.kill_requests) == 1 and guest.off_requests == []        # then the job, and no more than that
+    kill = guest.kill_requests[0]
+    config = json.loads(fake.calls[0]["request"]["config_json"])
+    assert kill["op"] == "job_kill" and kill["job_name"] == config["job_name"]
+    assert kill["target_pid"] == 4242 and kill["target_created"] == TARGET_CREATED
+    assert result["job"]["terminated"] is True
+    assert result["provenance"]["termination_path"] == "HOST_JOB_KILL"
+    assert result["status"] == "TRANSPORT_ERROR" and result["reason"] == "WAIT_REPLY_INVALID"   # silence is never a success
+    assert result["status"] != "COMPLETED" and result["exit_code"] is None
+
+
+def test_each_job_gets_a_name_of_its_own_that_only_the_host_and_the_agent_know(cred):
+    names = set()
+    for _ in range(3):
+        launcher, guest, fake, run_id = started(cred)
+        config = json.loads(fake.calls[0]["request"]["config_json"])
+        assert re.fullmatch(r"Global\\liebert-job-[0-9a-f]{32}", config["job_name"]), config["job_name"]
+        names.add(config["job_name"])
+        assert run_id not in config["job_name"]
+    assert len(names) == 3
+
+
+@pytest.mark.parametrize("state,alive,confirmed", [
+    ("TERMINATED", False, True), ("TERMINATED", True, False), ("TERMINATED", None, True),
+    ("ABSENT", False, True), ("ABSENT", None, False), ("ABSENT", True, False),
+    ("ACTIVE_REMAIN", False, False), ("OPEN_FAILED", False, False), ("TERMINATE_FAILED", False, False),
+    ("QUERY_FAILED", False, False), ("something else", False, False),
+])
+def test_the_host_kill_confirms_only_what_the_job_accounting_or_the_target_identity_proves(cred, state, alive, confirmed):
+    guest = frozen(FakeGuest())
+    guest.job_state, guest.target_alive = state, alive
+    result, guest, fake = run_debugger(cred, guest, power_off=False)
+    assert (result["job"]["terminated"] is True) is confirmed, (state, alive, result["reason"])
+    if not confirmed:
+        assert result["status"] == "TRANSPORT_ERROR" and result["reason"] == "JOB_TERMINATION_NOT_CONFIRMED"
+        assert result["provenance"]["termination_path"] is None
+
+
+def test_the_last_resort_is_to_turn_the_vm_off_and_the_result_says_so(cred):
+    guest = frozen(FakeGuest())
+    guest.vm_off = True                                                       # the job cannot be reached either
+    result, guest, fake = run_debugger(cred, guest)
+    assert len(guest.kill_requests) == 1 and len(guest.off_requests) == 1
+    assert guest.off_requests[0]["op"] == "vm_off" and guest.off_requests[0]["vm"] == VM
+    assert result["job"]["terminated"] is True
+    assert result["provenance"]["termination_path"] == "VM_TURNED_OFF"
+    assert re.fullmatch(r"[A-Z][A-Z0-9_]+", result["provenance"]["termination_reason"])
+    assert result["status"] != "COMPLETED"
+
+
+def test_the_vm_is_not_turned_off_when_the_job_was_confirmed_dead(cred):
+    guest = frozen(FakeGuest())
+    guest.job_state = "TERMINATED"
+    guest.vm_off = True
+    result, guest, fake = run_debugger(cred, guest)
+    assert guest.off_requests == []
+
+
+@pytest.mark.parametrize("state", [None, "Running", "Paused", "Saved"])
+def test_a_vm_that_does_not_read_off_afterwards_is_no_confirmation(cred, state):
+    guest = frozen(FakeGuest())
+    guest.vm_off = state                                                       # None: no result at all
+    result, guest, fake = run_debugger(cred, guest)
+    assert len(guest.off_requests) == 1
+    assert result["status"] == "TRANSPORT_ERROR" and result["reason"] == "JOB_TERMINATION_NOT_CONFIRMED"
+    assert result["job"]["terminated"] is False and result["provenance"]["termination_path"] is None
+
+
+def test_turning_the_vm_off_can_be_declined_and_then_nothing_is_confirmed(cred):
+    guest = frozen(FakeGuest())
+    guest.vm_off = True
+    result, guest, fake = run_debugger(cred, guest, power_off=False)
+    assert guest.off_requests == [] and result["job"]["terminated"] is False
+    assert result["reason"] == "JOB_TERMINATION_NOT_CONFIRMED"
+
+
+def test_nothing_is_killed_from_outside_a_run_that_never_had_a_job_or_never_ran(cred):
+    launcher, guest, fake = build(cred, FakeGuest(terminate=hvt.proc([], returncode=1)))
+    run_id = launcher.create_suspended(VM, GUEST_PATH)["run_id"]               # created, not assigned, not resumed
+    sent = len(fake.calls)
+    reply = launcher.terminate_job(VM, run_id)
+    assert reply["ok"] is False
+    assert guest.kill_requests == [] and guest.off_requests == []              # no job to open, nothing ever ran
+    assert len(fake.calls) == sent + hvl._TERMINATE_ATTEMPTS
+    launcher.assign_to_job(VM, run_id, {"memory_bytes": 1 << 28})
+    reply = launcher.terminate_job(VM, run_id)
+    assert reply["ok"] is False and len(guest.kill_requests) == 1             # a job exists now, but still no power-off
+    assert guest.off_requests == []                                            # (the target has never been resumed)
+
+
+def test_an_agent_that_answers_terminate_needs_no_backup(cred):
+    result, guest, fake = run_debugger(cred, FakeGuest())
+    assert guest.kill_requests == [] and guest.off_requests == []
+    assert result["provenance"]["termination_path"] == "AGENT" and result["status"] == "COMPLETED"
+
+
+def test_an_agent_that_says_not_terminated_is_checked_from_outside_too(cred):
+    guest = FakeGuest()
+    guest.terminated = False
+    guest.job_state = "TERMINATED"
+    result, guest, fake = run_debugger(cred, guest)
+    assert guest.kill_requests and result["job"]["terminated"] is True
+    assert result["provenance"]["termination_path"] == "HOST_JOB_KILL"
+
+
+# ---- (b) the guest-side client checks WHO answers on the pipe
+
+
+def test_the_identity_of_the_agent_is_recorded_at_start_and_sent_with_every_later_step(cred):
+    launcher, guest, fake, run_id = started(cred)
+    launcher.assign_to_job(VM, run_id, {"memory_bytes": 1 << 28})
+    launcher.verify_job_assignment(VM, run_id)
+    assert "agent_pid" not in fake.calls[0]["request"]                         # the first call learns it
+    for call in fake.calls[1:]:
+        assert call["request"]["agent_pid"] == AGENT_PID and call["request"]["agent_created"] == AGENT_CREATED
+    run = launcher._runs[run_id]
+    assert (run.agent_pid, run.agent_created, run.target_created) == (AGENT_PID, AGENT_CREATED, TARGET_CREATED)
+
+
+@pytest.mark.parametrize("who", ["another_pid", "same_pid_other_creation_time"])
+def test_a_reply_from_a_server_that_is_not_the_agent_is_never_a_success(cred, who):
+    launcher, guest, fake, run_id = started(cred)
+
+    def impostor(on):
+        if who == "another_pid":
+            guest.server_pid = 31337 if on else AGENT_PID
+        else:
+            guest.server_created = AGENT_CREATED + 10_000_000 if on else AGENT_CREATED     # a recycled pid
+
+    steps = (lambda: launcher.assign_to_job(VM, run_id, {"memory_bytes": 1 << 28}),
+             lambda: launcher.verify_job_assignment(VM, run_id), lambda: launcher.resume(VM, run_id))
+    for call in steps:
+        impostor(True)
+        reply = call()
+        assert reply["ok"] is False and reply["reason"] == "AGENT_IDENTITY_MISMATCH", reply
+        impostor(False)
+        if call is not steps[-1]:
+            assert call()["ok"] is True                                         # the real agent is served
+    assert guest.ops() == ["create", "assign", "verify"]                        # the impostor was sent nothing
+
+
+@pytest.mark.parametrize("who", ["another_pid", "same_pid_other_creation_time"])
+def test_an_impostor_cannot_make_a_run_complete(cred, who):
+    guest = FakeGuest()
+    guest.job_state = "TERMINATED"
+    if who == "another_pid":
+        guest.server_pid = 31337
+    else:
+        guest.server_created = AGENT_CREATED + 1
+    result, guest, fake = run_debugger(cred, guest)
+    assert result["status"] != "COMPLETED" and result["exit_code"] is None and result["output"] is None
+    assert result["status"] == "JOB_ASSIGNMENT_UNCONFIRMED"                     # nothing past create was believed
+    assert "resume" not in guest.ops()
+
+
+def test_a_start_that_does_not_name_the_agent_is_not_a_start(cred):
+    class Anonymous(FakeGuest):
+        def __call__(self, req, argv):
+            out = super().__call__(req, argv)
+            if req["op"] == "agent_create":
+                return step_proc("agent_create", json.dumps(self.good(json.loads(req["agent_request_json"]))) + "\n",
+                                 identity=False)
+            return out
+
+    launcher, guest, fake = build(cred, Anonymous())
+    reply = launcher.create_suspended(VM, GUEST_PATH)
+    assert reply["ok"] is False and reply["reason"] == "AGENT_IDENTITY_UNKNOWN" and "run_id" in reply
+    assert launcher.assign_to_job(VM, reply["run_id"], {"memory_bytes": 1})["reason"] in {
+        "STEP_OUT_OF_ORDER", "AGENT_IDENTITY_UNKNOWN"}
+    assert guest.ops() == ["create"]
+
+
+# ---- (c) what the result says about where its facts come from
+
+
+def test_the_result_labels_the_guest_reports_as_such(cred):
+    result, guest, fake = run_debugger(cred, FakeGuest())
+    provenance = result["provenance"]
+    assert provenance["exit_code"] == "GUEST_REPORTED" and provenance["job_confirmations"] == "GUEST_REPORTED"
+    assert provenance["output"] == "GUEST_REPORTED" and provenance["termination_path"] == "AGENT"
+    assert any("same account" in line for line in result["not_verified"])
+
+
 # --------------------------------------------------------------------------------- the constant scripts
 
 
@@ -840,8 +1082,9 @@ def _method(text, signature):
 
 HOST_ALLOWED = frozenset({
     "Import-Clixml", "Get-VM", "Where-Object", "New-PSSession", "Remove-PSSession", "Invoke-Command",
-    "New-Object", "ConvertTo-Json", "ConvertFrom-Json", "Join-Path", "Invoke-CimMethod",
+    "New-Object", "ConvertTo-Json", "ConvertFrom-Json", "Join-Path", "Invoke-CimMethod", "Add-Type",
 })
+VMOFF_ALLOWED = frozenset({"Get-VM", "Where-Object", "Stop-VM", "New-Object", "ConvertTo-Json", "ConvertFrom-Json"})
 AGENT_ALLOWED = frozenset({"Add-Type", "New-Object", "Join-Path", "ConvertTo-Json", "ConvertFrom-Json"})
 FORBIDDEN = (
     "Restore-VMSnapshot", "Checkpoint-VM", "Stop-VM", "Start-VM", "Restart-VM", "Suspend-VM", "Save-VM", "Set-VM",
@@ -868,8 +1111,42 @@ def test_the_host_script_uses_a_short_cmdlet_list_and_nothing_that_touches_vm_st
         assert name.lower() not in _code(hvl._HOST_SCRIPT).lower(), name
     assert not re.search(r"snapshot|checkpoint|\biex\b|-EncodedCommand|\.Invoke\(|\[scriptblock\]::Create",
                          _code(hvl._HOST_SCRIPT), re.IGNORECASE)
-    assert "Add-Type" not in hvl._HOST_SCRIPT                     # nothing is compiled by the host script
+    # the one thing the host script compiles is the constant native helper, and only inside the guest blocks
+    # that read it from an argument, behind a check that the type is not already there
+    host = _code(hvl._HOST_SCRIPT)
+    assert host.count("Add-Type -TypeDefinition $nativeText -Language CSharp") == host.count("Add-Type") == 3
+    assert host.count("if (-not ('LrHostNative' -as [type])) { Add-Type") == 3
     assert "Start-Process" not in hvl._HOST_SCRIPT
+
+
+@contract
+def test_the_power_off_script_is_separate_and_does_exactly_one_state_change():
+    code = _code(hvl._VM_OFF_SCRIPT)
+    used = set(re.findall(r"\b[A-Z][A-Za-z]+-[A-Z][A-Za-z]+\b", code))
+    assert used <= VMOFF_ALLOWED, sorted(used - VMOFF_ALLOWED)
+    assert len(re.findall(r"Stop-VM", code)) == 1 and "Stop-VM -VM $found[0] -TurnOff -Force -ErrorAction Stop" in code
+    for name in FORBIDDEN:
+        if name != "Stop-VM":
+            assert name.lower() not in code.lower(), name
+    assert not re.search(r"snapshot|checkpoint|Restore|Remove-VM|Add-Type|Invoke-Command|PSSession", code, re.IGNORECASE)
+    assert "-ne 'Off'" in code and code.index("Stop-VM") < code.index("-ne 'Off'")      # the state is read back
+    assert "Stop-VM" not in hvl._HOST_SCRIPT and "Stop-VM" not in hvt_module._SCRIPT      # nothing else can power a VM off
+    assert hvl._VM_OFF_SCRIPT.isascii() and "\r" not in hvl._VM_OFF_SCRIPT
+
+
+@contract
+def test_the_native_helper_only_reads_identities_and_ends_a_named_job():
+    cs = hvl._HOST_NATIVE_CS
+    assert cs.isascii()
+    imports = set(re.findall(r"static extern \w+ (\w+)\(", cs))
+    assert imports == {"GetNamedPipeServerProcessId", "OpenProcess", "GetProcessTimes", "CloseHandle", "OpenJobObjectW",
+                       "TerminateJobObject", "QueryInformationJobObject"}, imports
+    assert not re.search(r"CreateProcess|ResumeThread|SuspendThread|WriteProcessMemory|AssignProcessToJobObject", cs)
+    assert "OpenProcess(0x1000" in cs                                   # query-limited only
+    assert "OpenJobObjectW(0x000C" in cs                                # terminate + query only: no set-attributes
+    kill = _method(cs, "public static string KillJob(")
+    assert kill.index("TerminateJobObject(") < kill.index("Active(job)") and "== 2" in kill
+    assert "ACTIVE_REMAIN" in kill and "TERMINATED" in kill and "ABSENT" in kill
 
 
 @contract
@@ -910,6 +1187,12 @@ def test_the_process_is_created_suspended_and_the_job_kills_on_close():
     assign = _method(cs, "public void AssignToJob(")
     assert "info.BasicLimitInformation.LimitFlags = WantedFlags;" in assign
     assert assign.index("SetInformationJobObject(_job, 9") < assign.index("AssignProcessToJobObject(")
+    # the job has the name the host gave it, and a job that already had that name is not ours
+    assert "CreateJobObjectW(IntPtr.Zero, jobName)" in assign and "IsNullOrEmpty(jobName)" in assign
+    assert assign.index("created == 183") < assign.index("_job = job;") < assign.index("SetInformationJobObject(_job, 9")
+    assert 'JOB_NAME_EXISTS' in assign and "CloseHandle(job)" in assign
+    assert "$script:Run.AssignToJob($mem, $JobName)" in hvl._AGENT_SCRIPT
+    assert r"-cnotmatch '^Global\\liebert-job-[0-9a-f]{32}$'" in hvl._AGENT_SCRIPT
     for const, value in (("ACTIVE_PROCESS", "0x00000008"), ("PROCESS_MEMORY", "0x00000100"),
                          ("JOB_MEMORY", "0x00000200"), ("JOB_TIME", "0x00000004")):
         assert re.search(rf"JOB_OBJECT_LIMIT_{const}\s*=\s*{value};", cs), const
@@ -1006,6 +1289,31 @@ def test_the_watchdog_is_armed_before_anything_else_and_narrowed_at_resume_and_w
     assert allows.count("return false;") >= 3 and "OpenProcess(0x1000" in allows
 
 
+def _block(script, name):
+    """The text of the PowerShell script block assigned to ``$name`` (brace matching)."""
+    at = script.index(f"${name} = {{")
+    return _method(script[at:], f"${name} = ")
+
+
+@contract
+def test_the_guest_side_client_checks_who_answers_before_it_sends_anything():
+    call = _block(hvl._HOST_SCRIPT, "callBlock")
+    order = [call.index(n) for n in ("$client.Connect(", "[LrHostNative]::ServerPid($client)",
+                                     "[LrHostNative]::Created(", "AGENT_IDENTITY_MISMATCH", "$client.Write(")]
+    assert order == sorted(order)
+    check = call[call.index("if (([int64] $expectedPid -le 0)"): call.index("$out = ")]
+    for needle in ("[int64] $expectedPid -le 0", "$expectedCreated -le 0", "$serverPid -ne [int64] $expectedPid", "$serverCreated -ne [int64] $expectedCreated"):
+        assert needle in check, needle
+    assert " -or " in check and " -and " not in check          # any single doubt refuses; nothing is let through by a match on one
+    assert "$serverCreated = [int64] -1" in call              # an unreadable creation time can never equal the expected one
+    start = _block(hvl._HOST_SCRIPT, "startBlock")
+    assert "[LrHostNative]::Created([uint32] $agentPid)" in start and "AGENT_IDENTITY_UNKNOWN" in start
+    kill = _block(hvl._HOST_SCRIPT, "killBlock")
+    assert "KillJob([string] $jobName)" in kill and "Created([uint32] $targetPid) -eq [int64] $targetCreated" in kill
+    host = hvl._HOST_SCRIPT
+    assert host.index("Mark 'job_kill'") < host.index("exit 0") and "job_name" in host
+
+
 @contract
 def test_no_agent_wait_is_longer_than_the_host_deadline_plus_the_stated_margins():
     agent = hvl._AGENT_SCRIPT
@@ -1046,7 +1354,7 @@ def _powershell():
 
 _PARSE = (
     "param([string]$Dir); "
-    "foreach ($n in 'agent.ps1','launcher.ps1') { "
+    "foreach ($n in 'agent.ps1','launcher.ps1','vmoff.ps1') { "
     "$e = $null; $t = $null; "
     "$ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $Dir $n), [ref]$t, [ref]$e); "
     "'FILE:' + $n + ':ERRORS:' + $e.Count; "
@@ -1059,6 +1367,7 @@ _PARSE = (
 def _write_scripts(folder: Path) -> None:
     (folder / "agent.ps1").write_text(hvl._AGENT_SCRIPT, encoding="ascii", newline="\r\n")
     (folder / "launcher.ps1").write_text(hvl._HOST_SCRIPT, encoding="ascii", newline="\r\n")
+    (folder / "vmoff.ps1").write_text(hvl._VM_OFF_SCRIPT, encoding="ascii", newline="\r\n")
 
 
 def test_both_scripts_parse_and_call_only_the_listed_commands(tmp_path):
@@ -1074,9 +1383,11 @@ def test_both_scripts_parse_and_call_only_the_listed_commands(tmp_path):
                            "-Dir", str(folder)], capture_output=True, text=True, timeout=180, check=False)
     assert done.returncode == 0, done.stderr[:300]
     lines = [ln.strip() for ln in done.stdout.splitlines() if ln.strip()]
-    assert "FILE:agent.ps1:ERRORS:0" in lines and "FILE:launcher.ps1:ERRORS:0" in lines, lines[:10]
+    for name in ("agent.ps1", "launcher.ps1", "vmoff.ps1"):
+        assert f"FILE:{name}:ERRORS:0" in lines, lines[:10]
     for script, allowed, own in (
         ("launcher.ps1", HOST_ALLOWED, {"Say", "Mark", "Fail", "AsciiJson", "ErrInfo", "Emit"}),
+        ("vmoff.ps1", VMOFF_ALLOWED, {"Say", "Mark", "Fail", "AsciiJson", "ErrInfo", "Emit"}),
         ("agent.ps1", AGENT_ALLOWED, {"ToJson", "Fail", "CodeOf", "OkReply", "RunOp", "Dispatch"}),
     ):
         names = {ln.split(":", 2)[2] for ln in lines if ln.startswith(f"CMD:{script}:")}
@@ -1112,6 +1423,14 @@ def test_the_csharp_compiles_and_its_struct_sizes_match_the_documented_x64_layou
                       "JOBOBJECT_EXTENDED_LIMIT_INFORMATION": "144", "JOBOBJECT_BASIC_ACCOUNTING_INFORMATION": "48",
                       "SECURITY_ATTRIBUTES": "24", "IntPtr": "8"}
     assert "LAYOUTOK:True" in lines
+    native = tmp_path / "hostnative.cs"
+    native.write_text(hvl._HOST_NATIVE_CS, encoding="ascii")
+    driver = tmp_path / "compile_native.ps1"
+    driver.write_text("param([string]$Source); Add-Type -TypeDefinition ([System.IO.File]::ReadAllText($Source)) "
+                      "-Language CSharp; 'NATIVE:' + [LrHostNative]::Created([uint32]$PID)", encoding="ascii")
+    done = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(driver),
+                           "-Source", str(native)], capture_output=True, text=True, timeout=300, check=False)
+    assert done.returncode == 0 and re.search(r"NATIVE:\d{15,19}", done.stdout), (done.stdout[-400:], done.stderr[-400:])
 
 
 _PROBE_CS = r"""
@@ -1371,6 +1690,121 @@ def test_the_agents_watchdog_and_pipe_server_hold_their_bounds_when_run_for_real
     failed = {n: v for n, v in seen.items() if v[0] != "PASS"}
     assert not failed, failed
     assert set(seen) == set(_PROBES) | {"END"}, sorted(set(_PROBES) ^ set(seen))
+
+
+_IDENT_CS = r"""
+public static class LrServeProbe
+{
+    public static string Seen;
+    public static bool Done;
+    public static string JobName;
+
+    // One real LrServer on a real pipe, served from another thread: it records the request line it was sent.
+    public static void ServeOnce(string name)
+    {
+        Seen = null;
+        Done = false;
+        LrServer server = new LrServer(name, 1500, 1500, 1500);
+        Task.Run(() =>
+        {
+            try { string line = server.Accept(4000); Seen = line; if (line != null) { server.Reply("{\"ok\":true}"); } }
+            catch (Exception) { }
+            Done = true;
+        });
+    }
+
+    // An empty job with a name, held open (nothing is assigned to it, nothing is started).
+    private static IntPtr _job = IntPtr.Zero;
+    public static void OpenEmptyJob(string name) { _job = LrNative.CreateJobObjectW(IntPtr.Zero, name); }
+    public static void CloseEmptyJob() { if (_job != IntPtr.Zero) { LrNative.CloseHandle(_job); _job = IntPtr.Zero; } }
+    public static bool EmptyJobExists { get { return _job != IntPtr.Zero; } }
+}
+"""
+
+_IDENT_DRIVER = r"""
+param([string]$Agent, [string]$Probe, [string]$Native, [string]$BlockPath)
+$text = [System.IO.File]::ReadAllText($Agent) + "`n" + [System.IO.File]::ReadAllText($Probe)
+Add-Type -TypeDefinition $text -Language CSharp
+$nativeText = [System.IO.File]::ReadAllText($Native)
+$block = [scriptblock]::Create([System.IO.File]::ReadAllText($BlockPath))
+$myPid = [int64] [System.Diagnostics.Process]::GetCurrentProcess().Id
+$request = '{"op":"x"}'
+
+function Report($name, $ok, $detail) { 'PROBE2:' + $name + ':' + $(if ($ok) { 'PASS' } else { 'FAIL' }) + ':' + $detail }
+function Case($name, $expPid, $expCreated, $wantOk, $wantCode) {
+    $pipe = 'lr-ident-' + [guid]::NewGuid().ToString('N')
+    [LrServeProbe]::ServeOnce($pipe)
+    $r = & $block $pipe $request 3000 3000 4096 $expPid $expCreated $nativeText
+    $end = [DateTime]::UtcNow.AddSeconds(8)
+    while ((-not [LrServeProbe]::Done) -and ([DateTime]::UtcNow -lt $end)) { Start-Sleep -Milliseconds 20 }
+    $seen = [LrServeProbe]::Seen
+    if ($wantOk) { $good = ($r.ok -eq $true) -and ($seen -ceq $request) -and ([string] $r.reply -ceq ('{"ok":true}' + "`n")) }
+    else { $good = ($r.ok -eq $false) -and ($r.code -ceq $wantCode) -and ($null -eq $seen) }
+    Report $name $good ('ok=' + $r.ok + ' code=' + $r.code + ' server_saw=' + $seen)
+}
+
+# the first case also proves that the block compiles the native helper by itself
+Case 'identity_wrong_pid_is_refused_and_nothing_is_sent' ($myPid + 1) 1 $false 'AGENT_IDENTITY_MISMATCH'
+$created = [LrHostNative]::Created([uint32] $myPid)
+Case 'identity_matching_pid_and_creation_time_is_served' $myPid $created $true $null
+Case 'identity_other_pid_with_the_right_creation_time_is_refused_and_nothing_is_sent' ($myPid + 1) $created $false 'AGENT_IDENTITY_MISMATCH'
+Case 'identity_same_pid_other_creation_time_is_refused_and_nothing_is_sent' $myPid ($created + 10000000) $false 'AGENT_IDENTITY_MISMATCH'
+Case 'identity_unknown_expectation_is_refused_and_nothing_is_sent' 0 0 $false 'AGENT_IDENTITY_MISMATCH'
+Case 'identity_unreadable_creation_time_never_matches' $myPid -1 $false 'AGENT_IDENTITY_MISMATCH'
+
+$started = [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToFileTimeUtc()
+Report 'created_is_the_process_start_time' ([Math]::Abs($created - $started) -lt 200000) ('created=' + $created + ' start=' + $started)
+Report 'created_of_a_missing_process_is_minus_one' (([LrHostNative]::Created([uint32] 2147483646)) -eq -1) ''
+
+$name = 'Local\lr-probe-job-' + [guid]::NewGuid().ToString('N')
+Report 'job_that_does_not_exist_is_absent' (([LrHostNative]::KillJob($name)) -ceq 'ABSENT') ''
+[LrServeProbe]::OpenEmptyJob($name)
+Report 'job_that_exists_and_is_empty_is_terminated_with_zero_active' (([LrHostNative]::KillJob($name)) -ceq 'TERMINATED') ''
+[LrServeProbe]::CloseEmptyJob()
+Report 'job_that_lost_its_last_handle_is_absent_again' (([LrHostNative]::KillJob($name)) -ceq 'ABSENT') ''
+'PROBE2:END:PASS:done'
+"""
+
+_IDENT_PROBES = (
+    "identity_wrong_pid_is_refused_and_nothing_is_sent", "identity_matching_pid_and_creation_time_is_served",
+    "identity_other_pid_with_the_right_creation_time_is_refused_and_nothing_is_sent",
+    "identity_same_pid_other_creation_time_is_refused_and_nothing_is_sent",
+    "identity_unknown_expectation_is_refused_and_nothing_is_sent", "identity_unreadable_creation_time_never_matches",
+    "created_is_the_process_start_time", "created_of_a_missing_process_is_minus_one",
+    "job_that_does_not_exist_is_absent", "job_that_exists_and_is_empty_is_terminated_with_zero_active",
+    "job_that_lost_its_last_handle_is_absent_again",
+)
+
+
+def test_the_guest_side_client_and_the_native_helper_do_what_they_claim_when_run_for_real(tmp_path):
+    """Runs the REAL guest-side client script block from the host script against a real LrServer on a real
+    pipe: a server whose process id or creation time is not the expected one is never sent the request, and
+    an unknown or unreadable expectation refuses too. Also reads creation times and ends an (empty) named job.
+    No target, no agent process, no guest: the 'agent' is a thread of the test's own PowerShell process."""
+    shell = _powershell()
+    if shell is None:
+        pytest.skip("powershell.exe is not available: the probe cannot run here")
+    if not sys.maxsize > 2 ** 32:
+        pytest.skip("a 64-bit host is needed: the agent itself refuses anything else")
+    (tmp_path / "agent.cs").write_text(_csharp(), encoding="ascii")
+    (tmp_path / "probe.cs").write_text(_IDENT_CS, encoding="ascii")
+    (tmp_path / "native.cs").write_text(hvl._HOST_NATIVE_CS, encoding="ascii")
+    (tmp_path / "block.ps1").write_text(_block(hvl._HOST_SCRIPT, "callBlock")[1:-1], encoding="ascii")   # the body
+    driver = tmp_path / "ident.ps1"
+    driver.write_text(_IDENT_DRIVER, encoding="ascii")
+    done = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(driver),
+                           "-Agent", str(tmp_path / "agent.cs"), "-Probe", str(tmp_path / "probe.cs"),
+                           "-Native", str(tmp_path / "native.cs"), "-BlockPath", str(tmp_path / "block.ps1")],
+                          capture_output=True, text=True, timeout=300, check=False)
+    seen = {}
+    for line in done.stdout.splitlines():
+        if line.startswith("PROBE2:"):
+            _, name, verdict, detail = line.strip().split(":", 3)
+            seen[name] = (verdict, detail)
+    assert "END" in seen, (done.stdout[-800:], done.stderr[-800:])
+    failed = {n: v for n, v in seen.items() if v[0] != "PASS"}
+    assert not failed, failed
+    assert set(seen) == set(_IDENT_PROBES) | {"END"}, sorted(set(_IDENT_PROBES) ^ set(seen))
 
 
 # --------------------------------------------------------------------------------- real Hyper-V (skipped by default)

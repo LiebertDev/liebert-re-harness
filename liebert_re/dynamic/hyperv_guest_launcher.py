@@ -48,6 +48,30 @@ itself a fixed time after; the times can only move earlier. The agent also refus
 a member of its own job (the target and its children) and one it cannot place. The first call hands the
 agent an absolute lifetime (``lifetime_seconds``) that covers every step the host may take.
 
+WHEN THE AGENT CANNOT BE REACHED OR TRUSTED. The target has the agent's token, so it can also suspend the
+agent's threads (the watchdog included) or kill the agent and take over its pipe name. Three host-side rules
+do not depend on the agent being alive or honest:
+
+* The job has a random name per run (``liebert-job-<32 hex>`` in the ``Global`` namespace, known to the host and the agent). If
+  the agent does not confirm a termination (no reply, a reply that is not valid, a negative answer, or a
+  server that is not the agent), the host opens a NEW PowerShell Direct session, opens the job by name
+  with terminate and query rights only (``LrHostNative.KillJob``), ends it, and reads the job's own
+  accounting until no process is active. That, or an absent job together with a target whose process id AND
+  creation time are seen to be gone, is a confirmation (``termination_path`` ``HOST_JOB_KILL``).
+* If that does not confirm either, and the target may have run (a ``resume`` was sent), the last resort is
+  ``Stop-VM -TurnOff`` from the host (a separate constant script, ``_VM_OFF_SCRIPT``; the transport and the
+  host script carry no cmdlet that changes VM state). It counts only when the VM then reads ``Off``, and the
+  result says so: ``termination_path`` ``VM_TURNED_OFF`` with a ``termination_reason``. It can be switched
+  off (``power_off_fallback=False``). A target that was never resumed (or whose job cannot exist yet) is
+  never the reason to power a VM off. When nothing is proven, the run stays unconfirmed
+  (``JOB_TERMINATION_NOT_CONFIRMED``).
+* Who answers on the pipe is checked before anything is sent. The first call records the agent's process id
+  AND creation time the moment it is started; every later call carries them, and the client script in the
+  guest asks ``GetNamedPipeServerProcessId`` for the connected pipe and the creation time of that process
+  and refuses (``AGENT_IDENTITY_MISMATCH``, never a success) unless both are equal. An unknown or unreadable
+  expectation refuses too. ``create`` also reports the target's creation time (``target_created``), kept
+  for the check above.
+
 STEPS, host to agent (``create``, ``assign``, ``verify``, ``resume``, ``wait``, ``terminate``,
 ``collect``), each one PowerShell Direct call:
 
@@ -84,7 +108,12 @@ the request was sent, the agent was not reachable, or the agent itself answered 
 the orchestrator still sends ``terminate_job`` for a process whose creation reply may have been lost.
 
 LIMITS, stated plainly. The target and the operator share one account in the guest, so the pipe ACL keeps
-other accounts out, nothing more; the job-membership refusal stops the target and its children, not a
+other accounts out, nothing more, and everything the guest agent reports (exit code, job confirmation,
+output) is reported by a process the target could in principle forge or silence; the result labels it
+``GUEST_REPORTED`` (``provenance``). Running the target under a separate, non-administrator account is
+recommended and is NOT done here (it would change the target's behaviour). The job's name can be opened by
+the target, so the limits read back at ``resume`` are the limits only up to ``resume``. The kill rights the
+host asks for are terminate and query only; the job-membership refusal stops the target and its children, not a
 process the target gets another service to start outside the job. Such a client can occupy the single
 pipe instance and delay the host's ``terminate_job`` and ``collect_output`` until the watchdog kills the
 job; the host then sees a failed or unconfirmed step (``TRANSPORT_ERROR``), never a success. The gate's
@@ -122,7 +151,8 @@ SCHEMA = "liebert-re.hyperv-guest-launcher/1"
 _RESULT_SCHEMA = "liebert-re.hyperv-guest-launcher-result/1"
 _AGENT_SCHEMA = "liebert-re.guest-agent/1"
 
-_PHASES = ("decode", "credential", "vm", "session", "session_open", "agent_start", "agent_call")
+_PHASES = ("decode", "credential", "vm", "session", "session_open", "agent_start", "agent_call", "job_kill",
+           "stop")
 
 MAX_OUTPUT_CAP = 1024 * 1024          # the same ceiling debugger_run applies to a caller's cap
 MAX_MEMORY_BYTES = 2 * 1024 ** 3      # likewise
@@ -142,12 +172,17 @@ _STEP_REPLY_S = 30
 _WAIT_REPLY_MARGIN_S = 15
 _TERMINATE_ATTEMPTS = 2
 _DEFAULT_IDLE_S = 300
+_JOB_NAME = re.compile(r"Global\\liebert-job-[0-9a-f]{32}")
+# What the host-side kill from a new session can say, and which of those prove the job is gone.
+_JOB_STATES = frozenset({"TERMINATED", "ABSENT", "ACTIVE_REMAIN", "OPEN_FAILED", "TERMINATE_FAILED", "QUERY_FAILED"})
+TERMINATION_PATHS = ("AGENT", "HOST_JOB_KILL", "VM_TURNED_OFF")
+_POWER_OFF_REASON = "AGENT_UNCONFIRMED_AND_HOST_JOB_KILL_UNCONFIRMED"
 _MIN_LIFETIME_S = 60                  # the range the agent accepts for its own absolute lifetime
 _MAX_LIFETIME_S = 40_000
 
 # --------------------------------------------------------------------------- the host script (a constant)
 
-_HOST_SCRIPT = r"""
+_COMMON_HEAD = r"""
 [CmdletBinding()]
 param([Parameter(Mandatory = $true)][string] $RequestB64)
 $ErrorActionPreference = 'Stop'
@@ -182,6 +217,9 @@ function Emit([bool] $ok, $failure) {
     Say ('LIEBERT_RESULT ' + (AsciiJson $obj))
 }
 
+"""
+
+_HOST_SCRIPT = _COMMON_HEAD + r"""
 try {
     Mark 'decode'
     $json = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($RequestB64))
@@ -199,50 +237,53 @@ try {
     $script:Data['vm_state'] = $found[0].State.ToString()
     if ($script:Data['vm_state'] -ne 'Running') { Fail 'VM_NOT_RUNNING' }
 
-    if (($script:Op -ne 'agent_create') -and ($script:Op -ne 'agent_step')) { Fail 'UNKNOWN_OPERATION' }
+    if (($script:Op -ne 'agent_create') -and ($script:Op -ne 'agent_step') -and ($script:Op -ne 'job_kill')) { Fail 'UNKNOWN_OPERATION' }
 
-    Mark 'session'
-    $session = New-PSSession -VMId $found[0].VMId -Credential $cred -ErrorAction Stop
-    Mark 'session_open'
-
-    if ($script:Op -eq 'agent_create') {
-        Mark 'agent_start'
-        $agentText = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'agent.ps1'), [System.Text.Encoding]::ASCII)
-        $started = Invoke-Command -Session $session -ErrorAction Stop -ArgumentList @([string] $req.target_path, [string] $req.agent_run_id, $agentText, [string] $req.config_json, [string] $req.agent_sha256) -ScriptBlock {
-            param($targetPath, $runId, $agentText, $configJson, $agentSha)
-            $fi = New-Object System.IO.FileInfo ($targetPath)
-            if (-not $fi.Exists) { return @{ ok = $false; code = 'TARGET_MISSING' } }
-            $bad = (($fi.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
-            $cur = $fi.Directory
-            while ((-not $bad) -and ($null -ne $cur)) {
-                if (($cur.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { $bad = $true }
-                $cur = $cur.Parent
-            }
-            if ($bad) { return @{ ok = $false; code = 'TARGET_PATH_REPARSE' } }
-            $runDir = [System.IO.Path]::Combine($fi.DirectoryName, 'liebert-run-' + $runId)
-            if ([System.IO.Directory]::Exists($runDir) -or [System.IO.File]::Exists($runDir)) { return @{ ok = $false; code = 'RUN_DIR_EXISTS' } }
-            [void] [System.IO.Directory]::CreateDirectory($runDir)
-            $agentPath = [System.IO.Path]::Combine($runDir, 'agent.ps1')
-            $configPath = [System.IO.Path]::Combine($runDir, 'config.json')
-            [System.IO.File]::WriteAllText($agentPath, $agentText, [System.Text.Encoding]::ASCII)
-            [System.IO.File]::WriteAllText($configPath, $configJson, [System.Text.Encoding]::ASCII)
-            $sha = [System.Security.Cryptography.SHA256]::Create()
-            $written = ([System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($agentPath)))).Replace('-', '').ToLowerInvariant()
-            if ($written -ne $agentSha) { return @{ ok = $false; code = 'AGENT_SCRIPT_HASH_MISMATCH' } }
-            $cmd = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $agentPath + '"'
-            $made = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd; CurrentDirectory = $runDir }
-            if ([int] $made.ReturnValue -ne 0) { return @{ ok = $false; code = 'AGENT_START_FAILED' } }
-            return @{ ok = $true; code = $null }
+    # The three blocks below run INSIDE the guest. Each compiles the same small constant native helper first.
+    $startBlock = {
+        param($targetPath, $runId, $agentText, $configJson, $agentSha, $nativeText)
+        if (-not ('LrHostNative' -as [type])) { Add-Type -TypeDefinition $nativeText -Language CSharp }
+        $fi = New-Object System.IO.FileInfo ($targetPath)
+        if (-not $fi.Exists) { return @{ ok = $false; code = 'TARGET_MISSING' } }
+        $bad = (($fi.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+        $cur = $fi.Directory
+        while ((-not $bad) -and ($null -ne $cur)) {
+            if (($cur.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { $bad = $true }
+            $cur = $cur.Parent
         }
-        if (-not $started.ok) { Fail ([string] $started.code) }
+        if ($bad) { return @{ ok = $false; code = 'TARGET_PATH_REPARSE' } }
+        $runDir = [System.IO.Path]::Combine($fi.DirectoryName, 'liebert-run-' + $runId)
+        if ([System.IO.Directory]::Exists($runDir) -or [System.IO.File]::Exists($runDir)) { return @{ ok = $false; code = 'RUN_DIR_EXISTS' } }
+        [void] [System.IO.Directory]::CreateDirectory($runDir)
+        $agentPath = [System.IO.Path]::Combine($runDir, 'agent.ps1')
+        $configPath = [System.IO.Path]::Combine($runDir, 'config.json')
+        [System.IO.File]::WriteAllText($agentPath, $agentText, [System.Text.Encoding]::ASCII)
+        [System.IO.File]::WriteAllText($configPath, $configJson, [System.Text.Encoding]::ASCII)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $written = ([System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($agentPath)))).Replace('-', '').ToLowerInvariant()
+        if ($written -ne $agentSha) { return @{ ok = $false; code = 'AGENT_SCRIPT_HASH_MISMATCH' } }
+        $cmd = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $agentPath + '"'
+        $made = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd; CurrentDirectory = $runDir }
+        if ([int] $made.ReturnValue -ne 0) { return @{ ok = $false; code = 'AGENT_START_FAILED' } }
+        # who the agent is, taken the moment it exists: its process id AND its creation time (an id alone can be reused)
+        $agentPid = [int64] $made.ProcessId
+        $agentCreated = [int64] [LrHostNative]::Created([uint32] $agentPid)
+        if (($agentPid -le 0) -or ($agentCreated -le 0)) { return @{ ok = $false; code = 'AGENT_IDENTITY_UNKNOWN' } }
+        return @{ ok = $true; code = $null; agent_pid = $agentPid; agent_created = $agentCreated }
     }
-
-    Mark 'agent_call'
-    $call = Invoke-Command -Session $session -ErrorAction Stop -ArgumentList @([string] $req.pipe_name, [string] $req.agent_request_json, [int] $req.connect_timeout_ms, [int] $req.reply_timeout_ms, [int] $req.max_reply_chars) -ScriptBlock {
-        param($pipeName, $requestJson, $connectMs, $replyMs, $maxChars)
+    $callBlock = {
+        param($pipeName, $requestJson, $connectMs, $replyMs, $maxChars, $expectedPid, $expectedCreated, $nativeText)
+        if (-not ('LrHostNative' -as [type])) { Add-Type -TypeDefinition $nativeText -Language CSharp }
         $client = New-Object System.IO.Pipes.NamedPipeClientStream ('.', $pipeName, [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::Asynchronous)
         try {
             try { $client.Connect([int] $connectMs) } catch { return @{ ok = $false; code = 'AGENT_NOT_REACHABLE' } }
+            # Before anything is sent: is the process that answers on this pipe the agent that was started?
+            $serverPid = [int64] [LrHostNative]::ServerPid($client)
+            $serverCreated = [int64] -1
+            if ($serverPid -gt 0) { $serverCreated = [int64] [LrHostNative]::Created([uint32] $serverPid) }
+            if (([int64] $expectedPid -le 0) -or ([int64] $expectedCreated -le 0) -or ($serverPid -ne [int64] $expectedPid) -or ($serverCreated -ne [int64] $expectedCreated)) {
+                return @{ ok = $false; code = 'AGENT_IDENTITY_MISMATCH' }
+            }
             $out = [System.Text.Encoding]::ASCII.GetBytes($requestJson + "`n")
             $client.Write($out, 0, $out.Length)
             $client.Flush()
@@ -264,6 +305,49 @@ try {
         }
         finally { $client.Dispose() }
     }
+    $killBlock = {
+        param($jobName, $targetPid, $targetCreated, $nativeText)
+        if (-not ('LrHostNative' -as [type])) { Add-Type -TypeDefinition $nativeText -Language CSharp }
+        $state = [string] [LrHostNative]::KillJob([string] $jobName)
+        $alive = $null
+        if (([int64] $targetPid -gt 0) -and ([int64] $targetCreated -gt 0)) {
+            $alive = ([int64] [LrHostNative]::Created([uint32] $targetPid) -eq [int64] $targetCreated)
+        }
+        return @{ state = $state; alive = $alive }
+    }
+
+    Mark 'session'
+    $session = New-PSSession -VMId $found[0].VMId -Credential $cred -ErrorAction Stop
+    Mark 'session_open'
+    $nativeText = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'native.cs'), [System.Text.Encoding]::ASCII)
+
+    if ($script:Op -eq 'job_kill') {
+        # From a session of its own, with nothing from the agent: open the run's job by its name and end it.
+        Mark 'job_kill'
+        $killed = Invoke-Command -Session $session -ErrorAction Stop -ArgumentList @([string] $req.job_name, [int64] $req.target_pid, [int64] $req.target_created, $nativeText) -ScriptBlock $killBlock
+        $script:Data['job_state'] = [string] $killed.state
+        $script:Data['target_alive'] = $killed.alive
+        Emit $true $null
+        exit 0
+    }
+
+    $expectedPid = [int64] $req.agent_pid
+    $expectedCreated = [int64] $req.agent_created
+    if ($script:Op -eq 'agent_create') {
+        Mark 'agent_start'
+        $agentText = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'agent.ps1'), [System.Text.Encoding]::ASCII)
+        $started = Invoke-Command -Session $session -ErrorAction Stop -ArgumentList @([string] $req.target_path, [string] $req.agent_run_id, $agentText, [string] $req.config_json, [string] $req.agent_sha256, $nativeText) -ScriptBlock $startBlock
+        if ($started.ok -and ($null -ne $started.agent_pid)) {
+            $script:Data['agent_pid'] = [int64] $started.agent_pid
+            $script:Data['agent_created'] = [int64] $started.agent_created
+        }
+        if (-not $started.ok) { Fail ([string] $started.code) }
+        $expectedPid = [int64] $started.agent_pid
+        $expectedCreated = [int64] $started.agent_created
+    }
+
+    Mark 'agent_call'
+    $call = Invoke-Command -Session $session -ErrorAction Stop -ArgumentList @([string] $req.pipe_name, [string] $req.agent_request_json, [int] $req.connect_timeout_ms, [int] $req.reply_timeout_ms, [int] $req.max_reply_chars, $expectedPid, $expectedCreated, $nativeText) -ScriptBlock $callBlock
     if (-not $call.ok) { Fail ([string] $call.code) }
     $script:Data['reply'] = [string] $call.reply
 
@@ -276,6 +360,121 @@ catch {
 }
 finally {
     if ($null -ne $session) { try { Remove-PSSession -Session $session -ErrorAction Stop } catch { } }
+}
+"""
+
+_HOST_NATIVE_CS = r"""
+using System;
+using System.IO.Pipes;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public static class LrHostNative
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ACCOUNTING
+    {
+        public long TotalUserTime; public long TotalKernelTime; public long ThisPeriodTotalUserTime; public long ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount; public uint TotalProcesses; public uint ActiveProcesses; public uint TotalTerminatedProcesses;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetNamedPipeServerProcessId(IntPtr pipe, out uint serverProcessId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetProcessTimes(IntPtr process, out long created, out long exited, out long kernel, out long user);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr OpenJobObjectW(uint access, bool inherit, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool QueryInformationJobObject(IntPtr job, int infoClass, ref ACCOUNTING info, uint size, out uint returned);
+
+    // The process id of the server end of a connected client pipe, or -1.
+    public static long ServerPid(NamedPipeClientStream client)
+    {
+        uint pid;
+        if (!GetNamedPipeServerProcessId(client.SafePipeHandle.DangerousGetHandle(), out pid)) { return -1; }
+        return (long)pid;
+    }
+
+    // The creation time (FILETIME ticks) of a process, or -1 when it cannot be read or does not exist.
+    public static long Created(uint pid)
+    {
+        IntPtr handle = OpenProcess(0x1000, false, pid);
+        if (handle == IntPtr.Zero) { return -1; }
+        try
+        {
+            long created, exited, kernel, user;
+            if (!GetProcessTimes(handle, out created, out exited, out kernel, out user)) { return -1; }
+            return created;
+        }
+        finally { CloseHandle(handle); }
+    }
+
+    private static uint Active(IntPtr job)
+    {
+        ACCOUNTING info = new ACCOUNTING();
+        uint returned;
+        if (!QueryInformationJobObject(job, 1, ref info, (uint)Marshal.SizeOf(typeof(ACCOUNTING)), out returned)) { return 0xFFFFFFFF; }
+        return info.ActiveProcesses;
+    }
+
+    // Open the named job (terminate + query rights only), end it, and read its accounting until no process
+    // is left. ABSENT (error 2) means no handle to the job exists any more.
+    public static string KillJob(string name)
+    {
+        IntPtr job = OpenJobObjectW(0x000C, false, name);
+        if (job == IntPtr.Zero) { return Marshal.GetLastWin32Error() == 2 ? "ABSENT" : "OPEN_FAILED"; }
+        try
+        {
+            if (!TerminateJobObject(job, 1)) { return "TERMINATE_FAILED"; }
+            for (int i = 0; i < 100; i++)
+            {
+                uint active = Active(job);
+                if (active == 0) { return "TERMINATED"; }
+                if (active == 0xFFFFFFFF) { return "QUERY_FAILED"; }
+                Thread.Sleep(100);
+            }
+            return "ACTIVE_REMAIN";
+        }
+        finally { CloseHandle(job); }
+    }
+}
+"""
+
+# The last resort: power the lab guest off from the Hyper-V host. A separate constant script, so that the
+# host script (and the transport) never carry a cmdlet that changes VM state.
+_VM_OFF_SCRIPT = _COMMON_HEAD + r"""
+try {
+    Mark 'decode'
+    $json = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($RequestB64))
+    $req = $json | ConvertFrom-Json
+    $script:Op = [string] $req.op
+    if ($script:Op -ne 'vm_off') { Fail 'UNKNOWN_OPERATION' }
+
+    Mark 'vm'
+    $found = @(Get-VM -ErrorAction Stop | Where-Object { $_.Name -eq [string] $req.vm })
+    if ($found.Count -eq 0) { Fail 'VM_NOT_FOUND' }
+    if ($found.Count -gt 1) { Fail 'VM_NOT_UNIQUE' }
+    $id = $found[0].Id
+
+    Mark 'stop'
+    Stop-VM -VM $found[0] -TurnOff -Force -ErrorAction Stop
+    $after = @(Get-VM -ErrorAction Stop | Where-Object { $_.Id -eq $id })
+    if ($after.Count -ne 1) { Fail 'VM_NOT_FOUND' }
+    $script:Data['vm_state'] = $after[0].State.ToString()
+    if ($script:Data['vm_state'] -ne 'Off') { Fail 'VM_NOT_OFF' }
+
+    Emit $true $null
+    exit 0
+}
+catch {
+    Emit $false (ErrInfo $_)
+    exit 1
 }
 """
 
@@ -396,6 +595,8 @@ public static class LrNative
     public static extern IntPtr GetCurrentProcess();
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CancelIoEx(IntPtr hFile, IntPtr lpOverlapped);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetProcessTimes(IntPtr hProcess, out long created, out long exited, out long kernel, out long user);
 }
 
 // Limit() moves the moment the target is killed EARLIER, never later, and the moment this process
@@ -702,6 +903,7 @@ public sealed class LrRun : IDisposable, LrClientGuard
     private LrPump _errPump;
     private long _memory;
     public int Pid;
+    public long Created;
     public bool InJob;
     public bool LimitsApplied;
     public long ExitCode;
@@ -760,6 +962,8 @@ public sealed class LrRun : IDisposable, LrClientGuard
             run._process = pi.hProcess;
             run._thread = pi.hThread;
             run.Pid = pi.dwProcessId;
+            long exited, kernel, user;
+            if (!LrNative.GetProcessTimes(pi.hProcess, out run.Created, out exited, out kernel, out user)) { throw Fail("PROCESS_TIMES_FAILED"); }
             LrNative.CloseHandle(outWrite); outWrite = IntPtr.Zero;
             LrNative.CloseHandle(errWrite); errWrite = IntPtr.Zero;
             LrNative.CloseHandle(nul); nul = IntPtr.Zero;
@@ -786,12 +990,17 @@ public sealed class LrRun : IDisposable, LrClientGuard
         }
     }
 
-    public void AssignToJob(long memoryBytes)
+    // The job has a name of its own, known to the host, so that the host can end it from a new session if
+    // this agent stops answering. A job that already exists under that name is not ours: refused.
+    public void AssignToJob(long memoryBytes, string jobName)
     {
         if (_job != IntPtr.Zero) { throw new LrFail("JOB_ALREADY_CREATED", 0); }
         if (memoryBytes <= 0) { throw new LrFail("MEMORY_LIMIT_INVALID", 0); }
-        IntPtr job = LrNative.CreateJobObjectW(IntPtr.Zero, null);
-        if (job == IntPtr.Zero) { throw Fail("CREATE_JOB_FAILED"); }
+        if (String.IsNullOrEmpty(jobName)) { throw new LrFail("JOB_NAME_INVALID", 0); }
+        IntPtr job = LrNative.CreateJobObjectW(IntPtr.Zero, jobName);
+        int created = Marshal.GetLastWin32Error();
+        if (job == IntPtr.Zero) { throw new LrFail("CREATE_JOB_FAILED", created); }
+        if (created == 183) { LrNative.CloseHandle(job); throw new LrFail("JOB_NAME_EXISTS", created); }
         _job = job;
         _memory = memoryBytes;
         LrNative.JOBOBJECT_EXTENDED_LIMIT_INFORMATION info = new LrNative.JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
@@ -989,6 +1198,8 @@ $TargetPath = [string] $cfg.target_path
 $Cap = [int64] $cfg.output_cap
 $IdleMs = [int] ([int64] $cfg.idle_seconds * 1000)
 $LifetimeMs = [int64] $cfg.lifetime_seconds * 1000
+$JobName = [string] $cfg.job_name
+if ($JobName -cnotmatch '^Global\\liebert-job-[0-9a-f]{32}$') { exit 2 }
 if (($IdleMs -lt 10000) -or ($IdleMs -gt 3600000) -or ($Cap -lt 1) -or ($Cap -gt 1048576)) { exit 2 }
 if (($LifetimeMs -lt 60000) -or ($LifetimeMs -gt 40000000)) { exit 2 }
 # After `resume` the target runs for at most the host's longest allowed wait plus a margin; `wait` narrows it
@@ -1030,14 +1241,14 @@ function RunOp([string] $op, $req) {
         $script:Run = [LrRun]::Create($TargetPath, [System.IO.Path]::GetDirectoryName($TargetPath), $OutFile, $ErrFile, $Cap)
         $script:Server.Guard = $script:Run
         $script:State = 'created'
-        return (OkReply 'create' @{ suspended = $true })
+        return (OkReply 'create' @{ suspended = $true; target_created = [int64] $script:Run.Created })
     }
     if ($null -eq $script:Run) { Fail 'NO_PROCESS' }
     if ($op -ceq 'assign') {
         if ($script:State -cne 'created') { Fail 'BAD_STATE' }
         $mem = [int64] $req.memory_bytes
         if (($mem -lt 1) -or ($mem -gt 2147483648)) { Fail 'MEMORY_LIMIT_INVALID' }
-        $script:Run.AssignToJob($mem)
+        $script:Run.AssignToJob($mem, $JobName)
         $script:Memory = $mem
         $script:State = 'assigned'
         return (OkReply 'assign' @{ assigned = $true })
@@ -1169,8 +1380,12 @@ def _is_text(value: object) -> bool:
     return type(value) is str
 
 
+def _is_filetime(value: object) -> bool:
+    return type(value) is int and 0 < value < 2 ** 63
+
+
 _OK_FIELDS: dict[str, dict[str, Any]] = {
-    "create": {"pid": _is_pid, "suspended": _is_bool},
+    "create": {"pid": _is_pid, "suspended": _is_bool, "target_created": _is_filetime},
     "assign": {"pid": _is_pid, "assigned": _is_bool},
     "verify": {"pid": _is_pid, "in_job": _is_bool, "limits_applied": _is_bool},
     "resume": {"pid": _is_pid, "resumed": _is_bool, "previous_suspend_count": _is_count},
@@ -1230,10 +1445,17 @@ def _parse_agent_reply(text: object, op: str, run_id: str, pid: int | None, max_
 
 
 class _Run:
-    __slots__ = ("vm", "pid", "state", "memory_bytes", "in_job", "limits_applied", "terminated")
+    __slots__ = ("vm", "pid", "state", "memory_bytes", "in_job", "limits_applied", "terminated", "agent_pid",
+                 "agent_created", "target_created", "job_name", "assign_attempted", "resume_attempted")
 
     def __init__(self, vm: str) -> None:
         self.vm = vm
+        self.agent_pid: int | None = None          # who the agent is: process id AND creation time, taken at start
+        self.agent_created: int | None = None
+        self.target_created: int | None = None
+        self.job_name = f"Global\\liebert-job-{uuid.uuid4().hex}"
+        self.assign_attempted = False              # a job may exist (the reply to assign may have been lost)
+        self.resume_attempted = False              # the target may be running (the reply to resume may have been lost)
         self.pid: int | None = None
         self.state = "creating"
         self.memory_bytes: int | None = None
@@ -1257,9 +1479,11 @@ class HypervGuestLauncher:
     """
 
     def __init__(self, transport: HypervTransport, *, step_timeout_s: float | None = None,
-                 idle_seconds: int = _DEFAULT_IDLE_S) -> None:
+                 idle_seconds: int = _DEFAULT_IDLE_S, power_off_fallback: bool = True) -> None:
         if not isinstance(transport, HypervTransport):
             raise TypeError("transport must be a HypervTransport")
+        if type(power_off_fallback) is not bool:
+            raise ValueError("power_off_fallback must be a bool")
         if type(idle_seconds) is not int or not 10 <= idle_seconds <= 3600:
             raise ValueError("idle_seconds must be an int in [10, 3600]")
         default_step = max(float(getattr(transport, "_probe_timeout_s", 90.0)), 120.0)
@@ -1269,6 +1493,7 @@ class HypervGuestLauncher:
         self._transport = transport
         self._step_timeout_s = float(step)
         self._idle_seconds = idle_seconds
+        self._power_off_fallback = power_off_fallback
         self._runs: OrderedDict[str, _Run] = OrderedDict()
 
     def __repr__(self) -> str:  # the credential path is not printed
@@ -1294,17 +1519,22 @@ class HypervGuestLauncher:
             "connect_timeout_ms": int(connect_s * 1000), "reply_timeout_ms": int(reply_s * 1000),
             "max_reply_chars": reply_chars,
         }
-        files: dict[str, str] | None = None
+        files: dict[str, str] = {"native.cs": _HOST_NATIVE_CS}
         script_op = "agent_step"
         if create_target is not None:
             script_op = "agent_create"
-            files = {"agent.ps1": _AGENT_SCRIPT}
+            files["agent.ps1"] = _AGENT_SCRIPT
             extra.update(
                 target_path=create_target, agent_sha256=_agent_sha256(),
                 config_json=json.dumps({"run_id": run_id, "target_path": create_target, "output_cap": MAX_OUTPUT_CAP,
                                         "idle_seconds": self._idle_seconds,
-                                        "lifetime_seconds": self._lifetime_seconds()}, separators=(",", ":")),
+                                        "lifetime_seconds": self._lifetime_seconds(),
+                                        "job_name": run.job_name}, separators=(",", ":")),
             )
+        else:
+            if run.agent_pid is None or run.agent_created is None:   # nobody to talk to: the agent was never identified
+                return None, _refusal("AGENT_IDENTITY_UNKNOWN", error_class="UNKNOWN", last_phase=None, _may_exist=True)
+            extra.update(agent_pid=run.agent_pid, agent_created=run.agent_created)
         phases, body, failure = self._transport._run_script(
             script_op, run.vm, extra, host_timeout_s, script=_HOST_SCRIPT, script_name="launcher.ps1",
             result_schema=_RESULT_SCHEMA, known_phases=_PHASES, extra_files=files,
@@ -1315,6 +1545,8 @@ class HypervGuestLauncher:
             return None, _refusal(failure[1] if _CODE.fullmatch(failure[1]) else "TRANSPORT_FAILURE",
                                   error_class=failure[0], last_phase=last, _may_exist=may_exist)
         assert body is not None
+        if create_target is not None:
+            self._note_identity(run, body.get("data"))      # kept even from a failed start: the agent may be running
         if body["ok"] is False:
             error_class, reason = self._transport._failure_of(body)
             cleaned = _clean_failure(body.get("failure"))
@@ -1323,9 +1555,14 @@ class HypervGuestLauncher:
             may_exist = not (body.get("phase") in _PRE_CALL_PHASES or reason == "AGENT_NOT_REACHABLE")
             return None, _refusal(reason, error_class=error_class, last_phase=body.get("phase"), _may_exist=may_exist)
         data = body["data"]
-        if set(data) != {"vm_state", "reply"} or data.get("vm_state") != "Running":
+        keys = set(data)
+        shape_ok = keys == {"vm_state", "reply"} or (
+            create_target is not None and keys == {"vm_state", "reply", "agent_pid", "agent_created"})
+        if not shape_ok or data.get("vm_state") != "Running":
             return None, _refusal("LAUNCHER_RESULT_DATA_UNEXPECTED", error_class="UNKNOWN", last_phase=last,
                                   _may_exist=True)
+        if create_target is not None and (run.agent_pid is None or run.agent_created is None):
+            return None, _refusal("AGENT_IDENTITY_UNKNOWN", error_class="UNKNOWN", last_phase=last, _may_exist=True)
         reply, problem = _parse_agent_reply(data.get("reply"), op, run_id, run.pid, reply_chars)
         if reply is None:
             return None, _refusal(problem or "AGENT_REPLY_INVALID", error_class="UNKNOWN", last_phase=last,
@@ -1334,6 +1571,15 @@ class HypervGuestLauncher:
             return None, _refusal("AGENT_" + reply["code"], error_class="UNKNOWN", last_phase=last,
                                   win32_error=reply["win32_error"], _may_exist=False)
         return reply, None
+
+    @staticmethod
+    def _note_identity(run: _Run, data: object) -> None:
+        """Remember who the agent is, once, from the script's own data (process id and creation time)."""
+        if run.agent_pid is not None or not isinstance(data, dict):
+            return
+        pid, created = data.get("agent_pid"), data.get("agent_created")
+        if _is_pid(pid) and _is_filetime(created):
+            run.agent_pid, run.agent_created = pid, created
 
     def _known(self, vm: object, run_id: object, states: tuple[str, ...]) -> _Run | dict[str, Any]:
         """The run record for this step, or the refusal that stops it before any guest call."""
@@ -1414,7 +1660,7 @@ class HypervGuestLauncher:
         assert reply is not None
         if reply["suspended"] is not True:
             return _refusal("AGENT_REPORTED_NOT_SUSPENDED", run_id=run_id)
-        run.pid, run.state = reply["pid"], "created"
+        run.pid, run.state, run.target_created = reply["pid"], "created", reply["target_created"]
         return {"ok": True, "run_id": run_id, "pid": run.pid, "suspended": True}
 
     def _assign(self, vm: str, run_id: str, limits: Mapping[str, Any]) -> dict[str, Any]:
@@ -1424,6 +1670,7 @@ class HypervGuestLauncher:
         memory = limits.get("memory_bytes") if isinstance(limits, Mapping) else None
         if type(memory) is not int or not 0 < memory <= MAX_MEMORY_BYTES:
             return _refusal("MEMORY_LIMIT_OUT_OF_RANGE", run_id=run_id)
+        run.assign_attempted = True                    # from here a job may exist, whatever the reply says
         reply, refusal = self._step(run_id, run, "assign", {"memory_bytes": memory})
         if refusal is not None:
             return refusal
@@ -1450,6 +1697,7 @@ class HypervGuestLauncher:
         run = self._known(vm, run_id, ("verified",))   # only after a verify that said both true
         if isinstance(run, dict):
             return run
+        run.resume_attempted = True                    # from here the target may be running, whatever the reply says
         reply, refusal = self._step(run_id, run, "resume", {})
         if refusal is not None:
             return refusal
@@ -1482,18 +1730,70 @@ class HypervGuestLauncher:
         if isinstance(run, dict):
             return run
         last: dict[str, Any] = _refusal("TERMINATE_NOT_ATTEMPTED", run_id=run_id)
-        for _ in range(_TERMINATE_ATTEMPTS):           # a failed call is retried; a negative answer is not
-            reply, refusal = self._step(run_id, run, "terminate", {})
-            if refusal is not None:
-                last = refusal
-                continue
-            assert reply is not None
-            if reply["terminated"] is not True:
-                return _refusal("AGENT_TERMINATION_NOT_CONFIRMED", run_id=run_id, pid=reply["pid"], terminated=False)
-            run.terminated, run.state = True, "terminated"
-            run.pid = run.pid if run.pid is not None else reply["pid"]
-            return {"ok": True, "run_id": run_id, "pid": reply["pid"], "terminated": True}
-        return last
+        if run.agent_pid is None:
+            last = _refusal("AGENT_IDENTITY_UNKNOWN", run_id=run_id)   # no agent is known: only the host's ways remain
+        else:
+            for _ in range(_TERMINATE_ATTEMPTS):       # a failed call is retried; a negative answer is not
+                reply, refusal = self._step(run_id, run, "terminate", {})
+                if refusal is not None:
+                    last = refusal
+                    continue
+                assert reply is not None
+                if reply["terminated"] is not True:
+                    last = _refusal("AGENT_TERMINATION_NOT_CONFIRMED", run_id=run_id, pid=reply["pid"], terminated=False)
+                    break
+                run.terminated, run.state = True, "terminated"
+                run.pid = run.pid if run.pid is not None else reply["pid"]
+                return {"ok": True, "run_id": run_id, "pid": reply["pid"], "terminated": True,
+                        "termination_path": "AGENT"}
+        # The agent did not confirm: it may be frozen, gone or replaced. Nothing it says is needed from here.
+        backup = self._terminate_from_outside(vm, run_id, run)
+        return backup if backup is not None else last
+
+    def _terminate_from_outside(self, vm: str, run_id: str, run: _Run) -> dict[str, Any] | None:
+        """End the run without the agent: the named job from a new session, then (only for a target that may
+        have run, and only if allowed) the VM itself. A confirmation is a fact the host read, not a reply."""
+        if not run.assign_attempted:
+            return None                                # no job exists yet; the target was never resumed
+        state, alive = self._job_kill(vm, run)
+        proven = (state == "TERMINATED" and alive is not True) or (
+            state == "ABSENT" and alive is False)      # an absent job proves nothing unless the target is seen gone
+        if proven:
+            path, reason = "HOST_JOB_KILL", None
+        elif run.resume_attempted and self._power_off_fallback and self._vm_off(vm):
+            path, reason = "VM_TURNED_OFF", _POWER_OFF_REASON
+        else:
+            return None
+        run.terminated, run.state = True, "terminated"
+        done: dict[str, Any] = {"ok": True, "run_id": run_id, "pid": run.pid, "terminated": True,
+                                "termination_path": path}
+        if reason is not None:
+            done["termination_reason"] = reason
+        return done
+
+    def _job_kill(self, vm: str, run: _Run) -> tuple[str | None, bool | None]:
+        """``(job state, target still alive)`` read from a session of its own, or ``(None, None)``."""
+        extra = {"job_name": run.job_name, "target_pid": run.pid or 0, "target_created": run.target_created or 0}
+        _, body, failure = self._transport._run_script(
+            "job_kill", vm, extra, self._step_timeout_s, script=_HOST_SCRIPT, script_name="launcher.ps1",
+            result_schema=_RESULT_SCHEMA, known_phases=_PHASES, extra_files={"native.cs": _HOST_NATIVE_CS},
+            max_output_chars=_RESULT_OVERHEAD_CHARS)
+        if failure is not None or body is None or body["ok"] is not True:
+            return None, None
+        data = body["data"]
+        state, alive = data.get("job_state"), data.get("target_alive")
+        if (set(data) != {"vm_state", "job_state", "target_alive"} or data.get("vm_state") != "Running"
+                or type(state) is not str or state not in _JOB_STATES or not (alive is None or type(alive) is bool)):
+            return None, None
+        return state, alive
+
+    def _vm_off(self, vm: str) -> bool:
+        """Stop-VM -TurnOff through the transport's plumbing; True only when the VM reads ``Off`` afterwards."""
+        _, body, failure = self._transport._run_script(
+            "vm_off", vm, {}, self._step_timeout_s, script=_VM_OFF_SCRIPT, script_name="vmoff.ps1",
+            result_schema=_RESULT_SCHEMA, known_phases=_PHASES, max_output_chars=_RESULT_OVERHEAD_CHARS)
+        return (failure is None and body is not None and body["ok"] is True
+                and body["data"] == {"vm_state": "Off"})
 
     def _collect(self, vm: str, run_id: str, max_bytes: int) -> dict[str, Any]:
         run = self._known(vm, run_id, ("terminated",))  # output is final only after the job is gone
