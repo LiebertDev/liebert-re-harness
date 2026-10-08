@@ -46,8 +46,8 @@ established is a refusal, never a pass):
 NOT ENFORCED by the gate itself, and reported as not verified (``isolation_verified: false``)
 unless an attestation says otherwise: an isolated, single-use guest; a known snapshot and
 rollback path; network off or allow-listed. An operation that EXECUTES a sample or instruments a
-process (``execute_sample``, ``launch_sample``, ``frida_trace``, ``frida_attach``,
-``frida_spawn``) is refused with ``ISOLATION_REQUIRED`` whatever else is supplied, UNLESS the
+process (``execute_sample``, ``launch_sample``, ``debugger_run``, ``frida_trace``,
+``frida_attach``, ``frida_spawn``) is refused with ``ISOLATION_REQUIRED`` whatever else is supplied, UNLESS the
 caller names a measurement file (``guest_measurement_path``, an explicit argument: no environment
 variable, no default location) and ``liebert_re.dynamic.guest_attestation.GuestAttestation.admit``
 judges it ``VERIFIED``: fresh, the VM's adapters only on Private switches with no host adapter, a
@@ -87,7 +87,7 @@ _MAX_MEASUREMENT_BYTES = 1024 ** 2
 
 # What each operation does to a live process. Anything not listed is refused.
 OBSERVE_OWNED = frozenset({"pe_sieve_scan"})
-NEEDS_ISOLATION = frozenset({"execute_sample", "launch_sample", "frida_trace", "frida_attach", "frida_spawn"})
+NEEDS_ISOLATION = frozenset({"execute_sample", "launch_sample", "debugger_run", "frida_trace", "frida_attach", "frida_spawn"})
 
 _UNVERIFIED = {
     "isolated_guest": "no VERIFIED guest attestation was supplied; a single-use, verified isolated guest cannot be confirmed",
