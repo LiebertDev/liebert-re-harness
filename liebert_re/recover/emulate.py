@@ -903,6 +903,10 @@ class _Refusal(Exception):
         self.status, self.error, self.detail = status, error, detail
 
 
+class _TotalBudgetSpent(Exception):
+    """A variant was prepared, but the request's total time was gone before its first instruction."""
+
+
 class _WriteLog:
     """Which bytes the emulated code wrote, and which of those it later executed.
 
@@ -1315,7 +1319,8 @@ class _Engine:
 
         This is the "rebuild from a clean start" choice, not a snapshot restore: every variant maps the image anew
         from the gated bytes, so nothing a variant wrote can reach the next (there is no state to reset and none to
-        forget). The cost is parsing and mapping once per variant, paid outside the per-variant time bound."""
+        forget). The cost is parsing and mapping once per variant, paid outside the per-variant time bound but
+        inside the total one: the total is checked again after that preparation (see ``_run_one``)."""
         import gc
         job = self.job
         total = job["total_timeout_s"]
@@ -1328,9 +1333,14 @@ class _Engine:
                 rows.append({**row, "ran": False, "completion": None, "stop_reason": None,
                              "not_run_because": "TOTAL_TIME_BUDGET_EXHAUSTED"})
                 continue
-            budget = min(job["timeout_s"], remaining)
+            budget, granted = min(job["timeout_s"], remaining), []
             try:
-                full = self._run_one(data, run_dir, payload, target, budget, "v%02d_" % index, VARIANT_REGION_CAP)
+                full = self._run_one(data, run_dir, payload, target, budget, "v%02d_" % index, VARIANT_REGION_CAP,
+                                     began + total, granted)
+            except _TotalBudgetSpent:       # preparing this variant used up what the total had left
+                rows.append({**row, "ran": False, "completion": None, "stop_reason": None,
+                             "not_run_because": "TOTAL_TIME_BUDGET_EXHAUSTED"})
+                continue
             except _Refusal as exc:
                 raise _Refusal(exc.status, exc.error, "variant %d: %s" % (index, exc.detail)) from None
             if frame is None:
@@ -1353,7 +1363,7 @@ class _Engine:
                           "calls": stub_calls[:VARIANT_STUB_CALLS_LISTED],
                           "calls_omitted": max(len(stub_calls) - VARIANT_STUB_CALLS_LISTED, 0)},
                 "elapsed_s": full["elapsed_s"], "mapped_bytes": full["mapped_bytes"],
-                "budget_s": round(budget, 3), "budget_limited_by_total": budget < job["timeout_s"]})
+                "budget_s": round(granted[0], 3), "budget_limited_by_total": granted[0] < job["timeout_s"]})
             files.extend(full["dump_files"])
             for item in full["limitations"]:
                 if item["code"] not in {x["code"] for x in limitations}:
@@ -1372,9 +1382,13 @@ class _Engine:
             "total_budget_exhausted": len(ran) < len(rows),
             "total_elapsed_s": round(time.monotonic() - began, 3), "variants_basis": _VARIANTS_BASIS}
 
-    def _run_one(self, data, run_dir, payload, target, budget, prefix, region_cap):
+    def _run_one(self, data, run_dir, payload, target, budget, prefix, region_cap, total_deadline=None, granted=None):
         """One emulation from a clean start. ``payload`` (or None) is placed per ``target`` before the first
-        instruction; ``budget`` is this run's time bound in seconds; ``prefix`` names its dump files."""
+        instruction; ``budget`` is this run's time bound in seconds; ``prefix`` names its dump files.
+        ``total_deadline`` (variant runs) is the monotonic time the whole request must end by. Parsing and mapping
+        take time before the first instruction, so the bound is applied again once they are done: the run's deadline
+        is the earlier of its own and the total one, and a run whose total time is already spent raises
+        ``_TotalBudgetSpent`` instead of starting. ``granted``, if a list, receives the budget actually given."""
         import numpy as np
         from unicorn import (UC_ARCH_X86, UC_HOOK_CODE, UC_HOOK_INSN, UC_HOOK_INSN_INVALID, UC_HOOK_INTR,
                              UC_HOOK_MEM_FETCH_PROT, UC_HOOK_MEM_FETCH_UNMAPPED, UC_HOOK_MEM_READ, UC_HOOK_MEM_READ_PROT,
@@ -1470,6 +1484,12 @@ class _Engine:
         stops = frozenset(job["stop_at"])
         max_n = job["max_instructions"]
         t0 = time.monotonic()
+        if total_deadline is not None:
+            if t0 >= total_deadline:
+                raise _TotalBudgetSpent()
+            budget = min(budget, total_deadline - t0)
+        if granted is not None:
+            granted.append(budget)
         deadline = t0 + budget
         book.deadline = deadline
         ring = [0] * 64

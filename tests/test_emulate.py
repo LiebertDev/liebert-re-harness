@@ -1489,22 +1489,92 @@ def test_the_instruction_bound_applies_to_each_variant_not_to_the_request(sandbo
 SPIN = asm("cmp byte ptr [rcx], 0; jne spin; ret; spin: jmp spin")
 
 
-def test_the_time_bound_applies_to_each_variant_and_the_total_bound_to_all_of_them(sandbox):
+def slow_preparation(monkeypatch, skews):
+    """A controllable clock for the variant runner, and a parse step that moves it. ``skews`` maps the 0-based
+    preparation (one per variant) to the seconds that preparation appears to take."""
+    skew, real, calls = [0.0], time.monotonic, [0]
+    original = emulate._Engine.parse_pe
+
+    def slow_parse(data):
+        skew[0] += skews.get(calls[0], 0.0)
+        calls[0] += 1
+        return original(data)
+
+    monkeypatch.setattr(time, "monotonic", lambda: real() + skew[0])
+    monkeypatch.setattr(emulate._Engine, "parse_pe", staticmethod(slow_parse))
+    return skew
+
+
+def test_a_variant_whose_preparation_outlasts_the_total_budget_is_not_run(sandbox, monkeypatch):
+    """Variant 1 is started with budget left, then its parse and map take longer than the whole total. The run
+    check at the top of the loop is stale by then: the variant must be reported as not run, not run in full."""
+    path = build(sandbox, SPIN)
+    slow_preparation(monkeypatch, {1: 1e6})
+    result = run_in_process(path, input_variants=["00", "01", "00"], input_at="reg:rcx", max_instructions=5000,
+                            timeout_s=100, total_timeout_s=50)
+    first, second, third = result["variants"]
+    assert first["ran"] is True and first["stop_reason"] == "RETURNED"
+    for row in (second, third):
+        assert row["ran"] is False and row["not_run_because"] == "TOTAL_TIME_BUDGET_EXHAUSTED"
+        assert row["stop_reason"] is None and row["completion"] is None and "registers" not in row
+    assert second["input"]["sha256"] == hashlib.sha256(b"").hexdigest()
+    assert result["variants_run"] == 1 and result["variants_not_run"] == 2 and result["total_budget_exhausted"] is True
+
+
+def test_a_variant_deadline_never_passes_the_total_deadline(sandbox, monkeypatch):
+    """Preparation takes 40 s of a 50 s total with 100 s per variant: what is left after it, not what was left
+    before it, bounds the variant."""
+    path = build(sandbox, SPIN)
+    slow_preparation(monkeypatch, {0: 40.0})
+    result = run_in_process(path, input_variants=["01"], input_at="reg:rcx", max_instructions=5000,
+                            timeout_s=100, total_timeout_s=50)
+    row = result["variants"][0]
+    assert row["ran"] is True and row["budget_limited_by_total"] is True
+    assert 0 < row["budget_s"] <= 10.0 + 1e-6, row["budget_s"]
+
+
+def test_the_time_bound_applies_to_each_variant_and_the_total_bound_to_all_of_them(sandbox, monkeypatch):
+    """The same behaviour as the wall-clock test below, on a clock the test moves: every instruction-hook check
+    sees time pass, so no machine load can change which variants run."""
+    path = build(sandbox, SPIN)
+    real, ticks = time.monotonic, [0.0]
+
+    def clock():
+        ticks[0] += 0.001
+        return real() * 0 + ticks[0]
+
+    monkeypatch.setattr(time, "monotonic", clock)
+    result = run_in_process(path, input_variants=["01", "01", "01"], input_at="reg:rcx", max_instructions=50_000_000,
+                            timeout_s=1, total_timeout_s=1.5)
+    rows = result["variants"]
+    assert rows[0]["stop_reason"] == "TIMEOUT" and rows[0]["completion"] == "TIMEOUT"
+    assert rows[0]["budget_s"] == 1.0 and rows[0]["budget_limited_by_total"] is False
+    assert rows[1]["ran"] is True and rows[1]["stop_reason"] == "TIMEOUT" and rows[1]["budget_limited_by_total"] is True
+    assert rows[1]["budget_s"] < 0.5
+    assert rows[-1]["ran"] is False and rows[-1]["not_run_because"] == "TOTAL_TIME_BUDGET_EXHAUSTED"
+    assert rows[-1]["stop_reason"] is None and rows[-1]["completion"] is None
+    assert rows[-1]["input"]["sha256"] == hashlib.sha256(b"").hexdigest()
+    assert result["total_budget_exhausted"] is True and result["variants_not_run"] == 1
+    assert result["variants_run"] + result["variants_not_run"] == 3 == result["variants_total"]
+    assert result["total_budget_s"] == 1.5
+
+
+def test_the_time_bounds_hold_on_the_real_clock_with_wide_margins(sandbox):
+    """Only what a wall clock can show: the request returns, a timed-out variant is a TIMEOUT, and the total
+    stops the later ones. No exact budget or count is asserted, so a loaded machine cannot fail it."""
     path = build(sandbox, SPIN)
     started = time.monotonic()
     result = emulate_json(path, input_variants=["01", "01", "01"], input_at="reg:rcx", max_instructions=50_000_000,
                           timeout_s=1, total_timeout_s=1.5)
     elapsed = time.monotonic() - started
     rows = result["variants"]
-    assert rows[0]["stop_reason"] == "TIMEOUT" and rows[0]["completion"] == "TIMEOUT"
-    assert rows[0]["budget_s"] == 1.0 and rows[0]["budget_limited_by_total"] is False
-    assert rows[-1]["ran"] is False and rows[-1]["not_run_because"] == "TOTAL_TIME_BUDGET_EXHAUSTED"
-    assert rows[-1]["stop_reason"] is None and rows[-1]["completion"] is None
-    assert rows[-1]["input"]["sha256"] == hashlib.sha256(b"\x01").hexdigest()
-    assert result["total_budget_exhausted"] is True and result["variants_not_run"] >= 1
-    assert result["variants_run"] + result["variants_not_run"] == 3 == result["variants_total"]
-    assert all(r["budget_limited_by_total"] for r in rows if r["ran"] and r["index"] > 0)
-    assert result["total_budget_s"] == 1.5 and elapsed < 20
+    assert rows[0]["stop_reason"] == "TIMEOUT"
+    assert result["variants_run"] + result["variants_not_run"] == 3 and result["total_budget_exhausted"] is True
+    assert all(r["not_run_because"] == "TOTAL_TIME_BUDGET_EXHAUSTED" for r in rows if not r["ran"])
+    assert result["total_budget_s"] == 1.5 and elapsed < 60
+
+
+def test_the_default_total_time_bound_is_the_variant_bound_times_the_count_capped(sandbox):
     # the default total is the per-variant bound times the count, capped at the ceiling
     quick = emulate_json(check_image(sandbox), input_variants=["42", "42"], input_at="reg:rcx", timeout_s=7)
     assert quick["total_budget_s"] == 14.0 and quick["bounds"]["total_timeout_s"] == 14.0
