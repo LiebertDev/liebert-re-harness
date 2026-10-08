@@ -165,8 +165,11 @@ def evaluate_record(record: dict, *, stored_content: str | None = None, workspac
 
     ``trusted: True`` means the record's declared checksum matches a fresh
     recomputation, its declared source/invocation bookkeeping is present,
-    and (when checked) its stored content and target file still hash to
-    what the record recorded. It does NOT mean the record was
+    and its stored content and (when the record pins a target hash) target
+    file still hash to what the record recorded. A check whose input was not
+    supplied (``stored_content``; ``workspace`` for a hash-pinned target) did
+    not run, so the result is ``UNVERIFIABLE`` and ``trusted`` is False --
+    never ``CURRENT``. It does NOT mean the record was
     cryptographically authenticated against a deliberate forger -- see the
     module docstring. A hand-constructed record with a self-consistent
     checksum passes exactly the same as a genuine one; that is a known,
@@ -188,6 +191,14 @@ def evaluate_record(record: dict, *, stored_content: str | None = None, workspac
         return {"trusted": False, "status": "CONTENT_HASH_MISMATCH", "reason": "stored evidence content changed"}
     target_hash = provenance.get("target_sha256")
     target = str(provenance.get("target") or record.get("target") or "")
+    # A check that was not run is not a check that passed: CURRENT is only returned once the
+    # content comparison ran and, where the record pins a target hash, the target comparison ran.
+    # Checks that can run still run first, so a detectable mismatch is never hidden by a skipped one.
+    skipped = []
+    if stored_content is None:
+        skipped.append("stored_content")
+    if target_hash and (workspace is None or not target):
+        skipped.append("target_file")
     if target_hash and workspace is not None and target:
         candidate = Path(target)
         try:
@@ -200,4 +211,9 @@ def evaluate_record(record: dict, *, stored_content: str | None = None, workspac
             return {"trusted": False, "status": "TARGET_MISSING", "reason": target}
         if current != target_hash:
             return {"trusted": False, "status": "STALE_TARGET", "reason": target, "expected": target_hash, "current": current}
+    if skipped:
+        return {
+            "trusted": False, "status": "UNVERIFIABLE", "checks_not_performed": skipped,
+            "reason": "freshness checks could not run: " + ", ".join(skipped),
+        }
     return {"trusted": True, "status": "CURRENT", "reason": None}

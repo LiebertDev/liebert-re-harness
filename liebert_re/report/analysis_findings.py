@@ -11,7 +11,9 @@ import json
 from typing import Any, Iterable
 
 
-HYPOTHESIS_STATUSES = frozenset({"SUPPORTED", "NEEDS_MORE_ANALYSIS", "REFUTED", "UNSUPPORTED"})
+# UNVERIFIED: evidence IDs are cited but were never resolved against an evidence index, so
+# SUPPORTED (which means "the cited evidence exists") cannot be claimed.
+HYPOTHESIS_STATUSES = frozenset({"SUPPORTED", "UNVERIFIED", "NEEDS_MORE_ANALYSIS", "REFUTED", "UNSUPPORTED"})
 COUNTER_KINDS = frozenset({
     "CALLER_VALIDATION", "WRAPPER_VALIDATION", "BOUNDS_CHECK", "ACL_CHECK",
     "TOKEN_CHECK", "PRIVILEGE_CHECK", "SIGNATURE_VALIDATION", "INTEGRITY_CHECK",
@@ -29,6 +31,19 @@ def _id(prefix: str, *parts: object) -> str:
     return prefix + hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
 
 
+def _evidence_binding(support: Iterable[str], known_evidence_ids: Iterable[str] | None) -> tuple[str, list[str]]:
+    """``(binding, unresolved)``: NONE (nothing cited), UNCHECKED (no index to check
+    against), UNRESOLVED (some cited ID is not in the index) or VERIFIED."""
+    cited = sorted({str(item) for item in support if str(item)})
+    if not cited:
+        return "NONE", []
+    if known_evidence_ids is None:
+        return "UNCHECKED", []
+    known = {str(item) for item in known_evidence_ids}
+    unresolved = [item for item in cited if item not in known]
+    return ("UNRESOLVED", unresolved) if unresolved else ("VERIFIED", [])
+
+
 def build_security_hypothesis(
     *, artifact_id: str, category: str, function_id: str = "UNKNOWN",
     location: str = "UNKNOWN", observed_pattern: str,
@@ -37,8 +52,14 @@ def build_security_hypothesis(
     severity: str = "UNKNOWN", remediation: str = "",
     claim_type: str = "", claim_target: str = "", claim_address: Any = None,
     claim_address_kind: str = "va", claim_constant_value: Any = None,
+    known_evidence_ids: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    """``claim_type``/``claim_target``/``claim_address``/``claim_address_kind``/
+    """``known_evidence_ids`` is the evidence index the cited ``supporting_evidence`` is
+    resolved against. ``SUPPORTED`` requires every cited ID to be in it; with no index
+    (``None``) the status is ``UNVERIFIED``, and an ID missing from the index leaves the
+    hypothesis at ``NEEDS_MORE_ANALYSIS``.
+
+    ``claim_type``/``claim_target``/``claim_address``/``claim_address_kind``/
     ``claim_constant_value`` are additive, opt-in (GAP-061 step 4): passing
     none of them leaves every existing caller's finding byte-for-byte
     unchanged. Setting ``claim_type="constant_at_address"`` (with
@@ -58,6 +79,13 @@ def build_security_hypothesis(
     severity_norm = str(severity or "UNKNOWN").upper()
     if severity_norm not in FINDING_SEVERITIES:
         severity_norm = "UNKNOWN"
+    binding, _unresolved = _evidence_binding(support, known_evidence_ids)
+    if missing or binding in {"NONE", "UNRESOLVED"}:
+        status, confidence = "NEEDS_MORE_ANALYSIS", "LOW"
+    elif binding == "UNCHECKED":
+        status, confidence = "UNVERIFIED", "LOW"
+    else:
+        status, confidence = "SUPPORTED", "MEDIUM"
     return {
         "schema_version": 1,
         "hypothesis_id": hypothesis_id,
@@ -69,8 +97,8 @@ def build_security_hypothesis(
         "supporting_evidence": support,
         "counter_evidence": [],
         "missing_evidence": missing,
-        "status": "NEEDS_MORE_ANALYSIS" if missing or not support else "SUPPORTED",
-        "confidence": "LOW" if missing or not support else "MEDIUM",
+        "status": status,
+        "confidence": confidence,
         "validation_required": True,
         "confirmed_vulnerability": False,
         "facet": facet_norm,
@@ -120,7 +148,10 @@ def verify_counter_evidence(
     if accepted:
         result["status"] = "REFUTED"
         result["confidence"] = "HIGH" if len(accepted) > 1 else "MEDIUM"
-    elif result.get("supporting_evidence") and not result.get("missing_evidence"):
+    elif (
+        result.get("supporting_evidence") and not result.get("missing_evidence")
+        and _evidence_binding(result["supporting_evidence"], known)[0] == "VERIFIED"
+    ):
         result["status"] = "SUPPORTED"
         result["confidence"] = "MEDIUM"
     else:
@@ -130,7 +161,7 @@ def verify_counter_evidence(
     return result
 
 
-def validate_finding(hypothesis: dict[str, Any]) -> dict[str, Any]:
+def validate_finding(hypothesis: dict[str, Any], *, known_evidence_ids: Iterable[str] | None = None) -> dict[str, Any]:
     issues = []
     status = str(hypothesis.get("status") or "").upper()
     if status not in HYPOTHESIS_STATUSES:
@@ -140,20 +171,63 @@ def validate_finding(hypothesis: dict[str, Any]) -> dict[str, Any]:
             issues.append(f"MISSING_{field.upper()}")
     if status == "SUPPORTED" and not hypothesis.get("supporting_evidence"):
         issues.append("SUPPORTED_WITHOUT_EVIDENCE")
+    binding, unresolved = _evidence_binding(hypothesis.get("supporting_evidence") or [], known_evidence_ids)
+    if status == "SUPPORTED" and binding == "UNRESOLVED":
+        issues.append("SUPPORTED_WITH_UNKNOWN_EVIDENCE")
     if status == "REFUTED" and not hypothesis.get("counter_evidence"):
         issues.append("REFUTED_WITHOUT_COUNTER_EVIDENCE")
     if hypothesis.get("confirmed_vulnerability"):
         issues.append("STATIC_CONFIRMATION_FORBIDDEN")
-    return {"ok": not issues, "status": "PASS" if not issues else "FAIL", "issues": issues}
+    return {
+        "ok": not issues, "status": "PASS" if not issues else "FAIL", "issues": issues,
+        "evidence_binding": binding, "unresolved_evidence": unresolved,
+    }
+
+
+def _reproduction_verdict(hypothesis: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    """The reproduction status a report may state, plus a record of any claim it refused.
+
+    ``CONFIRMED`` is accepted only when the hypothesis carries a ``validation_plan`` and
+    ``validation_result`` for this very hypothesis and
+    :func:`exploit_validation.verify_validation_result` confirms them. A bare
+    ``reproduction_status: "CONFIRMED"`` in free JSON is a claim, not a result: it is
+    reported as ``CONFIRMATION_UNVERIFIED`` and never counts as dynamic validation.
+    """
+    claimed = str(hypothesis.get("reproduction_status") or "NOT_EXECUTED")
+    if claimed.strip().upper() != "CONFIRMED":
+        return claimed, None
+    plan, result = hypothesis.get("validation_plan"), hypothesis.get("validation_result")
+    if not isinstance(plan, dict) or not isinstance(result, dict):
+        return "CONFIRMATION_UNVERIFIED", {"claimed": claimed, "verified": False, "reason": "NO_VALIDATION_PLAN_AND_RESULT"}
+    if not hypothesis.get("hypothesis_id") or plan.get("hypothesis_id") != hypothesis.get("hypothesis_id"):
+        return "CONFIRMATION_UNVERIFIED", {"claimed": claimed, "verified": False, "reason": "PLAN_NOT_FOR_THIS_HYPOTHESIS"}
+    from liebert_re.report.exploit_validation import verify_validation_result
+
+    verdict = verify_validation_result(plan, result)
+    if verdict.get("status") != "CONFIRMED":
+        codes = sorted({str(issue.get("code")) for issue in verdict.get("issues") or [] if issue.get("severity") == "REJECT"})
+        return "CONFIRMATION_UNVERIFIED", {"claimed": claimed, "verified": False, "reason": "VERIFIER_REJECTED", "issues": codes}
+    return "CONFIRMED", {"claimed": claimed, "verified": True, "reason": None}
 
 
 def render_finding_report(
     findings: Iterable[dict[str, Any]], *, artifact_hashes: dict[str, str] | None = None,
-    scope_notes: Iterable[str] = (),
+    scope_notes: Iterable[str] = (), known_evidence_ids: Iterable[str] | None = None,
 ) -> dict[str, Any]:
+    known = None if known_evidence_ids is None else {str(item) for item in known_evidence_ids}
     rows = []
     for hypothesis in findings:
-        validation = validate_finding(hypothesis)
+        validation = validate_finding(hypothesis, known_evidence_ids=known)
+        status = hypothesis.get("status")
+        confidence = hypothesis.get("confidence", "LOW")
+        if str(status or "").upper() == "SUPPORTED" and validation["evidence_binding"] != "VERIFIED":
+            # A SUPPORTED label asserts the cited evidence exists. Without an index to check
+            # it against that is unverified; with an index that lacks an ID it is unproven.
+            status = "UNVERIFIED" if validation["evidence_binding"] == "UNCHECKED" else "NEEDS_MORE_ANALYSIS"
+            confidence = "LOW"
+        reproduction_status, reproduction_claim = _reproduction_verdict(hypothesis)
+        if reproduction_claim is not None:
+            validation = {**validation, "reproduction_claim": reproduction_claim}
         facet = str(hypothesis.get("facet") or "UNSPECIFIED").upper()
         if facet not in FINDING_FACETS:
             facet = "UNSPECIFIED"
@@ -171,8 +245,8 @@ def render_finding_report(
             "supporting_evidence": list(hypothesis.get("supporting_evidence") or []),
             "counter_evidence": list(hypothesis.get("counter_evidence") or []),
             "missing_validation": list(hypothesis.get("missing_evidence") or []),
-            "confidence": hypothesis.get("confidence", "LOW"),
-            "status": hypothesis.get("status"),
+            "confidence": confidence,
+            "status": status,
             "validation_required": bool(hypothesis.get("validation_required", True)),
             "facet": facet,
             "attacker_goal": str(hypothesis.get("attacker_goal") or ""),
@@ -180,9 +254,9 @@ def render_finding_report(
             "severity": severity,
             "remediation": str(hypothesis.get("remediation") or ""),
             # "CONFIRMED" is never derived from confirmed_vulnerability (guarded to False by
-            # validate_finding); it only ever arrives here already-set on the hypothesis dict
-            # by a dynamic layer (exploit_validation.verify_validation_result), never invented.
-            "reproduction_status": str(hypothesis.get("reproduction_status") or "NOT_EXECUTED"),
+            # validate_finding) and never taken on the hypothesis dict's word alone: it needs
+            # a plan/result pair that exploit_validation.verify_validation_result confirms.
+            "reproduction_status": reproduction_status,
             "reproduction_ref": hypothesis.get("reproduction_ref"),
             "scope_notes": sorted({str(item) for item in scope_notes}),
             "contract_validation": validation,
@@ -236,7 +310,7 @@ def counter_evidence_verify(hypothesis_json: str, candidates_json: str, known_ev
 
 def finding_report_generate(
     findings_json: str, artifact_hashes_json: str = "{}", scope_notes: list[str] | None = None,
-    evidence: str | None = None,
+    evidence: str | None = None, known_evidence_ids: list[str] | None = None,
 ) -> str:
     """Render the finding report and, when ``evidence`` is supplied, audit its claims.
 
@@ -255,7 +329,9 @@ def finding_report_generate(
         return json.dumps({"ok": False, "status": "INVALID_JSON"})
     if not isinstance(findings, list) or not isinstance(artifact_hashes, dict):
         return json.dumps({"ok": False, "status": "INVALID_SCHEMA"})
-    report = render_finding_report(findings, artifact_hashes=artifact_hashes, scope_notes=scope_notes or ())
+    report = render_finding_report(
+        findings, artifact_hashes=artifact_hashes, scope_notes=scope_notes or (), known_evidence_ids=known_evidence_ids,
+    )
     guard: dict[str, Any] = {
         "checked": False, "state": "NOT_CHECKED", "issues": None, "contains_unproven_claims": None,
         "note": "No evidence text was supplied, so the report's claims were not audited.",

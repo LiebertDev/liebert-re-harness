@@ -301,6 +301,60 @@ class QueryTests(unittest.TestCase):
             self.assertEqual(payload["status"], "CANDIDATE")
 
 
+class UnverifiedEvidenceCannotProveTests(unittest.TestCase):
+    """An evidence_uid nobody resolved must never back a PROVEN claim, and a
+    non-bool ``inferred`` must never be coerced into metadata."""
+
+    FAKE = [{"evidence_uid": "EVX-made-up", "relation": "SUPPORTS"}]
+
+    def _unbound(self, tmp):
+        return ClaimIndex(db_path=tmp / "claims.sqlite", events_root=tmp / "claims_events")
+
+    def test_proven_with_made_up_uid_is_refused_without_an_evidence_store(self):
+        with TemporaryDirectory() as tmp:
+            claims = self._unbound(Path(tmp))
+            with self.assertRaises(ClaimError) as ctx:
+                claims.create_claim("t", "function", "FUN_1", "root_cause", "x", status="PROVEN", initial_evidence=self.FAKE)
+            self.assertEqual(ctx.exception.code, "PROVEN_REQUIRES_EVIDENCE_STORE")
+            self.assertEqual(claims.status()["claims"], 0)
+
+    def test_dispatcher_without_evidence_root_cannot_record_proven(self):
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            payload = json.loads(claim_index(
+                operation="create_claim", target="t", subject_kind="function", subject_value="FUN_1",
+                predicate="root_cause", asserted_value="x", claim_status="PROVEN", initial_evidence=self.FAKE,
+                events_root=str(tmp / "ev"), db_path=str(tmp / "c.sqlite"),
+            ))
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["error"], "PROVEN_REQUIRES_EVIDENCE_STORE")
+
+    def test_candidate_without_store_is_still_recorded_unverified(self):
+        with TemporaryDirectory() as tmp:
+            claims = self._unbound(Path(tmp))
+            result = claims.create_claim("t", "function", "FUN_1", "root_cause", "x", initial_evidence=self.FAKE)
+            self.assertEqual(result["status"], "CANDIDATE")
+
+    def test_proven_with_unresolvable_uid_leaves_no_event_to_resurrect_it(self):
+        with TemporaryDirectory() as tmp:
+            _, _, claims = _make_indices(Path(tmp))
+            with self.assertRaises(ClaimError) as ctx:
+                claims.create_claim("t", "function", "FUN_1", "root_cause", "x", status="PROVEN", initial_evidence=self.FAKE)
+            self.assertEqual(ctx.exception.code, "EVIDENCE_NOT_FOUND")
+            self.assertEqual(list(claims.events_root.rglob("*.json")), [], "a refused claim must not leave an event file")
+            claims.rebuild_from_events()
+            self.assertEqual(claims.claims_for_target("t")["results"], [])
+
+    def test_non_bool_inferred_is_rejected_not_coerced(self):
+        with TemporaryDirectory() as tmp:
+            claims = self._unbound(Path(tmp))
+            for bad in ("false", "true", 0, 1, None, "no"):
+                with self.assertRaises(ClaimError, msg=repr(bad)) as ctx:
+                    claims.create_claim("t", "function", "FUN_1", "root_cause", "x", inferred=bad)
+                self.assertEqual(ctx.exception.code, "INVALID_INFERRED")
+            self.assertEqual(claims.create_claim("t", "function", "FUN_1", "root_cause", "x", inferred=False)["status"], "CANDIDATE")
+
+
 class EvidenceUidSurvivesRebuildTests(unittest.TestCase):
     def test_claim_link_survives_full_evidence_index_rebuild(self):
         """The foundation-of-provenance property, verified directly: a

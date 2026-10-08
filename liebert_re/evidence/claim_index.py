@@ -55,7 +55,10 @@ STATUS AND ITS TRANSITIONS (PROVEN / CANDIDATE / CONTRADICTED / INSUFFICIENT)
   - PROVEN may only be asserted WITH at least one SUPPORTS evidence_uid at
     creation (``PROVEN_REQUIRES_SUPPORTING_EVIDENCE`` otherwise) -- a
     "proven" claim with no evidence link is exactly the failure this module
-    exists to prevent.
+    exists to prevent. The UID must also resolve in a bound evidence store
+    (``PROVEN_REQUIRES_EVIDENCE_STORE`` when none is bound,
+    ``EVIDENCE_NOT_FOUND`` when it does not resolve), checked before anything
+    is written: an unchecked string is not evidence.
   - CONTRADICTED can never be requested as an initial status (it is a
     consequence, not an assertion) -- ``CONTRADICTED_NOT_A_VALID_INITIAL_STATUS``.
   - THE load-bearing rule: any REFUTES evidence link added to a claim --
@@ -493,6 +496,27 @@ class ClaimIndex:
         )
         if status == "PROVEN" and not has_initial_support:
             raise ClaimError("PROVEN_REQUIRES_SUPPORTING_EVIDENCE")
+        if not isinstance(inferred, bool):
+            # bool("false") is True: a text/number flag must never be coerced into
+            # provenance metadata. Only a real bool states whether a claim is inferred.
+            raise ClaimError("INVALID_INFERRED", repr(inferred))
+        if self.evidence_index is None:
+            if status == "PROVEN":
+                # Without a bound evidence store the supplied evidence_uid is only a string
+                # nobody checked, so it cannot back a PROVEN claim. Refused rather than
+                # silently stored as CANDIDATE, so the caller sees the claim was not recorded.
+                raise ClaimError("PROVEN_REQUIRES_EVIDENCE_STORE")
+        else:
+            # Resolve every initial evidence UID BEFORE any event is written. A failure
+            # inside the write block would leave the claim_created event file on disk
+            # (the sqlite rollback does not remove it) and rebuild_from_events would
+            # resurrect the claim -- for PROVEN, with no verified evidence behind it.
+            for entry in initial_evidence:
+                uid = str(entry.get("evidence_uid") or "").strip()
+                if not uid:
+                    raise ClaimError("EVIDENCE_UID_REQUIRED")
+                if self._evidence_summary(uid) is None:
+                    raise ClaimError("EVIDENCE_NOT_FOUND", uid)
 
         claim_uid = _claim_uid()
         with self._write_guard(), self._session() as db:
@@ -502,7 +526,7 @@ class ClaimIndex:
                 "subject_value": norm_subject_value, "predicate": predicate, "predicate_norm": predicate_norm,
                 "asserted_value": asserted_value, "asserted_value_norm": asserted_value_norm,
                 "statement": str(statement or "")[:MAX_STATEMENT_CHARS], "status": status,
-                "inferred": bool(inferred), "source": str(source or ""),
+                "inferred": inferred, "source": str(source or ""),
             })
             self._apply_claim_created(db, create_event)
 

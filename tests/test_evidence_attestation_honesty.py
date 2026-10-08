@@ -168,5 +168,48 @@ class ChecksumDoesNotEstablishAuthenticityTests(unittest.TestCase):
         self.assertEqual(result["status"], "CURRENT")
 
 
+class MissingCheckInputsAreNotCurrentTests(unittest.TestCase):
+    """CURRENT/trusted may only follow checks that actually ran."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=tools_workspace.WORKSPACE)
+        self.workspace = Path(self.temp.name)
+        (self.workspace / "t.bin").write_bytes(b"target bytes")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _record(self, target_sha256=None, target=""):
+        provenance = build_provenance(
+            evidence_id="EV-INPUTS-1", invocation_id="call-1", source_kind="RUNTIME_TOOL",
+            tool="read_file", raw_output="out", stored_content="out", target=target,
+            target_sha256=target_sha256, workspace=self.workspace,
+            project_root=Path(tools_workspace.PROJECT_ROOT), timestamp="2026-09-05T00:00:00+00:00",
+        )
+        return {"evidence_id": "EV-INPUTS-1", "provenance": provenance}
+
+    def test_no_stored_content_is_unverifiable_not_current(self):
+        result = evaluate_record(self._record())
+        self.assertEqual(result["status"], "UNVERIFIABLE")
+        self.assertFalse(result["trusted"])
+        self.assertEqual(result["checks_not_performed"], ["stored_content"])
+
+    def test_hash_pinned_target_without_workspace_is_unverifiable_not_current(self):
+        digest = hashlib.sha256(b"target bytes").hexdigest()
+        result = evaluate_record(self._record(digest, "t.bin"), stored_content="out")
+        self.assertEqual(result["status"], "UNVERIFIABLE")
+        self.assertFalse(result["trusted"])
+        self.assertEqual(result["checks_not_performed"], ["target_file"])
+
+    def test_all_inputs_present_is_current(self):
+        digest = hashlib.sha256(b"target bytes").hexdigest()
+        result = evaluate_record(self._record(digest, "t.bin"), stored_content="out", workspace=self.workspace)
+        self.assertEqual((result["status"], result["trusted"]), ("CURRENT", True))
+
+    def test_a_detectable_stale_target_is_not_hidden_by_a_skipped_check(self):
+        result = evaluate_record(self._record("0" * 64, "t.bin"), workspace=self.workspace)
+        self.assertEqual(result["status"], "STALE_TARGET")
+
+
 if __name__ == "__main__":
     unittest.main()

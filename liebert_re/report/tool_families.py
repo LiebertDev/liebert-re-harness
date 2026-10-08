@@ -486,12 +486,24 @@ def tools_for_context(corpus: str) -> set[str]:
 
 
 def family_catalog(registry_rows: list[dict]) -> list[dict]:
+    """Per-family availability. Only a real ``bool`` ``installed`` counts: ``True`` is
+    available, ``False`` is missing, and anything else (the text ``"false"``, ``1``,
+    ``None`` or an absent key) is ``unknown_tools`` -- never treated as installed."""
     by_name = {row["name"]: row for row in registry_rows}
     output = []
     for family, tools in FAMILIES.items():
-        available = sorted(name for name in tools if by_name.get(name, {}).get("installed"))
-        missing = sorted(name for name in tools if name in by_name and not by_name[name].get("installed"))
-        output.append({"family": family, "available_tools": available, "missing_tools": missing, "status": "READY" if available and not missing else "PARTIAL" if available else "TOOL_MISSING"})
+        available = sorted(name for name in tools if name in by_name and by_name[name].get("installed") is True)
+        missing = sorted(name for name in tools if name in by_name and by_name[name].get("installed") is False)
+        unknown = sorted(name for name in tools if name in by_name and not isinstance(by_name[name].get("installed"), bool))
+        if available and not missing and not unknown:
+            status = "READY"
+        elif available:
+            status = "PARTIAL"
+        elif unknown and not missing:
+            status = "UNKNOWN"
+        else:
+            status = "TOOL_MISSING"
+        output.append({"family": family, "available_tools": available, "missing_tools": missing, "unknown_tools": unknown, "status": status})
     return output
 
 
@@ -552,15 +564,47 @@ def family_for_artifact_classification(classification: Any) -> str | None:
     return None
 
 
-def _relationship_needed(state: dict[str, Any], corpus_text: str = "") -> bool:
+def _known_count(state: dict[str, Any], key: str) -> int | None:
+    """A non-negative artifact count, or ``None`` (UNKNOWN) when it is absent, empty or
+    not a count. Unknown is never turned into 0: that would read as "no artifacts"."""
+    value = state.get(key)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def relationship_routing(state: dict[str, Any], corpus_text: str = "") -> str:
+    """``NEEDED``, ``NOT_NEEDED`` or ``UNKNOWN`` for the correlation family.
+
+    ``UNKNOWN``: the text asks about relationships but neither artifact count is a known
+    value reaching 2, and at least one is unknown, so "single artifact" cannot be claimed.
+    """
     if state.get("relationship_needed") or state.get("conflicting_evidence"):
-        return True
+        return "NEEDED"
     if state.get("claim_verification_needed"):
-        return True
+        return "NEEDED"
     text = str(corpus_text or "").casefold()
-    has_relationship_word = any(word in text for word in RELATIONSHIP_SIGNAL_WORDS)
-    multiple_artifacts = int(state.get("artifacts_analyzed") or 0) >= 2 or int(state.get("artifacts_discovered") or 0) >= 2
-    return bool(has_relationship_word and multiple_artifacts)
+    if not any(word in text for word in RELATIONSHIP_SIGNAL_WORDS):
+        return "NOT_NEEDED"
+    counts = [_known_count(state, "artifacts_analyzed"), _known_count(state, "artifacts_discovered")]
+    if any(count is not None and count >= 2 for count in counts):
+        return "NEEDED"
+    return "UNKNOWN" if any(count is None for count in counts) else "NOT_NEEDED"
+
+
+def routing_uncertainties_for_state(artifact_state: dict[str, Any] | None = None, *, corpus_text: str = "") -> list[str]:
+    """Reasons the family/tool selection for this state is uncertain (empty when none)."""
+    if relationship_routing(dict(artifact_state or {}), corpus_text) == "UNKNOWN":
+        return ["RELATIONSHIP_ROUTING_UNKNOWN: artifact counts missing or invalid, correlation family not selected"]
+    return []
+
+
+def _relationship_needed(state: dict[str, Any], corpus_text: str = "") -> bool:
+    return relationship_routing(state, corpus_text) == "NEEDED"
 
 
 def _native_deep_ready(state: dict[str, Any]) -> bool:

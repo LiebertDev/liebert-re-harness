@@ -9,6 +9,7 @@ throwaway package built in ``tmp_path``.
 from __future__ import annotations
 
 import textwrap
+import unittest
 from pathlib import Path
 
 import pytest
@@ -148,3 +149,73 @@ def test_python_only_declared_twice_is_refused(tmp_path):
     )
     with pytest.raises(ValueError, match="more than once"):
         tf.python_only_declarations(package)
+
+
+# -- installed flag and artifact counts are only believed when they are real values --
+
+_WORKSPACE_TOOLS = sorted(tf.FAMILIES["workspace"])
+_RELATIONSHIP_TEXT = "compare the two binaries"
+
+
+def _rows(installed):
+    return [{"name": name, "installed": installed} for name in _WORKSPACE_TOOLS]
+
+
+def _workspace(rows):
+    return next(item for item in tf.family_catalog(rows) if item["family"] == "workspace")
+
+
+class InstalledFlagTests(unittest.TestCase):
+    def test_text_false_is_not_installed(self):
+        entry = _workspace(_rows("false"))
+        self.assertEqual(entry["available_tools"], [])
+        self.assertEqual(entry["unknown_tools"], _WORKSPACE_TOOLS)
+        self.assertEqual(entry["status"], "UNKNOWN")
+
+    def test_other_truthy_non_bools_are_not_installed(self):
+        for value in ("true", "yes", 1, "installed", ["x"]):
+            self.assertEqual(_workspace(_rows(value))["available_tools"], [], repr(value))
+
+    def test_real_booleans_still_work(self):
+        self.assertEqual(_workspace(_rows(True))["status"], "READY")
+        entry = _workspace(_rows(False))
+        self.assertEqual((entry["status"], entry["missing_tools"]), ("TOOL_MISSING", _WORKSPACE_TOOLS))
+
+    def test_one_text_flag_downgrades_ready_to_partial(self):
+        rows = _rows(True)
+        rows[0]["installed"] = "false"
+        entry = _workspace(rows)
+        self.assertEqual(entry["status"], "PARTIAL")
+        self.assertEqual(entry["unknown_tools"], [rows[0]["name"]])
+        self.assertNotIn(rows[0]["name"], entry["available_tools"])
+
+
+class ArtifactCountTests(unittest.TestCase):
+    def test_missing_counts_with_relationship_text_are_unknown_and_flagged(self):
+        state = {}
+        self.assertEqual(tf.relationship_routing(state, _RELATIONSHIP_TEXT), "UNKNOWN")
+        reasons = tf.routing_uncertainties_for_state(state, corpus_text=_RELATIONSHIP_TEXT)
+        self.assertEqual(len(reasons), 1)
+        self.assertTrue(reasons[0].startswith("RELATIONSHIP_ROUTING_UNKNOWN"))
+
+    def test_invalid_counts_are_unknown_not_zero(self):
+        for bad in (None, "", "many", -1, True, 2.5):
+            state = {"artifacts_analyzed": bad, "artifacts_discovered": bad}
+            self.assertEqual(tf.relationship_routing(state, _RELATIONSHIP_TEXT), "UNKNOWN", repr(bad))
+
+    def test_known_counts_are_decided(self):
+        known_one = {"artifacts_analyzed": 1, "artifacts_discovered": 1}
+        self.assertEqual(tf.relationship_routing(known_one, _RELATIONSHIP_TEXT), "NOT_NEEDED")
+        self.assertEqual(tf.relationship_routing({"artifacts_analyzed": 0, "artifacts_discovered": 3}, _RELATIONSHIP_TEXT), "NEEDED")
+        self.assertEqual(tf.relationship_routing({"artifacts_analyzed": "2"}, _RELATIONSHIP_TEXT), "NEEDED")
+
+    def test_no_relationship_text_needs_no_counts(self):
+        self.assertEqual(tf.relationship_routing({}, "unpack the sample"), "NOT_NEEDED")
+        self.assertEqual(tf.routing_uncertainties_for_state({}, corpus_text="unpack the sample"), [])
+
+    def test_unknown_does_not_select_correlation_but_known_two_does(self):
+        self.assertNotIn("correlation", tf.families_for_state({}, corpus_text="compare"))
+        self.assertIn("correlation", tf.families_for_state({"artifacts_analyzed": 2}, corpus_text="compare"))
+        selected = set(tf.tools_for_state({"artifacts_analyzed": 2}, corpus_text="compare"))
+        self.assertTrue(set(tf.FAMILIES["correlation"]) <= selected)
+
