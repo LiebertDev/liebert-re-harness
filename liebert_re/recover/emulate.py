@@ -24,6 +24,8 @@ happened next:
   ``READ_PROTECT`` ``FETCH_PROTECT`` ``INVALID_INSTRUCTION`` ``PORT_IO``   as named
   ``INSN_LIMIT`` ``TIMEOUT``   the caller's bounds
   ``UNMODELLED_VEX``    a VEX instruction :mod:`liebert_re.recover.vex` does not model (see that module)
+  ``STUB_LIMIT``        an import the caller allowed a stub for was reached, but the stub could not answer this call
+                        (an argument it does not model, an exhausted stub heap, a full call trace); nothing was applied
   ``ENGINE_ERROR``      the engine raised an error this module has no name for
   ``ENGINE_CRASH``      the emulator process died; whatever it had written is listed and ``unverified``
   ``UNKNOWN_STOP``      the engine returned and nothing explains why
@@ -37,8 +39,13 @@ nothing ran. ``limitations`` lists what weakens this particular run; an unreadab
 is trapped, so the IMPORT_CALL guarantee is gone, and the run is kept because everything up to the call is still a
 real measurement).
 
-There are NO API stubs: a call into an import stops the run, it is not answered. Nothing here fakes a
-Windows environment beyond the minimal TEB/PEB declared in ``teb_peb_model``.
+A call into an import stops the run, it is not answered, UNLESS the caller names the import in ``allow_stubs``.
+The list is empty by default. A listed name is answered by a small declarative stub (see ``_StubBook``: fixed tick
+counts, last-error, a bounded bump allocator, ``lstrlenA``/``lstrlenW``), x86-64 ABI only, and only for the
+``kernel32.dll`` import of that name. A stub's answer is an ASSUMPTION, never a measurement: every call is recorded
+in ``stubs.calls`` with ``"stubbed": true, "basis": "assumed"``, the result lists a ``STUBBED_IMPORTS`` limitation
+whenever one was applied, and a name that is not listed, or has no stub, still ends the run as ``IMPORT_CALL``.
+Nothing here fakes a Windows environment beyond the minimal TEB/PEB declared in ``teb_peb_model`` and those stubs.
 
 The target gate (:class:`EmulationGate`) is a declaration plus a hash, and nothing more. ``target_class``
 is required: ``public_crackme`` (a challenge written to be solved) or ``owned_target`` (the caller owns
@@ -95,6 +102,13 @@ STACK_HIGH = 0x7FFC0000
 TEB_VA, TEB_SIZE = 0x7FFDA000, 0x2000
 PEB_VA, PEB_SIZE = 0x7FFDE000, 0x1000
 SENTINEL_VA = 0x7FEE00000000
+STUB_HEAP_VA = 0x7FED00000000
+STUB_DLL = "kernel32.dll"
+STUB_HEAP_DEFAULT_BYTES = 0x100000
+STUB_HEAP_MAX_BYTES = 0x4000000
+STUB_VA_GRANULARITY = 0x10000
+MAX_STUB_CALLS = 1000
+MAX_STRLEN_UNITS = 0x10000
 TRAP_BASE = 0x7FEF00000000
 TRAP_STRIDE = 16
 
@@ -102,11 +116,23 @@ _GPRS = ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
          "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15")
 _SETTABLE = frozenset(_GPRS) | {"eflags", "rflags"}
 
+_STUB_NAMES = ("GetTickCount", "GetTickCount64", "GetLastError", "SetLastError", "VirtualAlloc", "HeapAlloc",
+               "lstrlenA", "lstrlenW")
+_STUB_OPTION_NAMES = ("tick_count", "heap_bytes")
+_STUB_BASIS = ("every stubbed call is an assumption about what the operating system would answer, not a "
+               "measurement: the result of this run holds only if that assumption holds. x86-64 (Microsoft x64 "
+               "calling convention) only; a 32-bit image is refused before anything runs")
+_STUBS_INFLUENCED = {
+    "code": "STUBBED_IMPORTS",
+    "detail": "stubbed imports influenced the run: at least one import call was answered by an assumed model, "
+              "not stopped; see stubs.calls for each answer (basis: assumed)"}
+
 _LIMITS = (
     "x86-64 PE32+ images only; a 32-bit PE is refused (UNSUPPORTED_ARCHITECTURE)",
     "no relocation: the image is mapped at its preferred base or the run is refused (MAP_CONFLICT)",
     "TLS callbacks, loader initialisers and entry-point wrappers do not run; the caller names start_va",
-    "import slots point at unmapped trap addresses; a call into one stops the run, nothing is answered",
+    "import slots point at unmapped trap addresses; a call into one stops the run unless the caller listed it in "
+    "allow_stubs, and a stub's answer is an assumption (basis: assumed), not a measurement",
     "delay-load and bound imports are not read; only the ordinary import directory is",
     "no OS state: no handles, files, threads, exceptions/SEH, or syscalls (a syscall stops the run)",
     "cpuid and rdtsc answer from Unicorn's synthetic CPU model, not from any real machine",
@@ -126,6 +152,7 @@ _REG_BASIS = ("registers as the engine holds them when the run stops; an instruc
 _COMPLETION = {
     "RETURNED": "RETURNED", "IMPORT_CALL": "STOPPED_AT_IMPORT", "SYSCALL": "STOPPED_AT_SYSCALL",
     "INSN_LIMIT": "INSN_LIMIT", "TIMEOUT": "TIMEOUT",
+    "STUB_LIMIT": "STOPPED_AT_IMPORT",
     "UNMAPPED_READ": "FAULT", "UNMAPPED_WRITE": "FAULT", "UNMAPPED_FETCH": "FAULT", "READ_PROTECT": "FAULT",
     "WRITE_PROTECT": "FAULT", "FETCH_PROTECT": "FAULT", "INVALID_INSTRUCTION": "FAULT", "UD2": "FAULT",
 }
@@ -354,7 +381,8 @@ class _Runner:
         return {"ok": False, "tool": TOOL, "status": "TOOL_USAGE", "error": error, "message": message}
 
     @staticmethod
-    def validate(start_va, stop_at, max_instructions, timeout_s, watch_writes, registers, stack_size, perm_mode):
+    def validate(start_va, stop_at, max_instructions, timeout_s, watch_writes, registers, stack_size, perm_mode,
+                 allow_stubs=None, stub_options=None):
         """``(params, None)`` or ``(None, usage dict)``."""
         start = _int_value(start_va)
         if start is None or not 0 <= start < 1 << 64:
@@ -398,9 +426,48 @@ class _Runner:
                     return None, _Runner.usage("BAD_REGISTERS", "registers accepts %s with integer values below 2**64"
                                                % ", ".join(sorted(_SETTABLE)))
                 regs["eflags" if key == "rflags" else key] = value
+        allowed, options, bad = _Runner.validate_stubs(allow_stubs, stub_options)
+        if bad is not None:
+            return None, bad
         return {"start_va": start, "stop_at": sorted(set(stops)), "max_instructions": max_instructions,
                 "timeout_s": float(timeout_s), "watch_writes": watch_writes, "registers": regs,
-                "stack_size": size, "perm_mode": perm_mode}, None
+                "stack_size": size, "perm_mode": perm_mode, "allow_stubs": allowed, "stub_options": options}, None
+
+    @staticmethod
+    def validate_stubs(allow_stubs, stub_options):
+        """``(allowed names, options, None)`` or ``(None, None, usage dict)``. No list means no stub."""
+        names = []
+        if allow_stubs is not None:
+            if isinstance(allow_stubs, (str, bytes)) or not hasattr(allow_stubs, "__iter__"):
+                return None, None, _Runner.usage("BAD_STUBS", "allow_stubs must be a list of stub names")
+            for item in allow_stubs:
+                if not isinstance(item, str) or item not in _STUB_NAMES:
+                    return None, None, _Runner.usage("BAD_STUBS", "unknown stub %r; the stubs are: %s"
+                                                     % (item if isinstance(item, str) else type(item).__name__,
+                                                        ", ".join(_STUB_NAMES)))
+                names.append(item)
+        names = sorted(set(names))
+        options = {}
+        if stub_options is not None:
+            if not isinstance(stub_options, dict):
+                return None, None, _Runner.usage("BAD_STUB_OPTIONS", "stub_options must be an object")
+            for key, raw in stub_options.items():
+                value = _int_value(raw)
+                if key not in _STUB_OPTION_NAMES or value is None:
+                    return None, None, _Runner.usage("BAD_STUB_OPTIONS", "stub_options accepts %s, with integer values"
+                                                     % ", ".join(_STUB_OPTION_NAMES))
+                if key == "tick_count" and not 0 <= value < 1 << 64:
+                    return None, None, _Runner.usage("BAD_STUB_OPTIONS", "tick_count must be below 2**64")
+                if key == "heap_bytes" and (value % PAGE or not PAGE <= value <= STUB_HEAP_MAX_BYTES):
+                    return None, None, _Runner.usage("BAD_STUB_OPTIONS", "heap_bytes must be a multiple of 0x1000 "
+                                                     "from 0x1000 to 0x%X" % STUB_HEAP_MAX_BYTES)
+                options[key] = value
+        if ("GetTickCount" in names or "GetTickCount64" in names) and "tick_count" not in options:
+            return None, None, _Runner.usage("BAD_STUB_OPTIONS", "GetTickCount and GetTickCount64 answer a value "
+                                             "the caller supplies: give stub_options tick_count")
+        if options and not names:
+            return None, None, _Runner.usage("BAD_STUB_OPTIONS", "stub_options given without allow_stubs")
+        return names, options, None
 
     @staticmethod
     def child_command(job_path):
@@ -500,7 +567,8 @@ class _Runner:
                              "memory_bytes": DEFAULT_MAX_MEMORY_BYTES, "stack_size": params["stack_size"],
                              "watch_writes": params["watch_writes"], "perm_mode": params["perm_mode"]},
                   "request": {"start_va": _hx(params["start_va"]), "stop_at": [_hx(a) for a in params["stop_at"]],
-                              "registers": {k: _hx(v) for k, v in params["registers"].items()}}}
+                              "registers": {k: _hx(v) for k, v in params["registers"].items()},
+                              "allow_stubs": list(params["allow_stubs"]), "stub_options": dict(params["stub_options"])}}
         if not gate["ok"]:
             name = "%s_refused.json" % run_id
             record.update(status=gate["status"], detail=gate["detail"])
@@ -560,7 +628,7 @@ class _Runner:
 
 def emulate_range(path, start_va, *, stop_at=(), max_instructions=5_000_000, timeout_s=120,
                   watch_writes="image", registers=None, stack_size=0x100000, perm_mode="as_declared",
-                  target_class=None, authorization=None, sample_sha256=None):
+                  target_class=None, authorization=None, sample_sha256=None, allow_stubs=None, stub_options=None):
     """Emulate a bounded range of a PE32+ (x86-64) image from ``start_va`` and report why and where it stopped.
 
     Runs inside the Unicorn engine in a separate interpreter (a process boundary, not a sandbox; nothing
@@ -572,6 +640,10 @@ def emulate_range(path, start_va, *, stop_at=(), max_instructions=5_000_000, tim
     stop before executing; ``registers`` sets initial values (``rsp`` is where the return sentinel is
     written). ``perm_mode="rwx"`` maps every section read-write-execute and is reported as an approximation.
     ``watch_writes`` is ``"image"`` or ``"all"``: which writes are recorded in ``written_regions``.
+    ``allow_stubs`` lists the kernel32 imports to answer instead of stopping at (``GetTickCount``,
+    ``GetTickCount64``, ``GetLastError``, ``SetLastError``, ``VirtualAlloc``, ``HeapAlloc``, ``lstrlenA``,
+    ``lstrlenW``); empty by default. The first two need ``stub_options={"tick_count": N}``; ``heap_bytes`` sizes the
+    stub allocator's region. Every stub answer is an assumption (``basis: assumed``) listed in ``stubs.calls``.
 
     ``ok`` is true when the engine ran and reports a stop; ``stop_reason`` says which, and ``completion`` says
     whether the routine finished (``RETURNED``, ``STOPPED_AT_IMPORT``, ``STOPPED_AT_SYSCALL``, ``INSN_LIMIT``,
@@ -585,7 +657,7 @@ def emulate_range(path, start_va, *, stop_at=(), max_instructions=5_000_000, tim
     """
     try:
         params, bad = _Runner.validate(start_va, stop_at, max_instructions, timeout_s, watch_writes,
-                                       registers, stack_size, perm_mode)
+                                       registers, stack_size, perm_mode, allow_stubs, stub_options)
         if bad is not None:
             return _j(_Runner.finish(bad))
         params.update(_target_class=target_class, _authorization=authorization, _sample_sha256=sample_sha256)
@@ -676,6 +748,144 @@ class _WriteLog:
             first = next((a for a in self.first if lo <= a < hi or lo <= a + 14 and a < hi), None) if hit else None
             out.append((lo, hi, bool(hit), first))
         return out
+
+
+class _StubStop(Exception):
+    """A stub that cannot answer this call; nothing has been applied when it is raised."""
+
+
+class _StubBook:
+    """The answers an allowed stub gives, and the state they share (last error, a bump allocator).
+
+    Everything here is an ASSUMPTION about the operating system. A handler raises :class:`_StubStop`, before it
+    changes anything, for an argument it does not model; it never guesses one. x86-64 only: arguments come from
+    RCX, RDX, R8, R9 (no stub takes more than four, so no stack argument is read), the result goes in RAX, and
+    the caller's return address is popped by the stub (the callee does not clean up in this convention)."""
+
+    ARGS = ("rcx", "rdx", "r8", "r9")
+    MEM_COMMIT, MEM_RESERVE = 0x1000, 0x2000
+    PROTECTIONS = {0x02: "r", 0x04: "rw", 0x20: "rx", 0x40: "rwx"}
+    HEAP_NO_SERIALIZE, HEAP_ZERO_MEMORY = 0x1, 0x8
+
+    def __init__(self, uc, ux, allowed, options):
+        self.uc, self.ux = uc, ux
+        self.allowed = frozenset(allowed)
+        self.tick = options.get("tick_count")
+        self.last_error = 0
+        self.heap_bytes = options.get("heap_bytes", STUB_HEAP_DEFAULT_BYTES) \
+            if self.allowed & {"VirtualAlloc", "HeapAlloc"} else 0
+        self.used = 0                 # offset of the next free byte in the stub heap
+        self.calls = []
+        self.handlers = {
+            "GetTickCount": ((), lambda: (self.tick & 0xFFFFFFFF, [])),
+            "GetTickCount64": ((), lambda: (self.tick, [])),
+            "GetLastError": ((), lambda: (self.last_error, [])),
+            "SetLastError": ((32,), self._set_last_error),
+            "VirtualAlloc": ((64, 64, 32, 32), self._virtual_alloc),
+            "HeapAlloc": ((64, 32, 64), self._heap_alloc),
+            "lstrlenA": ((64,), lambda p: self._strlen(p, 1)),
+            "lstrlenW": ((64,), lambda p: self._strlen(p, 2)),
+        }
+
+    @staticmethod
+    def stub_name(label):
+        """The stub name for a ``dll!function`` import label, or None."""
+        dll, _, function = label.partition("!")
+        return function if dll.lower() == STUB_DLL and function in _STUB_NAMES else None
+
+    def _set_last_error(self, code):
+        self.last_error = code
+        return None, [{"kind": "last_error_set", "value": _hx(code)}]
+
+    def _carve(self, size, align):
+        start = _align_up(self.used, align)
+        if start + size > self.heap_bytes:
+            raise _StubStop("the stub heap (%d bytes) cannot hold this allocation (%d bytes used, %d requested)"
+                            % (self.heap_bytes, self.used, size))
+        return start
+
+    def _virtual_alloc(self, address, size, kind, protect):
+        if address:
+            raise _StubStop("VirtualAlloc with a non-NULL lpAddress is not modelled")
+        if kind not in (self.MEM_COMMIT, self.MEM_COMMIT | self.MEM_RESERVE):
+            raise _StubStop("VirtualAlloc flAllocationType 0x%X is not modelled (only MEM_COMMIT, with or without "
+                            "MEM_RESERVE)" % kind)
+        if protect not in self.PROTECTIONS:
+            raise _StubStop("VirtualAlloc flProtect 0x%X is not modelled" % protect)
+        if not 0 < size <= self.heap_bytes:
+            raise _StubStop("VirtualAlloc dwSize %d is zero or larger than the stub heap" % size)
+        span = _align_up(size, PAGE)
+        start = self._carve(span, STUB_VA_GRANULARITY)
+        from unicorn import UC_PROT_EXEC, UC_PROT_READ, UC_PROT_WRITE
+        wanted = {"r": UC_PROT_READ, "rw": UC_PROT_READ | UC_PROT_WRITE, "rx": UC_PROT_READ | UC_PROT_EXEC,
+                  "rwx": UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC}[self.PROTECTIONS[protect]]
+        try:
+            self.uc.mem_protect(STUB_HEAP_VA + start, span, wanted)
+        except Exception as exc:  # noqa: BLE001 - reported as a refusal, nothing was applied
+            raise _StubStop("the engine refused to set the protection (%s)" % type(exc).__name__) from None
+        self.used = start + span
+        return STUB_HEAP_VA + start, [{"kind": "alloc", "va": _hx(STUB_HEAP_VA + start), "size": span,
+                                       "protection": self.PROTECTIONS[protect], "zero_filled": True}]
+
+    def _heap_alloc(self, _heap, flags, size):
+        if flags & ~(self.HEAP_NO_SERIALIZE | self.HEAP_ZERO_MEMORY):
+            raise _StubStop("HeapAlloc dwFlags 0x%X is not modelled (only HEAP_NO_SERIALIZE, HEAP_ZERO_MEMORY)" % flags)
+        if size > self.heap_bytes:
+            raise _StubStop("HeapAlloc dwBytes %d is larger than the stub heap" % size)
+        take = _align_up(max(size, 1), 16)
+        start = self._carve(take, 16)
+        self.used = start + take
+        return STUB_HEAP_VA + start, [{"kind": "alloc", "va": _hx(STUB_HEAP_VA + start), "size": take,
+                                       "zero_filled": True}]
+
+    def _strlen(self, pointer, unit):
+        if pointer == 0:
+            return 0, [{"kind": "read", "va": "0x0", "bytes": 0, "note": "NULL pointer, length 0 assumed"}]
+        count, at = 0, pointer
+        while count <= MAX_STRLEN_UNITS:
+            room = PAGE - (at & (PAGE - 1))
+            room -= room % unit
+            if room == 0:
+                raise _StubStop("an unaligned wide-character string straddles a page; not modelled")
+            try:
+                chunk = bytes(self.uc.mem_read(at, room))
+            except Exception:  # noqa: BLE001 - UcError; the unreadable string is not guessed at
+                raise _StubStop("the string at 0x%X runs into memory that is not readable" % pointer) from None
+            for i in range(0, room, unit):
+                if chunk[i:i + unit] == b"\0" * unit:
+                    return count + i // unit, [{"kind": "read", "va": _hx(pointer), "bytes": (count + i // unit) * unit}]
+            count += room // unit
+            at += room
+        raise _StubStop("no terminator within %d units" % MAX_STRLEN_UNITS)
+
+    def apply(self, label, name):
+        """Answer one trapped call. Returns the return address to resume at. Raises :class:`_StubStop` untouched."""
+        uc, ux = self.uc, self.ux
+        rsp = uc.reg_read(ux.UC_X86_REG_RSP)
+        try:
+            return_address = struct.unpack("<Q", bytes(uc.mem_read(rsp, 8)))[0]
+        except Exception:  # noqa: BLE001
+            raise _StubStop("the return address at rsp is not readable") from None
+        if len(self.calls) >= MAX_STUB_CALLS:
+            raise _StubStop("the stub call trace is full (%d calls)" % MAX_STUB_CALLS)
+        widths, handler = self.handlers[name]
+        args = [uc.reg_read(getattr(ux, "UC_X86_REG_" + reg.upper())) & ((1 << bits) - 1)
+                for reg, bits in zip(self.ARGS, widths)]
+        ret, effects = handler(*args)
+        if ret is not None:
+            uc.reg_write(ux.UC_X86_REG_RAX, ret)
+        uc.reg_write(ux.UC_X86_REG_RSP, rsp + 8)
+        self.calls.append({"seq": len(self.calls) + 1, "import": label, "stubbed": True, "basis": "assumed",
+                           "args": [_hx(a) for a in args], "ret": None if ret is None else _hx(ret),
+                           "effects": effects, "return_address": _hx(return_address)})
+        return return_address
+
+    def report(self):
+        return {"allowed": sorted(self.allowed), "calls": self.calls, "calls_total": len(self.calls),
+                "applied": bool(self.calls), "basis": _STUB_BASIS,
+                "heap": ({"va": _hx(STUB_HEAP_VA), "size": self.heap_bytes, "used": self.used}
+                         if self.heap_bytes else None),
+                "last_error": self.last_error if self.allowed & {"GetLastError", "SetLastError"} else None}
 
 
 class _Engine:
@@ -827,11 +1037,16 @@ class _Engine:
         base, image_end = info["base"], info["base"] + _align_up(info["size_of_image"], PAGE)
         flat = self.flat_image(data, info)
         trap_table, import_report = self.trap_imports(flat, info)
+        book = _StubBook(None, None, job.get("allow_stubs", ()), job.get("stub_options", {}))
+        stub_traps = {addr: name for addr, label in trap_table.items()
+                      if (name := book.stub_name(label)) in book.allowed}
 
         stack_low = STACK_HIGH - job["stack_size"]
         aux = [("stack", stack_low, STACK_HIGH), ("teb", TEB_VA, TEB_VA + TEB_SIZE), ("peb", PEB_VA, PEB_VA + PEB_SIZE),
                ("sentinel", SENTINEL_VA, SENTINEL_VA + PAGE),
                ("import traps", TRAP_BASE, TRAP_BASE + _align_up(TRAP_STRIDE * (len(trap_table) + 1), PAGE))]
+        if book.heap_bytes:
+            aux.append(("stub heap", STUB_HEAP_VA, STUB_HEAP_VA + book.heap_bytes))
         for label, lo, hi in aux:
             if lo < image_end and base < hi:
                 raise _Refusal("MAP_CONFLICT", "IMAGE_OVERLAPS_FIXED_REGION",
@@ -863,6 +1078,9 @@ class _Engine:
         map_region(stack_low, job["stack_size"], UC_PROT_READ | UC_PROT_WRITE)
         map_region(TEB_VA, TEB_SIZE, UC_PROT_READ | UC_PROT_WRITE)
         map_region(PEB_VA, PEB_SIZE, UC_PROT_READ | UC_PROT_WRITE)
+        if book.heap_bytes:
+            map_region(STUB_HEAP_VA, book.heap_bytes, UC_PROT_READ | UC_PROT_WRITE)
+        book.uc, book.ux = uc, UX
 
         # Minimal TEB/PEB. Only the fields listed in teb_peb_model are assigned; every other byte is zero.
         teb = bytearray(TEB_SIZE)
@@ -1025,11 +1243,31 @@ class _Engine:
         uc.hook_add(UC_HOOK_INSN_INVALID, on_invalid)
 
         engine_error = None
+        stub_refusal = None
+        resume_at = job["start_va"]
         t_run = time.monotonic()
-        try:
-            uc.emu_start(job["start_va"], 0xFFFFFFFFFFFFFFFF, timeout=int((budget + 2) * 1_000_000))
-        except UcError as exc:
-            engine_error = exc
+        while True:
+            engine_error = None
+            try:
+                uc.emu_start(resume_at, 0xFFFFFFFFFFFFFFFF,
+                             timeout=int((max(deadline - time.monotonic(), 0) + 2) * 1_000_000))
+            except UcError as exc:
+                engine_error = exc
+            # Stop, apply, resume: a fetch at the trap of an allowed stub is answered and the run goes on from
+            # the caller's return address. Nothing else resumes, and the instruction and time bounds carry over.
+            if not (stub_traps and outcome["reason"] is None and fault and fault[-1][0] == "UNMAPPED_FETCH"
+                    and fault[-1][1] in stub_traps):
+                break
+            trap = fault[-1][1]
+            if time.monotonic() >= deadline:
+                outcome["reason"], outcome["detail"] = "TIMEOUT", {"bound_s": budget, "enforced_by": "stub resume"}
+                break
+            try:
+                resume_at = book.apply(trap_table[trap], stub_traps[trap])
+            except _StubStop as exc:
+                stub_refusal = str(exc)
+                break
+            fault.clear()
         elapsed = time.monotonic() - t_run
         rip = uc.reg_read(UX.UC_X86_REG_RIP)
 
@@ -1060,6 +1298,9 @@ class _Engine:
                     top = None
                 reason, detail = "IMPORT_CALL", {"import": trap_table[address], "trap_va": _hx(address),
                                                  "qword_at_rsp": top}
+                if stub_refusal is not None:
+                    reason = "STUB_LIMIT"
+                    detail.update(stub=stub_traps[address], why=stub_refusal, basis="an allowed stub did not answer")
             else:
                 reason = kind
                 if kind in ("UD2", "INVALID_INSTRUCTION"):
@@ -1114,7 +1355,9 @@ class _Engine:
         return {
             "ok": True, "status": "OK", "stop_reason": reason, "stop_detail": detail,
             "completion": _completion(reason), "completion_basis": _COMPLETION_BASIS,
-            "limitations": [dict(_IMPORT_UNREADABLE)] if import_report["status"] == "UNREADABLE" else [],
+            "limitations": ([dict(_IMPORT_UNREADABLE)] if import_report["status"] == "UNREADABLE" else [])
+                           + ([dict(_STUBS_INFLUENCED)] if book.calls else []),
+            "stubs": book.report(),
             "instructions": executed, "instruction_count_basis": _COUNT_BASIS,
             "rip": _hx(rip), "registers": registers, "registers_basis": _REG_BASIS,
             "recent_rips": [_hx(a) for a in recent], "recent_rips_basis": _RIP_BASIS,

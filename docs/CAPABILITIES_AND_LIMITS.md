@@ -374,7 +374,7 @@ return a named tool-missing status when absent. Function inventory
   5 million instructions takes roughly 4 to 9 seconds, well inside the default 120 seconds. VEX-encoded instructions are executed by `recover/vex.py`, and one it does not model stops the run.
   **What it does not do.** It executes nothing natively on the host: the engine runs inside Unicorn, in a separate interpreter
   with a timeout and a memory limit. That is a process boundary and **not a sandbox**, and every response says so
-  (`host_isolation`). It answers no import and no syscall (there are no API stubs, no handles, files, threads or exceptions),
+  (`host_isolation`). It answers no syscall and, unless the caller lists the name in `allow_stubs` (empty by default), no import: the only stubs are eight kernel32 functions (`GetTickCount`, `GetTickCount64`, `GetLastError`, `SetLastError`, `VirtualAlloc`, `HeapAlloc`, `lstrlenA`, `lstrlenW`) on the x86-64 ABI, each answer is an assumption recorded in `stubs.calls` with `basis: assumed`, a `STUBBED_IMPORTS` limitation says the run was influenced, an allowed stub that cannot answer a call stops the run as `STUB_LIMIT`, and any other import still stops it (no handles, files, threads or exceptions),
   it does not read delay-load or bound imports, it refuses 32-bit images, and it does not know what a real CPU would return
   for `cpuid` or `rdtsc` (Unicorn's model answers). It is not a way to run a sample safely, and the gate is not a way to
   establish that you may analyse it. **The gate.** `target_class` is required: `public_crackme` (a challenge written to be
@@ -515,9 +515,10 @@ a real IDA, is marked `heavy`, and skips when idat is absent.
   lists (`pe_function_extent`, CLI `pdata`): leaf functions have no entry, so most small functions
   are not recoverable this way, and there is no recovery for x86 images or from prologue patterns.
   The unwind records are not decoded.
-- Bounded code-range emulation exists (`emulate_range`), but it stops at the first import or syscall and has no API stubs,
-  so a routine that calls the operating system cannot be run through it yet; there are no traces beyond the last 64
-  instruction addresses and no slicer.
+- Bounded code-range emulation exists (`emulate_range`), but it stops at the first syscall and, unless the caller lists it, at the first import; the
+  only API stubs are the eight assumed-answer kernel32 ones named above, so a routine that calls any other part of the
+  operating system cannot be run through it yet; there are no traces beyond the last 64 instruction addresses (and the
+  stub call trace) and no slicer.
 - No kernel-debugger or live-kernel integration, and no parser for kernel-dump
   formats. Only `MDMP`-format dumps are read.
 - No decompiler and no cross-reference engine of its own. With a licensed IDA Pro 9.x on the

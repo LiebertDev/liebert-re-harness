@@ -74,12 +74,13 @@ hidden feature.
   emulates a bounded range of an x86-64 PE in a separate process behind a
   declared-target-class gate, with a minimal TEB/PEB, and stops at every import,
   syscall, interrupt, unmapped access and bound. `liebert_re/recover/vex.py` corrects
-  its AVX instructions. **Still open (stage 2):** API stubs (today an import call
-  simply stops the run), a trace richer than the last 64 instruction addresses,
+  its AVX instructions. A first, opt-in set of eight kernel32 stubs exists
+  (`allow_stubs`, assumed answers recorded as such). **Still open (stage 2):** any further API stubs (an import
+  outside that set simply stops the run), a trace richer than the last 64 instruction addresses,
   TLS callbacks and loader initialisers, delay-load imports, 32-bit images, and
-  anything like slicing. Stubs are the next useful piece, because a routine that
-  calls the operating system cannot be run past that call today; they need their
-  own design discussion, since each stub is a claim about what the operating system
+  anything like slicing. More stubs are the next useful piece, because a routine that
+  calls the operating system outside the first set cannot be run past that call; each
+  needs its own discussion, since each stub is a claim about what the operating system
   would have done.
 - **IDA and Ghidra wrappers** (headless decompilation, cross-references,
   callers/callees, answers normalised across engines so a caller does not need to

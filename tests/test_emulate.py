@@ -794,3 +794,207 @@ def test_tool_run_reaches_emulate_range(sandbox, capsys):
     code, out = run_cli(capsys, "tool", "describe", "emulate_range")
     assert code == 0 and out["module"] == "liebert_re.recover.emulate" and out["python_only"] is None
     assert {p["name"] for p in out["parameters"] if p["required"]} == {"path", "start_va"}
+
+
+# -- declarative API stubs: off by default, an allow-list opens them, every answer is an assumption -------------------------------------------
+
+STUB_IMPORTS = {"kernel32.dll": ["ExitProcess", "GetTickCount", "GetTickCount64", "GetLastError", "SetLastError",
+                                 "VirtualAlloc", "HeapAlloc", "lstrlenA", "lstrlenW"],
+                "user32.dll": ["MessageBeep"]}
+STRING_AT = 0x100
+
+
+def program(sandbox, *steps, imports=STUB_IMPORTS, patches=()):
+    """A PE running ``steps``: an assembly string, ``"@Name"`` (call through the IAT slot of ``Name``) or
+    ``("data", reg, offset)`` (point ``reg`` at .text+offset). Returns the path."""
+    slots = iat_slots(build(sandbox, imports=imports))
+    code = b""
+    for step in steps:
+        here = TEXT + len(code)
+        if isinstance(step, tuple):
+            code += asm(f"lea {step[1]}, [rip + {TEXT + step[2] - (here + 7)}]", here)
+        elif step.startswith("@"):
+            code += asm(f"call qword ptr [rip + {slots[step[1:]] - (here + 6)}]", here)
+        else:
+            code += asm(step, here)
+    assert len(code) < STRING_AT
+    return build(sandbox, code, imports=imports, patches=patches)
+
+
+def test_stubs_are_off_unless_the_caller_lists_them(sandbox):
+    path = program(sandbox, "@GetTickCount", "ret")
+    for kwargs in ({}, {"allow_stubs": []}, {"allow_stubs": None}):
+        result = emulate_json(path, **kwargs)
+        assert result["stop_reason"] == "IMPORT_CALL" and result["completion"] == "STOPPED_AT_IMPORT"
+        assert result["stop_detail"]["import"] == "kernel32.dll!GetTickCount"
+        assert result["stubs"]["allowed"] == [] and result["stubs"]["calls"] == [] and result["stubs"]["applied"] is False
+        assert result["limitations"] == []
+
+
+def test_a_listed_stub_answers_with_the_supplied_value_and_leaves_an_assumed_trace_entry(sandbox):
+    path = program(sandbox, "@GetTickCount", "mov rbx, rax", "@GetTickCount", "ret")
+    result = emulate_json(path, allow_stubs=["GetTickCount"], stub_options={"tick_count": 0x1_2345_6789})
+    assert result["stop_reason"] == "RETURNED" and result["completion"] == "RETURNED"
+    assert result["registers"]["rax"] == "0x23456789" == result["registers"]["rbx"]       # a DWORD: the low 32 bits
+    calls = result["stubs"]["calls"]
+    assert len(calls) == 2 and result["stubs"]["calls_total"] == 2 and result["stubs"]["applied"] is True
+    first = calls[0]
+    assert {k: first[k] for k in ("import", "stubbed", "basis", "args", "ret")} == {
+        "import": "kernel32.dll!GetTickCount", "stubbed": True, "basis": "assumed", "args": [], "ret": "0x23456789"}
+    assert calls[1]["ret"] == first["ret"] and [c["seq"] for c in calls] == [1, 2]       # fixed: the same every time
+    notes = [item for item in result["limitations"] if item["code"] == "STUBBED_IMPORTS"]
+    assert len(notes) == 1 and "stubbed imports influenced the run" in notes[0]["detail"]
+    assert "assumption" in result["stubs"]["basis"]
+    assert result["request"]["allow_stubs"] == ["GetTickCount"]
+    assert result["request"]["stub_options"] == {"tick_count": 0x123456789}
+    assert result["instructions"] == 4                  # the call into a stub is an instruction; the stub is not
+
+
+def test_the_64_bit_tick_count_is_not_truncated(sandbox):
+    path = program(sandbox, "@GetTickCount64", "ret")
+    result = emulate_json(path, allow_stubs=["GetTickCount64"], stub_options={"tick_count": 0x1_0000_0005})
+    assert result["registers"]["rax"] == "0x100000005" and result["completion"] == "RETURNED"
+
+
+def test_set_and_get_last_error_follow_the_windows_x64_convention(sandbox):
+    path = program(sandbox, "@GetLastError", "mov rbx, rax", "mov rcx, 0x100000057", "@SetLastError",
+                   "@GetLastError", "ret")
+    result = emulate_json(path, allow_stubs=["GetLastError", "SetLastError"])
+    assert result["completion"] == "RETURNED"
+    assert result["registers"]["rbx"] == "0x0" and result["registers"]["rax"] == "0x57"      # the DWORD argument only
+    calls = result["stubs"]["calls"]
+    assert [c["import"].split("!")[1] for c in calls] == ["GetLastError", "SetLastError", "GetLastError"]
+    assert calls[1]["args"] == ["0x57"] and calls[1]["ret"] is None            # void: nothing is returned or written
+    assert result["stubs"]["last_error"] == 0x57
+
+
+def test_an_import_outside_the_allow_list_or_in_another_dll_still_stops_the_run(sandbox):
+    path = program(sandbox, "@GetTickCount", "@ExitProcess", "ret")
+    result = emulate_json(path, allow_stubs=["GetTickCount"], stub_options={"tick_count": 1})
+    assert result["stop_reason"] == "IMPORT_CALL" and result["stop_detail"]["import"] == "kernel32.dll!ExitProcess"
+    assert [c["import"] for c in result["stubs"]["calls"]] == ["kernel32.dll!GetTickCount"]
+    other = program(sandbox, "@MessageBeep", "ret")
+    assert emulate_json(other, allow_stubs=["GetTickCount"], stub_options={"tick_count": 1})["stop_reason"] == "IMPORT_CALL"
+    # A same-named import from another DLL is not the kernel32 function the stub models.
+    lookalike = program(sandbox, "@GetTickCount", "ret", imports={"user32.dll": ["GetTickCount"]})
+    result = emulate_json(lookalike, allow_stubs=["GetTickCount"], stub_options={"tick_count": 1})
+    assert result["stop_reason"] == "IMPORT_CALL" and result["stubs"]["applied"] is False and result["limitations"] == []
+
+
+def test_a_name_with_no_stub_or_a_missing_option_is_a_usage_error_and_nothing_runs(sandbox):
+    path = program(sandbox, "ret")
+    for kwargs, error in (({"allow_stubs": ["ExitProcess"]}, "BAD_STUBS"),
+                          ({"allow_stubs": "GetTickCount"}, "BAD_STUBS"),
+                          ({"allow_stubs": [7]}, "BAD_STUBS"),
+                          ({"allow_stubs": ["GetTickCount"]}, "BAD_STUB_OPTIONS"),
+                          ({"allow_stubs": ["GetLastError"], "stub_options": {"colour": 1}}, "BAD_STUB_OPTIONS"),
+                          ({"allow_stubs": ["HeapAlloc"], "stub_options": {"heap_bytes": 0x1800}}, "BAD_STUB_OPTIONS"),
+                          ({"stub_options": {"tick_count": 1}}, "BAD_STUB_OPTIONS")):
+        result = emulate_json(path, **kwargs)
+        assert result["status"] == "TOOL_USAGE" and result["error"] == error and result["completion"] is None, kwargs
+
+
+def test_heap_alloc_hands_out_distinct_zeroed_aligned_blocks_from_a_bounded_region(sandbox):
+    path = program(sandbox, "mov edx, 8", "mov r8d, 20", "@HeapAlloc", "mov rbx, rax",
+                   "mov qword ptr [rbx], 0x41", "mov r8d, 1", "@HeapAlloc", "mov rsi, qword ptr [rbx + 8]", "ret")
+    result = emulate_json(path, allow_stubs=["HeapAlloc"], watch_writes="all")
+    assert result["completion"] == "RETURNED", result["stop_detail"]
+    first, second = (int(c["ret"], 16) for c in result["stubs"]["calls"])
+    heap = int(result["stubs"]["heap"]["va"], 16)
+    assert first == heap and second == heap + 32 and first % 16 == 0 and second % 16 == 0   # 20 rounds up to 32
+    assert result["registers"]["rsi"] == "0x0" and result["registers"]["rax"] == hex(second)
+    assert result["stubs"]["calls"][0]["args"] == ["0x0", "0x8", "0x14"]
+    assert result["stubs"]["calls"][0]["effects"] == [{"kind": "alloc", "va": hex(first), "size": 32, "zero_filled": True}]
+    assert result["stubs"]["heap"]["used"] == 48 and result["stubs"]["heap"]["size"] == 0x100000
+    assert any(r["va"] == hex(first) for r in result["written_regions"])               # the program's own write is still seen
+
+
+def test_allocations_count_against_the_bounded_region_and_the_run_stops_when_it_is_full(sandbox):
+    path = program(sandbox, "mov r8d, 0x1000", "@HeapAlloc", "mov rbx, rax", "@HeapAlloc", "mov r12, rax",
+                   "@HeapAlloc", "mov r13, rax", "ret")
+    result = emulate_json(path, allow_stubs=["HeapAlloc"], stub_options={"heap_bytes": 0x2000})
+    assert result["stop_reason"] == "STUB_LIMIT" and result["completion"] == "STOPPED_AT_IMPORT"
+    assert result["stop_detail"]["import"] == "kernel32.dll!HeapAlloc" and "cannot hold" in result["stop_detail"]["why"]
+    assert result["stubs"]["calls_total"] == 2 and result["stubs"]["heap"] == {
+        "va": hex(0x7FED00000000), "size": 0x2000, "used": 0x2000}
+    assert result["registers"]["r13"] == "0x0" and result["registers"]["r12"] == result["stubs"]["calls"][1]["ret"]
+    assert result["rip"] == result["stop_detail"]["trap_va"]       # the refused call was not applied or skipped
+
+
+def test_virtual_alloc_is_64k_aligned_honours_the_protection_and_refuses_what_it_does_not_model(sandbox):
+    read_only = program(sandbox, "xor ecx, ecx", "mov edx, 0x1800", "mov r8d, 0x3000", "mov r9d, 2", "@VirtualAlloc",
+                        "mov rbx, rax", "mov qword ptr [rbx], 1", "ret")
+    result = emulate_json(read_only, allow_stubs=["VirtualAlloc"])
+    base = int(result["stubs"]["calls"][0]["ret"], 16)
+    assert base == 0x7FED00000000 and result["stubs"]["calls"][0]["effects"][0]["size"] == 0x2000
+    assert result["stop_reason"] == "WRITE_PROTECT" and result["completion"] == "FAULT"
+    two = program(sandbox, "xor ecx, ecx", "mov edx, 0x10", "mov r8d, 0x1000", "mov r9d, 4", "@VirtualAlloc",
+                  "mov rbx, rax", "@VirtualAlloc", "mov qword ptr [rax + 8], 7", "ret")
+    result = emulate_json(two, allow_stubs=["VirtualAlloc"])
+    assert result["completion"] == "RETURNED"
+    first, second = (int(c["ret"], 16) for c in result["stubs"]["calls"])
+    assert (first, second) == (0x7FED00000000, 0x7FED00010000)
+    base_steps = {"rcx": "xor ecx, ecx", "rdx": "mov edx, 0x10", "r8": "mov r8d, 0x1000", "r9": "mov r9d, 4"}
+    for reg, setup, why in (("rcx", "mov ecx, 0x10000", "non-NULL lpAddress"), ("rdx", "xor edx, edx", "dwSize"),
+                            ("r8", "mov r8d, 0x2000", "flAllocationType"), ("r9", "mov r9d, 0x104", "flProtect")):
+        steps = [setup if key == reg else step for key, step in base_steps.items()]
+        refused = emulate_json(program(sandbox, *steps, "@VirtualAlloc", "ret"), allow_stubs=["VirtualAlloc"])
+        assert refused["stop_reason"] == "STUB_LIMIT" and why in refused["stop_detail"]["why"], (reg, refused["stop_reason"])
+        assert refused["stubs"]["calls"] == [] and refused["limitations"] == []             # nothing was applied
+
+
+def test_lstrlen_counts_narrow_and_wide_strings_and_stops_on_a_string_it_cannot_read(sandbox):
+    patches = [(STRING_AT, b"hello\0"), (STRING_AT + 0x20, "héllo!".encode("utf-16-le") + b"\0\0")]
+    path = program(sandbox, ("data", "rcx", STRING_AT), "@lstrlenA", "mov rbx, rax",
+                   ("data", "rcx", STRING_AT + 0x20), "@lstrlenW", "mov rsi, rax", "xor ecx, ecx", "@lstrlenA", "ret",
+                   patches=patches)
+    result = emulate_json(path, allow_stubs=["lstrlenA", "lstrlenW"])
+    assert result["completion"] == "RETURNED"
+    assert (result["registers"]["rbx"], result["registers"]["rsi"], result["registers"]["rax"]) == ("0x5", "0x6", "0x0")
+    assert result["stubs"]["calls"][0]["effects"] == [{"kind": "read", "va": hex(TEXT + STRING_AT), "bytes": 5}]
+    bad = program(sandbox, "mov ecx, 0x10", "@lstrlenA", "ret")
+    refused = emulate_json(bad, allow_stubs=["lstrlenA"])
+    assert refused["stop_reason"] == "STUB_LIMIT" and "not readable" in refused["stop_detail"]["why"]
+    # Non-zero bytes right up to the end of the mapped stack: no terminator, then unmapped memory. A stop, not a length.
+    open_ended = program(sandbox, "mov rcx, 0x7FFBFFF0", "mov rax, -1", "mov qword ptr [rcx], rax",
+                         "mov qword ptr [rcx + 8], rax", "@lstrlenA", "ret")
+    stopped = emulate_json(open_ended, allow_stubs=["lstrlenA"])
+    assert stopped["stop_reason"] == "STUB_LIMIT" and stopped["stubs"]["calls"] == []
+
+
+def test_the_trace_is_bounded_and_a_full_trace_stops_instead_of_dropping_calls(sandbox):
+    path = program(sandbox, "mov ebx, 1005", "@GetLastError", "dec ebx", f"jnz {TEXT + 5}", "ret")
+    result = emulate_json(path, allow_stubs=["GetLastError"], max_instructions=50_000)
+    assert result["stop_reason"] == "STUB_LIMIT" and "trace is full" in result["stop_detail"]["why"]
+    assert result["stubs"]["calls_total"] == len(result["stubs"]["calls"]) == 1000
+    assert result["registers"]["rbx"] == hex(1005 - 1000)
+
+
+def test_the_instruction_bound_still_applies_across_stub_calls(sandbox):
+    path = program(sandbox, "@GetLastError", f"jmp {TEXT}")
+    result = emulate_json(path, allow_stubs=["GetLastError"], max_instructions=100)
+    assert result["stop_reason"] == "INSN_LIMIT" and result["instructions"] == 100
+    assert result["stubs"]["calls_total"] == 50
+
+
+def test_a_32_bit_image_is_refused_even_with_stubs_listed(sandbox):
+    path = build(sandbox, asm("ret"))
+    data = bytearray(path.read_bytes())
+    struct.pack_into("<H", data, 64 + 4, 0x014C)
+    x86 = sandbox / "x86.exe"
+    x86.write_bytes(bytes(data))
+    result = emulate_json(x86, allow_stubs=["GetLastError"])
+    assert result["status"] == "UNSUPPORTED_ARCHITECTURE" and result["completion"] is None
+
+
+def test_the_emulate_subcommand_takes_repeatable_allow_stub_flags(sandbox, capsys):
+    path = program(sandbox, "@GetTickCount", "mov rbx, rax", "@GetLastError", "ret")
+    base = ["emulate", _relative(path), "--start", hex(TEXT), "--target-class", "public_crackme"]
+    code, out = run_cli(capsys, *base, "--allow-stub", "GetTickCount", "--allow-stub", "GetLastError",
+                        "--stub-tick-count", "0x4d2")
+    assert code == 0 and out["completion"] == "RETURNED" and out["registers"]["rbx"] == "0x4d2"
+    assert out["stubs"]["allowed"] == ["GetLastError", "GetTickCount"] and out["stubs"]["calls_total"] == 2
+    code, out = run_cli(capsys, *base)
+    assert code == 0 and out["stop_reason"] == "IMPORT_CALL"
+    code, out = run_cli(capsys, *base, "--allow-stub", "GetTickCount")
+    assert code != 0 and out["error"] == "BAD_STUB_OPTIONS"

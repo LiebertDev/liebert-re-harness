@@ -310,10 +310,16 @@ def _emulate(a):
     authorization = None
     if a.authorized_by or a.purpose:
         authorization = {"authorized_by": a.authorized_by, "purpose": a.purpose, "sample_sha256": a.sha256}
+    stub_options = {}
+    if a.stub_tick_count is not None:
+        stub_options["tick_count"] = a.stub_tick_count
+    if a.stub_heap_bytes is not None:
+        stub_options["heap_bytes"] = a.stub_heap_bytes
     return _load("liebert_re.recover.emulate", "emulate_range")(
         a.path, a.start, stop_at=a.stop_at or (), max_instructions=a.max_instructions, timeout_s=a.timeout,
         watch_writes=a.watch_writes, registers=dict(a.reg) or None, perm_mode=a.perm_mode,
-        target_class=a.target_class, authorization=authorization, sample_sha256=a.sha256)
+        target_class=a.target_class, authorization=authorization, sample_sha256=a.sha256,
+        allow_stubs=a.allow_stub or None, stub_options=stub_options or None)
 
 
 def _sieve_status(a):
@@ -891,6 +897,13 @@ def _build_parser():
     sp.add_argument("--perm-mode", dest="perm_mode", choices=("as_declared", "rwx"), default="as_declared",
                     help="section permissions as declared, or all read-write-execute (an approximation, reported as one)")
     sp.add_argument("--reg", action="append", type=_reg_assignment, default=[], metavar="NAME=VALUE", help="initial register value; repeatable")
+    sp.add_argument("--allow-stub", dest="allow_stub", action="append", default=[], metavar="NAME",
+                    help="answer this kernel32 import with an assumed model instead of stopping at it; repeatable, off by default "
+                         "(GetTickCount, GetTickCount64, GetLastError, SetLastError, VirtualAlloc, HeapAlloc, lstrlenA, lstrlenW). Every answer is an assumption and is listed in the result")
+    sp.add_argument("--stub-tick-count", dest="stub_tick_count", type=lambda t: int(t, 0), default=None, metavar="N",
+                    help="the value GetTickCount / GetTickCount64 return (required when either is allowed)")
+    sp.add_argument("--stub-heap-bytes", dest="stub_heap_bytes", type=lambda t: int(t, 0), default=None, metavar="N",
+                    help="size of the region VirtualAlloc / HeapAlloc stubs allocate from (multiple of 0x1000, default 0x100000)")
     add("unpack", _unpack, "statically unpack a UPX-packed PE (output goes to the evidence cache)").add_argument("--timeout", type=int, default=60)
     add("scan", _scan, "scan with YARA-X rules").add_argument("--rules", required=True, help="rules file")
     sp = add("minidump", _minidump, "analyse a Windows minidump")
