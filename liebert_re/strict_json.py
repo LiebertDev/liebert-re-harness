@@ -72,23 +72,18 @@ def _text(data: Any, max_bytes: int | None) -> str:
     raise TypeError(f"strict_json.loads wants str or bytes, not {type(data).__name__}")
 
 
-def loads(data: str | bytes | bytearray, *, max_bytes: int | None = None,
-          allow_non_finite: bool = False) -> Any:
+def loads(data: str | bytes | bytearray, *, max_bytes: int | None = None) -> Any:
     """Parse ``data`` as strict JSON; raise :class:`StrictJSONError` (a ``ValueError``) otherwise.
 
     Duplicate object keys are refused at every depth (DUPLICATE_KEY), as are ``NaN`` /
-    ``Infinity`` / ``-Infinity`` (NON_FINITE) unless ``allow_non_finite`` is set (kept only so a
-    caller that never refused them can migrate without a behaviour change). Over-large input is
+    ``Infinity`` / ``-Infinity`` (NON_FINITE); there is no switch to allow them. Over-large input is
     TOO_LARGE (exactly ``max_bytes`` is accepted), nesting deeper than the interpreter's recursion
     limit is TOO_DEEP, and anything else unparsable is MALFORMED. A non-str/bytes argument is a
     ``TypeError``: that is a caller bug, not a bad document.
     """
     text = _text(data, max_bytes)
-    kwargs: dict[str, Any] = {"object_pairs_hook": _no_duplicate_keys}
-    if not allow_non_finite:
-        kwargs["parse_constant"] = _refuse_constant
     try:
-        return json.loads(text, **kwargs)
+        return json.loads(text, object_pairs_hook=_no_duplicate_keys, parse_constant=_refuse_constant)
     except StrictJSONError:
         raise
     except RecursionError:

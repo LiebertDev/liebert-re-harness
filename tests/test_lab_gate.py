@@ -175,6 +175,17 @@ class TestRefusals:
         data = _gate(child.pid, authorization=json.dumps(_auth(child.pid)), sample_sha256=image_sha)
         assert data["status"] == "GATE_PASSED"
 
+    @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+    def test_authorization_text_with_a_non_finite_number_does_not_open_the_gate(self, child, image_sha, lab_open, constant):
+        # The text is otherwise a valid, covering authorization (the extra key would be ignored by
+        # the cleaning step, and test_authorization_may_be_given_as_json_text is its passing twin),
+        # so only the strict read can refuse it.
+        text = json.dumps(_auth(child.pid))[:-1] + ', "x": ' + constant + "}"
+        data = _gate(child.pid, authorization=text, sample_sha256=image_sha)
+        assert data["status"] == "AUTHORIZATION_REQUIRED" and data["decision"] == "REFUSE"
+        assert data["error"] == "AUTHORIZATION_MISSING_OR_OUT_OF_SCOPE"
+        assert lg.LabGate.authorization(text, "pe_sieve_scan", child.pid) == (None, "the authorization is not valid JSON")
+
     @pytest.mark.parametrize("declared", [None, "", "abc", "z" * 64, "a" * 63, 123])
     def test_hash_must_be_declared(self, child, lab_open, declared):
         data = _gate(child.pid, sample_sha256=declared)

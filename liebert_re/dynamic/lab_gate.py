@@ -172,7 +172,7 @@ class LabGate:
             return None, "no authorization was supplied"
         if isinstance(value, str):
             try:
-                value = strict_json.loads(value, allow_non_finite=True)
+                value = strict_json.loads(value)
             except strict_json.StrictJSONError as exc:
                 if exc.reason == strict_json.DUPLICATE_KEY:
                     return None, "the authorization has a duplicate key"

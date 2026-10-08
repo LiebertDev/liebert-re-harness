@@ -36,10 +36,9 @@ def test_non_finite_constants_are_refused_anywhere(constant):
     assert _reason(f'{{"a": [{constant}]}}') == strict_json.NON_FINITE
 
 
-def test_non_finite_can_be_allowed_explicitly_but_duplicates_still_cannot():
-    assert loads("[NaN]", allow_non_finite=True)[0] != loads("[NaN]", allow_non_finite=True)[0]
-    assert loads("Infinity", allow_non_finite=True) == float("inf")
-    assert _reason('{"a": 1, "a": 2}', allow_non_finite=True) == strict_json.DUPLICATE_KEY
+def test_there_is_no_switch_to_allow_non_finite():
+    with pytest.raises(TypeError):
+        loads("[NaN]", allow_non_finite=True)
 
 
 def test_size_limit_exact_accepted_and_one_over_refused():
