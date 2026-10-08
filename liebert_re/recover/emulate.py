@@ -754,6 +754,10 @@ class _StubStop(Exception):
     """A stub that cannot answer this call; nothing has been applied when it is raised."""
 
 
+class _StubTimeout(Exception):
+    """The absolute deadline passed while a stub was working; nothing has been applied when it is raised."""
+
+
 class _StubBook:
     """The answers an allowed stub gives, and the state they share (last error, a bump allocator).
 
@@ -776,6 +780,8 @@ class _StubBook:
             if self.allowed & {"VirtualAlloc", "HeapAlloc"} else 0
         self.used = 0                 # offset of the next free byte in the stub heap
         self.calls = []
+        self.deadline = None          # absolute time.monotonic() deadline of the whole run; set by the engine
+        self.clock = time.monotonic
         self.handlers = {
             "GetTickCount": ((), lambda: (self.tick & 0xFFFFFFFF, [])),
             "GetTickCount64": ((), lambda: (self.tick, [])),
@@ -838,15 +844,21 @@ class _StubBook:
         return STUB_HEAP_VA + start, [{"kind": "alloc", "va": _hx(STUB_HEAP_VA + start), "size": take,
                                        "zero_filled": True}]
 
+    def _check_deadline(self):
+        if self.deadline is not None and self.clock() >= self.deadline:
+            raise _StubTimeout("the absolute deadline passed while a stub was scanning memory")
+
     def _strlen(self, pointer, unit):
         if pointer == 0:
             return 0, [{"kind": "read", "va": "0x0", "bytes": 0, "note": "NULL pointer, length 0 assumed"}]
         count, at = 0, pointer
-        while count <= MAX_STRLEN_UNITS:
+        while count < MAX_STRLEN_UNITS:
+            self._check_deadline()
             room = PAGE - (at & (PAGE - 1))
             room -= room % unit
             if room == 0:
                 raise _StubStop("an unaligned wide-character string straddles a page; not modelled")
+            room = min(room, (MAX_STRLEN_UNITS - count) * unit)      # never read past the bound the stub promises
             try:
                 chunk = bytes(self.uc.mem_read(at, room))
             except Exception:  # noqa: BLE001 - UcError; the unreadable string is not guessed at
@@ -1112,6 +1124,7 @@ class _Engine:
         budget = job["timeout_s"]
         t0 = time.monotonic()
         deadline = t0 + budget
+        book.deadline = deadline
         ring = [0] * 64
         outcome = {"reason": None, "detail": {}}
         fault = []
@@ -1264,8 +1277,16 @@ class _Engine:
                 break
             try:
                 resume_at = book.apply(trap_table[trap], stub_traps[trap])
+            except _StubTimeout:
+                outcome["reason"], outcome["detail"] = "TIMEOUT", {"bound_s": budget, "enforced_by": "stub scan",
+                                                                   "stub_applied": False}
+                break
             except _StubStop as exc:
                 stub_refusal = str(exc)
+                break
+            if time.monotonic() >= deadline:     # checked before anything is classified: a stub may have run long
+                outcome["reason"], outcome["detail"] = "TIMEOUT", {"bound_s": budget, "enforced_by": "stub apply",
+                                                                   "stub_applied": True}
                 break
             fault.clear()
         elapsed = time.monotonic() - t_run

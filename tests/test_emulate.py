@@ -17,6 +17,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import capstone
@@ -998,3 +999,90 @@ def test_the_emulate_subcommand_takes_repeatable_allow_stub_flags(sandbox, capsy
     assert code == 0 and out["stop_reason"] == "IMPORT_CALL"
     code, out = run_cli(capsys, *base, "--allow-stub", "GetTickCount")
     assert code != 0 and out["error"] == "BAD_STUB_OPTIONS"
+
+
+# -- the stub path honours the absolute deadline and its own scan bound -------------------------------------------------------------
+
+def run_in_process(path, start=TEXT, *, timeout_s=5, max_instructions=100_000, **options):
+    """The engine run directly in this process (no child), for tests that must control the clock the engine reads."""
+    params, bad = emulate._Runner.validate(start, (), max_instructions, timeout_s, "image", None, 0x100000,
+                                           "as_declared", **options)
+    assert bad is None, bad
+    data = Path(path).read_bytes()
+    run_dir = emulate.DUMP_ROOT / "in_process" / str(len(list((emulate.DUMP_ROOT).glob("in_process/*"))))
+    run_dir.mkdir(parents=True)
+    (run_dir / "input.bin").write_bytes(data)
+    job = dict(params, input_sha256=hashlib.sha256(data).hexdigest(), dump_dir=str(run_dir), input_file="input.bin")
+    return emulate._Engine(job).run()
+
+
+class RecordingMemory:
+    """A stand-in for the engine's memory: non-zero bytes everywhere, optionally a terminator at one byte offset."""
+
+    def __init__(self, terminator_at=None):
+        self.base, self.terminator_at, self.reads = None, terminator_at, []
+
+    def mem_read(self, address, size):
+        self.base = address if self.base is None else self.base
+        self.reads.append((address, size))
+        data = bytearray(b"A" * size)
+        if self.terminator_at is not None:
+            for k in range(size):
+                if address + k - self.base == self.terminator_at:
+                    data[k:k + 2] = b"\x00\x00"[:min(2, size - k)]
+                    break
+        return bytes(data)
+
+
+def test_a_stub_that_returns_after_the_deadline_is_a_timeout_not_a_return(sandbox, monkeypatch):
+    """The clock jumps past the deadline while the stub is applied. Resuming would run the final ret and report
+    RETURNED; the deadline has to be checked after the stub, before the stop is classified."""
+    path = program(sandbox, "@GetLastError", "ret")
+    skew, real = [0.0], time.monotonic
+    original = emulate._StubBook.apply
+
+    def slow_apply(self, label, name):
+        answered = original(self, label, name)
+        skew[0] = 1e6
+        return answered
+
+    monkeypatch.setattr(time, "monotonic", lambda: real() + skew[0])
+    monkeypatch.setattr(emulate._StubBook, "apply", slow_apply)
+    result = run_in_process(path, allow_stubs=["GetLastError"])
+    assert result["stop_reason"] == "TIMEOUT" and result["completion"] == "TIMEOUT"
+    assert result["stop_detail"]["enforced_by"] == "stub apply" and result["stop_detail"]["stub_applied"] is True
+    assert result["stubs"]["calls_total"] == 1 and result["registers"]["rax"] != hex(SENTINEL)
+    skew[0] = 0.0
+    monkeypatch.setattr(emulate._StubBook, "apply", original)
+    fast = run_in_process(path, allow_stubs=["GetLastError"])      # the same program inside its time is a return
+    assert fast["stop_reason"] == "RETURNED"
+
+
+def test_a_long_string_scan_stops_at_the_deadline_without_applying_the_stub():
+    ticks = iter(range(100))
+    book = emulate._StubBook(RecordingMemory(), None, ["lstrlenA"], {})
+    book.deadline, book.clock = 3, lambda: next(ticks)
+    with pytest.raises(emulate._StubTimeout):
+        book._strlen(0x10000, 1)
+    assert 1 <= len(book.uc.reads) <= 3 and book.calls == []
+
+
+def test_a_string_scan_never_reads_past_the_unit_bound_whatever_the_alignment():
+    limit = emulate.MAX_STRLEN_UNITS
+    for unit, pointer in ((1, 0x10000), (1, 0x10001), (1, 0x10FFF), (2, 0x10002), (2, 0x10FFE)):
+        memory = RecordingMemory()
+        with pytest.raises(emulate._StubStop, match="no terminator"):
+            emulate._StubBook(memory, None, ["lstrlenA"], {})._strlen(pointer, unit)
+        assert sum(size for _, size in memory.reads) == limit * unit, (unit, pointer)
+        assert all((address & 0xFFF) + size <= 0x1000 for address, size in memory.reads)
+
+
+def test_the_longest_string_the_stub_models_is_one_unit_short_of_the_bound():
+    limit = emulate.MAX_STRLEN_UNITS
+    book = emulate._StubBook(RecordingMemory(terminator_at=limit - 1), None, ["lstrlenA"], {})
+    assert book._strlen(0x10001, 1)[0] == limit - 1
+    memory = RecordingMemory(terminator_at=limit)
+    with pytest.raises(emulate._StubStop, match="no terminator"):
+        emulate._StubBook(memory, None, ["lstrlenA"], {})._strlen(0x10001, 1)
+    wide = emulate._StubBook(RecordingMemory(terminator_at=(limit - 1) * 2), None, ["lstrlenW"], {})
+    assert wide._strlen(0x10000, 2)[0] == limit - 1
