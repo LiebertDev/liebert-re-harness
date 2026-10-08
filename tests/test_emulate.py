@@ -1343,3 +1343,327 @@ def test_wide_accesses_arrive_in_pieces_of_at_most_8_bytes_each_with_a_value_and
     basis = result["memory_trace_basis"]
     assert "read of at most 16 bytes" in basis and "write of at most 8 bytes" in basis
     assert "nothing wider than 8 bytes" in basis and "was not observed" in basis
+
+
+# -- input injection and variant runs -------------------------------------------------------------------------------
+
+STACK_HIGH = 0x7FFC0000
+INITIAL_RSP = STACK_HIGH - 0x100 + 8
+CHECK_BODY = "movzx eax, byte ptr [rcx]; cmp al, 0x42; jne bad; mov rax, 0x1111; ret; bad: mov rax, 0x2222; ret"
+SECRET_HEX = "c0ffee11deadbeef"       # distinctive bytes: they must never appear in a result or a record
+
+
+def check_image(sandbox, **kwargs):
+    """A routine that reads the first byte of the buffer RCX points at and returns 0x1111 for 0x42, else 0x2222."""
+    return build(sandbox, asm(CHECK_BODY), **kwargs)
+
+
+def variants_of(result):
+    return {row["input"]["sha256"]: row for row in result["variants"]}
+
+
+def test_two_inputs_give_two_different_outcomes_in_one_request(sandbox):
+    path = check_image(sandbox)
+    result = emulate_json(path, input_variants=["42", "41"], input_at="reg:RCX")
+    assert result["ok"] is True and result["status"] == "OK" and result["variant_mode"] is True
+    first, second = result["variants"]
+    assert (first["stop_reason"], first["completion"], first["registers"]["rax"]) == ("RETURNED", "RETURNED", "0x1111")
+    assert (second["stop_reason"], second["completion"], second["registers"]["rax"]) == ("RETURNED", "RETURNED", "0x2222")
+    assert first["registers"]["rcx"] == hex(emulate.INPUT_VA) == second["registers"]["rcx"]
+    assert first["input"]["sha256"] == hashlib.sha256(b"\x42").hexdigest() and first["input"]["length"] == 1
+    assert second["input"]["sha256"] == hashlib.sha256(b"\x41").hexdigest()
+    assert (result["variants_total"], result["variants_run"], result["variants_not_run"]) == (2, 2, 0)
+    assert result["total_budget_exhausted"] is False and "fresh emulator" in result["variants_basis"]
+    assert [r["index"] for r in result["variants"]] == [0, 1] and result["completion"] is None
+    # the same input as a single run gives the same registers and instruction count as its variant
+    single = emulate_json(path, input_data="42", input_at="reg:rcx")
+    assert single["registers"] == first["registers"] and single["instructions"] == first["instructions"]
+    assert single["input_injection"]["sha256"] == first["input"]["sha256"]
+
+
+@pytest.mark.parametrize("register", ["rcx", "rdx", "r8", "r9", "rsi", "r15"])
+def test_the_buffer_address_goes_into_the_named_register_and_the_buffer_is_there(sandbox, register):
+    code = asm(f"mov rax, qword ptr [{register}]; mov rbx, {register}; ret")
+    result = emulate_json(build(sandbox, code), input_data="0102030405060708", input_at=f"reg:{register.upper()}")
+    assert result["stop_reason"] == "RETURNED"
+    assert result["registers"]["rax"] == hex(int.from_bytes(bytes(range(1, 9)), "little"))
+    assert result["registers"]["rbx"] == hex(emulate.INPUT_VA) == result["registers"][register]
+    injected = result["input_injection"]
+    assert (injected["mode"], injected["register"], injected["length"], injected["region_bytes"]) == (
+        "register", register, 8, 0x1000)
+    assert injected["buffer_address"] == hex(emulate.INPUT_VA) and injected["content_omitted"] is True
+    assert result["input_basis"] and "never its content" in result["input_basis"]
+
+
+def test_a_buffer_can_be_written_to_a_mapped_address_instead(sandbox):
+    code = asm(f"mov rcx, {DATA}; {CHECK_BODY}")
+    path = build(sandbox, code)
+    for data, rax in (("42", "0x1111"), ("43", "0x2222")):
+        result = emulate_json(path, input_data=data, input_at=hex(DATA))
+        assert result["stop_reason"] == "RETURNED" and result["registers"]["rax"] == rax
+        assert result["input_injection"]["mode"] == "address" and result["input_injection"]["region_bytes"] is None
+        assert result["input_injection"]["buffer_address"] == hex(DATA)
+        # bytes injected into the image are a difference from the loaded image, and the result says so
+        assert result["section_diffs"][0]["changed_bytes"] == 1
+    stack = emulate_json(path, input_data="42", input_at=INITIAL_RSP - 0x80)      # the stack is writable memory too
+    assert stack["stop_reason"] == "RETURNED" and stack["input_injection"]["buffer_address"] == hex(INITIAL_RSP - 0x80)
+    assert stack["registers"]["rax"] == "0x2222"         # the routine reads DATA, which holds 0, not the stack buffer
+
+
+def test_the_result_and_the_record_carry_the_hash_and_length_of_the_input_and_never_its_content(sandbox):
+    path = check_image(sandbox)
+    for kwargs in ({"input_data": SECRET_HEX}, {"input_variants": [SECRET_HEX, "01"]}):
+        result = emulate_json(path, input_at="reg:rcx", **kwargs)
+        text = json.dumps(result)
+        assert SECRET_HEX not in text and "c0ffee11" not in text and "deadbeef" not in text
+        record = (emulate.EVIDENCE / result["evidence_name"]).read_text(encoding="utf-8")
+        assert SECRET_HEX not in record and "deadbeef" not in record
+        buffers = result["request"]["input"]["buffers"]
+        assert buffers[0] == {"sha256": hashlib.sha256(bytes.fromhex(SECRET_HEX)).hexdigest(), "length": 8}
+        assert result["request"]["input"]["content_omitted"] is True
+        assert result["request"]["input"]["mode"] == "register"
+    # with no input there is no injection and the field says so
+    plain = emulate_json(path, registers={"rcx": 0})
+    assert plain["input_injection"] is None and plain["request"]["input"] is None and "variant_mode" not in plain
+
+
+LEAKY = (f"mov rdx, {DATA}; mov rbx, qword ptr [rdx]; mov rdi, qword ptr [rsp - 0x40]; movzx eax, byte ptr [rcx]; "
+         "test eax, eax; jz out; mov dword ptr [rdx], 0x5A5A5A5A; mov qword ptr [rsp - 0x40], 0x77; "
+         "mov r12, 0x99; stc; out: mov rax, r12; ret")
+
+
+def test_a_variant_never_sees_what_an_earlier_one_wrote(sandbox):
+    """Variant 0 and 2 (input 1) write a marker to .text, to the stack, set r12 and the carry flag; variant 1
+    (input 0) reads all four and must find the initial state. Variant 2 repeats variant 0 exactly."""
+    path = build(sandbox, asm(LEAKY))
+    result = emulate_json(path, input_variants=["01", "00", "01", "00"], input_at="reg:rcx")
+    one, zero, one_again, zero_again = result["variants"]
+    assert one["registers"]["rax"] == "0x99" and one["registers"]["rbx"] == "0x0"
+    assert [r["size"] for r in one["written_regions"]] == [4]       # the stack write is outside the image: not listed
+    assert one["sections_changed"] and one["dump_files"]
+    # nothing leaked into the variant that ran after a writer
+    for clean in (zero, zero_again):
+        assert clean["stop_reason"] == "RETURNED"
+        assert clean["registers"]["rbx"] == "0x0", "memory written by an earlier variant is visible"
+        assert clean["registers"]["rdi"] == "0x0", "the stack of an earlier variant is visible"
+        assert clean["registers"]["rax"] == "0x0" and clean["registers"]["r12"] == "0x0", "a register leaked"
+        assert int(clean["registers"]["eflags"], 16) & 1 == 0, "the carry flag leaked"
+        assert clean["written_regions"] == [] and clean["sections_changed"] == [] and clean["dump_files"] == []
+    keys = ("stop_reason", "stop_detail", "completion", "instructions", "registers", "written_regions", "rip")
+    assert {k: one_again[k] for k in keys} == {k: one[k] for k in keys}
+    assert {k: zero_again[k] for k in keys} == {k: zero[k] for k in keys}
+    # the dumps are per variant: the second writer has its own file, with its own marker
+    assert one["dump_files"] != one_again["dump_files"]
+    first = dump_bytes(result, one["dump_files"][0])
+    second = dump_bytes(result, one_again["dump_files"][0])
+    assert first == second and first[0x100:0x104] == bytes.fromhex("5a5a5a5a")
+
+
+def test_stub_state_does_not_carry_between_variants(sandbox):
+    """The allocator a variant used is fresh for the next: both get the first block, and what the first wrote into
+    it is not there for the second. r9 carries the input pointer, which HeapAlloc (three arguments) leaves alone."""
+    path = program(sandbox, "mov ecx, 0", "mov edx, 0", "mov r8d, 0x20", "@HeapAlloc", "mov rbx, rax",
+                   "movzx edi, byte ptr [rbx]", "mov byte ptr [rbx], 0x55", "ret")
+    result = emulate_json(path, input_variants=["01", "02"], input_at="reg:r9", allow_stubs=["HeapAlloc"],
+                          stub_options={"heap_bytes": 0x2000})
+    for row in result["variants"]:
+        assert row["stop_reason"] == "RETURNED", row["stop_detail"]
+        assert row["registers"]["rbx"] == hex(emulate.STUB_HEAP_VA) and row["registers"]["rdi"] == "0x0"
+        assert row["stubs"]["calls_total"] == 1 and row["stubs"]["heap"]["used"] == 0x20
+        assert row["registers"]["r9"] == hex(emulate.INPUT_VA)
+    assert [e["code"] for e in result["limitations"]] == ["STUBBED_IMPORTS"]
+
+
+def test_the_instruction_bound_applies_to_each_variant_not_to_the_request(sandbox):
+    loop = asm("movzx ecx, byte ptr [rcx]; test ecx, ecx; jz done; l: dec ecx; jnz l; done: mov eax, 7; ret")
+    path = build(sandbox, loop)
+    result = emulate_json(path, input_variants=["64", "64", "c8"], input_at="reg:rcx", max_instructions=250)
+    first, second, third = result["variants"]
+    assert (first["stop_reason"], second["stop_reason"]) == ("RETURNED", "RETURNED")
+    assert first["instructions"] == second["instructions"] == 3 + 2 * 100 + 2 and first["instructions"] < 250
+    assert 2 * first["instructions"] > 250            # together they exceed the bound that each stays under
+    assert (third["stop_reason"], third["instructions"], third["completion"]) == ("INSN_LIMIT", 250, "INSN_LIMIT")
+    assert result["bounds"]["max_instructions"] == 250
+
+
+SPIN = asm("cmp byte ptr [rcx], 0; jne spin; ret; spin: jmp spin")
+
+
+def test_the_time_bound_applies_to_each_variant_and_the_total_bound_to_all_of_them(sandbox):
+    path = build(sandbox, SPIN)
+    started = time.monotonic()
+    result = emulate_json(path, input_variants=["01", "01", "01"], input_at="reg:rcx", max_instructions=50_000_000,
+                          timeout_s=1, total_timeout_s=1.5)
+    elapsed = time.monotonic() - started
+    rows = result["variants"]
+    assert rows[0]["stop_reason"] == "TIMEOUT" and rows[0]["completion"] == "TIMEOUT"
+    assert rows[0]["budget_s"] == 1.0 and rows[0]["budget_limited_by_total"] is False
+    assert rows[-1]["ran"] is False and rows[-1]["not_run_because"] == "TOTAL_TIME_BUDGET_EXHAUSTED"
+    assert rows[-1]["stop_reason"] is None and rows[-1]["completion"] is None
+    assert rows[-1]["input"]["sha256"] == hashlib.sha256(b"\x01").hexdigest()
+    assert result["total_budget_exhausted"] is True and result["variants_not_run"] >= 1
+    assert result["variants_run"] + result["variants_not_run"] == 3 == result["variants_total"]
+    assert all(r["budget_limited_by_total"] for r in rows if r["ran"] and r["index"] > 0)
+    assert result["total_budget_s"] == 1.5 and elapsed < 20
+    # the default total is the per-variant bound times the count, capped at the ceiling
+    quick = emulate_json(check_image(sandbox), input_variants=["42", "42"], input_at="reg:rcx", timeout_s=7)
+    assert quick["total_budget_s"] == 14.0 and quick["bounds"]["total_timeout_s"] == 14.0
+    assert emulate_json(check_image(sandbox), input_variants=["42"] * 3, input_at="reg:rcx",
+                        timeout_s=400)["total_budget_s"] == 600.0
+
+
+def test_each_variant_has_its_own_memory_trace(sandbox):
+    code = asm(f"mov rdx, {DATA}; movzx eax, byte ptr [rcx]; mov byte ptr [rdx + rax], 1; ret")
+    path = build(sandbox, code)
+    result = emulate_json(path, input_variants=["00", "03"], input_at="reg:rcx", memory_watch=[rng(DATA, DATA + 8)],
+                          memory_watch_limit=10)
+    first, second = result["variants"]
+    assert [(e["seq"], e["kind"], e["address"]) for e in first["memory_trace"]] == [(1, "write", hex(DATA))]
+    assert [(e["seq"], e["kind"], e["address"]) for e in second["memory_trace"]] == [(1, "write", hex(DATA + 3))]
+    assert first["memory_trace_truncated"] is False and result["memory_trace_basis"]
+    plain = emulate_json(path, input_variants=["00"], input_at="reg:rcx")
+    assert plain["variants"][0]["memory_trace"] is None
+
+
+def test_the_buffer_counts_as_emulated_memory_and_the_largest_one_is_accepted(sandbox):
+    path = check_image(sandbox)
+    small = emulate_json(path, input_data="42", input_at="reg:rcx")
+    largest = emulate_json(path, input_data=bytes([0x42]) * emulate.MAX_INPUT_BYTES, input_at="reg:rcx")
+    assert largest["stop_reason"] == "RETURNED" and largest["input_injection"]["region_bytes"] == 0x10000
+    assert largest["mapped_bytes"] - small["mapped_bytes"] == 0x10000 - 0x1000
+    assert largest["input_injection"]["length"] == 0x10000
+    thirty_two = emulate_json(path, input_variants=["42"] * emulate.MAX_VARIANTS, input_at="reg:rcx")
+    assert thirty_two["variants_run"] == 32 and {r["registers"]["rax"] for r in thirty_two["variants"]} == {"0x1111"}
+    assert all(r["mapped_bytes"] == small["mapped_bytes"] for r in thirty_two["variants"])
+
+
+@pytest.mark.parametrize("kwargs, error", [
+    ({"input_data": "42"}, "BAD_INPUT"),                                                          # no input_at
+    ({"input_data": "42", "input_variants": ["42"], "input_at": "reg:rcx"}, "BAD_INPUT"),         # both forms
+    ({"input_at": "reg:rcx"}, "BAD_INPUT"),                                                       # no buffer
+    ({"total_timeout_s": 5}, "BAD_INPUT"),
+    ({"input_data": "", "input_at": "reg:rcx"}, "BAD_INPUT"),                                     # empty
+    ({"input_data": b"", "input_at": "reg:rcx"}, "BAD_INPUT"),
+    ({"input_data": "4", "input_at": "reg:rcx"}, "BAD_INPUT"),                                    # odd length
+    ({"input_data": "zz", "input_at": "reg:rcx"}, "BAD_INPUT"),
+    ({"input_data": "0x42", "input_at": "reg:rcx"}, "BAD_INPUT"),
+    ({"input_data": 42, "input_at": "reg:rcx"}, "BAD_INPUT"),
+    ({"input_data": b"\x00" * (emulate.MAX_INPUT_BYTES + 1), "input_at": "reg:rcx"}, "BAD_INPUT"),
+    ({"input_variants": [], "input_at": "reg:rcx"}, "BAD_INPUT"),
+    ({"input_variants": "42", "input_at": "reg:rcx"}, "BAD_INPUT"),
+    ({"input_variants": ["42"] * (emulate.MAX_VARIANTS + 1), "input_at": "reg:rcx"}, "BAD_INPUT"),
+    ({"input_variants": ["42", "zz"], "input_at": "reg:rcx"}, "BAD_INPUT"),
+    ({"input_variants": [b"\x00" * emulate.MAX_INPUT_BYTES] * 17, "input_at": "reg:rcx"}, "BAD_INPUT"),   # over 1 MiB together
+    ({"input_data": "42", "input_at": "reg:rsp"}, "BAD_INPUT"),
+    ({"input_data": "42", "input_at": "reg:rip"}, "BAD_INPUT"),
+    ({"input_data": "42", "input_at": "reg:"}, "BAD_INPUT"),
+    ({"input_data": "42", "input_at": "rcx"}, "BAD_INPUT"),
+    ({"input_data": "42", "input_at": "-1"}, "BAD_INPUT"),
+    ({"input_data": "42", "input_at": True}, "BAD_INPUT"),
+    ({"input_data": "42", "input_at": hex(1 << 64)}, "BAD_INPUT"),
+    ({"input_data": "42424242", "input_at": hex((1 << 64) - 2)}, "BAD_INPUT"),                   # runs past 2**64
+    ({"input_data": "42", "input_at": "reg:rcx", "registers": {"rcx": 5}}, "BAD_INPUT"),        # contradicting registers
+    ({"input_data": "42", "input_at": "reg:rcx", "total_timeout_s": 5}, "BAD_INPUT"),           # single run
+    ({"input_variants": ["42"], "input_at": "reg:rcx", "total_timeout_s": 0}, "BAD_TIMEOUT"),
+    ({"input_variants": ["42"], "input_at": "reg:rcx", "total_timeout_s": 601}, "BAD_TIMEOUT"),
+    ({"input_variants": ["42"], "input_at": "reg:rcx", "total_timeout_s": True}, "BAD_TIMEOUT"),
+    ({"input_variants": ["42", "42"], "input_at": "reg:rcx", "memory_watch": [{"start": 0, "end": 8}],
+      "memory_watch_limit": 5001}, "BAD_MEMORY_WATCH"),                                          # one bounded result line
+])
+def test_an_invalid_input_request_is_refused_before_anything_runs(sandbox, kwargs, error):
+    result = emulate_json(check_image(sandbox), **kwargs)
+    assert result["ok"] is False and result["status"] == "TOOL_USAGE" and result["error"] == error
+    assert result["completion"] is None and "operation_ran" not in result and "run_id" not in result
+
+
+def test_a_watch_limit_that_fits_the_variant_count_is_accepted(sandbox):
+    result = emulate_json(check_image(sandbox), input_variants=["42", "42"], input_at="reg:rcx",
+                          memory_watch=[rng(DATA, DATA + 8)], memory_watch_limit=5000)
+    assert result["ok"] is True and result["variants_run"] == 2
+
+
+@pytest.mark.parametrize("address, detail", [
+    (0x1234, "mapped, writable"),                                  # unmapped
+    (IMAGE_BASE, "mapped, writable"),                              # the read-only headers
+    (INITIAL_RSP - 3, "return slot"),                              # a buffer that reaches the sentinel slot
+    (INITIAL_RSP, "return slot"),
+    (0x7FFDA000, "TEB"),
+    (0x7FFDE000 + 0xFFE, "PEB"),
+    (SENTINEL, "return sentinel"),
+    (STACK_HIGH - 2, "mapped, writable"),                          # runs off the top of the stack
+])
+def test_an_address_the_buffer_cannot_be_written_to_is_refused_and_nothing_runs(sandbox, address, detail):
+    result = emulate_json(check_image(sandbox), input_data="42424242", input_at=address)
+    assert result["status"] == "TOOL_USAGE" and result["error"] == "BAD_INPUT_ADDRESS" and detail in result["detail"]
+    assert result["stop_reason"] is None and result["completion"] is None
+    variants = emulate_json(check_image(sandbox), input_variants=["42", "42424242"], input_at=address)
+    assert variants["error"] == "BAD_INPUT_ADDRESS" and "variants" not in variants
+
+
+def test_an_address_in_a_section_declared_read_only_is_refused_unless_rwx_is_forced(sandbox):
+    path = build(sandbox, asm(f"mov rcx, {DATA}; {CHECK_BODY}"), chars=RX)
+    refused = emulate_json(path, input_data="42", input_at=hex(DATA))
+    assert refused["error"] == "BAD_INPUT_ADDRESS" and "writable" in refused["detail"]
+    forced = emulate_json(path, input_data="42", input_at=hex(DATA), perm_mode="rwx")
+    assert forced["registers"]["rax"] == "0x1111" and forced["input_injection"]["buffer_address"] == hex(DATA)
+
+
+def test_a_refusal_in_a_later_variant_names_the_variant_and_fails_the_request(sandbox):
+    """Address mode: the first buffer fits below the end of the stack, the second does not."""
+    result = emulate_json(check_image(sandbox), input_variants=["42", "4242424242424242"], input_at=STACK_HIGH - 4)
+    assert result["status"] == "TOOL_USAGE" and result["error"] == "BAD_INPUT_ADDRESS"
+    assert result["detail"].startswith("variant 1:") and "variants" not in result
+
+
+def test_a_numeric_string_with_a_leading_zero_is_decimal_not_an_error():
+    assert emulate._int_value("010") == 10 and emulate._int_value("0x10") == 16 and emulate._int_value(" 07 ") == 7
+    assert emulate._int_value("0b1") is None and emulate._int_value("1_0") is None and emulate._int_value("-1") is None
+    assert emulate._int_value(True) is None and emulate._int_value(5) == 5
+
+
+def test_the_emulate_subcommand_injects_one_input_and_runs_variants(sandbox, capsys):
+    path = check_image(sandbox)
+    base = ["emulate", _relative(path), "--start", hex(TEXT), "--target-class", "public_crackme"]
+    code, out = run_cli(capsys, *base, "--input-hex", "42", "--input-at", "reg:RCX")
+    assert code == 0 and out["registers"]["rax"] == "0x1111" and out["input_injection"]["register"] == "rcx"
+    blob = sandbox / "buffer.bin"
+    blob.write_bytes(b"\x41")
+    code, out = run_cli(capsys, *base, "--input-file", _relative(blob), "--input-at", "reg:rcx")
+    assert code == 0 and out["registers"]["rax"] == "0x2222" and out["registers"]["rcx"] == hex(emulate.INPUT_VA) \
+        and out["input_injection"]["sha256"] == hashlib.sha256(b"\x41").hexdigest()
+    lines = sandbox / "variants.txt"
+    lines.write_text("42\n 41 \nc0ffee\n", encoding="ascii")
+    code, out = run_cli(capsys, *base, "--variants-file", _relative(lines), "--input-at", "reg:RCX", "--total-timeout", "30")
+    assert code == 0 and [r["registers"]["rax"] for r in out["variants"]] == ["0x1111", "0x2222", "0x2222"]
+    assert out["total_budget_s"] == 30.0 and out["command"] == "emulate"
+    assert "c0ffee" not in json.dumps(out)
+    # the same through an address
+    code, out = run_cli(capsys, *base, "--reg", "rcx=" + hex(DATA), "--input-hex", "42", "--input-at", hex(DATA))
+    assert code == 0 and out["registers"]["rax"] == "0x1111" and out["input_injection"]["mode"] == "address"
+    code, out = run_cli(capsys, *base, "--input-hex", "42", "--input-at", "reg:rcx", "--reg", "rcx=1")
+    assert code != 0 and out["error"] == "BAD_INPUT"
+
+
+def test_the_emulate_subcommand_refuses_unusable_input_flags(sandbox, capsys):
+    path = check_image(sandbox)
+    base = ["emulate", _relative(path), "--start", hex(TEXT), "--target-class", "public_crackme"]
+    blank = sandbox / "blank.txt"
+    blank.write_text("42\n\n41\n", encoding="ascii")
+    nonascii = sandbox / "nonascii.txt"
+    nonascii.write_bytes("42\n\u00e9\n".encode("utf-8"))
+    big = sandbox / "big.bin"
+    big.write_bytes(b"\x00" * (emulate.MAX_INPUT_BYTES + 1))
+    for argv in (["--input-hex", "42"],                                                       # no --input-at
+                 ["--input-at", "reg:rcx"],                                                   # no input
+                 ["--total-timeout", "5"],
+                 ["--input-hex", "42", "--input-file", _relative(big), "--input-at", "reg:rcx"],
+                 ["--input-hex", "42", "--variants-file", _relative(blank), "--input-at", "reg:rcx"],
+                 ["--variants-file", _relative(blank), "--input-at", "reg:rcx"],              # blank line
+                 ["--variants-file", _relative(nonascii), "--input-at", "reg:rcx"],
+                 ["--input-file", _relative(big), "--input-at", "reg:rcx"],                    # over the size bound
+                 ["--input-file", _relative(sandbox / "missing.bin"), "--input-at", "reg:rcx"],
+                 ["--input-hex", "4", "--input-at", "reg:rcx"],                               # odd hex
+                 ["--input-hex", "42", "--input-at", "reg:rsp"]):
+        code, out = run_cli(capsys, *base, *argv)
+        assert code != 0 and out["ok"] is False and out["status"] in ("TOOL_USAGE", "PATH_REFUSED"), argv
+        assert out.get("stop_reason") is None
