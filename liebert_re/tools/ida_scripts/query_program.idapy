@@ -135,7 +135,8 @@ def _job():
 # nothing), ``UNRESOLVED`` (the name or address could not be resolved to anything to look at) and
 # ``QUERY_FAILED`` (the lookup itself did not run to the end). ``lookup_errors`` lists each sub-step that
 # raised, as ``STEP: ExceptionClass: short message`` (no path, at most ``_ERROR_MESSAGE_MAX`` characters);
-# an answer that still carries something while some sub-step failed is ``OK`` with ``partial: true``.
+# an answer that still carries something while some sub-step failed, or a walk hit its ceiling, is ``OK`` with
+# ``partial: true``; an empty answer from a lookup that failed or was cut short is ``QUERY_FAILED``, never ``NOT_FOUND``.
 # ``_safe`` records into one collector that ``_run`` resets before and reads after each operation.
 _ERROR_MESSAGE_MAX = 120
 _LOOKUP_ERRORS_MAX = 50
@@ -379,6 +380,8 @@ def _find_imports(name, budget, errors):
                 break
     except Exception as exc:  # noqa: BLE001
         errors.append(_error_entry("IMPORT_LOOKUP_FAILED", exc))
+    if budget.tripped:  # the walk was cut short: an import not found past the cut is not an absent one
+        errors.append("IMPORT_NAME_WALK_LIMIT: stopped after %d entries (%s)" % (budget.items, budget.tripped))
     return found
 
 
@@ -460,6 +463,8 @@ def _op_xrefs_to(result, query, max_results, offset):
         result["error"] = "SYMBOL_NOT_FOUND"
         if errors:
             result["lookup_errors"] = errors
+        if budget.tripped:  # the demangled-name walk was cut short: "no such symbol" is not established
+            result.update(budget.as_limited())
         return
     shown = candidates[:_CANDIDATE_LIMIT]
     methods = sorted({c["resolved_by"] for c in shown}, key=_RESOLVED_BY_ORDER.index)
@@ -1901,18 +1906,40 @@ def _answer_is_empty(result, operation):
     return isinstance(count, int) and not isinstance(count, bool) and count == 0
 
 
+# A walk that only feeds a side count (not the counted answer): stopping it leaves that one field null.
+_SECONDARY_WALKS = frozenset({"flirt_library_functions"})
+
+
+def _search_cut_short(result, operation):
+    """Why the search behind this answer did not run to its end (a step budget reached, or candidates / imports
+    left unexamined), or None. A cut-short search that found nothing has not shown that nothing is there."""
+    limit = result.get("walk_limit")
+    if isinstance(limit, dict) and limit.get("walk") not in _SECONDARY_WALKS:
+        return "the %s walk stopped at its %s ceiling" % (limit.get("walk"), limit.get("reason"))
+    if operation == "xrefs_to" and result.get("candidates_truncated") is True:
+        return "only the first %d candidate addresses were examined" % _CANDIDATE_LIMIT
+    if operation == "callers_of_import" and result.get("imports_truncated") is True:
+        return "only the first %d matching imports were examined" % _CANDIDATE_LIMIT
+    return None
+
+
 def _apply_status(result, operation):
     """Set ``status`` (OK / NOT_FOUND / UNRESOLVED / QUERY_FAILED), ``partial`` and ``lookup_errors`` (always a
-    list). A lookup that raised never reads as "not found": a not-found answer with errors recorded for the
-    lookup itself is QUERY_FAILED, and a successful empty answer with errors is an incomplete lookup. Fields the
-    operation already set are kept."""
+    list). A lookup that raised or was cut short never reads as "not found": a not-found or empty answer with
+    errors recorded for the lookup itself, or whose search hit a walk ceiling, is QUERY_FAILED (``error`` is
+    LOOKUP_INCOMPLETE for an empty answer); a cut-short answer that holds something is OK with ``partial``.
+    Fields the operation already set are kept."""
     operation_errors = list(result.get("lookup_errors") or [])
     errors = _merged_lookup_errors(operation_errors)
     result["lookup_errors"] = errors
+    cut_short = _search_cut_short(result, operation)
     error = result.get("error")
     if not result.get("ok"):
-        if operation_errors and error in (_UNRESOLVED_ERRORS | _NOT_FOUND_ERRORS):
-            status = "QUERY_FAILED"      # the resolution step itself raised: "not found" would be a guess
+        if (operation_errors or cut_short) and error in (_UNRESOLVED_ERRORS | _NOT_FOUND_ERRORS):
+            status = "QUERY_FAILED"      # the resolution step itself failed or was cut short: "not found" would be a guess
+            if cut_short and not operation_errors:
+                result["detail"] = ("%s; the search was cut short (%s), so %s is not established."
+                                    % ((result.get("detail") or "").rstrip(". ") or "Nothing was resolved", cut_short, error))
         elif error in _UNRESOLVED_ERRORS:
             status = "UNRESOLVED"
         elif error in _NOT_FOUND_ERRORS:
@@ -1922,16 +1949,21 @@ def _apply_status(result, operation):
         result["status"], result["partial"] = status, False
         return
     if _answer_is_empty(result, operation):
-        if errors:
+        if errors or cut_short:
+            reasons = []
+            if errors:
+                reasons.append("a sub-step of the lookup failed (see lookup_errors)")
+            if cut_short:
+                reasons.append("the search was cut short (%s)" % cut_short)
             result["ok"] = False
             result["error"] = "LOOKUP_INCOMPLETE"
-            result["detail"] = ("The answer is empty but a sub-step of the lookup failed (see lookup_errors), so "
-                                "'nothing found' is not established.")
+            result["detail"] = "The answer is empty but %s, so 'nothing found' is not established." % " and ".join(reasons)
             result["status"], result["partial"] = "QUERY_FAILED", False
         else:
             result["status"], result["partial"] = "NOT_FOUND", False
         return
-    result["status"], result["partial"] = "OK", bool(errors)
+    result["status"] = "OK"
+    result["partial"] = bool(errors) or isinstance(result.get("walk_limit"), dict) or cut_short is not None
 
 
 def _stamp_input_identity(result):

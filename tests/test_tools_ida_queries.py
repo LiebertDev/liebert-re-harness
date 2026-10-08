@@ -1725,6 +1725,139 @@ def test_get_struct_not_found_unresolved_and_failed(w2):
     assert _shape(_status_run(w2.module, "get_struct", "Empty")) == ("NOT_FOUND", True, False)
 
 
+# ---- a cut-short search is never "not found"; a helper step never changes a definite answer ----
+def _small_budgets(monkeypatch, module, max_items):
+    real = module._Budget
+    monkeypatch.setattr(module, "_Budget", lambda label, **kw: real(label, max_items=max_items))
+    return lambda: monkeypatch.setattr(module, "_Budget", real)
+
+
+def test_strings_a_walk_cut_by_its_budget_with_no_match_is_incomplete_not_not_found(worker, monkeypatch):
+    module, ida, _db = worker
+    _strings_world(ida)
+    restore = _small_budgets(monkeypatch, module, 3)
+    ida["idautils"].Strings.side_effect = lambda: iter([_Str(0x3000 + 16 * n, "alpha") for n in range(10)])
+    r = _status_run(module, "strings", "zzz")
+    assert r["items_matched"] == 0 and r["walk_limit"]["reason"] == "MAX_ITEMS"
+    assert (r["status"], r["ok"], r["error"], r["partial"]) == ("QUERY_FAILED", False, "LOOKUP_INCOMPLETE", False)
+    assert "cut short" in r["detail"] and "strings" in r["detail"]
+    # the same filter over a walk that ran to its end is still a definite "not found"
+    restore()
+    assert _shape(_status_run(module, "strings", "zzz")) == ("NOT_FOUND", True, False)
+
+
+def test_strings_a_walk_cut_by_its_budget_after_a_match_is_ok_and_partial(worker, monkeypatch):
+    module, ida, _db = worker
+    _strings_world(ida)
+    _small_budgets(monkeypatch, module, 3)
+    ida["idautils"].Strings.side_effect = lambda: iter([_Str(0x3000, "needle")] + [_Str(0x3100 + 16 * n, "x") for n in range(9)])
+    r = _status_run(module, "strings", "needle")
+    assert _shape(r) == ("OK", True, True) and r["items_matched"] == 1 and "walk_limit" in r
+
+
+@pytest.mark.parametrize("operation", [
+    "list_functions", "segments", "xrefs_to", "strings", "xrefs_from", "callers_of_import", "disasm_range",
+    "basic_blocks", "stack_frame", "local_variables", "find_bytes", "find_immediate", "list_structs", "get_struct",
+    "flirt_signatures"])
+def test_every_counted_operation_with_a_zero_count_and_a_walk_limit_is_incomplete(worker, operation):
+    module, _ida, _db = worker
+    assert operation in module._ANSWER_COUNT_KEYS
+    result = {"ok": True, "items": [], module._ANSWER_COUNT_KEYS[operation]: 0,
+              "walk_limit": {"walk": "w", "reason": "MAX_SECONDS", "items_visited": 1, "max_items": 5, "max_seconds": 1.0}}
+    module._LOOKUP_ERRORS.clear()
+    module._apply_status(result, operation)
+    assert (result["status"], result["ok"], result["error"]) == ("QUERY_FAILED", False, "LOOKUP_INCOMPLETE")
+    done = {"ok": True, "items": [], module._ANSWER_COUNT_KEYS[operation]: 0}
+    module._apply_status(done, operation)
+    assert (done["status"], done["ok"]) == ("NOT_FOUND", True)
+
+
+def test_imports_exports_empty_with_a_walk_limit_is_incomplete(worker):
+    module, _ida, _db = worker
+    result = {"ok": True, "items": [], "exports": [], "walk_limit": {"walk": "imports_exports", "reason": "MAX_ITEMS"}}
+    module._LOOKUP_ERRORS.clear()
+    module._apply_status(result, "imports_exports")
+    assert (result["status"], result["error"]) == ("QUERY_FAILED", "LOOKUP_INCOMPLETE")
+
+
+def test_a_walk_limit_on_a_side_count_does_not_make_an_empty_answer_incomplete(worker):
+    module, _ida, _db = worker
+    result = {"ok": True, "items": [], "total_signature_count": 0,
+              "walk_limit": {"walk": "flirt_library_functions", "reason": "MAX_ITEMS"}}
+    module._LOOKUP_ERRORS.clear()
+    module._apply_status(result, "flirt_signatures")
+    assert (result["status"], result["ok"], result["partial"]) == ("NOT_FOUND", True, False)
+
+
+def test_list_structs_cut_by_its_budget_before_any_match_is_incomplete(w2, monkeypatch):
+    _types(w2)
+    _small_budgets(monkeypatch, w2.module, 1)
+    r = _status_run(w2.module, "list_structs", "")
+    assert r["total_struct_count"] == 0 and r["walk_limit"]["walk"] == "list_structs"
+    assert (r["status"], r["error"]) == ("QUERY_FAILED", "LOOKUP_INCOMPLETE")
+
+
+def test_xrefs_to_a_demangled_name_walk_cut_short_is_not_symbol_not_found(worker, monkeypatch):
+    module, _ida, db = worker
+    db.names.update({"?f%d@@YAXXZ" % n: 0x2000 + n for n in range(8)})
+    restore = _small_budgets(monkeypatch, module, 3)
+    r = _status_run(module, "xrefs_to", "NoSuchThing")
+    assert (r["status"], r["ok"], r["error"]) == ("QUERY_FAILED", False, "SYMBOL_NOT_FOUND")
+    assert r["walk_limit"]["walk"] == "xref_target_names" and "cut short" in r["detail"]
+    restore()
+    assert _shape(_status_run(module, "xrefs_to", "NoSuchThing")) == ("UNRESOLVED", False, False)
+
+
+def test_xrefs_to_unexamined_candidates_make_an_empty_answer_incomplete(worker):
+    module, _ida, db = worker
+    db.imports = [("M%02d" % n, "Dup", None, 0x4000 + 8 * n) for n in range(module._CANDIDATE_LIMIT + 1)]
+    r = _status_run(module, "xrefs_to", "Dup")
+    assert r["candidates_truncated"] is True and r["total_xref_count"] == 0
+    assert (r["status"], r["error"]) == ("QUERY_FAILED", "LOOKUP_INCOMPLETE")
+    db.refs_to[0x4000] = [_xref(0x1010, 0x4000, 17, True)]
+    r = _status_run(module, "xrefs_to", "Dup")
+    assert _shape(r) == ("OK", True, True) and r["lookup_errors"] == []
+
+
+def test_callers_of_import_unexamined_imports_make_an_empty_answer_incomplete(worker):
+    module, _ida, db = worker
+    db.imports = [("M%02d" % n, "Dup", None, 0x4000 + 8 * n) for n in range(module._CANDIDATE_LIMIT + 1)]
+    r = _status_run(module, "callers_of_import", "Dup")
+    assert r["imports_truncated"] is True and r["total_caller_count"] == 0
+    assert (r["status"], r["error"]) == ("QUERY_FAILED", "LOOKUP_INCOMPLETE")
+
+
+def test_callers_of_import_an_import_name_walk_cut_short_is_not_import_not_found(worker, monkeypatch):
+    module, _ida, db = worker
+    db.imports = [("K", "Other%d" % n, None, 0x4000 + 8 * n) for n in range(6)] + [("K", "Wanted", None, 0x4100)]
+    _small_budgets(monkeypatch, module, 3)
+    r = _status_run(module, "callers_of_import", "Wanted")
+    assert (r["status"], r["error"]) == ("QUERY_FAILED", "IMPORT_NOT_FOUND")
+    assert any(e.startswith("IMPORT_NAME_WALK_LIMIT") for e in r["lookup_errors"])
+
+
+def test_type_member_offset_a_failing_suggestion_step_does_not_change_the_definite_answer(w2, monkeypatch):
+    _types(w2)
+    typeinf = sys.modules["ida_typeinf"]
+    base = typeinf.tinfo_t
+
+    class Tif(base):
+        def find_udm(self, udm, how):
+            return -1
+
+        def get_udm(self, index):
+            raise RuntimeError("member list died")
+
+    monkeypatch.setattr(typeinf, "tinfo_t", Tif)
+    monkeypatch.setattr(typeinf, "udm_t", SimpleNamespace, raising=False)
+    monkeypatch.setattr(typeinf, "STRMEM_NAME", 1, raising=False)
+    r = _status_run(w2.module, "type_member_offset", json.dumps({"struct_name": "_GUID", "member_name": "NoSuch"}))
+    assert (r["status"], r["ok"], r["error"], r["partial"]) == ("NOT_FOUND", False, "MEMBER_NOT_FOUND", False)
+    assert r["member_names"] == [None, None] and r["member_names_truncated"] is False
+    # the failed helper step stays visible, but it is not what decided the status
+    assert r["lookup_errors"] == ["TYPE_MEMBER_NAME_LIST: RuntimeError: member list died (x2)"]
+
+
 # ---- every other query ----
 @pytest.mark.parametrize("operation", ["function_at_address", "decompile_function", "stack_frame", "basic_blocks",
                                        "local_variables", "callgraph", "xrefs_from"])

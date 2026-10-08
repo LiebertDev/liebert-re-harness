@@ -1437,7 +1437,7 @@ def _success_response(tool, p, sha256, md5, operation, data, *, cache_state, sig
         for key in _WORKER_QUERY_FIELDS:
             body.pop(key, None)
         body["query_result"] = _query_result(data)
-        if body["query_result"]["partial"]:
+        if body["query_result"]["partial"] and body["query_result"]["lookup_errors"]:
             limitations.append(
                 f"{len(body['query_result']['lookup_errors'])} sub-step(s) of the lookup failed (see lookup_errors); "
                 "what is listed is what could be read, and an absent entry is not proof of absence"
@@ -1605,7 +1605,7 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
     `query_result` says what the LOOKUP found, apart from the run-level `status` below: `status` is `OK`,
     `NOT_FOUND` (the lookup ran to the end and found nothing), `UNRESOLVED` (the name or address could not be
     resolved to anything to look at) or `QUERY_FAILED` (a step of the lookup raised, or the run failed), and
-    `UNKNOWN` when the worker did not say. `partial` is true when something is listed but a sub-step failed;
+    `UNKNOWN` when the worker did not say. `partial` is true when something is listed but a sub-step failed or a walk hit its ceiling;
     `lookup_errors` (also at the top level) names each failed sub-step and exception class, without paths.
     An empty `items` with no `NOT_FOUND` status is not a finding. A field IDA could not be asked is null
     (`is_bitfield` included), never a default.
