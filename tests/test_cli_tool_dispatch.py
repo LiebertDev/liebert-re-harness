@@ -175,6 +175,8 @@ def test_text_answer_is_wrapped_in_the_generic_envelope_and_says_it_is_unclassif
     assert out["result_format"] == "text" and "hello" in out["text"]
     assert out["ok"] is True and out["status"] == "OK" and out["classified"] is False
 
+    assert "not classified as a success" in out["note"]
+
 
 def _str_annotated_tools():
     """Published tools declared ``-> str``, read from the AST (never imported), minus the python-only ones."""

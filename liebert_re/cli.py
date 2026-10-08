@@ -156,6 +156,8 @@ def _decode(raw, shape=None, tool=None):
             out["empty"] = True
         if tool is not None:
             out["classified"] = False
+            out["note"] = ("ok:true here means only that the tool returned without a known failure code; "
+                           "the text was not classified as a success, read it")
     return out
 
 

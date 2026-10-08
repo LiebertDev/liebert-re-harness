@@ -84,6 +84,26 @@ class NormalizeToolResultTests(unittest.TestCase):
         self.assertEqual(out["summary"], "plain text result, not json")
         self.assertFalse(out["truncated"])
 
+    def test_non_json_text_is_unknown_not_ready(self):
+        out = normalize_tool_result("plain text result, not json", tool="x", target="y")
+        self.assertEqual(out["status"], "UNKNOWN")
+        self.assertTrue(any("not JSON" in text for text in out["limitations"]))
+
+    def test_json_without_status_or_ok_is_unknown_not_ready(self):
+        for raw in ({"summary": "something"}, {}, "{}", '{"summary": "s"}'):
+            out = normalize_tool_result(raw, tool="x", target="y")
+            self.assertEqual(out["status"], "UNKNOWN", raw)
+            self.assertTrue(any("neither status nor ok" in text for text in out["limitations"]), raw)
+
+    def test_json_that_is_not_an_object_is_unknown_and_does_not_raise(self):
+        for raw in ("[1, 2]", '"text"', "null", "5"):
+            out = normalize_tool_result(raw, tool="x", target="y")
+            self.assertEqual(out["status"], "UNKNOWN", raw)
+
+    def test_ok_must_be_literally_true_to_be_ready(self):
+        self.assertEqual(normalize_tool_result({"ok": "yes"}, tool="x", target="y")["status"], "FAILED")
+        self.assertEqual(normalize_tool_result({"ok": 1}, tool="x", target="y")["status"], "FAILED")
+
 
 class ProbeEvidenceBindingTests(unittest.TestCase):
     def setUp(self):

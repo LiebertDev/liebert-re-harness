@@ -86,10 +86,21 @@ def normalize_tool_result(result, *, tool: str, target: str, file_type: str = "U
         try:
             payload = json.loads(result)
         except json.JSONDecodeError:
-            payload = {"summary": result[:2000], "truncated": len(result) > 2000}
+            # Text that is not JSON carries no success field: it is summarised, never taken as READY.
+            payload = {"summary": result[:2000], "truncated": len(result) > 2000,
+                       "limitations": ["tool output was not JSON; its status could not be determined"]}
     else:
         payload = dict(result or {})
-    raw_status = str(payload.get("status") or ("READY" if payload.get("ok", True) else "FAILED")).upper()
+    if not isinstance(payload, dict):
+        payload = {"value": payload, "limitations": ["tool output was JSON but not an object; its status could not be determined"]}
+    # Success comes only from an explicit status or an explicit ok field; neither present is UNKNOWN.
+    if payload.get("status"):
+        raw_status = str(payload["status"]).upper()
+    elif "ok" in payload:
+        raw_status = "READY" if payload["ok"] is True else "FAILED"
+    else:
+        raw_status = "UNKNOWN"
+        payload = {**payload, "limitations": [*(payload.get("limitations") or []), "tool output carried neither status nor ok; success was not assumed"]}
     allowed = ALLOWED_STATUSES
     status = raw_status if raw_status in allowed else "READY" if raw_status in {"PASS", "OK"} else "FAILED"
     return {
