@@ -13,7 +13,8 @@ every "fail-closed contract" test that reached the write calls deposited a real 
 real ledger -- roughly 250 of them, all built from one fabricated response and one fixture
 file, indistinguishable at a glance from a genuine run recorded in the ledger.
 
-What this package has instead: no guest (Hyper-V) layer, and no ``tools_*.py`` modules. The
+What this package has instead: no guest run layer (only the file transport in
+``dynamic/hyperv_transport.py``, which binds no ``EVIDENCE`` directory), and no ``tools_*.py`` modules. The
 wrappers live in ``liebert_re/tools/`` and ``liebert_re/dynamic/`` and several of them
 (``tools/capa.py``, ``tools/die.py``, ``tools/ida.py``, ``tools/rizin.py``, ``tools/ghidra.py``,
 ``dynamic/lab_gate.py``, ...) bind a module-level ``EVIDENCE`` directory the same way.

@@ -21,7 +21,7 @@ written here) and does integer arithmetic; it never touches a live process,
 never opens a guest transport, and never executes anything. Host-side static
 analysis of a file, full stop -- the same class of tool as the other static
 readers in this package (e.g. ``liebert_re/tools/binary.py``), not a tool that needs a guest VM:
-this package has no guest layer.
+this package has no guest run layer.
 
 **Why naive ``base + rva`` is wrong, and what this module does about it.**
 

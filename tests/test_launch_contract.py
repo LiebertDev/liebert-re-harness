@@ -28,6 +28,8 @@ SHARED = {
 OWN_CODE = {
     "tools/ida.py": ["IDA_LAUNCH_FAILED"],
     "tools/ghidra.py": ["JAVA_LAUNCH_FAILED", "GHIDRA_LAUNCH_FAILED"],
+    # the guest transport reports an unstartable PowerShell as UNKNOWN/POWERSHELL_LAUNCH_FAILED
+    "dynamic/hyperv_transport.py": ["POWERSHELL_LAUNCH_FAILED"],
 }
 # lab_gate builds its own TOOL_UNLAUNCHABLE record without the helper.
 LAB_GATE = "dynamic/lab_gate.py"
@@ -57,9 +59,9 @@ def _scan():
     return callers, importers
 
 
-def test_fourteen_modules_call_run_bounded_process():
+def test_pinned_set_of_modules_calls_run_bounded_process():
     callers, _ = _scan()
-    assert len(callers) == 14, sorted(callers)
+    assert len(callers) == 15, sorted(callers)
     assert callers == SHARED | set(OWN_CODE) | {LAB_GATE}
 
 
