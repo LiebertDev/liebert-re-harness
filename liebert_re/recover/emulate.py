@@ -718,12 +718,14 @@ class _Runner:
                     "detail": "the emulator process exceeded its memory bound and was terminated"}
         lines = [ln for ln in (outcome.stdout or "").splitlines() if ln.strip()]
         body = None
+        untrusted = None       # strict_json reason when the result line IS JSON but not strict JSON
         if outcome.returncode == 0 and lines:
             try:
                 parsed = strict_json.loads(lines[-1])
                 body = parsed if isinstance(parsed, dict) else None
-            except ValueError:
-                body = None
+            except strict_json.StrictJSONError as exc:
+                if exc.reason != strict_json.MALFORMED:
+                    untrusted = exc.reason
         if body is None:
             partial = []
             try:
@@ -733,6 +735,15 @@ class _Runner:
                                         "sha256": _Runner.sha256_of(item), "unverified": True})
             except OSError:
                 pass
+            if untrusted is not None:
+                return {"ok": False, "status": "ANALYSIS_LIMITED", "error": "NON_STRICT_JSON_RESULT",
+                        "reason": untrusted, "stop_reason": "NON_STRICT_JSON_RESULT",
+                        "state_available": False, "emulator_exit_code": outcome.returncode,
+                        "stderr_chars": len(outcome.stderr or ""), "partial_dumps": partial,
+                        "detail": "the emulator exited normally but its result line is not strict JSON (%s: a "
+                                  "repeated key, NaN/Infinity, an overflowing number or absurd nesting); it is "
+                                  "not trusted and is not a crash. Files under partial_dumps are unverified."
+                                  % untrusted}
             return {"ok": False, "status": "ANALYSIS_LIMITED", "error": "ENGINE_CRASH", "stop_reason": "ENGINE_CRASH",
                     "state_available": False, "emulator_exit_code": outcome.returncode,
                     "stderr_chars": len(outcome.stderr or ""), "partial_dumps": partial,

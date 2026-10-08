@@ -240,9 +240,16 @@ def test_emulator_result_line_with_a_repeated_key_or_nan_is_not_a_result():
 
     ok = emulate._Runner.interpret(outcome('{"ok": true, "status": "OK"}\n'), Path("."))
     assert ok == {"ok": True, "status": "OK"}
-    for line in ('{"ok": true, "ok": false}', '{"ok": true, "n": NaN}', '{"ok": true, "n": Infinity}'):
+    cases = (('{"ok": true, "ok": false}', "DUPLICATE_KEY"), ('{"ok": true, "n": NaN}', "NON_FINITE"),
+             ('{"ok": true, "n": Infinity}', "NON_FINITE"), ('{"ok": true, "n": 1e999}', "NON_FINITE"),
+             ("[" * 300 + "]" * 300, "TOO_DEEP"),
+             ('{"a":' * 300 + "1" + "}" * 300, "TOO_DEEP"))
+    for line, reason in cases:
         body = emulate._Runner.interpret(outcome(line + "\n"), Path("."))
-        assert body["ok"] is False and body["error"] == "ENGINE_CRASH", line
+        assert body["ok"] is False and body["status"] == "ANALYSIS_LIMITED", line[:30]
+        assert body["error"] == "NON_STRICT_JSON_RESULT" and body["reason"] == reason, line[:30]
+    # a genuinely unparsable line is still the crash answer
+    assert emulate._Runner.interpret(outcome("{not json\n"), Path("."))["error"] == "ENGINE_CRASH"
 
 
 def test_emulator_authorization_text_with_a_repeated_key_or_nan_is_refused():
