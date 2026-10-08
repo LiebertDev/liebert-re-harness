@@ -18,7 +18,9 @@ As a hook (git feeds "<local ref> <local sha> <remote ref> <remote sha>" lines o
      .venv*, the running interpreter. LIEBERT_CONTRACT_STRICT=1 turns a missing version into a BLOCK.
      The final line names any version whose contract tests did not run; "ok" alone is never printed then.
   4. the SAME identity probes that gate uses, over every commit's author, e-mail and message in
-     the pushed range (the file scan cannot see commit messages or history).
+     the pushed range (the file scan cannot see commit messages or history), plus a refusal of any
+     case-insensitive `Co-Authored-By:` line in a pushed commit message (AGENTS.md rule 14). Only the
+     pushed range is looked at; history already on the remote is never rewritten or re-judged.
 The installed hook never skips silently: if git cannot resolve the repository root, or this checkout has no
 scripts/pre_push_gate.py (an old branch), it prints why no checks ran and BLOCKS. Only the operator typing
 LIEBERT_GATE_ALLOW_MISSING=1 on that push turns this into a loud, deliberate skip (like
@@ -479,9 +481,19 @@ def _discipline():
     return mod
 
 
+_COAUTHOR_TRAILER = re.compile(r"^\s*co-authored-by\s*:", re.IGNORECASE)
+
+
+def coauthor_trailer_lines(message: str) -> list[int]:
+    """1-based line numbers of `Co-Authored-By:` lines in a commit message, case-insensitive
+    (AGENTS.md rule 14). A line only counts when it starts with the trailer key."""
+    return [n for n, line in enumerate(message.splitlines(), 1) if _COAUTHOR_TRAILER.match(line)]
+
+
 def message_findings(rev_ranges: list[list[str]], mod=None) -> list[str]:
     """Run the discipline gate's identity probes + product denylist over author, e-mail and full
-    message of every commit in each rev-list argument set."""
+    message of every commit in each rev-list argument set, and refuse a `Co-Authored-By:` trailer
+    (AGENTS.md rule 14) in any of those messages."""
     mod = mod or _discipline()
     ident = [p for p in mod._machine_identity() if p[0] != "operator-home"]
     deny = mod._denylist_probes()
@@ -494,6 +506,10 @@ def message_findings(rev_ranges: list[list[str]], mod=None) -> list[str]:
             for label, fmt in (("author name", "%an"), ("author e-mail", "%ae"), ("committer", "%cn%n%ce"),
                                ("message", "%B")):
                 text = _git("show", "-s", f"--format={fmt}", sha)
+                if label == "message":
+                    out.extend(f"commit {sha[:10]} message, line {n}: [co-authored-by-trailer] "
+                               "Co-Authored-By trailers are not allowed (AGENTS.md rule 14)"
+                               for n in coauthor_trailer_lines(text))
                 for n, line in enumerate(text.split("\n"), 1):
                     for rule, shown in mod._identity_findings(line, ident, deny):
                         masked = shown if rule == "denylisted-product" else mod._mask(shown)
@@ -631,8 +647,8 @@ def _run_gate(ranges: list[list[str]]) -> int:
         print(f"pre-push gate: BLOCKED, {scan_error}", file=sys.stderr)
         failed = True
     if hits:
-        print("pre-push gate: BLOCKED, commit metadata matches the identity probes "
-              "(values masked):", file=sys.stderr)
+        print("pre-push gate: BLOCKED, commit metadata matches the identity probes or carries a "
+              "Co-Authored-By trailer (values masked):", file=sys.stderr)
         for h in hits:
             print("  " + h, file=sys.stderr)
         print("  fix: reword/rewrite those commits locally, or --no-verify if you accept the leak.",

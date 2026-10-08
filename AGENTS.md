@@ -102,5 +102,7 @@ Full text and the report template: `CASE_POLICY.md`.
     development practice and is not part of the published package; the harness itself
     needs only one model driving its CLI. Checked by review.
 14. **Commit messages carry no `Co-Authored-By` trailer.** Write the message
-    without one, whatever a tool's default attribution suggests. No machine check;
-    this one is held by hand.
+    without one, whatever a tool's default attribution suggests. Checked at push time by
+    `scripts/pre_push_gate.py` (`message_findings`, stage 4): any case-insensitive
+    `Co-Authored-By:` line in a pushed commit message blocks the push and names the commit.
+    Only the pushed range is checked; nothing is checked at commit time.

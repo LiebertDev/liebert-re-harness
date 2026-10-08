@@ -975,9 +975,22 @@ class IdalibSubprocessTests(IdaCase):
 
     def test_the_probe_runs_in_the_child_and_reports_what_it_imported(self):
         public, private = ti._idalib_probe(use_cache=False)
-        self.assertEqual((public["status"], public["idapro_version"]), ("OK", None))   # no dist-info for a stub: UNKNOWN stays None
+        # The stub is not owned by any distribution. Whether or not the interpreter running the suite has a real
+        # `idapro` dist-info installed (the gate's venv does), that version says nothing about this module: None.
+        self.assertEqual((public["status"], public["idapro_version"]), ("OK", None))
         self.assertEqual(public["library_version"], [9, 4, 0])
         self.assertEqual(private["install_dir"], str(self.install))
+
+    def test_the_probe_reports_the_version_of_the_distribution_that_owns_the_imported_module(self):
+        info = self.stubs / "idapro-9.9.9.dist-info"
+        info.mkdir()
+        (info / "METADATA").write_text("Metadata-Version: 2.1\nName: idapro\nVersion: 9.9.9\n", encoding="utf-8")
+        (info / "RECORD").write_text("idapro.py,,\n", encoding="utf-8")
+        public, _ = ti._idalib_probe(use_cache=False)
+        self.assertEqual((public["status"], public["idapro_version"]), ("OK", "9.9.9"))
+        (info / "RECORD").write_text("not_idapro.py,,\n", encoding="utf-8")       # a dist that does not list the module
+        public, _ = ti._idalib_probe(use_cache=False)
+        self.assertEqual((public["status"], public["idapro_version"]), ("OK", None))
 
     def test_banners_on_stdout_do_not_reach_the_answer_or_fail_it(self):
         data = self.q("summary")
