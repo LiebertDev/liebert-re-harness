@@ -123,6 +123,8 @@ class FakeIdat:
         self.discard_flag = True
         self.result_operation = None   # override the `operation` the result claims
         self.log_unreadable = False    # make ida.log a directory, so reading it raises OSError
+        self.root_missing_reopens = 0  # the next N reopen loads come up with empty root information (no input hash)
+        self.root_missing_creates = 0  # the same for a first analysis (not a defect there: it reads the input file)
 
     def __call__(self, command, *, timeout_seconds, cancellation_token=None, cwd=None,
                  environment=None, max_output_chars=None):
@@ -160,6 +162,10 @@ class FakeIdat:
             return _cp(0)
         sha = "0" * 64 if name == "mismatch" else self.sha256
         body = self._body(job, sha)
+        for attr, wanted in (("root_missing_reopens", "reopen"), ("root_missing_creates", "create")):
+            if mode == wanted and getattr(self, attr) > 0:
+                setattr(self, attr, getattr(self, attr) - 1)
+                body["engine_input_sha256"] = body["engine_input_md5"] = None
         if name == "incomplete":
             body.pop("script_completed")
         if name == "script_error":
@@ -2298,6 +2304,117 @@ class IdaRealInstallTests(unittest.TestCase):
         data = json.loads(ti.ida_query(str(rsds), "summary"))
         self.assertTrue(data["ok"], data)
         self.assertFalse(data["signals"]["log_network_text_found"])
+
+
+class EngineRootInfoTests(IdaCase):
+    """IDA Pro 9.4 loads a good database with empty root information (no input hash, image base 0) about once
+    in 70 times. A reopen like that must not answer; it is repeated, and said so."""
+
+    def test_a_reopen_with_empty_root_information_is_repeated_and_the_repeat_is_reported(self):
+        self.assertTrue(self.q()["ok"])
+        self.fake.root_missing_reopens = 1
+        data = self.q("list_functions")
+        self.assertTrue(data["ok"], data)
+        self.assertEqual(data["provenance"]["status"], "VERIFIED")
+        self.assertEqual(data["signals"]["engine_root_info_repeats"], 1)
+        self.assertEqual(self.fake.modes, ["create", "reopen", "reopen"])
+
+    def test_three_loads_in_a_row_are_a_classed_failure_and_the_cached_database_is_kept(self):
+        self.assertTrue(self.q()["ok"])
+        self.fake.root_missing_reopens = 9
+        data = self.q("list_functions")
+        self.assertEqual((data["ok"], data["status"], data["error"]), (False, "ANALYSIS_LIMITED", "IDA_ENGINE_ROOT_INFO_MISSING"))
+        self.assertEqual(data["engine_root_info_attempts"], ti._ROOT_INFO_ATTEMPTS)
+        self.assertIs(data["signals"]["engine_root_info_present"], False)
+        self.assertEqual(self.fake.modes.count("reopen"), ti._ROOT_INFO_ATTEMPTS)
+        self.assertEqual(len(self.slots()), 1, "the database file is intact: only the load was bad")
+
+    def test_a_first_analysis_without_input_hash_is_not_refused_here(self):
+        self.fake.root_missing_creates = 1
+        data = self.q()
+        self.assertTrue(data["ok"], data)
+        self.assertEqual(data["provenance"]["status"], "UNVERIFIABLE")
+
+
+class ShortPathSessionTests(IdaCase):
+    """idat.exe cannot open a file whose full path is 260 characters or longer (measured; `_IDA_PATH_LIMIT`).
+    The limit is lowered here so the work directory of the fake run is "too deep" without a deep tree."""
+
+    LIMIT = 120   # a scratch work directory below the cache is ~150 characters; the short stage is ~70
+
+    def deep(self, limit=None):
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(mock.patch.object(ti, "_IDA_PATH_LIMITED", True))
+        stack.enter_context(mock.patch.object(ti, "_IDA_PATH_LIMIT", self.LIMIT if limit is None else limit))
+
+    def test_a_work_directory_that_fits_is_used_as_it_is(self):
+        with mock.patch.object(ti, "_IDA_PATH_LIMITED", True):
+            data = self.q()
+        self.assertTrue(data["ok"], data)
+        self.assertTrue(str(self.fake.calls[0]["cwd"]).startswith(str(self.cache)))
+
+    def test_a_too_deep_work_directory_runs_in_a_short_scratch_directory_and_the_result_comes_back(self):
+        self.deep()
+        data = self.q()
+        self.assertTrue(data["ok"], data)
+        cwd = self.fake.calls[0]["cwd"]
+        self.assertFalse(str(cwd).startswith(str(self.cache)), "idat ran in the deep directory")
+        self.assertLessEqual(len(str(cwd)) + 1 + ti._IDA_LONGEST_NAME, self.LIMIT)
+        self.assertFalse(cwd.exists(), "the short scratch directory is removed")
+        self.assertEqual(Path(self.fake.calls[0]["job"]["output"]).parent, cwd, "the result is written beside the session")
+        self.assertEqual(len(self.slots()), 1)
+        self.assertTrue((self.slots()[0] / ti._DB_NAME).is_file(), "the database came back into the slot")
+        self.assertEqual(self.leftovers(), [])
+
+    def test_the_staged_session_is_reported_with_measured_lengths_and_no_path_text(self):
+        self.deep()
+        self.fake.behaviour = "no_output"
+        data = self.q()
+        self.assertEqual(data["error"], "IDA_NO_OUTPUT")
+        staged = data["signals"]["short_path_session"]
+        self.assertIs(staged["staged"], True)
+        self.assertEqual(staged["limit_chars"], self.LIMIT)
+        self.assertGreater(staged["work_directory_chars"], self.LIMIT)
+        self.assertLess(staged["short_directory_chars"], staged["work_directory_chars"])
+        self.assertFalse(any(isinstance(v, str) for v in staged.values()), staged)
+
+    def test_a_reopen_of_a_deep_cached_database_works_on_a_copy_and_leaves_the_slot_alone(self):
+        self.deep()
+        self.assertTrue(self.q()["ok"])
+        slot_db = self.slots()[0] / ti._DB_NAME
+        before = slot_db.read_bytes()
+        data = self.q("list_functions")
+        self.assertTrue(data["ok"], data)
+        cwd = self.fake.calls[-1]["cwd"]
+        self.assertEqual(self.fake.calls[-1]["job"]["mode"], "reopen")
+        self.assertFalse(str(cwd).startswith(str(self.cache)))
+        self.assertEqual(slot_db.read_bytes(), before)
+
+    def test_when_even_the_short_directory_does_not_fit_the_answer_is_a_classed_refusal(self):
+        self.deep(limit=40)
+        data = self.q()
+        self.assertEqual((data["ok"], data["status"], data["error"]), (False, "ANALYSIS_LIMITED", "IDA_PATH_TOO_LONG"))
+        measured = data["path_measurement"]
+        self.assertEqual(measured["limit_chars"], 40)
+        self.assertGreater(measured["work_directory_chars"], 40)
+        self.assertGreater(measured["short_directory_chars"], 0)
+        self.assertEqual(self.fake.calls, [], "idat must not be started")
+        self.assertEqual(self.slots(), [])
+
+    def test_a_path_that_is_not_compared_on_other_systems_always_fits(self):
+        with mock.patch.object(ti, "_IDA_PATH_LIMITED", False), mock.patch.object(ti, "_IDA_PATH_LIMIT", 1):
+            self.assertTrue(ti._ida_path_fit(self.root, self.root)["fits"])
+
+    def test_rebasing_moves_only_paths_under_the_old_directory(self):
+        old, new = str(self.root / "w"), str(self.root / "s")
+        job = {"output": old + "/result.json", "other": old + "x/result.json", "n": 3,
+               "nested": [{"p": old}], "same": old}
+        out = ti._rebase_paths(job, old, new)
+        self.assertEqual(out["output"], new + "/result.json")
+        self.assertEqual(out["other"], job["other"])
+        self.assertEqual(out["nested"], [{"p": new}])
+        self.assertEqual((out["same"], out["n"]), (new, 3))
 
 
 if __name__ == "__main__":
