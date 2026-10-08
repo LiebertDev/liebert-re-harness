@@ -7,10 +7,11 @@ back bounded output. ``HypervGuestLauncher`` implements the seven methods of
 dict, and anything it cannot confirm is ``{"ok": False, "reason": <fixed code>, ...}``.
 
 WHAT IT IS NOT. It has NOT been run against a real guest. Everything below is written from the Win32
-documentation and checked only by tests that read the script text, parse it, and (on a Windows host
-with ``powershell.exe``) compile the C# and compare struct sizes. No target was started, no VM was
-touched, no job object was created while writing it. ``docs/CAPABILITIES_AND_LIMITS.md`` says the
-same. ``hyperv_transport`` keeps its contract of never
+documentation and checked by tests that read the script text, parse it, and (on a Windows host with
+``powershell.exe``) compile the C#, compare struct sizes, and RUN the agent's watchdog and pipe server
+over real named pipes with a stub guard (no target, no job, no guest). Outside the suite the whole agent
+was driven once on a development host, not a guest, with benign system binaries; no VM was touched.
+``docs/CAPABILITIES_AND_LIMITS.md`` says the same. ``hyperv_transport`` keeps its contract of never
 starting a target; this module is the separate capability, and it reuses the transport's PowerShell
 Direct plumbing (credential file, runner, PowerShell executable, per-call timeout, bounded process
 output, request size limit, strict result parsing) through ``HypervTransport._run_script`` so there is
@@ -33,6 +34,19 @@ call, so no handle, job or suspended thread can live in a session. Two designs w
   next to the pushed sample, checks its SHA-256 BEFORE starting it, and starts it detached
   (``Win32_Process.Create``); each later call only carries one request line to the pipe and one reply
   line back.
+
+A TARGET THAT HOLDS THE AGENT. The target runs under the same account as the operator, so it can open the
+agent's pipe. It must not be able to stretch its own life by doing so (connect and send a request, then
+never read the reply, so a blocking drain never returns and the job handle is never closed), so the agent
+has two independent bounds. Every pipe wait is bounded in C# (``LrServer``): the request read, the reply
+write and the wait for the client to close its end each have a fixed millisecond limit, a client that is
+silent, trickling or not reading costs those limits and nothing more, and ``WaitForPipeDrain`` (which
+blocks for ever on such a client) is not used. And a watchdog thread (``LrWatchdog``) that shares no lock
+and no call with the pipe loop kills the job at an absolute time: ``resume`` limits it to the host's longest
+allowed wait plus a margin, ``wait`` to that call's deadline plus a margin, and the agent process ends
+itself a fixed time after; the times can only move earlier. The agent also refuses a pipe client that is
+a member of its own job (the target and its children) and one it cannot place. The first call hands the
+agent an absolute lifetime (``lifetime_seconds``) that covers every step the host may take.
 
 STEPS, host to agent (``create``, ``assign``, ``verify``, ``resume``, ``wait``, ``terminate``,
 ``collect``), each one PowerShell Direct call:
@@ -69,8 +83,13 @@ the ``run_id`` it tried unless the failure proves nothing was made (PowerShell n
 the request was sent, the agent was not reachable, or the agent itself answered that creation failed), so
 the orchestrator still sends ``terminate_job`` for a process whose creation reply may have been lost.
 
-LIMITS, stated plainly. The target and the operator share one account in the guest, so the target
-could connect to the agent's pipe; the pipe ACL keeps other accounts out, nothing more. Handles are
+LIMITS, stated plainly. The target and the operator share one account in the guest, so the pipe ACL keeps
+other accounts out, nothing more; the job-membership refusal stops the target and its children, not a
+process the target gets another service to start outside the job. Such a client can occupy the single
+pipe instance and delay the host's ``terminate_job`` and ``collect_output`` until the watchdog kills the
+job; the host then sees a failed or unconfirmed step (``TRANSPORT_ERROR``), never a success. The gate's
+host-pid model for a guest run is still undecided (see ``debugger_run``); this module does not change it.
+Handles are
 inherited by the target (``bInheritHandles``) with no handle list. The job limits do not stop network
 use. The job does not follow a child that escapes it before assignment (none can: the process is
 suspended); grandchildren are inside the job. Disk use by the target itself is not limited, only what
@@ -123,6 +142,8 @@ _STEP_REPLY_S = 30
 _WAIT_REPLY_MARGIN_S = 15
 _TERMINATE_ATTEMPTS = 2
 _DEFAULT_IDLE_S = 300
+_MIN_LIFETIME_S = 60                  # the range the agent accepts for its own absolute lifetime
+_MAX_LIFETIME_S = 40_000
 
 # --------------------------------------------------------------------------- the host script (a constant)
 
@@ -271,10 +292,15 @@ $ErrorActionPreference = 'Stop'
 
 $source = @'
 using System;
+using System.Diagnostics;
 using System.IO;
+using System.IO.Pipes;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 
 public sealed class LrFail : Exception
@@ -362,6 +388,227 @@ public static class LrNative
     public static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetNamedPipeClientProcessId(IntPtr pipe, out uint clientProcessId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CancelIoEx(IntPtr hFile, IntPtr lpOverlapped);
+}
+
+// Limit() moves the moment the target is killed EARLIER, never later, and the moment this process
+// kills itself follows it. The loop runs on its own thread and shares no lock and no blocking call with
+// the pipe server, so a blocked pipe call can delay nothing here.
+public sealed class LrWatchdog
+{
+    private readonly object _gate = new object();
+    private readonly Action _kill;
+    private readonly Action _exit;
+    private readonly Stopwatch _clock = Stopwatch.StartNew();
+    private long _killAt = long.MaxValue;
+    private long _exitAt;
+    private bool _killed;
+    private bool _stopped;
+
+    public LrWatchdog(Action kill, Action exit, long exitAfterMs)
+    {
+        if (kill == null || exit == null) { throw new ArgumentNullException("kill"); }
+        if (exitAfterMs <= 0) { throw new ArgumentOutOfRangeException("exitAfterMs"); }
+        _kill = kill;
+        _exit = exit;
+        _exitAt = exitAfterMs;
+        Thread thread = new Thread(Loop);
+        thread.IsBackground = true;
+        thread.Start();
+    }
+
+    public bool Killed { get { lock (_gate) { return _killed; } } }
+
+    public void Limit(long killAfterMs, long exitGraceMs)
+    {
+        if (killAfterMs < 0 || exitGraceMs < 0) { throw new ArgumentOutOfRangeException("killAfterMs"); }
+        lock (_gate)
+        {
+            long kill = _clock.ElapsedMilliseconds + killAfterMs;
+            if (kill < _killAt) { _killAt = kill; }
+            long exit = _killAt + exitGraceMs;
+            if (exit < _exitAt) { _exitAt = exit; }
+            Monitor.PulseAll(_gate);
+        }
+    }
+
+    public void Stop()
+    {
+        lock (_gate) { _stopped = true; Monitor.PulseAll(_gate); }
+    }
+
+    private void Loop()
+    {
+        while (true)
+        {
+            bool doKill = false;
+            bool doExit = false;
+            lock (_gate)
+            {
+                if (_stopped) { return; }
+                long now = _clock.ElapsedMilliseconds;
+                if (now >= _exitAt) { doExit = true; }
+                else if (!_killed && now >= _killAt) { _killed = true; doKill = true; }
+                else
+                {
+                    long next = _killed ? _exitAt : Math.Min(_killAt, _exitAt);
+                    long wait = Math.Min(next - now, 60000L);
+                    Monitor.Wait(_gate, (int)Math.Max(1L, wait));
+                    continue;
+                }
+            }
+            if (doKill) { try { _kill(); } catch (Exception) { } }
+            if (doExit)
+            {
+                try { _kill(); } catch (Exception) { }
+                try { _exit(); } catch (Exception) { }
+                return;
+            }
+        }
+    }
+}
+
+public interface LrClientGuard { bool Allows(int clientPid); }
+
+// One pipe instance, one client at a time, and every wait has a bound: a silent client, a slow writer
+// and a client that never reads the reply each cost a fixed number of milliseconds, not the process.
+public sealed class LrServer : IDisposable
+{
+    private const int MaxRequest = 4096;
+    private readonly NamedPipeServerStream _pipe;
+    private readonly int _readMs;
+    private readonly int _writeMs;
+    private readonly int _drainMs;
+    private Task _pending;
+    public LrClientGuard Guard;
+    public bool IdledOut;
+    public int Rejected;
+    public string LastError = "";
+
+    public LrServer(string name, int readMs, int writeMs, int drainMs)
+    {
+        _readMs = readMs;
+        _writeMs = writeMs;
+        _drainMs = drainMs;
+        PipeSecurity acl = new PipeSecurity();
+        acl.AddAccessRule(new PipeAccessRule(WindowsIdentity.GetCurrent().User, PipeAccessRights.FullControl, AccessControlType.Allow));
+        _pipe = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 65536, 65536, acl);
+    }
+
+    // Ends the connection. An I/O call left pending (a read that timed out, a write the client never
+    // drains) is cancelled and finished FIRST: disconnecting under it makes its late failure mark the
+    // pipe broken after the next client has connected, and the pipe then refuses every later client.
+    private void Drop()
+    {
+        Task pending = _pending;
+        _pending = null;
+        if (pending != null && !pending.IsCompleted)
+        {
+            try { LrNative.CancelIoEx(_pipe.SafePipeHandle.DangerousGetHandle(), IntPtr.Zero); } catch (Exception) { }
+            try { pending.Wait(1000); } catch (Exception) { }
+        }
+        try { _pipe.Disconnect(); }
+        catch (Exception ex) { LastError += "[drop:" + ex.GetType().Name + "]"; }
+    }
+
+    // The request line of the next admitted client, or null (idle: IdledOut is set; anything else:
+    // nothing was admitted and the connection is already dropped).
+    public string Accept(int idleMs)
+    {
+        IdledOut = false;
+        try
+        {
+            IAsyncResult waiting = _pipe.BeginWaitForConnection(null, null);
+            if (!waiting.AsyncWaitHandle.WaitOne(idleMs)) { IdledOut = true; return null; }
+            _pipe.EndWaitForConnection(waiting);
+        }
+        catch (Exception ex)
+        {
+            LastError = "accept:" + ex.GetType().Name + ":" + ex.Message;
+            Drop();
+            Thread.Sleep(50);
+            return null;
+        }
+        try
+        {
+            LrClientGuard guard = Guard;
+            if (guard != null)
+            {
+                uint client;
+                if (!LrNative.GetNamedPipeClientProcessId(_pipe.SafePipeHandle.DangerousGetHandle(), out client) || !guard.Allows((int)client))
+                {
+                    Rejected++;
+                    Drop();
+                    return null;
+                }
+            }
+            string line = ReadLine();
+            if (line == null) { Drop(); }
+            return line;
+        }
+        catch (Exception ex)
+        {
+            LastError = "read:" + ex.GetType().Name + ":" + ex.Message;
+            Drop();
+            return null;
+        }
+    }
+
+    private string ReadLine()
+    {
+        byte[] buffer = new byte[MaxRequest];
+        int used = 0;
+        Stopwatch clock = Stopwatch.StartNew();
+        while (used < buffer.Length)
+        {
+            long left = _readMs - clock.ElapsedMilliseconds;
+            if (left <= 0) { return null; }
+            Task<int> read = _pipe.ReadAsync(buffer, used, buffer.Length - used);
+            _pending = read;
+            if (!read.Wait((int)left)) { return null; }
+            _pending = null;
+            if (read.Result <= 0) { return null; }
+            used += read.Result;
+            int end = Array.IndexOf(buffer, (byte)10, 0, used);
+            if (end >= 0) { return Encoding.ASCII.GetString(buffer, 0, end); }
+        }
+        return null;
+    }
+
+    // True only when the reply was written and the client then closed its end (that is how a client
+    // shows it has read it). Always drops the connection.
+    public bool Reply(string line)
+    {
+        bool delivered = false;
+        try
+        {
+            byte[] bytes = Encoding.ASCII.GetBytes(line + "\n");
+            Task write = _pipe.WriteAsync(bytes, 0, bytes.Length);
+            _pending = write;
+            if (write.Wait(_writeMs))
+            {
+                byte[] one = new byte[1];
+                Task<int> closed = _pipe.ReadAsync(one, 0, 1);
+                _pending = closed;
+                delivered = closed.Wait(_drainMs) && closed.Result == 0;
+            }
+        }
+        catch (Exception) { delivered = false; }
+        Drop();
+        return delivered;
+    }
+
+    public void Dispose()
+    {
+        try { _pipe.Dispose(); } catch (Exception) { }
+    }
 }
 
 public sealed class LrPump
@@ -429,7 +676,7 @@ public sealed class LrPump
     public bool Finish(int ms) { return _thread.Join(ms); }
 }
 
-public sealed class LrRun : IDisposable
+public sealed class LrRun : IDisposable, LrClientGuard
 {
     public const uint ActiveProcessLimit = 8;
     public const long CpuSeconds = 600;
@@ -446,6 +693,8 @@ public sealed class LrRun : IDisposable
     private const uint WantedFlags = JOB_OBJECT_LIMIT_JOB_TIME | JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     private const uint ForbiddenFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
 
+    private readonly object _handleGate = new object();
+    private static LrRun _current;
     private IntPtr _process = IntPtr.Zero;
     private IntPtr _thread = IntPtr.Zero;
     private IntPtr _job = IntPtr.Zero;
@@ -518,6 +767,7 @@ public sealed class LrRun : IDisposable
             run._outPump = new LrPump(takenOut, outPath, cap);
             IntPtr takenErr = errRead; errRead = IntPtr.Zero;
             run._errPump = new LrPump(takenErr, errPath, cap);
+            _current = run;
             return run;
         }
         catch
@@ -671,11 +921,61 @@ public sealed class LrRun : IDisposable
         return result;
     }
 
+    // Called from the watchdog thread: no wait, no confirmation, only the two kill calls.
+    public void HardKill()
+    {
+        lock (_handleGate)
+        {
+            if (_job != IntPtr.Zero) { LrNative.TerminateJobObject(_job, 1); }
+            if (_process != IntPtr.Zero) { LrNative.TerminateProcess(_process, 1); }
+        }
+    }
+
+    // The target and everything it starts is in the job once the job exists (no breakaway), so a pipe
+    // client inside the job is the target or its child. It is refused. A client that cannot be placed is
+    // refused too. Before the job exists nothing runs, so nothing is refused.
+    public bool Allows(int clientPid)
+    {
+        lock (_handleGate)
+        {
+            if (_job == IntPtr.Zero || _process == IntPtr.Zero) { return true; }
+            if (clientPid <= 0 || clientPid == Pid) { return false; }
+            IntPtr client = LrNative.OpenProcess(0x1000, false, (uint)clientPid);
+            if (client == IntPtr.Zero) { return false; }
+            try
+            {
+                bool inJob;
+                if (!LrNative.IsProcessInJob(client, _job, out inJob)) { return false; }
+                return !inJob;
+            }
+            finally { LrNative.CloseHandle(client); }
+        }
+    }
+
+    public static void KillCurrent()
+    {
+        LrRun run = _current;
+        if (run != null) { run.HardKill(); }
+    }
+
+    public static void ExitSelf()
+    {
+        LrNative.TerminateProcess(LrNative.GetCurrentProcess(), 3);
+    }
+
+    public static LrWatchdog StartWatchdog(long lifetimeMs)
+    {
+        return new LrWatchdog(KillCurrent, ExitSelf, lifetimeMs);
+    }
+
     public void Dispose()
     {
-        if (_thread != IntPtr.Zero) { LrNative.CloseHandle(_thread); _thread = IntPtr.Zero; }
-        if (_process != IntPtr.Zero) { LrNative.CloseHandle(_process); _process = IntPtr.Zero; }
-        if (_job != IntPtr.Zero) { LrNative.CloseHandle(_job); _job = IntPtr.Zero; }
+        lock (_handleGate)
+        {
+            if (_thread != IntPtr.Zero) { LrNative.CloseHandle(_thread); _thread = IntPtr.Zero; }
+            if (_process != IntPtr.Zero) { LrNative.CloseHandle(_process); _process = IntPtr.Zero; }
+            if (_job != IntPtr.Zero) { LrNative.CloseHandle(_job); _job = IntPtr.Zero; }
+        }
     }
 }
 '@
@@ -688,7 +988,15 @@ if ($RunId -cnotmatch '^[A-Za-z0-9_-]{1,64}$') { exit 2 }
 $TargetPath = [string] $cfg.target_path
 $Cap = [int64] $cfg.output_cap
 $IdleMs = [int] ([int64] $cfg.idle_seconds * 1000)
+$LifetimeMs = [int64] $cfg.lifetime_seconds * 1000
 if (($IdleMs -lt 10000) -or ($IdleMs -gt 3600000) -or ($Cap -lt 1) -or ($Cap -gt 1048576)) { exit 2 }
+if (($LifetimeMs -lt 60000) -or ($LifetimeMs -gt 40000000)) { exit 2 }
+# After `resume` the target runs for at most the host's longest allowed wait plus a margin; `wait` narrows it
+# to that call's own deadline plus the margin. Past that the watchdog thread kills the job whatever the pipe
+# loop is doing, and the agent process ends a fixed time after.
+$RunCeilingMs = [int64] 630000
+$KillGraceMs = [int64] 30000
+$ExitGraceMs = [int64] 600000
 $PipeName = 'liebert-run-' + $RunId
 $RunDir = $PSScriptRoot
 $OutFile = Join-Path $RunDir 'stdout.bin'
@@ -697,6 +1005,7 @@ $script:Run = $null
 $script:State = 'new'
 $script:Memory = [int64] 0
 $script:IdleMs = $IdleMs
+$script:Dog = $null
 
 function ToJson($value) { return (ConvertTo-Json -InputObject $value -Compress -Depth 4) }
 function Fail([string] $code) { throw (New-Object System.InvalidOperationException ('lr:' + $code)) }
@@ -719,6 +1028,7 @@ function RunOp([string] $op, $req) {
         if ($script:State -cne 'new') { Fail 'BAD_STATE' }
         if (-not [LrRun]::LayoutOk()) { Fail 'LAYOUT_MISMATCH' }
         $script:Run = [LrRun]::Create($TargetPath, [System.IO.Path]::GetDirectoryName($TargetPath), $OutFile, $ErrFile, $Cap)
+        $script:Server.Guard = $script:Run
         $script:State = 'created'
         return (OkReply 'create' @{ suspended = $true })
     }
@@ -742,6 +1052,7 @@ function RunOp([string] $op, $req) {
     }
     if ($op -ceq 'resume') {
         if ($script:State -cne 'verified') { Fail 'BAD_STATE' }
+        $script:Dog.Limit($RunCeilingMs, $ExitGraceMs)
         $previous = [int] $script:Run.Resume()
         $script:State = 'resumed'
         return (OkReply 'resume' @{ resumed = ($previous -eq 1); previous_suspend_count = $previous })
@@ -750,6 +1061,7 @@ function RunOp([string] $op, $req) {
         if ($script:State -cne 'resumed') { Fail 'BAD_STATE' }
         $ms = [int64] $req.timeout_ms
         if (($ms -lt 1) -or ($ms -gt 615000)) { Fail 'TIMEOUT_INVALID' }
+        $script:Dog.Limit($ms + $KillGraceMs, $ExitGraceMs)
         $exited = [bool] $script:Run.WaitExit([uint32] $ms)
         $code = $null
         if ($exited) { $code = [int64] $script:Run.ExitCode }
@@ -792,42 +1104,21 @@ function Dispatch([string] $text) {
         return @{ json = (ToJson $o); final = (($op -ceq 'create') -and ($script:State -ceq 'new')) }
     }
 }
-function ReadRequest($stream) {
-    $buf = New-Object byte[] 4096
-    $n = 0
-    while ($n -lt 4096) {
-        $task = $stream.ReadAsync($buf, $n, 4096 - $n)
-        if (-not $task.Wait(5000)) { Fail 'REQUEST_READ_TIMEOUT' }
-        $got = [int] $task.Result
-        if ($got -le 0) { break }
-        $n += $got
-        if ([System.Array]::IndexOf($buf, [byte] 10, 0, $n) -ge 0) { break }
-    }
-    return [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
-}
-
-$server = $null
+$script:Server = $null
 try {
-    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-    $acl = New-Object System.IO.Pipes.PipeSecurity
-    $rule = New-Object System.IO.Pipes.PipeAccessRule ($sid, [System.IO.Pipes.PipeAccessRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow)
-    $acl.AddAccessRule($rule)
-    $server = New-Object System.IO.Pipes.NamedPipeServerStream ($PipeName, [System.IO.Pipes.PipeDirection]::InOut, 1, [System.IO.Pipes.PipeTransmissionMode]::Byte, [System.IO.Pipes.PipeOptions]::Asynchronous, 65536, 65536, $acl)
+    $script:Dog = [LrRun]::StartWatchdog($LifetimeMs)
+    $script:Server = New-Object LrServer ($PipeName, 5000, 10000, 5000)
     $finished = $false
     while (-not $finished) {
-        $wait = $server.BeginWaitForConnection($null, $null)
-        if (-not $wait.AsyncWaitHandle.WaitOne($script:IdleMs)) { break }
-        $server.EndWaitForConnection($wait)
+        $text = $script:Server.Accept($script:IdleMs)
+        if ($script:Server.IdledOut) { break }
+        if ($null -eq $text) { continue }
         try {
-            $answer = Dispatch (ReadRequest $server)
-            $bytes = [System.Text.Encoding]::ASCII.GetBytes([string] $answer.json + "`n")
-            $server.Write($bytes, 0, $bytes.Length)
-            $server.Flush()
-            $server.WaitForPipeDrain()
+            $answer = Dispatch $text
+            [void] $script:Server.Reply([string] $answer.json)
             if ($answer.final) { $finished = $true }
         }
         catch { }
-        finally { try { if ($server.IsConnected) { $server.Disconnect() } } catch { } }
     }
 }
 finally {
@@ -835,7 +1126,8 @@ finally {
         try { [void] $script:Run.Terminate() } catch { }
         try { $script:Run.Dispose() } catch { }
     }
-    if ($null -ne $server) { try { $server.Dispose() } catch { } }
+    if ($null -ne $script:Server) { try { $script:Server.Dispose() } catch { } }
+    if ($null -ne $script:Dog) { try { $script:Dog.Stop() } catch { } }
 }
 """
 
@@ -982,6 +1274,14 @@ class HypervGuestLauncher:
     def __repr__(self) -> str:  # the credential path is not printed
         return "HypervGuestLauncher(transport=<REDACTED>)"
 
+    def _lifetime_seconds(self) -> int:
+        """The agent's absolute lifetime, whatever the pipe or the host does: the longest the host may spend on
+        one run (create and terminate each get a second try or twice the step bound, five more steps, the
+        longest wait with its margin), rounded up. A run that needs longer than this is killed by the agent,
+        which the host sees as an unconfirmed result, never as a success."""
+        worst = 9 * self._step_timeout_s + MAX_TIMEOUT_S + _WAIT_REPLY_MARGIN_S
+        return max(_MIN_LIFETIME_S, min(_MAX_LIFETIME_S, int(worst) + 1))
+
     # ---- one PowerShell Direct call, one agent request
 
     def _exchange(self, run_id: str, run: _Run, op: str, fields: Mapping[str, Any], *, create_target: str | None,
@@ -1002,7 +1302,8 @@ class HypervGuestLauncher:
             extra.update(
                 target_path=create_target, agent_sha256=_agent_sha256(),
                 config_json=json.dumps({"run_id": run_id, "target_path": create_target, "output_cap": MAX_OUTPUT_CAP,
-                                        "idle_seconds": self._idle_seconds}, separators=(",", ":")),
+                                        "idle_seconds": self._idle_seconds,
+                                        "lifetime_seconds": self._lifetime_seconds()}, separators=(",", ":")),
             )
         phases, body, failure = self._transport._run_script(
             script_op, run.vm, extra, host_timeout_s, script=_HOST_SCRIPT, script_name="launcher.ps1",

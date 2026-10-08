@@ -750,6 +750,63 @@ def test_invalid_replies_and_failed_steps_are_transport_errors(cred):
         assert guest.ops()[-1] in ("terminate", "collect") and "terminate" in guest.ops()
 
 
+def _silent_agent_faults():
+    """Ways one step can get no usable answer from the agent, as the host sees them."""
+    def failed_in_agent_call(code):
+        failure = {"code": code, "category": None, "error_id": None, "exception_type": None,
+                   "auth_hint": False, "timeout_hint": False}
+        return hvt.proc(["LIEBERT_PHASE " + p for p in STEP_PHASES]
+                        + [result_line("agent_step", False, "agent_call", failure=failure)], returncode=1)
+
+    return {
+        "reply_timeout": failed_in_agent_call("AGENT_REPLY_TIMEOUT"),
+        "not_reachable": failed_in_agent_call("AGENT_NOT_REACHABLE"),
+        "empty_reply": Raw(""),
+        "powershell_timed_out": hvt.proc(["LIEBERT_PHASE " + p for p in STEP_PHASES], returncode=1, timed_out=True),
+        "no_result_at_all": hvt.proc([], returncode=1),
+    }
+
+
+@pytest.mark.parametrize("silence", sorted(_silent_agent_faults()))
+def test_an_agent_that_never_answers_terminate_is_not_a_confirmed_termination_and_never_a_success(cred, silence):
+    fault = _silent_agent_faults()[silence]
+    result, guest, fake = run_debugger(cred, FakeGuest(terminate=fault))
+    assert guest.ops().count("terminate") == hvl._TERMINATE_ATTEMPTS         # tried, not assumed
+    assert result["status"] == "TRANSPORT_ERROR" and result["reason"] == "JOB_TERMINATION_NOT_CONFIRMED", result
+    assert result["job"]["terminated"] is False
+    assert result["primary_status"] != "COMPLETED" and result["status"] not in {"COMPLETED", "OUTPUT_TRUNCATED"}
+    # the target exited and its output was fine; that does not make an unconfirmed kill acceptable
+    assert guest.exited is True and guest.exit_code == 0
+
+
+@pytest.mark.parametrize("silence", sorted(_silent_agent_faults()))
+def test_an_agent_that_goes_silent_after_resume_never_yields_a_success_of_any_kind(cred, silence):
+    fault = _silent_agent_faults()[silence]
+    result, guest, fake = run_debugger(cred, FakeGuest(wait=fault, terminate=fault, collect=fault))
+    assert result["status"] == "TRANSPORT_ERROR" and result["reason"] == "JOB_TERMINATION_NOT_CONFIRMED", result
+    assert result["job"]["terminated"] is False and result.get("exit_code") is None
+    assert result.get("output") is None
+
+
+@pytest.mark.parametrize("silence", sorted(_silent_agent_faults()))
+def test_an_agent_that_goes_silent_in_wait_alone_is_a_transport_error(cred, silence):
+    result, guest, fake = run_debugger(cred, FakeGuest(wait=_silent_agent_faults()[silence]))
+    assert result["status"] == "TRANSPORT_ERROR" and result["reason"] == "WAIT_REPLY_INVALID", result
+    assert "terminate" in guest.ops()                                      # and the cleanup still ran
+
+
+def test_the_agent_gets_an_absolute_lifetime_that_covers_every_step_the_host_may_take(cred):
+    for step in (33.0, 120.0, 600.0, 3600.0):
+        launcher, guest, fake, run_id = started(cred, step_timeout_s=step)
+        config = json.loads(fake.calls[0]["request"]["config_json"])
+        lifetime = config["lifetime_seconds"]
+        worst_case = 9 * step + hvl.MAX_TIMEOUT_S + hvl._WAIT_REPLY_MARGIN_S  # create twice, five steps, wait, terminate twice
+        assert type(lifetime) is int and lifetime >= worst_case, (step, lifetime)
+        assert 60 <= lifetime <= 40_000, (step, lifetime)                     # the range the agent accepts
+        assert config["idle_seconds"] == hvl._DEFAULT_IDLE_S and config["output_cap"] == hvl.MAX_OUTPUT_CAP
+    assert "lifetime_seconds" in hvl._AGENT_SCRIPT and "-lt 60000" in hvl._AGENT_SCRIPT
+
+
 def test_a_lost_create_reply_is_still_followed_by_a_terminate(cred):
     result, guest, fake = run_debugger(cred, FakeGuest(create=Raw("garbage\n")))
     assert result["status"] == "TRANSPORT_ERROR"
@@ -890,7 +947,7 @@ def test_termination_kills_the_job_and_the_process_and_confirms_both():
 @contract
 def test_output_is_pumped_into_capped_files_and_counted():
     cs = _csharp()
-    loop = _method(cs, "private void Loop(")
+    loop = _method(cs[cs.index("public sealed class LrPump"):], "private void Loop(")
     assert "room = _cap - " in loop and "_total" in loop and "_kept" in loop
     assert "FileMode.CreateNew" in cs                              # an existing output file is never reused
     agent = hvl._AGENT_SCRIPT
@@ -909,13 +966,52 @@ def test_the_struct_layout_is_checked_by_the_agent_itself_before_it_starts_anyth
 
 
 @contract
-def test_the_agent_serves_one_user_and_idles_out():
+def test_the_agent_serves_one_user_through_bounded_pipe_calls_only():
     agent = hvl._AGENT_SCRIPT
-    assert "PipeAccessRule" in agent and "WindowsIdentity]::GetCurrent().User" in agent
-    assert "NamedPipeServerStream" in agent and ", 1, [System.IO.Pipes.PipeTransmissionMode]" in agent
-    assert "WaitOne($script:IdleMs)" in agent and "$script:Run.Terminate()" in agent
+    cs = _csharp()
+    ps_only = agent[: agent.index("$source = @'")] + agent[agent.index("\n'@\n"):]
+    assert "PipeAccessRule(WindowsIdentity.GetCurrent().User" in cs and "FullControl" in cs
+    assert "NamedPipeServerStream(name, PipeDirection.InOut, 1," in cs        # one instance
+    assert "WaitForPipeDrain" not in agent                                    # it blocks for ever on a client that never reads
+    assert "WaitForPipeDrain" not in cs
+    # every wait in the server class has a bound: no Wait(), no WaitOne(), no Read/Write that blocks
+    server = cs[cs.index("public sealed class LrServer"): cs.index("public sealed class LrPump")]
+    assert not re.search(r"\.Wait\(\s*\)|WaitOne\(\s*\)|(?<![A-Za-z])WaitForConnection\(|\.Read\(|\.Write\(|\.Flush\(", server)
+    assert len(re.findall(r"\.Wait\((?!\s*\))", server)) >= 4 and "WaitOne(idleMs)" in server
+    # the PowerShell loop does no pipe I/O of its own; it only asks the server and dispatches
+    assert "Accept($script:IdleMs)" in ps_only and "NamedPipeServerStream" not in ps_only
+    assert ".ReadAsync(" not in ps_only and ".Write(" not in ps_only and "$script:Run.Terminate()" in ps_only
     assert re.search(r"\$script:State -cne 'new'.*?\n.*?LayoutOk", agent, re.DOTALL)
     assert "-cnotin @('create', 'assign', 'verify', 'resume', 'wait', 'terminate', 'collect')" in agent
+
+
+@contract
+def test_the_watchdog_is_armed_before_anything_else_and_narrowed_at_resume_and_wait():
+    agent = hvl._AGENT_SCRIPT
+    loop = agent[agent.index("$script:Server = $null"):]
+    assert loop.index("StartWatchdog($LifetimeMs)") < loop.index("New-Object LrServer") < loop.index("Accept(")
+    resume = agent[agent.index("if ($op -ceq 'resume')"): agent.index("if ($op -ceq 'wait')")]
+    assert resume.index("$script:Dog.Limit($RunCeilingMs, $ExitGraceMs)") < resume.index(".Resume()")
+    wait = agent[agent.index("if ($op -ceq 'wait')"): agent.index("if ($op -ceq 'terminate')")]
+    assert wait.index("$script:Dog.Limit($ms + $KillGraceMs, $ExitGraceMs)") < wait.index(".WaitExit(")
+    create = agent[agent.index("if ($op -ceq 'create')"): agent.index("if ($null -eq $script:Run)")]
+    assert "$script:Server.Guard = $script:Run" in create
+    # the kill is the job and the process, with no wait, and the exit is the whole agent process
+    cs = _csharp()
+    assert "TerminateJobObject(_job, 1)" in _method(cs, "public void HardKill(")
+    assert "TerminateProcess(LrNative.GetCurrentProcess()" in _method(cs, "public static void ExitSelf(")
+    # a client inside the job (the target and its children) is refused; one that cannot be placed too
+    allows = _method(cs, "public bool Allows(")
+    assert "IsProcessInJob(client, _job" in allows and "return !inJob;" in allows
+    assert allows.count("return false;") >= 3 and "OpenProcess(0x1000" in allows
+
+
+@contract
+def test_no_agent_wait_is_longer_than_the_host_deadline_plus_the_stated_margins():
+    agent = hvl._AGENT_SCRIPT
+    assert "$RunCeilingMs = [int64] 630000" in agent and hvl.MAX_TIMEOUT_S * 1000 + 30_000 == 630_000
+    assert "$KillGraceMs = [int64] 30000" in agent and "$ExitGraceMs = [int64] 600000" in agent
+    assert "-gt 615000" in agent and hvl.MAX_TIMEOUT_S * 1000 + hvl._WAIT_REPLY_MARGIN_S * 1000 == 615_000
 
 
 @contract
@@ -981,7 +1077,7 @@ def test_both_scripts_parse_and_call_only_the_listed_commands(tmp_path):
     assert "FILE:agent.ps1:ERRORS:0" in lines and "FILE:launcher.ps1:ERRORS:0" in lines, lines[:10]
     for script, allowed, own in (
         ("launcher.ps1", HOST_ALLOWED, {"Say", "Mark", "Fail", "AsciiJson", "ErrInfo", "Emit"}),
-        ("agent.ps1", AGENT_ALLOWED, {"ToJson", "Fail", "CodeOf", "OkReply", "RunOp", "Dispatch", "ReadRequest"}),
+        ("agent.ps1", AGENT_ALLOWED, {"ToJson", "Fail", "CodeOf", "OkReply", "RunOp", "Dispatch"}),
     ):
         names = {ln.split(":", 2)[2] for ln in lines if ln.startswith(f"CMD:{script}:")}
         assert "<DYNAMIC>" not in names, "a command with no static name"
@@ -1016,6 +1112,265 @@ def test_the_csharp_compiles_and_its_struct_sizes_match_the_documented_x64_layou
                       "JOBOBJECT_EXTENDED_LIMIT_INFORMATION": "144", "JOBOBJECT_BASIC_ACCOUNTING_INFORMATION": "48",
                       "SECURITY_ATTRIBUTES": "24", "IntPtr": "8"}
     assert "LAYOUTOK:True" in lines
+
+
+_PROBE_CS = r"""
+public sealed class LrProbeGuard : LrClientGuard
+{
+    public bool Allow;
+    public int Calls;
+    public int LastPid;
+    public bool Allows(int clientPid) { Calls++; LastPid = clientPid; return Allow; }
+}
+
+public static class LrProbe
+{
+    private static int _kills;
+    private static int _exits;
+    private static long _killAt = -1;
+    private static long _exitAt = -1;
+    private static readonly System.Diagnostics.Stopwatch Clock = System.Diagnostics.Stopwatch.StartNew();
+
+    private static void Kill() { System.Threading.Interlocked.Increment(ref _kills); if (_killAt < 0) { _killAt = Clock.ElapsedMilliseconds; } }
+    private static void Exit() { System.Threading.Interlocked.Increment(ref _exits); if (_exitAt < 0) { _exitAt = Clock.ElapsedMilliseconds; } }
+    private static void Reset() { _kills = 0; _exits = 0; _killAt = -1; _exitAt = -1; }
+    private static void Report(string name, bool ok, string detail) { Console.WriteLine("PROBE:" + name + ":" + (ok ? "PASS" : "FAIL") + ":" + detail); }
+    private static string Unique() { return "lr-probe-" + Guid.NewGuid().ToString("N"); }
+
+    private static bool WaitFor(Func<bool> condition, int ms)
+    {
+        long end = Clock.ElapsedMilliseconds + ms;
+        while (Clock.ElapsedMilliseconds < end) { if (condition()) { return true; } System.Threading.Thread.Sleep(10); }
+        return condition();
+    }
+
+    private static NamedPipeClientStream Open(string name)
+    {
+        NamedPipeClientStream client = new NamedPipeClientStream(".", name, PipeDirection.InOut, PipeOptions.Asynchronous);
+        client.Connect(5000);
+        return client;
+    }
+
+    // A client that sends `request` and then reads one line (or nothing, when `read` is false) and closes.
+    private static Task<string> Talk(string name, string request, bool read, int holdMs)
+    {
+        return Task.Run(() =>
+        {
+            try
+            {
+                using (NamedPipeClientStream client = Open(name))
+                {
+                    byte[] bytes = Encoding.ASCII.GetBytes(request);
+                    client.Write(bytes, 0, bytes.Length);
+                    if (!read) { System.Threading.Thread.Sleep(holdMs); return "(did not read)"; }
+                    StringBuilder text = new StringBuilder();
+                    byte[] buffer = new byte[65536];
+                    while (text.ToString().IndexOf('\n') < 0)
+                    {
+                        Task<int> got = client.ReadAsync(buffer, 0, buffer.Length);
+                        if (!got.Wait(5000) || got.Result <= 0) { break; }
+                        text.Append(Encoding.ASCII.GetString(buffer, 0, got.Result));
+                    }
+                    return text.ToString();
+                }
+            }
+            catch (Exception ex) { return "(client error " + ex.GetType().Name + ")"; }
+        });
+    }
+
+    private static bool ServesNext(LrServer server, string name)
+    {
+        Task<string> client = Talk(name, "ping\n", true, 0);
+        string line = server.Accept(5000);
+        bool replied = line == "ping" && server.Reply("pong");
+        return replied && client.Wait(5000) && client.Result == "pong\n";
+    }
+
+    public static void RunAll()
+    {
+        long t0;
+
+        Reset();
+        t0 = Clock.ElapsedMilliseconds;
+        LrWatchdog dog = new LrWatchdog(Kill, Exit, 600000);
+        dog.Limit(200, 300);
+        System.Threading.Thread.Sleep(100);                       // the caller is blocked, as in a hung pipe call
+        bool early = _kills != 0;
+        bool killed = WaitFor(() => _kills >= 1, 3000);
+        bool exited = WaitFor(() => _exits >= 1, 3000);
+        Report("watchdog_kills_then_exits_while_the_caller_is_blocked",
+            !early && killed && exited && (_killAt - t0) >= 150 && _exitAt > _killAt && (_exitAt - _killAt) >= 250,
+            "early=" + early + " kill_after=" + (_killAt - t0) + " exit_after_kill=" + (_exitAt - _killAt));
+        dog.Stop();
+
+        Reset();
+        t0 = Clock.ElapsedMilliseconds;
+        dog = new LrWatchdog(Kill, Exit, 600000);
+        dog.Limit(150, 200);
+        dog.Limit(600000, 600000);                                // an attempt to extend the life
+        bool both = WaitFor(() => _kills >= 1, 3000) && WaitFor(() => _exits >= 1, 3000);
+        Report("watchdog_limit_only_tightens",
+            both && (_killAt - t0) < 1000 && _exitAt > _killAt && (_exitAt - _killAt) >= 120,
+            "kill_after=" + (_killAt - t0) + " exit_after_kill=" + (_exitAt - _killAt));
+        dog.Stop();
+
+        Reset();
+        dog = new LrWatchdog(Kill, Exit, 300);
+        Report("watchdog_has_an_absolute_lifetime_without_any_limit_call",
+            WaitFor(() => _exits >= 1, 3000) && _kills >= 1, "kills=" + _kills + " exits=" + _exits);
+        dog.Stop();
+
+        Reset();
+        dog = new LrWatchdog(Kill, Exit, 200);
+        dog.Stop();
+        System.Threading.Thread.Sleep(600);
+        Report("watchdog_stop_prevents_firing", _kills == 0 && _exits == 0, "kills=" + _kills + " exits=" + _exits);
+
+        string name = Unique();
+        using (LrServer server = new LrServer(name, 400, 400, 400))
+        {
+            Report("server_serves_a_client_that_reads_and_closes", ServesNext(server, name), "");
+
+            Task<NamedPipeClientStream> silentTask = Task.Run(() => Open(name));   // connects and says nothing
+            long start = Clock.ElapsedMilliseconds;
+            string line = server.Accept(5000);
+            long spent = Clock.ElapsedMilliseconds - start;
+            NamedPipeClientStream silent = silentTask.Result;
+            Report("server_silent_client_costs_only_the_read_bound", line == null && !server.IdledOut && spent >= 300 && spent < 2000,
+                "line=" + line + " spent=" + spent);
+            Report("server_serves_the_next_client_after_a_silent_one", ServesNext(server, name), "");
+            silent.Dispose();
+
+            Task<string> trickle = Task.Run(() =>
+            {
+                try
+                {
+                    using (NamedPipeClientStream client = Open(name))
+                    {
+                        for (int i = 0; i < 40; i++) { client.WriteByte((byte)'a'); System.Threading.Thread.Sleep(100); }
+                    }
+                }
+                catch (Exception) { }
+                return "";
+            });
+            start = Clock.ElapsedMilliseconds;
+            line = server.Accept(5000);
+            spent = Clock.ElapsedMilliseconds - start;
+            Report("server_trickling_client_is_cut_off_by_the_total_bound", line == null && spent >= 300 && spent < 1500,
+                "line=" + line + " spent=" + spent);
+            Report("server_serves_the_next_client_after_a_trickle", ServesNext(server, name), "");
+
+            Task<string> big = Talk(name, "req\n", false, 4000);   // sends a request and never reads the reply
+            line = server.Accept(5000);
+            start = Clock.ElapsedMilliseconds;
+            bool delivered = server.Reply(new string('a', 2000000));
+            spent = Clock.ElapsedMilliseconds - start;
+            Report("server_client_that_never_reads_a_big_reply_is_cut_off", line == "req" && !delivered && spent < 2000,
+                "line=" + line + " delivered=" + delivered + " spent=" + spent);
+            Report("server_serves_the_next_client_after_a_big_unread_reply", ServesNext(server, name), "");
+
+            Task<string> small = Talk(name, "req\n", false, 4000);
+            line = server.Accept(5000);
+            start = Clock.ElapsedMilliseconds;
+            delivered = server.Reply("ok");
+            spent = Clock.ElapsedMilliseconds - start;
+            Report("server_client_that_never_reads_a_small_reply_is_cut_off", line == "req" && !delivered && spent >= 300 && spent < 2000,
+                "line=" + line + " delivered=" + delivered + " spent=" + spent);
+            Report("server_serves_the_next_client_after_a_small_unread_reply", ServesNext(server, name), "");
+
+            Task<string> longLine = Task.Run(() =>
+            {
+                try
+                {
+                    using (NamedPipeClientStream client = Open(name))
+                    {
+                        byte[] bytes = new byte[4096];
+                        for (int i = 0; i < bytes.Length; i++) { bytes[i] = (byte)'a'; }
+                        client.Write(bytes, 0, bytes.Length);
+                        System.Threading.Thread.Sleep(1500);
+                    }
+                }
+                catch (Exception) { }
+                return "";
+            });
+            start = Clock.ElapsedMilliseconds;
+            line = server.Accept(5000);
+            spent = Clock.ElapsedMilliseconds - start;
+            Report("server_request_without_a_newline_is_refused", line == null && spent < 1500, "line=" + line + " spent=" + spent);
+            Report("server_serves_the_next_client_after_an_unterminated_request", ServesNext(server, name), "");
+
+            start = Clock.ElapsedMilliseconds;
+            line = server.Accept(250);
+            spent = Clock.ElapsedMilliseconds - start;
+            Report("server_idle_is_reported_and_bounded", line == null && server.IdledOut && spent >= 200 && spent < 2000,
+                "idled=" + server.IdledOut + " spent=" + spent);
+        }
+
+        name = Unique();
+        using (LrServer server = new LrServer(name, 400, 400, 400))
+        {
+            LrProbeGuard guard = new LrProbeGuard();
+            server.Guard = guard;
+            guard.Allow = false;
+            Task<string> refused = Talk(name, "x\n", true, 0);
+            string line = server.Accept(5000);
+            bool eof = refused.Wait(5000) && refused.Result == "";
+            Report("server_guard_refuses_a_client_and_names_its_process",
+                line == null && server.Rejected == 1 && guard.Calls == 1 && eof && guard.LastPid == System.Diagnostics.Process.GetCurrentProcess().Id,
+                "line=" + line + " rejected=" + server.Rejected + " calls=" + guard.Calls + " eof=" + eof + " pid=" + guard.LastPid);
+            guard.Allow = true;
+            Report("server_guard_lets_an_allowed_client_through", ServesNext(server, name) && guard.Calls == 2, "calls=" + guard.Calls);
+        }
+        Console.WriteLine("PROBE:END:PASS:done");
+    }
+}
+"""
+
+_PROBE_DRIVER = (
+    "param([string]$Agent, [string]$Probe); "
+    "$text = [System.IO.File]::ReadAllText($Agent) + \"`n\" + [System.IO.File]::ReadAllText($Probe); "
+    "Add-Type -TypeDefinition $text -Language CSharp; "
+    "[LrProbe]::RunAll()"
+)
+
+_PROBES = (
+    "watchdog_kills_then_exits_while_the_caller_is_blocked", "watchdog_limit_only_tightens",
+    "watchdog_has_an_absolute_lifetime_without_any_limit_call", "watchdog_stop_prevents_firing",
+    "server_serves_a_client_that_reads_and_closes", "server_silent_client_costs_only_the_read_bound",
+    "server_serves_the_next_client_after_a_silent_one", "server_trickling_client_is_cut_off_by_the_total_bound",
+    "server_serves_the_next_client_after_a_trickle", "server_client_that_never_reads_a_big_reply_is_cut_off",
+    "server_serves_the_next_client_after_a_big_unread_reply", "server_client_that_never_reads_a_small_reply_is_cut_off",
+    "server_serves_the_next_client_after_a_small_unread_reply", "server_request_without_a_newline_is_refused",
+    "server_serves_the_next_client_after_an_unterminated_request", "server_idle_is_reported_and_bounded",
+    "server_guard_refuses_a_client_and_names_its_process", "server_guard_lets_an_allowed_client_through",
+)
+
+
+def test_the_agents_watchdog_and_pipe_server_hold_their_bounds_when_run_for_real(tmp_path):
+    """Compiles the agent's C# next to a probe and RUNS the watchdog and the pipe server in a local
+    PowerShell process, with real named pipes and real clocks. No target, no job object, no guest: the job
+    is never created, so the guard is a stub and the kill/exit actions are counters."""
+    shell = _powershell()
+    if shell is None:
+        pytest.skip("powershell.exe is not available: the probe cannot run here")
+    if not sys.maxsize > 2 ** 32:
+        pytest.skip("a 64-bit host is needed: the agent itself refuses anything else")
+    (tmp_path / "agent.cs").write_text(_csharp(), encoding="ascii")
+    (tmp_path / "probe.cs").write_text(_PROBE_CS, encoding="ascii")
+    driver = tmp_path / "probe.ps1"
+    driver.write_text(_PROBE_DRIVER, encoding="ascii")
+    done = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(driver),
+                           "-Agent", str(tmp_path / "agent.cs"), "-Probe", str(tmp_path / "probe.cs")],
+                          capture_output=True, text=True, timeout=300, check=False)
+    seen = {}
+    for line in done.stdout.splitlines():
+        if line.startswith("PROBE:"):
+            _, name, verdict, detail = line.strip().split(":", 3)
+            seen[name] = (verdict, detail)
+    assert "END" in seen, (done.stdout[-800:], done.stderr[-800:])
+    failed = {n: v for n, v in seen.items() if v[0] != "PASS"}
+    assert not failed, failed
+    assert set(seen) == set(_PROBES) | {"END"}, sorted(set(_PROBES) ^ set(seen))
 
 
 # --------------------------------------------------------------------------------- real Hyper-V (skipped by default)
