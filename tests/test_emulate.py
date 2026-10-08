@@ -1086,3 +1086,233 @@ def test_the_longest_string_the_stub_models_is_one_unit_short_of_the_bound():
         emulate._StubBook(memory, None, ["lstrlenA"], {})._strlen(0x10001, 1)
     wide = emulate._StubBook(RecordingMemory(terminator_at=(limit - 1) * 2), None, ["lstrlenW"], {})
     assert wide._strlen(0x10000, 2)[0] == limit - 1
+
+
+# -- memory-access watch: off by default, address-range filtered, capped, never a way round the budgets -----------------------------
+
+DATA = TEXT + 0x100
+WATCH_ARGS = ("seq", "pc", "kind", "address", "size", "value")
+
+
+def watched(sandbox, code, ranges, *, patches=(), **kwargs):
+    """Run ``code`` with ``ranges`` watched and return the result; the sample is RWX so nothing faults by accident."""
+    return emulate_json(build(sandbox, code, patches=patches), memory_watch=ranges, **kwargs)
+
+
+def rng(start, end, access="both"):
+    return {"start": start, "end": end, "access": access}
+
+
+MIXED = (f"mov rax, {DATA}; mov rcx, 0x1122334455667788; mov qword ptr [rax], rcx; mov rdx, qword ptr [rax]; "
+         f"mov byte ptr [rax + 0x40], 7; mov ebx, dword ptr [rax - 2]; ret")
+
+
+def test_the_memory_watch_is_off_unless_ranges_are_given(sandbox):
+    path = build(sandbox, asm(MIXED), patches=[(0x100 - 2, b"\xaa\xbb")])
+    plain = emulate_json(path)
+    assert plain["memory_trace"] is None and plain["memory_trace_truncated"] is False
+    assert plain["memory_trace_skipped"] == 0 and plain["memory_trace_basis"] is None
+    assert plain["request"]["memory_watch"] == [] and plain["limitations"] == []
+    for empty in (None, []):
+        assert emulate_json(path, memory_watch=empty)["memory_trace"] is None
+
+
+def test_a_watch_does_not_change_what_the_run_does(sandbox):
+    """The same program with a range that is never touched, with one that is, and with none: every other field of
+    the result is the same, so the hook observes and does not steer."""
+    path = build(sandbox, asm(MIXED), patches=[(0x100 - 2, b"\xaa\xbb")])
+    keys = ("stop_reason", "stop_detail", "completion", "instructions", "rip", "registers", "recent_rips",
+            "written_regions", "written_regions_total", "section_diffs")
+    plain = emulate_json(path)
+    for ranges in ([rng(0x200000, 0x200100)], [rng(DATA, DATA + 8)], [rng(DATA, DATA + 0x80, "write")]):
+        traced = emulate_json(path, memory_watch=ranges)
+        assert {k: traced[k] for k in keys if k != "section_diffs"} == {k: plain[k] for k in keys if k != "section_diffs"}
+        assert [(r["name"], r["changed_bytes"], r["final_sha256"]) for r in traced["section_diffs"]] \
+            == [(r["name"], r["changed_bytes"], r["final_sha256"]) for r in plain["section_diffs"]]
+    assert emulate_json(path, memory_watch=[rng(0x200000, 0x200100)])["memory_trace"] == []
+
+
+def test_reads_and_writes_in_a_range_are_recorded_with_pc_address_size_and_value(sandbox):
+    result = watched(sandbox, asm(MIXED), [rng(DATA, DATA + 8)], patches=[(0x100 - 2, b"\xaa\xbb")])
+    assert result["stop_reason"] == "RETURNED"
+    trace = result["memory_trace"]
+    assert [tuple(event) for event in trace] == [WATCH_ARGS] * len(trace)
+    at = TEXT + len(asm(f"mov rax, {DATA}; mov rcx, 0x1122334455667788", TEXT))
+    store = asm("mov qword ptr [rax], rcx", at)
+    load = asm("mov rdx, qword ptr [rax]", at + len(store))
+    assert trace[0] == {"seq": 1, "pc": hex(at), "kind": "write", "address": hex(DATA), "size": 8,
+                        "value": "0x1122334455667788"}
+    assert trace[1] == {"seq": 2, "pc": hex(at + len(store)), "kind": "read", "address": hex(DATA), "size": 8,
+                        "value": "0x1122334455667788"}
+    assert result["registers"]["rdx"] == "0x1122334455667788"
+    # The dword at DATA-2 reaches into the range by two bytes: an overlap is recorded, with the bytes that were read.
+    third = trace[2]
+    assert (third["kind"], third["address"], third["size"], third["pc"]) == (
+        "read", hex(DATA - 2), 4, hex(at + len(store) + len(load) + len(asm("mov byte ptr [rax + 0x40], 7", 0))))
+    assert third["value"] == hex(int.from_bytes(b"\xaa\xbb" + b"\x88\x77", "little"))
+    assert len(trace) == 3 and result["memory_trace_truncated"] is False and result["memory_trace_skipped"] == 0
+    assert "attempt" in result["memory_trace_basis"] and result["request"]["memory_watch"] == [
+        {"start": hex(DATA), "end": hex(DATA + 8), "access": "both"}]
+
+
+def test_an_access_outside_the_range_is_not_recorded_and_the_range_is_half_open(sandbox):
+    code = asm(f"mov rax, {DATA}; mov byte ptr [rax - 1], 1; mov byte ptr [rax + 8], 2; mov dword ptr [rax - 4], 3; "
+               f"mov dword ptr [rax + 8], 4; mov byte ptr [rax + 7], 5; mov byte ptr [rax], 6; ret")
+    result = watched(sandbox, code, [rng(DATA, DATA + 8)])
+    assert [(e["address"], e["size"], e["value"]) for e in result["memory_trace"]] == [
+        (hex(DATA + 7), 1, "0x5"), (hex(DATA), 1, "0x6")]
+
+
+def test_the_access_kind_filters_reads_and_writes(sandbox):
+    code = asm(f"mov rax, {DATA}; mov qword ptr [rax], rax; mov rbx, qword ptr [rax]; ret")
+    for access, kinds in (("read", ["read"]), ("write", ["write"]), ("both", ["write", "read"])):
+        result = watched(sandbox, code, [rng(DATA, DATA + 8, access)])
+        assert [e["kind"] for e in result["memory_trace"]] == kinds, access
+    default = watched(sandbox, code, [{"start": DATA, "end": DATA + 8}])        # access defaults to both
+    assert [e["kind"] for e in default["memory_trace"]] == ["write", "read"]
+    mixed = watched(sandbox, code, [rng(DATA - 0x10, DATA, "read"), rng(DATA, DATA + 8, "write")])
+    assert [e["kind"] for e in mixed["memory_trace"]] == ["write"]
+
+
+def test_several_ranges_are_watched_and_an_access_touching_two_is_recorded_once(sandbox):
+    code = asm(f"mov rax, {DATA}; mov dword ptr [rax + 6], 0x01020304; mov byte ptr [rax + 0x20], 9; ret")
+    result = watched(sandbox, code, [rng(DATA, DATA + 8, "write"), rng(DATA + 8, DATA + 16, "write"),
+                                     rng(DATA + 0x20, DATA + 0x28, "write")])
+    assert [(e["seq"], e["address"], e["size"]) for e in result["memory_trace"]] == [
+        (1, hex(DATA + 6), 4), (2, hex(DATA + 0x20), 1)]
+
+
+def test_a_read_that_cannot_be_read_is_listed_as_an_attempt_with_a_null_value(sandbox):
+    code = asm("mov rbx, 0x10000000; mov rax, qword ptr [rbx]; ret")
+    result = watched(sandbox, code, [rng(0x10000000, 0x10001000, "read")])
+    assert result["stop_reason"] == "UNMAPPED_READ"
+    assert [(e["kind"], e["address"], e["size"], e["value"]) for e in result["memory_trace"]] == [
+        ("read", "0x10000000", 8, None)]
+
+
+def test_the_trace_is_cut_at_the_cap_and_the_run_goes_on(sandbox):
+    code = asm(f"mov rax, {DATA}; mov ecx, 20; l: mov byte ptr [rax], cl; dec ecx; jnz l; ret")
+    full = watched(sandbox, code, [rng(DATA, DATA + 1)], memory_watch_limit=100)
+    assert len(full["memory_trace"]) == 20 and full["memory_trace_truncated"] is False
+    cut = watched(sandbox, code, [rng(DATA, DATA + 1)], memory_watch_limit=5)
+    assert cut["stop_reason"] == "RETURNED" and cut["completion"] == "RETURNED"      # the cap does not stop emulation
+    assert cut["memory_trace_truncated"] is True and cut["memory_trace_skipped"] == 15
+    assert [e["seq"] for e in cut["memory_trace"]] == [1, 2, 3, 4, 5]
+    assert cut["memory_trace"] == full["memory_trace"][:5]
+    assert (cut["instructions"], cut["registers"]) == (full["instructions"], full["registers"])
+    assert cut["request"]["memory_watch_limit"] == 5
+    exact = watched(sandbox, code, [rng(DATA, DATA + 1)], memory_watch_limit=20)
+    assert len(exact["memory_trace"]) == 20 and exact["memory_trace_truncated"] is False and exact["memory_trace_skipped"] == 0
+
+
+def test_the_default_cap_is_a_thousand_and_the_ceiling_keeps_the_result_line_parseable(sandbox):
+    assert emulate.DEFAULT_WATCH_EVENTS == 1000
+    code = asm(f"mov rax, {DATA}; mov ecx, 1200; l: mov byte ptr [rax], cl; dec ecx; jnz l; ret")
+    default = watched(sandbox, code, [rng(DATA, DATA + 1)])
+    assert len(default["memory_trace"]) == 1000 and default["memory_trace_skipped"] == 200
+    widest = {"seq": 10_000, "pc": "0x" + "f" * 16, "kind": "write", "address": "0x" + "f" * 16, "size": 16,
+              "value": "0x" + "f" * 32}
+    assert emulate.MAX_WATCH_EVENTS_CEILING * len(json.dumps(widest)) < emulate.MAX_CHILD_OUTPUT_CHARS // 2
+    code = asm(f"mov rax, {DATA}; mov ecx, 10500; l: mov byte ptr [rax], cl; dec ecx; jnz l; ret")
+    ceiling = watched(sandbox, code, [rng(DATA, DATA + 1)], memory_watch_limit=emulate.MAX_WATCH_EVENTS_CEILING)
+    assert len(ceiling["memory_trace"]) == 10_000 and ceiling["memory_trace_skipped"] == 500
+    assert ceiling["stop_reason"] == "RETURNED"
+
+
+def test_the_watch_does_not_widen_the_instruction_or_time_budget(sandbox):
+    code = asm(f"mov rax, {DATA}; l: mov byte ptr [rax], 1; jmp l")
+    result = watched(sandbox, code, [rng(DATA, DATA + 1)], max_instructions=1001, memory_watch_limit=10)
+    assert result["stop_reason"] == "INSN_LIMIT" and result["instructions"] == 1001
+    assert len(result["memory_trace"]) == 10 and result["memory_trace_skipped"] == 500 - 10
+    result = watched(sandbox, code, [rng(DATA, DATA + 1)], max_instructions=50_000_000, timeout_s=1)
+    assert result["stop_reason"] == "TIMEOUT" and result["memory_trace_truncated"] is True
+    assert len(result["memory_trace"]) == emulate.DEFAULT_WATCH_EVENTS
+
+
+@pytest.mark.parametrize("ranges", [
+    [rng(DATA, DATA)], [rng(DATA + 1, DATA)], [rng(-1, 8)], [rng(0, (1 << 64) + 1)], [rng("zz", 8)], [rng(True, 8)],
+    [rng(DATA, DATA + 8, "execute")], [rng(DATA, DATA + 8, "rw")], [rng(DATA, DATA + 8, None)],
+    [{"start": DATA}], [{"end": DATA}], [{"start": DATA, "end": DATA + 8, "extra": 1}], [(DATA, DATA + 8)], [5], "0x1:0x2",
+    {"start": DATA, "end": DATA + 8},
+    [rng(DATA, DATA + 8), rng(DATA + 4, DATA + 12)], [rng(DATA, DATA + 8, "read"), rng(DATA, DATA + 8, "write")],
+    [rng(0, emulate.MAX_WATCH_SPAN + 1)], [rng(1 << 40, (1 << 40) + (1 << 32))],
+    [rng(DATA + 16 * n, DATA + 16 * n + 8) for n in range(emulate.MAX_WATCH_RANGES + 1)],
+])
+def test_an_invalid_range_is_refused_before_anything_runs(sandbox, ranges):
+    result = emulate_json(build(sandbox, asm("ret")), memory_watch=ranges)
+    assert result["status"] == "TOOL_USAGE" and result["error"] == "BAD_MEMORY_WATCH" and result["ok"] is False
+    assert result.get("operation_ran") is not True and result.get("stop_reason") is None
+
+
+@pytest.mark.parametrize("limit", [0, -1, emulate.MAX_WATCH_EVENTS_CEILING + 1, True, 5.0, "10", None])
+def test_a_cap_outside_its_bounds_is_refused(sandbox, limit):
+    result = emulate_json(build(sandbox, asm("ret")), memory_watch=[rng(DATA, DATA + 8)], memory_watch_limit=limit)
+    assert result["status"] == "TOOL_USAGE" and result["error"] == "BAD_MEMORY_WATCH"
+
+
+def test_the_largest_range_and_the_most_ranges_are_accepted(sandbox):
+    path = build(sandbox, asm("ret"))
+    largest = emulate_json(path, memory_watch=[rng(0, emulate.MAX_WATCH_SPAN)])
+    assert largest["stop_reason"] == "RETURNED" and largest["memory_trace"] == []
+    many = emulate_json(path, memory_watch=[rng(DATA + 16 * n, DATA + 16 * n + 8) for n in range(emulate.MAX_WATCH_RANGES)])
+    assert many["stop_reason"] == "RETURNED" and many["memory_trace"] == []
+    top = emulate_json(path, memory_watch=[rng((1 << 64) - 8, 1 << 64)])
+    assert top["stop_reason"] == "RETURNED"
+
+
+def test_stub_memory_effects_are_not_in_the_trace_but_the_codes_own_accesses_are(sandbox):
+    patches = [(STRING_AT, b"hello\0")]
+    path = program(sandbox, ("data", "rcx", STRING_AT), "@lstrlenA", "mov rdx, qword ptr [rcx]",
+                   "mov qword ptr [rcx + 8], rdx", "ret", patches=patches)
+    result = emulate_json(path, allow_stubs=["lstrlenA"], memory_watch=[rng(TEXT + STRING_AT, TEXT + STRING_AT + 0x10)])
+    assert result["stop_reason"] == "RETURNED"
+    assert result["stubs"]["calls"][0]["effects"] == [{"kind": "read", "va": hex(TEXT + STRING_AT), "bytes": 5}]
+    assert [(e["seq"], e["kind"], e["address"]) for e in result["memory_trace"]] == [
+        (1, "read", hex(TEXT + STRING_AT)), (2, "write", hex(TEXT + STRING_AT + 8))]
+    assert "stubs.calls" in result["memory_trace_basis"]
+
+
+def test_vex_memory_operands_are_not_hooked_and_the_result_says_the_trace_may_be_incomplete(sandbox):
+    code = Code().vmovdqu_load(0, 0x100).vmovdqu_store(OUT_BLOCK, 0).asm("ret")
+    path = build(sandbox, bytes(code.blob), patches=[(0x100, A_BLOCK)])
+    traced = emulate_json(path, memory_watch=[rng(TEXT + 0x100, TEXT + 0x130)])
+    assert traced["vex"]["instructions_executed_by_layer"] == 2
+    assert [item["code"] for item in traced["limitations"]] == ["MEMORY_TRACE_INCOMPLETE"]
+    assert traced["memory_trace"] == []                  # the gap the limitation names, pinned rather than hidden
+    assert emulate_json(path)["limitations"] == []
+
+
+def test_the_emulate_subcommand_takes_repeatable_mem_watch_flags(sandbox, capsys):
+    path = build(sandbox, asm(f"mov rax, {DATA}; mov qword ptr [rax], rax; mov rbx, qword ptr [rax + 0x10]; ret"))
+    base = ["emulate", _relative(path), "--start", hex(TEXT), "--target-class", "public_crackme"]
+    code, out = run_cli(capsys, *base, "--mem-watch", f"{hex(DATA)}:{hex(DATA + 8)}:w",
+                        "--mem-watch", f"{DATA + 0x10}:{DATA + 0x18}")
+    assert code == 0 and [(e["kind"], e["address"]) for e in out["memory_trace"]] == [
+        ("write", hex(DATA)), ("read", hex(DATA + 0x10))]
+    assert out["request"]["memory_watch"][0] == {"start": hex(DATA), "end": hex(DATA + 8), "access": "write"}
+    code, out = run_cli(capsys, *base, "--mem-watch", f"{hex(DATA)}:{hex(DATA + 8)}:r", "--mem-watch-limit", "1")
+    assert code == 0 and out["memory_trace"] == [] and out["memory_trace_truncated"] is False
+    code, out = run_cli(capsys, *base)
+    assert code == 0 and out["memory_trace"] is None
+    code, out = run_cli(capsys, *base, "--mem-watch", f"{hex(DATA + 8)}:{hex(DATA)}")
+    assert code != 0 and out["error"] == "BAD_MEMORY_WATCH"
+    for bad in ("0x10", "a:b", "1:2:x", "1:2:rw:3"):
+        with pytest.raises(SystemExit):
+            cli.main([*base, "--mem-watch", bad])
+        capsys.readouterr()
+
+
+def test_an_access_that_faults_is_listed_once_as_the_last_event(sandbox):
+    protected = emulate_json(build(sandbox, asm(f"mov rax, {DATA}; mov dword ptr [rax], 0x01020304; ret"), chars=RX),
+                             memory_watch=[rng(DATA, DATA + 8)])
+    assert protected["stop_reason"] == "WRITE_PROTECT"
+    assert [(e["kind"], e["address"], e["size"], e["value"]) for e in protected["memory_trace"]] == [
+        ("write", hex(DATA), 4, "0x1020304")]
+    unmapped = watched(sandbox, asm("mov rbx, 0x10000000; mov qword ptr [rbx + 8], rbx; ret"),
+                       [rng(0x10000000, 0x10001000, "write")])
+    assert unmapped["stop_reason"] == "UNMAPPED_WRITE"
+    assert [(e["kind"], e["address"], e["size"], e["value"]) for e in unmapped["memory_trace"]] == [
+        ("write", "0x10000008", 8, "0x10000000")]
+    unfiltered = watched(sandbox, asm("mov rbx, 0x10000000; mov rax, qword ptr [rbx]; ret"),
+                         [rng(0x10000000, 0x10001000, "write")])
+    assert unfiltered["stop_reason"] == "UNMAPPED_READ" and unfiltered["memory_trace"] == []

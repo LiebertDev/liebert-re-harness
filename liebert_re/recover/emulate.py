@@ -109,6 +109,15 @@ STUB_HEAP_MAX_BYTES = 0x4000000
 STUB_VA_GRANULARITY = 0x10000
 MAX_STUB_CALLS = 1000
 MAX_STRLEN_UNITS = 0x10000
+# Memory-access watch (off unless the caller gives ranges). The event ceiling keeps the one result line the child
+# prints far below MAX_CHILD_OUTPUT_CHARS; the range count and span bound what a hook set can cover.
+MAX_WATCH_RANGES = 16
+MAX_WATCH_SPAN = 0x10000000
+MAX_WATCH_EVENTS_CEILING = 10_000
+DEFAULT_WATCH_EVENTS = 1000
+WATCH_ACCESS = ("read", "write", "both")
+WATCH_WINDOW = 63               # an access may start this far below a range and still overlap it
+MAX_TRACE_VALUE_BYTES = 16      # a wider access is recorded without its value
 TRAP_BASE = 0x7FEF00000000
 TRAP_STRIDE = 16
 
@@ -126,6 +135,17 @@ _STUBS_INFLUENCED = {
     "code": "STUBBED_IMPORTS",
     "detail": "stubbed imports influenced the run: at least one import call was answered by an assumed model, "
               "not stopped; see stubs.calls for each answer (basis: assumed)"}
+_TRACE_BASIS = ("accesses by the emulated code that overlap a watched range, in execution order, as the engine reports "
+                "them (a wide access may arrive as several narrower ones), recorded before the access completes: a "
+                "read is an attempt, and an access that faults is listed too (the run stops there; its value is null "
+                "for a read and what it tried to store for a write). pc is the instruction that made the access. "
+                "value is the little-endian integer of at most %d bytes; a wider access has value null. Accesses "
+                "made by a stub model are not listed here (see stubs.calls[].effects); neither are the memory "
+                "operands of instructions the VEX layer executed" % MAX_TRACE_VALUE_BYTES)
+_TRACE_VEX_UNTRACED = {
+    "code": "MEMORY_TRACE_INCOMPLETE",
+    "detail": "the VEX layer executed instructions in this run, and the memory they read or wrote is not hooked: "
+              "memory_trace may be missing those accesses (see vex.instructions_executed_by_layer)"}
 
 _LIMITS = (
     "x86-64 PE32+ images only; a 32-bit PE is refused (UNSUPPORTED_ARCHITECTURE)",
@@ -382,7 +402,7 @@ class _Runner:
 
     @staticmethod
     def validate(start_va, stop_at, max_instructions, timeout_s, watch_writes, registers, stack_size, perm_mode,
-                 allow_stubs=None, stub_options=None):
+                 allow_stubs=None, stub_options=None, memory_watch=None, memory_watch_limit=DEFAULT_WATCH_EVENTS):
         """``(params, None)`` or ``(None, usage dict)``."""
         start = _int_value(start_va)
         if start is None or not 0 <= start < 1 << 64:
@@ -429,9 +449,52 @@ class _Runner:
         allowed, options, bad = _Runner.validate_stubs(allow_stubs, stub_options)
         if bad is not None:
             return None, bad
+        watch, bad = _Runner.validate_watch(memory_watch, memory_watch_limit)
+        if bad is not None:
+            return None, bad
         return {"start_va": start, "stop_at": sorted(set(stops)), "max_instructions": max_instructions,
                 "timeout_s": float(timeout_s), "watch_writes": watch_writes, "registers": regs,
-                "stack_size": size, "perm_mode": perm_mode, "allow_stubs": allowed, "stub_options": options}, None
+                "stack_size": size, "perm_mode": perm_mode, "allow_stubs": allowed, "stub_options": options,
+                "memory_watch": watch, "memory_watch_limit": memory_watch_limit}, None
+
+    @staticmethod
+    def validate_watch(memory_watch, limit):
+        """``(ranges, None)`` or ``(None, usage dict)``. No ranges means no hook at all.
+
+        Each range is ``{"start": A, "end": B, "access": "read"|"write"|"both"}`` (``access`` defaults to both),
+        half-open: ``[A, B)``. Ranges may not overlap, so no access can be listed twice."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_WATCH_EVENTS_CEILING:
+            return None, _Runner.usage("BAD_MEMORY_WATCH", "memory_watch_limit must be an integer from 1 to %d"
+                                       % MAX_WATCH_EVENTS_CEILING)
+        if memory_watch is None:
+            return [], None
+        if isinstance(memory_watch, (str, bytes, dict)) or not hasattr(memory_watch, "__iter__"):
+            return None, _Runner.usage("BAD_MEMORY_WATCH", "memory_watch must be a list of range objects")
+        items = list(memory_watch)
+        if len(items) > MAX_WATCH_RANGES:
+            return None, _Runner.usage("BAD_MEMORY_WATCH", "at most %d watched ranges" % MAX_WATCH_RANGES)
+        ranges = []
+        for item in items:
+            if not isinstance(item, dict) or not {"start", "end"} <= set(item) \
+                    or not set(item) <= {"start", "end", "access"}:
+                return None, _Runner.usage("BAD_MEMORY_WATCH", "every range is an object with start, end and "
+                                           "optionally access (%s)" % ", ".join(WATCH_ACCESS))
+            start, end = _int_value(item["start"]), _int_value(item["end"])
+            access = item.get("access", "both")
+            if start is None or end is None or not 0 <= start < end <= 1 << 64:
+                return None, _Runner.usage("BAD_MEMORY_WATCH", "a range needs integer start < end, end at most 2**64 "
+                                           "([start, end) is half-open)")
+            if end - start > MAX_WATCH_SPAN:
+                return None, _Runner.usage("BAD_MEMORY_WATCH", "a watched range spans at most 0x%X bytes"
+                                           % MAX_WATCH_SPAN)
+            if access not in WATCH_ACCESS:
+                return None, _Runner.usage("BAD_MEMORY_WATCH", "access must be one of %s" % ", ".join(WATCH_ACCESS))
+            ranges.append({"start": start, "end": end, "access": access})
+        ranges.sort(key=lambda r: r["start"])
+        for prev, cur in zip(ranges, ranges[1:]):
+            if cur["start"] < prev["end"]:
+                return None, _Runner.usage("BAD_MEMORY_WATCH", "watched ranges may not overlap")
+        return ranges, None
 
     @staticmethod
     def validate_stubs(allow_stubs, stub_options):
@@ -568,7 +631,10 @@ class _Runner:
                              "watch_writes": params["watch_writes"], "perm_mode": params["perm_mode"]},
                   "request": {"start_va": _hx(params["start_va"]), "stop_at": [_hx(a) for a in params["stop_at"]],
                               "registers": {k: _hx(v) for k, v in params["registers"].items()},
-                              "allow_stubs": list(params["allow_stubs"]), "stub_options": dict(params["stub_options"])}}
+                              "allow_stubs": list(params["allow_stubs"]), "stub_options": dict(params["stub_options"]),
+                              "memory_watch": [{"start": _hx(r["start"]), "end": _hx(r["end"]), "access": r["access"]}
+                                               for r in params["memory_watch"]],
+                              "memory_watch_limit": params["memory_watch_limit"]}}
         if not gate["ok"]:
             name = "%s_refused.json" % run_id
             record.update(status=gate["status"], detail=gate["detail"])
@@ -628,7 +694,8 @@ class _Runner:
 
 def emulate_range(path, start_va, *, stop_at=(), max_instructions=5_000_000, timeout_s=120,
                   watch_writes="image", registers=None, stack_size=0x100000, perm_mode="as_declared",
-                  target_class=None, authorization=None, sample_sha256=None, allow_stubs=None, stub_options=None):
+                  target_class=None, authorization=None, sample_sha256=None, allow_stubs=None, stub_options=None,
+                  memory_watch=None, memory_watch_limit=DEFAULT_WATCH_EVENTS):
     """Emulate a bounded range of a PE32+ (x86-64) image from ``start_va`` and report why and where it stopped.
 
     Runs inside the Unicorn engine in a separate interpreter (a process boundary, not a sandbox; nothing
@@ -644,6 +711,11 @@ def emulate_range(path, start_va, *, stop_at=(), max_instructions=5_000_000, tim
     ``GetTickCount64``, ``GetLastError``, ``SetLastError``, ``VirtualAlloc``, ``HeapAlloc``, ``lstrlenA``,
     ``lstrlenW``); empty by default. The first two need ``stub_options={"tick_count": N}``; ``heap_bytes`` sizes the
     stub allocator's region. Every stub answer is an assumption (``basis: assumed``) listed in ``stubs.calls``.
+    ``memory_watch`` (off by default) lists up to 16 non-overlapping ``{"start": A, "end": B, "access":
+    "read"|"write"|"both"}`` ranges, half-open and each at most 0x10000000 bytes; every access that overlaps one is
+    recorded in ``memory_trace`` (``seq``, ``pc``, ``kind``, ``address``, ``size``, ``value``). At most
+    ``memory_watch_limit`` events (default 1000, ceiling 10000) are kept; past that the run goes on, the trace is cut,
+    ``memory_trace_truncated`` is true and ``memory_trace_skipped`` counts what was not kept.
 
     ``ok`` is true when the engine ran and reports a stop; ``stop_reason`` says which, and ``completion`` says
     whether the routine finished (``RETURNED``, ``STOPPED_AT_IMPORT``, ``STOPPED_AT_SYSCALL``, ``INSN_LIMIT``,
@@ -657,7 +729,8 @@ def emulate_range(path, start_va, *, stop_at=(), max_instructions=5_000_000, tim
     """
     try:
         params, bad = _Runner.validate(start_va, stop_at, max_instructions, timeout_s, watch_writes,
-                                       registers, stack_size, perm_mode, allow_stubs, stub_options)
+                                       registers, stack_size, perm_mode, allow_stubs, stub_options,
+                                       memory_watch, memory_watch_limit)
         if bad is not None:
             return _j(_Runner.finish(bad))
         params.update(_target_class=target_class, _authorization=authorization, _sample_sha256=sample_sha256)
@@ -1031,7 +1104,7 @@ class _Engine:
     def run(self):
         import numpy as np
         from unicorn import (UC_ARCH_X86, UC_HOOK_CODE, UC_HOOK_INSN, UC_HOOK_INSN_INVALID, UC_HOOK_INTR,
-                             UC_HOOK_MEM_FETCH_PROT, UC_HOOK_MEM_FETCH_UNMAPPED, UC_HOOK_MEM_READ_PROT,
+                             UC_HOOK_MEM_FETCH_PROT, UC_HOOK_MEM_FETCH_UNMAPPED, UC_HOOK_MEM_READ, UC_HOOK_MEM_READ_PROT,
                              UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_WRITE, UC_HOOK_MEM_WRITE_PROT,
                              UC_HOOK_MEM_WRITE_UNMAPPED, UC_MEM_FETCH_PROT, UC_MEM_FETCH_UNMAPPED, UC_MEM_READ_PROT,
                              UC_MEM_READ_UNMAPPED, UC_MEM_WRITE_PROT, UC_MEM_WRITE_UNMAPPED, UC_MODE_64,
@@ -1209,8 +1282,10 @@ class _Engine:
                  UC_MEM_FETCH_UNMAPPED: "UNMAPPED_FETCH", UC_MEM_READ_PROT: "READ_PROTECT",
                  UC_MEM_WRITE_PROT: "WRITE_PROTECT", UC_MEM_FETCH_PROT: "FETCH_PROTECT"}
 
-        def on_fault(_uc, access, address, size, _value, _data):
+        def on_fault(_uc, access, address, size, value, _data):
             fault.append((kinds.get(access, "ENGINE_ERROR"), address, size))
+            if watch:
+                trace_fault(kinds.get(access), address, size, value)
             return False
 
         def on_intr(_uc, number, _data):
@@ -1254,6 +1329,65 @@ class _Engine:
         uc.hook_add(UC_HOOK_INSN, on_in, None, 1, 0, UX.UC_X86_INS_IN)
         uc.hook_add(UC_HOOK_INSN, on_out, None, 1, 0, UX.UC_X86_INS_OUT)
         uc.hook_add(UC_HOOK_INSN_INVALID, on_invalid)
+
+        # Memory-access watch: one hook per range and kind, each covering the range plus WATCH_WINDOW bytes below it
+        # (an access is hooked by its first byte, and may start below the range and still overlap it). An access that
+        # more than one hook sees is recorded by the lowest-numbered of them only. Off, no hook exists.
+        watch = job.get("memory_watch") or []
+        cap = job.get("memory_watch_limit", DEFAULT_WATCH_EVENTS)
+        events, trace_skipped = [], [0]
+        by_kind = {"read": [(r["start"], r["end"]) for r in watch if r["access"] in ("read", "both")],
+                   "write": [(r["start"], r["end"]) for r in watch if r["access"] in ("write", "both")]}
+
+        seen_by_hook = [None]       # (kind, address, size, instruction ordinal) of the last access a hook handled
+
+        def record(kind, address, size, seen):
+            if len(events) >= cap:
+                trace_skipped[0] += 1
+                return
+            events.append({"seq": len(events) + 1, "pc": _hx(last_addr), "kind": kind, "address": _hx(address),
+                           "size": size, "value": _hx(seen)})
+
+        def stored(value, size):
+            return value & ((1 << (8 * size)) - 1) if 0 < size <= 8 else None
+
+        def trace_fault(fault_kind, address, size, value):
+            """An access that faulted never reaches the access hooks; the attempt is still listed, read value null."""
+            kind = {"UNMAPPED_READ": "read", "READ_PROTECT": "read",
+                    "UNMAPPED_WRITE": "write", "WRITE_PROTECT": "write"}.get(fault_kind)
+            if kind is not None and seen_by_hook[0] != (kind, address, size, executed) \
+                    and any(lo < address + size and address < hi for lo, hi in by_kind[kind]):
+                record(kind, address, size, stored(value, size) if kind == "write" else None)
+
+        def make_watch(kind):
+            ranges = by_kind[kind]
+
+            def on_watch(_uc, _access, address, size, value, index):
+                end = address + size
+                owner, hit = None, False
+                for j, (lo, hi) in enumerate(ranges):
+                    if owner is None and lo - WATCH_WINDOW <= address < hi:
+                        owner = j
+                    if lo < end and address < hi:
+                        hit = True
+                if owner != index or not hit:
+                    return
+                seen_by_hook[0] = (kind, address, size, executed)     # a protection fault reports it again
+                seen = None
+                if size <= MAX_TRACE_VALUE_BYTES and len(events) < cap:
+                    if kind == "write":
+                        seen = stored(value, size)
+                    else:
+                        try:
+                            seen = int.from_bytes(bytes(uc.mem_read(address, size)), "little")
+                        except UcError:
+                            seen = None
+                record(kind, address, size, seen)
+            return on_watch
+
+        for kind, hook_type in (("read", UC_HOOK_MEM_READ), ("write", UC_HOOK_MEM_WRITE)):
+            for index, (lo, hi) in enumerate(by_kind[kind]):
+                uc.hook_add(hook_type, make_watch(kind), index, max(lo - WATCH_WINDOW, 0), hi - 1)
 
         engine_error = None
         stub_refusal = None
@@ -1377,8 +1511,13 @@ class _Engine:
             "ok": True, "status": "OK", "stop_reason": reason, "stop_detail": detail,
             "completion": _completion(reason), "completion_basis": _COMPLETION_BASIS,
             "limitations": ([dict(_IMPORT_UNREADABLE)] if import_report["status"] == "UNREADABLE" else [])
-                           + ([dict(_STUBS_INFLUENCED)] if book.calls else []),
+                           + ([dict(_STUBS_INFLUENCED)] if book.calls else [])
+                           + ([dict(_TRACE_VEX_UNTRACED)] if watch and layer.executed else []),
             "stubs": book.report(),
+            "memory_trace": events if watch else None,
+            "memory_trace_truncated": trace_skipped[0] > 0,
+            "memory_trace_skipped": trace_skipped[0],
+            "memory_trace_basis": _TRACE_BASIS if watch else None,
             "instructions": executed, "instruction_count_basis": _COUNT_BASIS,
             "rip": _hx(rip), "registers": registers, "registers_basis": _REG_BASIS,
             "recent_rips": [_hx(a) for a in recent], "recent_rips_basis": _RIP_BASIS,

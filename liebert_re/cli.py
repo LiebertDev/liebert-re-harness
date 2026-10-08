@@ -308,6 +308,19 @@ def _reg_assignment(text):
     return name.strip(), value.strip()
 
 
+def _mem_watch(text):
+    """``START:END[:r|w|rw]`` (END exclusive) into a memory_watch range for ``emulate_range``."""
+    parts = text.split(":")
+    access = {"r": "read", "w": "write", "rw": "both"}
+    if len(parts) not in (2, 3) or (len(parts) == 3 and parts[2] not in access):
+        raise argparse.ArgumentTypeError("expected START:END or START:END:r|w|rw, for example 0x140002000:0x140002100:w")
+    try:
+        start, end = int(parts[0], 0), int(parts[1], 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("START and END must be integers, decimal or 0x-hex") from None
+    return {"start": start, "end": end, "access": access[parts[2]] if len(parts) == 3 else "both"}
+
+
 def _emulate(a):
     authorization = None
     if a.authorized_by or a.purpose:
@@ -321,7 +334,8 @@ def _emulate(a):
         a.path, a.start, stop_at=a.stop_at or (), max_instructions=a.max_instructions, timeout_s=a.timeout,
         watch_writes=a.watch_writes, registers=dict(a.reg) or None, perm_mode=a.perm_mode,
         target_class=a.target_class, authorization=authorization, sample_sha256=a.sha256,
-        allow_stubs=a.allow_stub or None, stub_options=stub_options or None)
+        allow_stubs=a.allow_stub or None, stub_options=stub_options or None,
+        memory_watch=a.mem_watch or None, memory_watch_limit=a.mem_watch_limit)
 
 
 def _sieve_status(a):
@@ -902,6 +916,11 @@ def _build_parser():
     sp.add_argument("--allow-stub", dest="allow_stub", action="append", default=[], metavar="NAME",
                     help="answer this kernel32 import with an assumed model instead of stopping at it; repeatable, off by default "
                          "(GetTickCount, GetTickCount64, GetLastError, SetLastError, VirtualAlloc, HeapAlloc, lstrlenA, lstrlenW). Every answer is an assumption and is listed in the result")
+    sp.add_argument("--mem-watch", dest="mem_watch", action="append", type=_mem_watch, default=[], metavar="START:END[:rw]",
+                    help="record the code's reads and/or writes (r, w or rw, default rw) that touch [START, END); repeatable (at most 16 "
+                         "ranges, each at most 0x10000000 bytes, no overlap); off by default. Lands in memory_trace")
+    sp.add_argument("--mem-watch-limit", dest="mem_watch_limit", type=int, default=1000, metavar="N",
+                    help="most memory-trace events kept (1-10000, default 1000); past it the run continues and memory_trace_truncated is set")
     sp.add_argument("--stub-tick-count", dest="stub_tick_count", type=lambda t: int(t, 0), default=None, metavar="N",
                     help="the value GetTickCount / GetTickCount64 return (required when either is allowed)")
     sp.add_argument("--stub-heap-bytes", dest="stub_heap_bytes", type=lambda t: int(t, 0), default=None, metavar="N",
