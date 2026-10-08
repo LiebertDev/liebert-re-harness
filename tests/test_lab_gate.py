@@ -573,7 +573,10 @@ class TestIsolationFromAttestation:
         ("nan_constant", b'{"schema_version": NaN}', "GUEST_MEASUREMENT_NOT_JSON"),
         ("array", b"[]", "MEASUREMENT_NOT_AN_OBJECT"),
         ("scalar", b"7", "MEASUREMENT_NOT_AN_OBJECT"),
-        ("deeply_nested", b"[" * 5000 + b"]" * 5000, "GUEST_MEASUREMENT_NOT_JSON"),
+        # Deep enough to exceed the json parser's recursion guard on every supported Python (3.14 parses 5000
+        # levels fine and would answer NOT_AN_OBJECT; 50000 already raises there), under the 1 MiB size cap.
+        pytest.param("deeply_nested", b"[" * 200_000 + b"]" * 200_000, "GUEST_MEASUREMENT_NOT_JSON",
+                     id="deeply_nested"),     # an explicit id: the payload must not become the test id
     ])
     def test_a_broken_file_is_unknown(self, child, image_sha, lab_open, tmp_path, label, payload, reason):
         path = tmp_path / "broken.json"
