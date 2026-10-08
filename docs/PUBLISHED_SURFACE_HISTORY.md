@@ -268,3 +268,4 @@ FAMILIES["emulation"] name with no implementation here. One new module, and one 
 and the only other top-level functions are underscore-private, so they are not part of the pin. The module
 owns an EVIDENCE directory (dataset/evidence/emulate_range), which is why EVIDENCE_OWNERS in
 tests/test_layout_invariants.py gained it. Digest recomputed from the source.
+Updated again: the package gained liebert_re/strict_json.py, the one dependency-free strict JSON reader (duplicate object keys and NaN/Infinity refused at every depth, one error type with a reason code). One new module, and one public name (loads); the error type is a class, so it is not in the pin. It is not a registered tool and is not in tool_families.FAMILIES: the pin counts every public top-level function in the package, so the new name moves the digest. Digest recomputed from the source.

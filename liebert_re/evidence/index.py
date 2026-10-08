@@ -99,6 +99,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from liebert_re import strict_json
 from liebert_re.evidence.process_lock import DurableLock
 
 from liebert_re.workspace import PROJECT_ROOT as APP
@@ -298,26 +299,13 @@ def _read_bounded(path: Path, limit: int):
     return raw.decode("utf-8", errors="replace"), None if not truncated else "TRUNCATED"
 
 
-def _strict_pairs(pairs):
-    seen = {}
-    for key, value in pairs:
-        if key in seen:
-            raise ValueError(f"duplicate JSON key {key!r}")
-        seen[key] = value
-    return seen
-
-
-def _strict_constant(name):
-    raise ValueError(f"non-finite JSON number {name}")
-
-
 def _strict_json_loads(text):
-    """``json.loads`` that refuses what Python quietly accepts: a repeated object key (last one
-    wins, so two readers can disagree about the value) and ``NaN`` / ``Infinity`` / ``-Infinity``.
-    Same two rules as the strict readers in ``dynamic/lab_gate.py`` and
-    ``dynamic/hyperv_transport.py`` (commit c01f2d8); kept here because the evidence layer must
-    not import from ``dynamic``. Raises ``ValueError`` (``RecursionError`` on absurd nesting)."""
-    return json.loads(text, object_pairs_hook=_strict_pairs, parse_constant=_strict_constant)
+    """Strict JSON for the evidence layer: a repeated object key (last one wins, so two readers can
+    disagree about the value) and ``NaN`` / ``Infinity`` / ``-Infinity`` are refused. The rules
+    live in ``liebert_re.strict_json`` (the dependency-free bottom layer, so the evidence layer
+    need not import ``dynamic``). Raises ``strict_json.StrictJSONError``, a ``ValueError``; absurd
+    nesting is its TOO_DEEP, not a bare ``RecursionError``."""
+    return strict_json.loads(text)
 
 
 def _record_resolves(record, evidence_id) -> bool:

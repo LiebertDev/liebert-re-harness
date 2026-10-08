@@ -72,6 +72,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+from liebert_re import strict_json
 from liebert_re.dynamic.guest_attestation import GuestAttestation
 from liebert_re.workspace import PROJECT_ROOT as APP_DIR
 
@@ -96,19 +97,6 @@ _UNVERIFIED = {
 }
 _CHECKS = ("operation_known", "isolation_requirement", "operator_switch", "pid", "authorization",
            "ownership", "sample_hash", "bounds", "evidence_writable")
-
-
-class _DuplicateKey(ValueError):
-    """A JSON object repeated a key; ``json.loads`` would silently keep the last value."""
-
-
-def _no_duplicate_keys(pairs):
-    seen = set()
-    for key, _ in pairs:
-        if key in seen:
-            raise _DuplicateKey(key)
-        seen.add(key)
-    return dict(pairs)
 
 
 def _j(payload):
@@ -184,10 +172,10 @@ class LabGate:
             return None, "no authorization was supplied"
         if isinstance(value, str):
             try:
-                value = json.loads(value, object_pairs_hook=_no_duplicate_keys)
-            except _DuplicateKey:
-                return None, "the authorization has a duplicate key"
-            except ValueError:
+                value = strict_json.loads(value, allow_non_finite=True)
+            except strict_json.StrictJSONError as exc:
+                if exc.reason == strict_json.DUPLICATE_KEY:
+                    return None, "the authorization has a duplicate key"
                 return None, "the authorization is not valid JSON"
         if not isinstance(value, dict):
             return None, "the authorization must be an object"
@@ -322,15 +310,11 @@ class LabGate:
         if count > _MAX_MEASUREMENT_BYTES:
             return unknown("GUEST_MEASUREMENT_TOO_LARGE", measurement_sha256=digest, measurement_bytes=count)
 
-        def refuse_constant(name):
-            raise ValueError(name)
-
         try:
-            document = json.loads(raw.decode("utf-8-sig"), parse_constant=refuse_constant,
-                                  object_pairs_hook=_no_duplicate_keys)
-        except _DuplicateKey:
-            return unknown("GUEST_MEASUREMENT_DUPLICATE_KEY", measurement_sha256=digest, measurement_bytes=count)
-        except (ValueError, RecursionError):
+            document = strict_json.loads(raw)
+        except strict_json.StrictJSONError as exc:
+            if exc.reason == strict_json.DUPLICATE_KEY:
+                return unknown("GUEST_MEASUREMENT_DUPLICATE_KEY", measurement_sha256=digest, measurement_bytes=count)
             return unknown("GUEST_MEASUREMENT_NOT_JSON", measurement_sha256=digest, measurement_bytes=count)
         result = GuestAttestation.admit(document, now_utc=datetime.now(timezone.utc),
                                         local_vm_id=local_vm_id, max_age_s=max_age_s)

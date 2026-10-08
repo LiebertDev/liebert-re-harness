@@ -96,6 +96,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from liebert_re import strict_json
 from liebert_re.bounded_subprocess import BoundedProcessResult, run_bounded_process
 
 __all__ = ["ERROR_CLASSES", "SCHEMA", "HypervTransport"]
@@ -536,23 +537,6 @@ def _positive_int(value: object) -> int | None:
 # --------------------------------------------------------------------------- script output
 
 
-class _DuplicateKey(ValueError):
-    pass
-
-
-def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in out:
-            raise _DuplicateKey(key)
-        out[key] = value
-    return out
-
-
-def _refuse_constant(_name: str) -> Any:
-    raise ValueError("non-finite number")
-
-
 def _parse_script_output(stdout: str) -> tuple[list[str], dict[str, Any] | None, str | None]:
     """``(phases reached, result object, problem)``. A problem means no result may be trusted."""
     phases: list[str] = []
@@ -570,10 +554,10 @@ def _parse_script_output(stdout: str) -> tuple[list[str], dict[str, Any] | None,
     if len(result_lines) > 1:
         return phases, None, "MULTIPLE_RESULTS"
     try:
-        body = json.loads(result_lines[0], object_pairs_hook=_no_duplicates, parse_constant=_refuse_constant)
-    except _DuplicateKey:
-        return phases, None, "RESULT_DUPLICATE_KEY"
-    except (ValueError, RecursionError):
+        body = strict_json.loads(result_lines[0])
+    except strict_json.StrictJSONError as exc:
+        if exc.reason == strict_json.DUPLICATE_KEY:
+            return phases, None, "RESULT_DUPLICATE_KEY"
         return phases, None, "RESULT_NOT_JSON"
     if not isinstance(body, dict) or body.get("schema") != _SCRIPT_SCHEMA:
         return phases, None, "RESULT_SCHEMA_MISMATCH"
