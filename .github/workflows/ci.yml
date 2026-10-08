@@ -56,6 +56,42 @@ jobs:
       - name: Repo discipline gate
         run: pytest -q tests/test_repo_discipline.py
 
+  # The `test` job installs no optional format extras, so the tests that need py7zr, androguard,
+  # dpkt or UnityPy skip there and say so. This job installs exactly those extras and runs only
+  # the two files that use them, and it fails if even one test in them is skipped: a skip here
+  # would mean an extra stopped installing or stopped being detected, and the format would go
+  # unchecked while CI stayed green.
+  optional-formats:
+    name: optional formats (no skips allowed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,lattice,7z,android,pcap,unity]"
+
+      - name: Test with the extras installed
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest -q -rs tests/test_decompression_bounds.py tests/test_public_format_probes.py | tee optional-formats.log
+
+      - name: Fail on any skip
+        run: |
+          if grep -Eq '[0-9]+ skipped' optional-formats.log; then
+            echo "::error::A test in the optional-format files was skipped although its extra is installed."
+            grep -E '^SKIPPED' optional-formats.log || true
+            exit 1
+          fi
+          echo "No skips."
+
   lint:
     name: lint
     runs-on: ubuntu-latest
