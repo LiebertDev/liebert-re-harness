@@ -1263,6 +1263,44 @@ def _read_text(path):
         return ""
 
 
+# Log forms that were actually observed when idat exited non-zero. The rule below names ONLY these; a log that
+# shows none of them is "UNKNOWN". There is deliberately no licence, concurrency or database-lock class: no such
+# log text has been observed here, and naming one without it would be a guess presented as a diagnosis.
+_LOG_DB_EMPTY = "database is empty"
+_LOG_DB_INIT_FAILED = re.compile(r"database initialization failed with error (\d+)", re.I)
+_LOG_DB_OPEN_FAILED = re.compile(r"open database failed with result:? *(\d+)", re.I)
+_LOG_SCRIPT_NOT_LOCATED = re.compile(r"liebert_ida_job\.py: could not locate file", re.I)
+
+
+def _classify_exit_log(log):
+    """What idat's own log says about a non-zero exit, from observed forms only. Returns
+    {"class", "error_code", "evidence"}; `evidence` names the fixed patterns that matched (never log text, so
+    nothing in it needs redaction).
+    DATABASE_OPEN_FAILED_EMPTY   "Database is empty" and an open/initialization failure with a numeric code
+                                 (observed with code 4). The log shows IDA saw an empty database; it does NOT
+                                 say why, so this class names the symptom, not a cause.
+    DATABASE_OPEN_FAILED         an open/initialization failure with a numeric code and no "Database is empty"
+    SCRIPT_NOT_LOCATED           idat could not find the worker script it was told to run (observed with a
+                                 scratch path near the Windows path-length limit)
+    UNKNOWN                      none of the above, an unreadable log, or no log text: nothing is guessed."""
+    text = log if isinstance(log, str) else ""
+    init, opened = _LOG_DB_INIT_FAILED.search(text), _LOG_DB_OPEN_FAILED.search(text)
+    empty = _LOG_DB_EMPTY in text.lower()
+    code = None
+    for hit in (init, opened):
+        if hit:
+            code = int(hit.group(1))
+            break
+    evidence = [name for name, found in (("database_is_empty", empty), ("database_initialization_failed", init),
+                                         ("open_database_failed", opened)) if found]
+    if init or opened:
+        return {"class": "DATABASE_OPEN_FAILED_EMPTY" if empty else "DATABASE_OPEN_FAILED",
+                "error_code": code, "evidence": evidence}
+    if _LOG_SCRIPT_NOT_LOCATED.search(text):
+        return {"class": "SCRIPT_NOT_LOCATED", "error_code": None, "evidence": ["script_could_not_locate_file"]}
+    return {"class": "UNKNOWN", "error_code": None, "evidence": []}
+
+
 def _verdict(cp, work, db_path, *, expect_database, expect_operation=None, require_discard=False):
     """The four signals, read together. Returns (data, failure_error,
     signals). `failure_error` is None only when every signal agrees.
@@ -1336,7 +1374,8 @@ def _verdict(cp, work, db_path, *, expect_database, expect_operation=None, requi
                 "never running, but the log markers and stderr are the evidence for which.")
         signals["exit_diagnosis"] = {"class": kind, "meaning": meaning, "exit_code": cp.returncode,
                                      "result_file_present": result_present, "script_completed": completed,
-                                     "log_fatal_markers": markers}
+                                     "log_fatal_markers": markers,
+                                     "log_class": _classify_exit_log(log if log_readable else None)}
         return data, "IDA_EXITED_NONZERO", signals
     if markers:
         return data, "IDA_LOG_REPORTS_FAILURE", signals
@@ -2795,7 +2834,8 @@ def _verdict_idalib(cp, work, *, creating, operations):
         else:
             kind = "NONZERO_EXIT_NO_RESULT"
         signals["exit_diagnosis"] = {"class": kind, "exit_code": cp.returncode, "result_file_present": result_present,
-                                     "script_completed": completed, "log_fatal_markers": markers}
+                                     "script_completed": completed, "log_fatal_markers": markers,
+                                     "log_class": _classify_exit_log(log if log_readable else None)}
         return envelope, None, "IDA_EXITED_NONZERO", signals
     if markers:
         return envelope, None, "IDA_LOG_REPORTS_FAILURE", signals

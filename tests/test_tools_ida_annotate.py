@@ -2889,7 +2889,10 @@ class AnnotateRealInstallTests(unittest.TestCase):
         self.assertEqual(self.apply(again)["version"], 4, "version numbers are never reused (3 was prepared by the kept candidate)")
 
     def test_purge_touches_nothing_outside_the_annotated_root_in_a_real_run(self):
-        self.apply(self.plan([{"address": "0x140001000", "new_name": "liebert_start"}]))
+        applied = self.apply(self.plan([{"address": "0x140001000", "new_name": "liebert_start"}]))
+        # Observability: an intermittent idat start failure (exit code 4) used to surface here only as a
+        # KeyError two steps later. Show the apply answer, with its exit diagnosis and log tail, instead.
+        self.assertTrue(applied.get("ok"), applied)
         evidence = self.base / "e"
         evidence_before = {p.name: ti._file_sha256(p)[0] for p in evidence.glob("*") if p.is_file()}
         cache_before = {p.relative_to(self.cache).as_posix(): ti._file_sha256(p)[0] for p in self.cache.rglob("*") if p.is_file()}

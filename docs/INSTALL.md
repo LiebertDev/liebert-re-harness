@@ -5,7 +5,7 @@
 Only what you need to run and develop the analysis code. Concretely:
 
 - **76<!-- count:modules --> Python modules** in the `liebert_re/` package — the analysis code itself.
-- **122<!-- count:test_files --> test files** in `tests/` (`tests/test_*.py`), plus `conftest.py` and an empty `__init__.py`
+- **124<!-- count:test_files --> test files** in `tests/` (`tests/test_*.py`), plus `conftest.py` and an empty `__init__.py`
   (the latter is required so the flat top-level modules resolve on `sys.path`).
 - No challenge-solution scripts: they are not distributed in this public package (see [SOLVED_INDEX.md](../SOLVED_INDEX.md) for the record of what was solved).
 - Documentation, licence, CI configuration, and issue templates.
@@ -280,6 +280,15 @@ pytest -m heavy
 
 An explicit `-m` on the command line replaces the ini's marker filter rather than
 combining with it.
+
+CI has no IDA, so the heavy tier cannot run there. `python scripts/run_heavy.py` runs it locally in one
+command and writes a summary (counts, failed test names, duration, exit code, and any file that appeared in
+or vanished from `samples/` during the run) to `out/heavy/<UTC>.json`, with the raw output beside it as
+`.log`. `out/` is gitignored. Keep the checkout on a short path: with the repository under a very long
+directory the real-IDA microcode tests failed on every run (13 of 13 in three runs; `idat` logged that it
+could not locate its worker script), while the same code on a short path passed. That is a measured
+correlation with the path length, not a proven mechanism. The failure now classifies as
+`SCRIPT_NOT_LOCATED` in `exit_diagnosis.log_class`.
 
 ## Platform notes
 
