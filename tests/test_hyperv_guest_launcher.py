@@ -100,6 +100,7 @@ class FakeGuest:
         self.stderr = b""
         self.total_extra = 0
         self.terminated = True
+        self.on_wait = None
 
     def good(self, areq):
         op, run_id = areq["op"], areq["run_id"]
@@ -113,6 +114,8 @@ class FakeGuest:
         if op == "resume":
             return {**base, "resumed": True, "previous_suspend_count": 1}
         if op == "wait":
+            if self.on_wait is not None:
+                self.on_wait()
             return {**base, "exited": self.exited, "exit_code": self.exit_code if self.exited else None}
         if op == "terminate":
             return {**base, "terminated": self.terminated}
@@ -281,6 +284,9 @@ BAD_REPLIES = {
     "raw_not_json": Raw("not json\n"),
     "raw_list": Raw("[1, 2]\n"),
     "raw_nan": Raw('{"pid": NaN}\n'),
+    "raw_infinity": Raw('{"pid": -Infinity}\n'),
+    "raw_overflowing_number": Raw('{"pid": 1e999}\n'),
+    "raw_deep_nesting": Raw("[" * 2000 + "]" * 2000 + "\n"),
     "raw_duplicate_key": Raw('{"schema":"liebert-re.guest-agent/1","schema":"x"}\n'),
     "raw_two_lines": Raw('{"a":1}\n{"b":2}\n'),
     "raw_non_ascii": Raw('{"a":"\u00e9"}\n'),
@@ -306,6 +312,33 @@ def test_launcher_rejects_malformed_or_mismatched_reply(cred, name):
         assert reply["ok"] is False, (op, name, reply)
         assert re.fullmatch(r"[A-Z][A-Z0-9_]+", reply["reason"]), reply
         json.dumps(reply)
+
+
+@pytest.mark.parametrize("text,reason", [
+    ('{"schema":"liebert-re.guest-agent/1","schema":"x"}', "AGENT_REPLY_DUPLICATE_KEY"),
+    ('{"a":{"b":1,"b":2}}', "AGENT_REPLY_DUPLICATE_KEY"),
+    ('{"pid": NaN}', "AGENT_REPLY_NOT_JSON"),
+    ('{"pid": Infinity}', "AGENT_REPLY_NOT_JSON"),
+    ('{"pid": 1e999}', "AGENT_REPLY_NOT_JSON"),
+    ("[" * 2000 + "]" * 2000, "AGENT_REPLY_NOT_JSON"),
+    ("{not json", "AGENT_REPLY_NOT_JSON"),
+])
+def test_agent_replies_are_read_through_strict_json_with_the_reason_it_gives(text, reason):
+    assert hvl._parse_agent_reply(text, "create", "run", None, 4096) == (None, reason)
+
+
+def test_the_launcher_imports_only_names_the_transport_still_has_and_reads_json_strictly():
+    import ast
+
+    source = Path(hvl.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    wanted = [alias.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+              and node.module == "liebert_re.dynamic.hyperv_transport" for alias in node.names]
+    assert wanted and all(hasattr(hvt_module, name) for name in wanted), wanted
+    assert "json.loads(" not in source.replace("strict_json.loads(", "")      # no lenient reader
+    assert "strict_json.loads(" in source
+    for gone in ("_DuplicateKey", "_no_duplicates", "_refuse_constant"):
+        assert gone not in source and not hasattr(hvt_module, gone), gone     # the helpers moved to strict_json
 
 
 def test_a_valid_failure_reply_is_a_refusal_with_the_agents_code(cred):
@@ -432,6 +465,7 @@ def test_steps_out_of_order_are_refused_before_any_guest_call(cred):
     for call in (lambda: launcher.verify_job_assignment(VM, run_id), lambda: launcher.resume(VM, run_id),
                  lambda: launcher.wait(VM, run_id, 1.0), lambda: launcher.collect_output(VM, run_id, 8)):
         assert call()["reason"] == "STEP_OUT_OF_ORDER"
+    assert len(fake.calls) == sent and guest.ops() == ["create"]           # nothing out of order reached the guest
     launcher.assign_to_job(VM, run_id, {"memory_bytes": 1 << 28})
     sent = len(fake.calls)
     assert launcher.resume(VM, run_id)["reason"] == "STEP_OUT_OF_ORDER"       # assigned but not verified
@@ -623,7 +657,9 @@ def test_a_termination_reply_about_another_process_is_not_a_confirmation(cred):
 def run_debugger(cred, guest, **over):
     calls = tdr.Calls()
     launcher, guest, fake = build(cred, guest)
-    runner = DebuggerRun(tdr.FakeTransport(calls), launcher, gate=lambda op, **kw: tdr.good_decision())
+    clock = over.pop("clock", None)
+    extra = {} if clock is None else {"clock": clock}
+    runner = DebuggerRun(tdr.FakeTransport(calls), launcher, gate=lambda op, **kw: tdr.good_decision(), **extra)
     result = runner.run(VM, "host-sample.bin", tdr.SHA, tdr.GUEST_DIR, timeout_s=over.pop("timeout_s", 5.0),
                         output_cap_bytes=over.pop("cap", 64), **over)
     return result, guest, fake
@@ -654,12 +690,37 @@ def test_a_failed_assignment_is_job_assignment_unconfirmed(cred):
     assert result["status"] == "JOB_ASSIGNMENT_UNCONFIRMED" and "resume" not in guest.ops()
 
 
-def test_a_deadline_that_passes_is_timed_out(cred):
+def _guest_that_spends(clock, seconds, **state):
+    """A guest whose ``wait`` takes ``seconds`` of the orchestrator's clock."""
     guest = FakeGuest()
-    guest.exited = False
-    result, guest, fake = run_debugger(cred, guest)
+    for key, value in state.items():
+        setattr(guest, key, value)
+    guest.on_wait = lambda: setattr(clock, "now", clock.now + seconds)
+    return guest
+
+
+def test_a_deadline_that_passes_is_timed_out(cred):
+    clock = tdr.FakeClock()
+    guest = _guest_that_spends(clock, 6.0, exited=False)          # the run was given 5 s
+    result, guest, fake = run_debugger(cred, guest, clock=clock, timeout_s=5.0)
+    assert clock.now == 1006.0                                    # the deadline really passed on the clock
     assert result["status"] == "TIMED_OUT" and result["reason"] == "DEADLINE_REACHED_BEFORE_EXIT"
     assert guest.ops()[-2:] == ["terminate", "collect"]
+
+
+def test_a_success_reply_that_comes_after_the_deadline_is_not_a_completion(cred):
+    clock = tdr.FakeClock()
+    guest = _guest_that_spends(clock, 6.0)                        # exited, code 0, but only after 6 s of a 5 s run
+    result, guest, fake = run_debugger(cred, guest, clock=clock, timeout_s=5.0)
+    assert result["status"] == "TIMED_OUT" and result["reason"] == "EXIT_NOT_PROVEN_WITHIN_DEADLINE"
+    assert guest.ops()[-2:] == ["terminate", "collect"]
+
+
+def test_the_same_reply_inside_the_deadline_is_a_completion(cred):
+    clock = tdr.FakeClock()
+    guest = _guest_that_spends(clock, 4.0)                        # control: only the time differs
+    result, guest, fake = run_debugger(cred, guest, clock=clock, timeout_s=5.0)
+    assert result["status"] == "COMPLETED" and result["exit_code"] == 0
 
 
 def test_output_beyond_the_cap_is_output_truncated(cred):
