@@ -330,7 +330,7 @@ def test_quarantine_list_and_tampered_manifest(env, tmp_path):
     repo, tmpdir = env
     _run(repo, "purge", "alpha", "--execute", "--yes")
     rc, out, _ = _run(repo, "quarantine")
-    assert rc == 0 and "alpha" in out and "expires in 6d" in out or "expires in 7d" in out
+    assert rc == 0 and "alpha" in out and ("expires in 6d" in out or "expires in 7d" in out)
     # a manifest trying to restore onto a kept path or outside the case is skipped
     qroot = tmpdir / cp.QUARANTINE_DIRNAME
     entry = next(iter((qroot / "alpha").iterdir()))

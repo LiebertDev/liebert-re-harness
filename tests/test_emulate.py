@@ -258,6 +258,95 @@ def test_an_unreadable_import_directory_runs_without_traps_and_says_so(sandbox):
     assert result["stop_reason"] == "RETURNED"
     imports = result["image"]["imports"]
     assert imports["status"] == "UNREADABLE" and imports["slots_trapped"] == 0 and "NO slot was rewritten" in imports["note"]
+    # The run is kept (everything up to a call is a real measurement) but it is marked as weakened: without
+    # trapped slots the IMPORT_CALL stop guarantee is gone, and the result must carry that.
+    assert [item["code"] for item in result["limitations"]] == ["IMPORT_DIRECTORY_UNREADABLE"]
+    assert "IMPORT_CALL" in result["limitations"][0]["detail"]
+
+
+def test_a_run_with_a_readable_import_directory_has_no_limitations(sandbox):
+    assert emulate_json(build(sandbox, asm("ret")))["limitations"] == []
+    assert emulate_json(build(sandbox, asm("ret"), imports={"kernel32.dll": ["ExitProcess"]}))["limitations"] == []
+
+
+# -- completion: whether the routine finished, apart from ok (a result record exists) -----------------------------
+
+def test_completion_names_how_the_routine_ended_while_ok_stays_true(sandbox):
+    imports = {"kernel32.dll": ["ExitProcess"]}
+    slot = iat_slots(build(sandbox, imports=imports))["ExitProcess"]
+    cases = [
+        (asm("ret"), {}, "RETURNED"),
+        (asm(f"call qword ptr [rip + {slot - (TEXT + 6)}]"), {}, "STOPPED_AT_IMPORT"),
+        (asm("syscall"), {}, "STOPPED_AT_SYSCALL"),
+        (asm("l: jmp l"), {"max_instructions": 50}, "INSN_LIMIT"),
+        (asm("l: jmp l"), {"max_instructions": 50_000_000, "timeout_s": 1}, "TIMEOUT"),
+        (asm("mov rax, [0x10]"), {}, "FAULT"),
+        (asm("ud2"), {}, "FAULT"),
+        (asm("nop; nop"), {"stop_at": [TEXT + 1]}, "UNKNOWN"),     # STOP_ADDRESS is the caller's stop, not a finish
+        (asm("int3"), {}, "UNKNOWN"),
+    ]
+    for code, kwargs, expected in cases:
+        result = emulate_json(build(sandbox, code, imports=imports), **kwargs)
+        assert result["ok"] is True, result["stop_reason"]
+        assert result["completion"] == expected, (result["stop_reason"], result["completion"])
+    assert "UNKNOWN" in result["completion_basis"]
+
+
+def test_every_stop_reason_the_module_names_has_a_completion_that_is_never_a_guess():
+    assert emulate._completion(None) is None
+    assert emulate._completion("NO_SUCH_STOP") == "UNKNOWN"
+    # Only RETURNED may claim the routine finished; a failed run must not read as a finished one.
+    assert [k for k, v in emulate._COMPLETION.items() if v == "RETURNED"] == ["RETURNED"]
+    for unmapped in ("STOP_ADDRESS", "INT3", "INTERRUPT", "HLT", "PORT_IO", "UNMODELLED_VEX", "ENGINE_ERROR",
+                     "ENGINE_CRASH", "MEMORY_LIMIT", "UNKNOWN_STOP"):
+        assert emulate._completion(unmapped) == "UNKNOWN"
+
+
+def test_a_run_that_never_started_has_no_completion(sandbox):
+    refused = emulate_json(build(sandbox, asm("ret")), target_class=None)
+    assert refused["status"] == "TARGET_CLASS_REQUIRED" and refused["completion"] is None
+    usage = emulate_json(build(sandbox, asm("ret")), registers={"cr0": 1})
+    assert usage["error"] == "BAD_REGISTERS" and usage["completion"] is None
+
+
+def test_a_killed_emulator_process_has_no_state_and_a_completion_that_does_not_claim_a_finish():
+    class Outcome:
+        launch_failed = False
+        resource_limit_unavailable = False
+        timed_out = False
+        memory_exceeded = True
+        process_tree_terminated = True
+        returncode = None
+        stdout = ""
+        stderr = ""
+
+    memory = emulate._Runner.interpret(Outcome, Path("."))
+    assert memory["ok"] is False and memory["state_available"] is False
+    assert emulate._completion(memory["stop_reason"]) == "UNKNOWN"
+    Outcome.memory_exceeded, Outcome.timed_out = False, True
+    wall = emulate._Runner.interpret(Outcome, Path("."))
+    assert wall["ok"] is False and wall["state_available"] is False and emulate._completion(wall["stop_reason"]) == "TIMEOUT"
+
+
+# -- the instruction bound at its edge --------------------------------------------------------------------------
+
+def test_the_instruction_bound_refuses_the_next_instruction_and_lets_an_exact_fit_finish(sandbox):
+    """Measured behaviour: the bound is checked BEFORE each instruction runs. A routine of exactly N instructions
+    with max_instructions=N finishes (RETURNED, instructions == N); with max_instructions=N-1 the Nth instruction
+    (the ret) is refused, never executed, and the state is the one after N-1 instructions."""
+    code = asm("mov eax, 1; mov ebx, 2; mov ecx, 3; ret")
+    after_three = TEXT + len(asm("mov eax, 1; mov ebx, 2; mov ecx, 3", 0))
+    exact = emulate_json(build(sandbox, code), max_instructions=4)
+    assert exact["stop_reason"] == "RETURNED" and exact["completion"] == "RETURNED" and exact["instructions"] == 4
+    assert exact["rip"] == hex(SENTINEL) and exact["registers"]["rcx"] == "0x3"
+    short = emulate_json(build(sandbox, code), max_instructions=3)
+    assert short["stop_reason"] == "INSN_LIMIT" and short["completion"] == "INSN_LIMIT"
+    assert short["instructions"] == 3 and short["stop_detail"] == {"limit": 3}
+    assert short["rip"] == hex(after_three)                       # the ret did not run
+    assert short["registers"]["rcx"] == "0x3"                     # the third mov did
+    assert int(short["registers"]["rsp"], 16) == int(exact["registers"]["rsp"], 16) - 8   # still holds the return address
+    fewer = emulate_json(build(sandbox, code), max_instructions=2)
+    assert fewer["registers"]["rcx"] == "0x0" and fewer["instructions"] == 2
 
 
 # -- the TEB / PEB model -------------------------------------------------------------------------------------------------
@@ -601,7 +690,9 @@ def test_the_evidence_record_holds_the_gate_the_result_and_no_path(sandbox):
     assert record["input"] == {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "size": path.stat().st_size, "name_omitted": True}
     for text in (json.dumps(result), records[0].read_text(encoding="utf-8")):
         assert str(REPO_ROOT) not in text and str(sandbox) not in text and "evidence-name-probe" not in text
-        assert "\\" not in text.replace("\\n", "").replace('\\"', "") or True
+        # json.dumps escapes a Windows path separator as a doubled backslash; the only backslashes a clean record
+        # may carry are the \n and \" escapes, so once those are removed none may be left.
+        assert "\\" not in text.replace("\\n", "").replace('\\"', "")
     assert result["dump"]["location"] == "dataset/emulation/<input_sha16>/<run_id>/"
     assert result["host_isolation"] == "process boundary; not a sandbox"
     assert result["limits"]

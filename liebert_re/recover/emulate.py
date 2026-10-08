@@ -24,6 +24,13 @@ happened next:
   ``ENGINE_CRASH``      the emulator process died; whatever it had written is listed and ``unverified``
   ``UNKNOWN_STOP``      the engine returned and nothing explains why
 
+``ok`` only says a result record exists. ``completion`` says whether the routine finished: ``RETURNED``,
+``STOPPED_AT_IMPORT``, ``STOPPED_AT_SYSCALL``, ``INSN_LIMIT``, ``TIMEOUT``, ``FAULT`` (a memory fault, a protection
+fault, ``UD2`` or an invalid encoding) or ``UNKNOWN`` (any other stop, including ``STOP_ADDRESS``); ``null`` when
+nothing ran. ``limitations`` lists what weakens this particular run; an unreadable import directory is one (no slot
+is trapped, so the IMPORT_CALL guarantee is gone, and the run is kept because everything up to the call is still a
+real measurement).
+
 There are NO API stubs: a call into an import stops the run, it is not answered. Nothing here fakes a
 Windows environment beyond the minimal TEB/PEB declared in ``teb_peb_model``.
 
@@ -107,6 +114,30 @@ _COUNT_BASIS = ("instructions the engine dispatched (counted by a per-instructio
 _RIP_BASIS = "the 64 most recently dispatched instruction addresses, oldest first"
 _REG_BASIS = ("registers as the engine holds them when the run stops; an instruction that trapped "
               "(syscall, int3) has already advanced RIP past itself")
+
+# ``completion`` says whether the routine finished, which ``ok`` does not ("a result record exists"). It is derived
+# from ``stop_reason`` and from nothing else: a reason that is not listed here is UNKNOWN, never a guess.
+_COMPLETION = {
+    "RETURNED": "RETURNED", "IMPORT_CALL": "STOPPED_AT_IMPORT", "SYSCALL": "STOPPED_AT_SYSCALL",
+    "INSN_LIMIT": "INSN_LIMIT", "TIMEOUT": "TIMEOUT",
+    "UNMAPPED_READ": "FAULT", "UNMAPPED_WRITE": "FAULT", "UNMAPPED_FETCH": "FAULT", "READ_PROTECT": "FAULT",
+    "WRITE_PROTECT": "FAULT", "FETCH_PROTECT": "FAULT", "INVALID_INSTRUCTION": "FAULT", "UD2": "FAULT",
+}
+_COMPLETION_BASIS = ("completion is derived from stop_reason alone: RETURNED only when control reached the sentinel "
+                     "return address; a stop this table does not name (STOP_ADDRESS, INT3, INTERRUPT, HLT, PORT_IO, "
+                     "UNMODELLED_VEX, ENGINE_ERROR, ENGINE_CRASH, MEMORY_LIMIT, UNKNOWN_STOP) is UNKNOWN, and null "
+                     "means no emulation ran. ok only says a result record exists")
+_IMPORT_UNREADABLE = {
+    "code": "IMPORT_DIRECTORY_UNREADABLE",
+    "detail": "the import directory could not be read, so no slot was trapped and the guarantee that a call into an "
+              "import stops as IMPORT_CALL does not hold for this run; a call through an import slot ends as some "
+              "other stop (usually an unmapped fetch) and cannot be told apart from a wild jump"}
+
+
+def _completion(stop_reason):
+    """The completion value for a stop reason; None when there is no stop reason (nothing ran)."""
+    return None if stop_reason is None else _COMPLETION.get(stop_reason, "UNKNOWN")
+
 
 _STATUS_PREFIX = {"public_crackme": "a challenge written to be solved (declared, not verified)",
                   "owned_target": "a target the caller owns, with a named authorizer and a bound hash"}
@@ -358,6 +389,7 @@ class _Runner:
     def finish(result):
         result["tool"] = TOOL
         result["host_isolation"] = HOST_ISOLATION
+        result.setdefault("completion", None)      # a refusal or a usage error ran nothing
         return result
 
     @staticmethod
@@ -471,6 +503,7 @@ class _Runner:
                 except OSError:
                     pass
         ran = bool(result.get("ok")) or result.get("stop_reason") is not None
+        result.setdefault("completion", _completion(result.get("stop_reason")))
         result.update(run_id=run_id, gate=gate, input=record["input"], bounds=record["bounds"],
                       request=record["request"], operation_ran=ran,
                       dump={"location": "dataset/emulation/<input_sha16>/<run_id>/", "input_sha16": sha[:16],
@@ -505,7 +538,9 @@ def emulate_range(path, start_va, *, stop_at=(), max_instructions=5_000_000, tim
     written). ``perm_mode="rwx"`` maps every section read-write-execute and is reported as an approximation.
     ``watch_writes`` is ``"image"`` or ``"all"``: which writes are recorded in ``written_regions``.
 
-    ``ok`` is true when the engine ran and reports a stop; ``stop_reason`` says which. Memory dumps are raw
+    ``ok`` is true when the engine ran and reports a stop; ``stop_reason`` says which, and ``completion`` says
+    whether the routine finished (``RETURNED``, ``STOPPED_AT_IMPORT``, ``STOPPED_AT_SYSCALL``, ``INSN_LIMIT``,
+    ``TIMEOUT``, ``FAULT``, ``UNKNOWN``; ``null`` if nothing ran). ``limitations`` lists what weakens this run. Memory dumps are raw
     bytes under ``dataset/emulation/`` and the response names no path. Statuses other than ``OK``:
     ``TARGET_CLASS_REQUIRED``, ``CLASS_CONFLICT``, ``AUTHORIZATION_REQUIRED``, ``SAMPLE_HASH_REQUIRED``,
     ``SAMPLE_HASH_MISMATCH`` (nothing ran), ``TOOL_USAGE``, ``PATH_REFUSED``, ``NOT_FOUND``, ``NOT_A_PE``,
@@ -1029,6 +1064,8 @@ class _Engine:
         recent = [ring[(ring_i - n_ring + k) & 63] for k in range(n_ring)]
         return {
             "ok": True, "status": "OK", "stop_reason": reason, "stop_detail": detail,
+            "completion": _completion(reason), "completion_basis": _COMPLETION_BASIS,
+            "limitations": [dict(_IMPORT_UNREADABLE)] if import_report["status"] == "UNREADABLE" else [],
             "instructions": executed, "instruction_count_basis": _COUNT_BASIS,
             "rip": _hx(rip), "registers": registers, "registers_basis": _REG_BASIS,
             "recent_rips": [_hx(a) for a in recent], "recent_rips_basis": _RIP_BASIS,
