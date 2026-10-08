@@ -83,6 +83,7 @@ class AnnotateFakeIdat:
         self.log_text = None            # what the engine writes to ida.log (None: the clean log)
         self.write_log = True           # False: the engine leaves no ida.log at all
         self.pid = 4000
+        self.root_missing = {}          # operation -> launches that load with empty root information (no input hash)
         self.pristine = {START: "start"}
         self.comments = {}      # (address, comment_kind) -> text the database holds
 
@@ -131,6 +132,12 @@ class AnnotateFakeIdat:
             body.setdefault("engine_input_sha256", self.sha256)
             body.setdefault("engine_input_md5", self.md5)
             body["script_completed"] = True
+            if self.root_missing.get(operation, 0) > 0:
+                # the engine's intermittent bad load: root information empty, and what it saves cannot be opened
+                self.root_missing[operation] -= 1
+                body["engine_input_sha256"] = body["engine_input_md5"] = None
+                if job.get("write_mode") == "write":
+                    db.write_bytes(b"UNOPENABLE" * 10)
         (work / ti._RESULT_NAME).write_text(json.dumps(body), encoding="utf-8")
         if failing:
             return _cp(self.exit_code, stderr=self.stderr_text)
@@ -760,6 +767,42 @@ class VerificationDiagnosisAndRetryTests(AnnotateCase):
         attempts = out["verification"]["attempts"]
         self.assertEqual([a["scratch"] for a in attempts], names)
         self.assertEqual(self.pristine_db(), pristine, "the pristine database is byte-for-byte unchanged")
+
+class EngineRootInfoTests(AnnotateCase):
+    """About 1 in 70 loads of a good database by IDA Pro 9.4 has empty root information (no input hash, no path,
+    image base 0); a write session that starts like that saves a database IDA cannot open again. The write is
+    repeated from a fresh copy of the base; nothing unopenable is promoted or kept."""
+
+    def writes(self):
+        return [c for c in self.fake.calls if c["job"]["operation"] == "rename_apply"]
+
+    def test_a_write_session_that_loaded_with_empty_root_information_is_repeated_from_a_fresh_copy(self):
+        self.fake.root_missing = {"rename_apply": 1}
+        out = self.write()
+        self.assertEqual((out["ok"], out["status"], out["version"]), (True, "OK", 1), out)
+        self.assertEqual(out["engine_root_info_repeats"], 1)
+        self.assertEqual(len(self.writes()), 2)
+        self.assertEqual(out["verification"]["names_matched"], 1)
+        self.assertNotIn(b"UNOPENABLE", ti._version_file(self.label_dir(), 1).read_bytes())
+        self.assertEqual(list((self.label_dir() / "recovery").glob("*")), [], "no candidate is kept")
+
+    def test_a_write_that_never_loads_properly_is_refused_after_three_launches_and_keeps_nothing(self):
+        self.fake.root_missing = {"rename_apply": 9}
+        out = self.write()
+        self.assertEqual((out["ok"], out["error"], out["written"]), (False, "IDA_ENGINE_ROOT_INFO_MISSING", False))
+        self.assertEqual(out["engine_root_info_attempts"], ti._ROOT_INFO_ATTEMPTS)
+        self.assertEqual(len(self.writes()), ti._ROOT_INFO_ATTEMPTS)
+        self.assertIs(out["signals"]["engine_root_info_present"], False)
+        self.assertEqual(self.events(), [], "nothing was journalled")
+        self.assertIsNone(self.manifest())
+        self.assertFalse(out["candidate_retained"])
+
+    def test_a_plan_session_with_empty_root_information_is_repeated_not_answered(self):
+        self.fake.root_missing = {"rename_plan": 1}
+        out = self.plan()
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(len([c for c in self.fake.calls if c["job"]["operation"] == "rename_plan"]), 2)
+
 
 class EngineLogAndScratchTests(AnnotateCase):
     """idat says "Check ida.log!" when it cannot start, so a failed run reports the end of that log (bounded,

@@ -1223,11 +1223,121 @@ def _job_environment(job_path):
     return env
 
 
+# idat.exe is not long-path aware. Measured against IDA Pro 9.4 on Windows (LongPathsEnabled on, so the
+# harness itself can create these directories): a working directory of up to 257 characters can be started,
+# a script or database path of 259 characters is found and one of 260 is not (the log then says
+# "could not locate file" or "Can't open for read file", and there is no result). It is the limit the Win32
+# MAX_PATH names, for the FULL path idat resolves, not for the directory alone.
+_IDA_PATH_LIMIT = 259
+_IDA_PATH_LIMITED = os.name == "nt"   # the limit was measured on Windows; elsewhere every path is accepted
+_IDA_LONGEST_NAME = max(len(n) for n in (_JOB_SCRIPT, _DB_NAME, _LOG_NAME, _RESULT_NAME, "job.json"))
+
+
+def _ida_path_fit(work, target):
+    """How the paths idat will be handed compare with `_IDA_PATH_LIMIT` (Windows only; elsewhere they always
+    fit). Returns a dict of measured lengths (no path text) with `fits`."""
+    work_chars = len(str(work))
+    longest_in_work = work_chars + 1 + _IDA_LONGEST_NAME
+    target_chars = len(str(target)) if target is not None else None
+    fits = not _IDA_PATH_LIMITED or (longest_in_work <= _IDA_PATH_LIMIT
+                               and (target_chars is None or target_chars <= _IDA_PATH_LIMIT))
+    return {"fits": fits, "limit_chars": _IDA_PATH_LIMIT, "work_directory_chars": work_chars,
+            "longest_file_in_work_chars": longest_in_work, "target_chars": target_chars}
+
+
+class _IdaPathTooLong(_EnvironmentFailure):
+    """Even a short scratch directory cannot hold what idat needs, or the input file's own path is over the
+    limit. A classed refusal carrying the measured lengths, never a launch that fails with an unreadable log."""
+
+    def __init__(self, measured, why):
+        super().__init__("IDA_PATH_TOO_LONG", OSError(None, why))
+        self.measured = measured
+
+    def body(self, tool, **extra):
+        body = super().body(tool, **extra)
+        body["path_measurement"] = self.measured
+        body["detail"] = (
+            f"idat.exe cannot open a file whose full path is longer than {_IDA_PATH_LIMIT} characters. The call "
+            "was refused before anything was started, with the measured lengths in `path_measurement`. It says "
+            "nothing about the input file or what IDA would have found. Use a shorter location for the input "
+            "or a shorter temporary directory.")
+        body.update(extra)
+        return body
+
+
+def _rebase_paths(value, old, new):
+    """`value` with every string that names a path under `old` moved under `new` (job fields that point at
+    files in the work directory)."""
+    if isinstance(value, str):
+        if value.startswith(old) and (len(value) == len(old) or value[len(old)] in ("\\", "/")):
+            return new + value[len(old):]
+        return value
+    if isinstance(value, dict):
+        return {k: _rebase_paths(v, old, new) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_rebase_paths(v, old, new) for v in value]
+    return value
+
+
 def _launch(exe, work, job, *, mode, target, timeout_seconds, cancellation_token, empty_database=False,
             worker_source=None):
     """Run idat once in `work`. `mode` is "create" (analyse `target` into
     work/db.i64) or "reopen" (open `target`, an existing database).
-    Returns (process_result, command)."""
+    Returns (process_result, command).
+
+    When the work directory (or the file idat would open) is too deep for idat's path limit, the session runs
+    in a short scratch directory and what it leaves is copied back into `work`, so callers read their usual
+    files. The process result then carries `liebert_short_path_session` (measured, path free), which
+    `_verdict` reports in the signals. If even that cannot work, the call is refused as IDA_PATH_TOO_LONG."""
+    fit = _ida_path_fit(work, target)
+    if fit["fits"]:
+        return _launch_in(exe, work, job, mode=mode, target=target, timeout_seconds=timeout_seconds,
+                          cancellation_token=cancellation_token, empty_database=empty_database,
+                          worker_source=worker_source)
+    stage = Path(tempfile.mkdtemp(prefix="lre-"))
+    try:
+        staged_fit = _ida_path_fit(stage, None)
+        measured = {**fit, "short_directory_chars": staged_fit["work_directory_chars"]}
+        if not staged_fit["fits"]:
+            raise _IdaPathTooLong(measured, "the temporary directory is too deep for idat")
+        target_in_work = target is not None and Path(target).parent == Path(work)
+        staged_target, copied_in = target, False
+        if mode == "reopen":
+            staged_target = stage / Path(target).name
+            try:
+                shutil.copyfile(target, staged_target)
+            except OSError as exc:
+                raise _EnvironmentFailure("IDA_LAUNCH_FAILED", exc) from exc
+            copied_in = True
+        elif target is not None and len(str(target)) > _IDA_PATH_LIMIT:
+            raise _IdaPathTooLong(measured, "the input file path is too long for idat")
+        cp, command = _launch_in(
+            exe, stage, _rebase_paths(job, str(work), str(stage)), mode=mode, target=staged_target,
+            timeout_seconds=timeout_seconds, cancellation_token=cancellation_token,
+            empty_database=empty_database, worker_source=worker_source)
+        # What the session left behind comes back into `work`. A database opened from OUTSIDE `work` (a cached
+        # slot) is not copied back: that session works on a throw-away copy.
+        db_stays_out = mode == "reopen" and not target_in_work
+        try:
+            for child in stage.iterdir():
+                if child.is_file() and not (db_stays_out and child.name == Path(target).name):
+                    shutil.copyfile(child, Path(work) / child.name)
+        except OSError as exc:
+            raise _EnvironmentFailure("IDA_LAUNCH_FAILED", exc) from exc
+        note = {**measured, "staged": True, "database_copied_in": copied_in,
+                "database_copied_back": mode == "reopen" and not db_stays_out}
+        try:
+            object.__setattr__(cp, "liebert_short_path_session", note)
+        except (AttributeError, TypeError):
+            pass
+        return cp, command
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def _launch_in(exe, work, job, *, mode, target, timeout_seconds, cancellation_token, empty_database=False,
+               worker_source=None):
+    """One idat launch with `work` as its working directory (see `_launch`)."""
     _write_worker(work, worker_source)
     job_path = work / "job.json"
     try:
@@ -1301,7 +1411,8 @@ def _classify_exit_log(log):
     return {"class": "UNKNOWN", "error_code": None, "evidence": []}
 
 
-def _verdict(cp, work, db_path, *, expect_database, expect_operation=None, require_discard=False):
+def _verdict(cp, work, db_path, *, expect_database, expect_operation=None, require_discard=False,
+             require_root_info=False):
     """The four signals, read together. Returns (data, failure_error,
     signals). `failure_error` is None only when every signal agrees.
 
@@ -1312,7 +1423,11 @@ def _verdict(cp, work, db_path, *, expect_database, expect_operation=None, requi
     operation. `require_discard` (a reopen session) makes the worker's
     `database_changes_discarded: true` mandatory: false or absent is a failure,
     so a worker that could not set up the discard guarantee never yields a
-    success."""
+    success. `require_root_info` (a session that reopens a database built from
+    an input file) makes the engine's record of that input mandatory: measured
+    on IDA Pro 9.4, about 1 in 70 loads of a perfectly good database comes up
+    with its root information empty (no input hash, no path, image base 0), and
+    such a session must neither answer nor save, so it is IDA_ENGINE_ROOT_INFO_MISSING."""
     try:
         log = Path(work / _LOG_NAME).read_text(encoding="utf-8", errors="replace")
         log_readable = True
@@ -1355,6 +1470,9 @@ def _verdict(cp, work, db_path, *, expect_database, expect_operation=None, requi
     }
     if require_discard:
         signals["database_changes_discarded"] = data.get("database_changes_discarded") if completed else None
+    staged = getattr(cp, "liebert_short_path_session", None)
+    if staged:
+        signals["short_path_session"] = staged
     if parse_error:
         return None, "RESULT_PARSE_FAILED", {**signals, "parse_error": parse_error}
     if cp.returncode not in (0, None):
@@ -1389,6 +1507,11 @@ def _verdict(cp, work, db_path, *, expect_database, expect_operation=None, requi
         return data, "IDA_RESULT_OPERATION_MISMATCH", signals
     if require_discard and data.get("database_changes_discarded") is not True:
         return data, "DATABASE_CHANGES_NOT_DISCARDED", signals
+    if require_root_info:
+        root_info = bool(data.get("engine_input_sha256") or data.get("engine_input_md5"))
+        signals["engine_root_info_present"] = root_info
+        if not root_info:
+            return data, "IDA_ENGINE_ROOT_INFO_MISSING", signals
     if expect_database and (db_bytes <= 0 or loose):
         return data, "IDA_NO_DATABASE", signals
     return data, None, signals
@@ -2334,7 +2457,7 @@ def _run_stage(exe, p, sha256, md5, slot, *, mode, operation, invocation, timeou
                 })
         data, error, signals = _verdict(
             cp, work, (work / _DB_NAME) if creating else (slot / _DB_NAME), expect_database=creating,
-            expect_operation=operation, require_discard=not creating,
+            expect_operation=operation, require_discard=not creating, require_root_info=not creating,
         )
         if integrity is not None:
             signals["database_integrity"] = integrity
@@ -2378,6 +2501,32 @@ def _run_stage(exe, p, sha256, md5, slot, *, mode, operation, invocation, timeou
             shutil.rmtree(work, ignore_errors=True)
         if state_dir is not None:
             shutil.rmtree(state_dir, ignore_errors=True)
+
+
+# A load of a good database that comes up with empty root information (IDA_ENGINE_ROOT_INFO_MISSING) is an
+# intermittent engine fault, not a property of the file: the same file loads correctly the next time. The
+# session is repeated, up to this many launches, and the repeats are reported.
+_ROOT_INFO_ATTEMPTS = 3
+
+
+def _run_stage_checked(*args, **kwargs):
+    """`_run_stage`, repeated while the engine reports a reopen with empty root information. The failed
+    session answered nothing and (being temporary) saved nothing, so repeating it is safe; a second
+    failure of another kind is returned as it is."""
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            data, signals, provenance = _run_stage(*args, **kwargs)
+        except _StageFailure as failure:
+            if failure.body.get("error") == "IDA_ENGINE_ROOT_INFO_MISSING" and attempts < _ROOT_INFO_ATTEMPTS:
+                continue
+            if attempts > 1:
+                failure.body["engine_root_info_attempts"] = attempts
+            raise
+        if attempts > 1:
+            signals["engine_root_info_repeats"] = attempts - 1
+        return data, signals, provenance
 
 
 def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation_token, profile=None):
@@ -2437,7 +2586,7 @@ def _query_locked(exe, p, sha256, md5, slot, invocation, max_chars, cancellation
                         "Do not read this as 'nothing found'."
                     ),
                 })
-            data, signals, provenance = _run_stage(
+            data, signals, provenance = _run_stage_checked(
                 exe, p, sha256, md5, slot, mode="reopen", operation=operation, invocation=invocation,
                 timeout_seconds=left, cancellation_token=cancellation_token, profile=profile,
             )
@@ -4047,6 +4196,32 @@ def _copy_into_budget(source, destination, tool, sha256, cancellation_token):
 
 
 def _annotated_session(exe, work, job, *, tool, sha256, md5, invocation, temporary, seconds, cancellation_token):
+    """`_annotated_session_once`, repeated for a TEMPORARY session (plan, verify) that the engine loaded with
+    empty root information (IDA_ENGINE_ROOT_INFO_MISSING): it answered nothing and saved nothing, so the same
+    directory is reused after its result and log are cleared. A write session is not repeated here: what it
+    saved may be unopenable, so its caller starts again from a fresh copy of the base."""
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            data, signals, provenance = _annotated_session_once(
+                exe, work, job, tool=tool, sha256=sha256, md5=md5, invocation=invocation, temporary=temporary,
+                seconds=seconds, cancellation_token=cancellation_token)
+        except _StageFailure as failure:
+            if not temporary or failure.body.get("error") != "IDA_ENGINE_ROOT_INFO_MISSING":
+                raise
+            if attempts >= _ROOT_INFO_ATTEMPTS:
+                failure.body["engine_root_info_attempts"] = attempts
+                raise
+            for name in (_RESULT_NAME, _LOG_NAME):
+                (work / name).unlink(missing_ok=True)
+            continue
+        if attempts > 1:
+            signals["engine_root_info_repeats"] = attempts - 1
+        return data, signals, provenance
+
+
+def _annotated_session_once(exe, work, job, *, tool, sha256, md5, invocation, temporary, seconds, cancellation_token):
     """One idat launch of the annotation worker over `work/db.i64`, with the four-signal verdict.
     `temporary` sessions (plan, verify) must report the discard guarantee; the write session must report
     that it did NOT discard (its changes are the point). Returns (data, signals, provenance) or raises
@@ -4069,7 +4244,7 @@ def _annotated_session(exe, work, job, *, tool, sha256, md5, invocation, tempora
                       "candidate in the recovery directory and published nothing.",
         })
     data, error, signals = _verdict(cp, work, work / _DB_NAME, expect_database=not temporary,
-                                    expect_operation=operation, require_discard=temporary)
+                                    expect_operation=operation, require_discard=temporary, require_root_info=True)
     if not error and not temporary and isinstance(data, dict) and data.get("ok") is True \
             and data.get("database_changes_discarded") is not False:
         error = "WRITE_SESSION_REPORTS_DISCARD"
@@ -4692,13 +4867,17 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
         # 1. the candidate, in its own recovery directory, from the published version (or the pristine analysis)
         try:
             rdir.mkdir(parents=True)
-            if state["version"] > 0:
-                _copy_into_budget(state["db"], rdir / _DB_NAME, tool, sha256, cancellation_token)
-            else:
-                staging = rdir / "pristine.copy"
-                _copy_pristine(exe, p, sha256, md5, staging, total, cancellation_token)
-                _copy_into_budget(staging, rdir / _DB_NAME, tool, sha256, cancellation_token)
-                staging.unlink()
+
+            def prepare_candidate():
+                if state["version"] > 0:
+                    _copy_into_budget(state["db"], rdir / _DB_NAME, tool, sha256, cancellation_token)
+                else:
+                    staging = rdir / "pristine.copy"
+                    _copy_pristine(exe, p, sha256, md5, staging, total, cancellation_token)
+                    _copy_into_budget(staging, rdir / _DB_NAME, tool, sha256, cancellation_token)
+                    staging.unlink()
+
+            prepare_candidate()
             left = remaining()
             if left < 1:
                 _remove_owned_work(rdir)
@@ -4714,13 +4893,32 @@ def _apply_locked(tool, exe, p, sha256, md5, label, plan, allow_partial, total, 
                 job = {"operation": "rename_apply", "write_mode": "write", "allow_partial": allow_partial, "marker": marker,
                        "items": [{"address": i["address"], "address_kind": "va", "new_name": i["new_name"],
                                   "expect_name": i["expect_name"]} for i in plan["items"]]}
-            try:
-                data, signals, provenance = _annotated_session(
-                    exe, rdir, job, tool=tool, sha256=sha256, md5=md5, invocation=invocation, temporary=False,
-                    seconds=min(left, _MAX_ANNOTATE_TIMEOUT_SECONDS), cancellation_token=cancellation_token)
-            finally:
-                if comments:      # the job and result files hold comment text; a kept candidate must not
-                    scrub_text_files(rdir)
+            # An engine load with empty root information saves a database IDA cannot open again, so that
+            # candidate is never kept: it is deleted and the write is repeated from a fresh copy of the
+            # same base, up to _ROOT_INFO_ATTEMPTS launches. Nothing was promoted or journalled yet.
+            write_launches = 0
+            while True:
+                write_launches += 1
+                try:
+                    data, signals, provenance = _annotated_session(
+                        exe, rdir, job, tool=tool, sha256=sha256, md5=md5, invocation=invocation, temporary=False,
+                        seconds=min(left, _MAX_ANNOTATE_TIMEOUT_SECONDS), cancellation_token=cancellation_token)
+                    break
+                except _StageFailure as failure:
+                    if failure.body.get("error") != "IDA_ENGINE_ROOT_INFO_MISSING":
+                        raise
+                    _remove_owned_work(rdir)
+                    left = remaining()
+                    if write_launches >= _ROOT_INFO_ATTEMPTS or left < 1:
+                        failure.body["engine_root_info_attempts"] = write_launches
+                        raise
+                    rdir.mkdir(parents=True)
+                    prepare_candidate()
+                finally:
+                    if comments:      # the job and result files hold comment text; a kept candidate must not
+                        scrub_text_files(rdir)
+            if write_launches > 1:
+                result["engine_root_info_repeats"] = write_launches - 1
         except _StageFailure as failure:
             return _j({**failure.body, "written": False, "candidate_retained": rdir.exists(),
                        "concurrency_policy": _CONCURRENCY_POLICY})
