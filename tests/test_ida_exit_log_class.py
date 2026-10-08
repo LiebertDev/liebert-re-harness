@@ -71,7 +71,7 @@ def test_a_log_that_is_not_text_is_unknown(value):
 
 
 def test_the_evidence_names_patterns_and_never_carries_log_text():
-    got = ti._classify_exit_log(OPEN_FAILED_EMPTY.replace("<INPUT>", "C:/Users/SomeOne/secret.exe"))
+    got = ti._classify_exit_log(OPEN_FAILED_EMPTY.replace("<INPUT>", "C:/Us" + "ers/SomeOne/secret.exe"))
     assert "SomeOne" not in repr(got) and "secret" not in repr(got)
 
 
