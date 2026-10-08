@@ -467,15 +467,23 @@ is the coarse reading. A module key that clashes with a versioned field is never
 module's whole result then sits under `module_result`. `tool list` carries
 `schema_version: "liebert-re.tool-list/1"` on top of its existing fields.
 
-A tool that answers in plain text comes back as `{"tool": <name>, "text": ...}`. The CLI has no
-grammar for that prose, and a failure written as prose looks like an answer, so plain text is **not**
-called a success: it is `ok: false`, `status: "UNKNOWN"`, `outcome: "UNKNOWN"`, `classified: false` and
-exits 1, with the text still carried for you to read. A text is a success (`classified: true`, exit 0)
-only on a structural signal the tool itself writes: it starts with `EMPTY_RESULT: ` (`empty: true`) or it
-ends in a consistent truncation marker (`truncation`, `truncated: true`). A text that starts with a
-status code (`ANALYSIS_LIMITED`-class codes such as `IMPORT_DIRECTORY_UNREADABLE`,
-`DOTNET_METADATA_UNREADABLE`, `DISASSEMBLY_FAILED`) is `ok: false` with that status (exit 3). So a plain
-listing such as `binary_strings` with matches exits 1 through `tool run` today, by design: read `text`. `authenticode_signature` answers in JSON (`signature_status`, `signer`, `issuer`, `raw`).
+A tool that answers in plain text comes back as `{"tool": <name>, "text": ...}`. A failure written as
+prose looks like an answer, so plain text is a success only when the tool's text grammar is declared
+(`TEXT_GRAMMARS` in `liebert_re/cli_text_grammars.py`, written from each tool's own code) and the text fits it:
+`ok: true`, `classified: true`, exit 0, with `empty: true` for the tool's no-result sentence and
+`truncation` / `truncated: true` for a listing cut at its cap. Declared today: `binary_strings`,
+`find_binaries`, `search_binary_bytes`, `pe_imports`, `pe_exports`, `disassemble_pe`, `dotnet_metadata`,
+`list_directory`, `find_files`, `search_text`, `read_file`, `read_files` (and `get_file_info` for its
+not-found line). A failure code the tool is known to write (for example `IMPORT_DIRECTORY_UNREADABLE`,
+`File not found:`) is `ok: false` with that status (exit 3). Every other text is `ok: false`,
+`status: "UNKNOWN"`, `outcome: "UNKNOWN"`, `classified: false` and exits 1, with the text still carried for
+you to read: a tool with no declared grammar, text that does not fit its grammar, a partial-directory
+marker, a `read_file` start line past the end, a `read_files` call where one of the files failed.
+A structured result that is not readable as a success is never exit 0 either: `ok` that is not a boolean,
+`ok: true` next to `failed: true`, a bare `failed: true` or non-empty `error` with no `ok`, a `FAILED` /
+`ERROR` status without `ok`, and a `null` result are all `UNKNOWN` or `FAILED` with a nonzero exit; a
+result with neither `ok` nor `status` (for example `hash_file`'s digests) is still an answer.
+`authenticode_signature` answers in JSON (`signature_status`, `signer`, `issuer`, `raw`).
 
 55<!-- count:cli_direct_commands --> published tools also have a dedicated subcommand (`cli.py` names
 them by string literal). `tool run` reaches the rest, except the tools that write to disk or need a

@@ -15,8 +15,9 @@ Exit codes
      (TOOL_MISSING, UNSUPPORTED, ANALYSIS_LIMITED, PATH_REFUSED, TIMEOUT, or a
      module's own NOT_FOUND / UPX_UNPACK_FAILED)
   2  bad invocation (argparse, a module's RULES_MISSING, or TOOL_USAGE from `tool`)
-  1  unexpected internal failure; still JSON with status FAILED, never a traceback. Also `tool run`
-     text the CLI cannot classify (status UNKNOWN): never exit 0 for an unverified answer
+  1  unexpected internal failure; still JSON with status FAILED, never a traceback. Also a result the
+     CLI cannot read as a success or a stated failure (status UNKNOWN: text with no fitting grammar, an
+     `ok` that is not a bool, a bare `failed`/`error`, no result at all): never exit 0 for an unverified answer
 
 `tool run` answers additionally carry ``schema_version`` ``liebert-re.tool-run/1`` and ``tool``,
 ``outcome`` (OK|FAILED|REFUSED|UNKNOWN), ``exit_code``, ``duration_ms``, ``payload``, ``truncated``,
@@ -59,6 +60,10 @@ _MODULE_REFUSALS = frozenset({"NOT_FOUND", "UPX_UNPACK_FAILED", "PID_REQUIRED", 
                               # the emulation gate (liebert_re.recover.emulate): a refusal to run, never a finding
                               "TARGET_CLASS_REQUIRED", "CLASS_CONFLICT"})
 _MODULE_USAGE = frozenset({"RULES_MISSING", "TOOL_USAGE"})
+# A status that says "this did not work" without being a refusal. Read as a failure (exit 1) even when the dict
+# carries no ``ok``. FAILED is in the package's status vocabulary (generic_static_probe.ALLOWED_STATUSES); the
+# others are the spellings a tool could use for the same thing.
+_FAILURE_STATUSES = frozenset({"FAILED", "FAIL", "FAILURE", "ERROR"})
 _REFUSAL_ERRORS = frozenset({"FILE_NOT_FOUND", "FILE_NOT_ACCESSIBLE"})
 
 # The text-returning pe/disasm functions answer with a listing. A failure either is
@@ -95,6 +100,30 @@ _IDA_MATURITIES = ("MMAT_GENERATED", "MMAT_PREOPTIMIZED", "MMAT_LOCOPT", "MMAT_C
                    "MMAT_GLBOPT1", "MMAT_GLBOPT2", "MMAT_GLBOPT3", "MMAT_LVARS")
 
 
+def _classify_tool_text(tool, raw):
+    """The fields for a `tool run` plain-text answer (see TEXT_GRAMMARS)."""
+    from liebert_re.cli_text_grammars import TEXT_GRAMMARS  # lazy: the module imports this one's constants
+    grammar = TEXT_GRAMMARS.get(tool)
+    if grammar:
+        for prefix, status in grammar["failures"]:
+            if raw.startswith(prefix):
+                return {"ok": False, "status": status, "classified": True}
+        truncation = _truncation(raw)
+        if truncation == "INCONSISTENT":
+            return {"ok": False, "status": "FAILED", "error": "UNCLASSIFIED_OUTPUT", "classified": False,
+                    "message": "The listing's truncation marker contradicts itself, so it is not trusted."}
+        extras = grammar["success"](raw) if grammar["success"] else None
+        if extras is not None:
+            if truncation and "truncation" not in extras:
+                extras = {**extras, "truncation": truncation}
+            return {"ok": True, "status": "OK", "classified": True, **extras}
+    why = ("does not fit the grammar declared for this tool" if grammar
+           else "comes from a tool with no declared text grammar")
+    return {"ok": False, "status": "UNKNOWN", "error": "UNCLASSIFIED_OUTPUT", "classified": False,
+            "message": f"The tool returned text that {why}, with no known failure code. The CLI cannot tell an answer "
+                       "from a failure written as prose, so it does not call it a success; read text."}
+
+
 RUN_SCHEMA = "liebert-re.tool-run/1"
 LIST_SCHEMA = "liebert-re.tool-list/1"
 
@@ -102,12 +131,17 @@ LIST_SCHEMA = "liebert-re.tool-list/1"
 def _outcome(payload, code):
     """Coarse, closed vocabulary for ``tool run``: OK | FAILED | REFUSED | UNKNOWN. The module's own ``status`` is
     left untouched next to it. UNKNOWN is "could not be classified", which is neither an answer nor a failure."""
-    if isinstance(payload, dict) and (payload.get("error") == "UNCLASSIFIED_OUTPUT"
-                                      or str(payload.get("status") or "").upper() == "UNKNOWN"):
+    if payload is None or (isinstance(payload, dict) and (payload.get("error") in ("UNCLASSIFIED_OUTPUT", "NO_RESULT")
+                                                           or str(payload.get("status") or "").upper() == "UNKNOWN")):
         return "UNKNOWN"
     if code == EXIT_OK:
         return "OK"
-    return "REFUSED" if code in (EXIT_REFUSED, EXIT_USAGE) else "FAILED"
+    if code in (EXIT_REFUSED, EXIT_USAGE):
+        return "REFUSED"
+    if isinstance(payload, dict) and payload.get("ok") is not False \
+            and str(payload.get("status") or "").upper() not in _FAILURE_STATUSES and _dict_unreadable(payload):
+        return "UNKNOWN"  # a dict the CLI could not read as success or as a stated failure
+    return "FAILED"
 
 
 def _run_fields(run, payload, code):
@@ -148,17 +182,22 @@ def _envelope(command, payload, workspace=None, run=None, code=None):
     return {"command": command, **fields, **extra, "result": payload}
 
 
+def _no_result():
+    return {"ok": False, "status": "UNKNOWN", "error": "NO_RESULT",
+            "message": "The command returned no result (None or JSON null); that is not an answer."}
+
+
 def _decode(raw, shape=None, tool=None):
     """Module return value -> JSON-able. Text that is not JSON is carried verbatim.
 
     ``tool`` is set by ``tool run`` only: the text is then the answer of a registry tool, wrapped
     in the generic envelope ``{"tool": name, "text": ...}`` with no per-tool shape. Such a text has
-    no listing grammar the CLI knows. It is a success only on a tool-authored structural signal: the
-    empty-result sentence or a consistent truncation marker (``classified: true``). A failure is
-    recognised only by a status prefix (``_TEXT_UNSUPPORTED_PREFIXES``, ``_TEXT_LIMITED_PREFIXES``).
-    Any other text cannot be told from a failure written as prose, so it is ``ok: false``,
-    ``status: "UNKNOWN"``, ``error: "UNCLASSIFIED_OUTPUT"``, ``classified: false`` (exit 1), with the
-    text still carried verbatim: never a silent success.
+    per-tool shape of ``_TEXT_SHAPES``. It is a success only if the tool declares a grammar in
+    ``TEXT_GRAMMARS`` and the text fits it (``classified: true``); a failure is recognised by a status
+    prefix (``_TEXT_UNSUPPORTED_PREFIXES``, ``_TEXT_LIMITED_PREFIXES``) or a failure prefix the tool's
+    grammar lists. Any other text cannot be told from a failure written as prose, so it is
+    ``ok: false``, ``status: "UNKNOWN"``, ``error: "UNCLASSIFIED_OUTPUT"``, ``classified: false``
+    (exit 1), with the text still carried verbatim: never a silent success.
 
     Empty result rule: a text that starts with ``_TEXT_EMPTY_PREFIX`` (``"EMPTY_RESULT: "`` followed
     by the tool's own sentence, e.g. ``EMPTY_RESULT: No strings found.``) is a genuine "nothing
@@ -176,9 +215,10 @@ def _decode(raw, shape=None, tool=None):
     ``ok: false`` plus their ``status``, and ``_exit_code`` maps both statuses to EXIT_REFUSED (3)
     before it looks at ``ok``, so adding ``ok`` changes no exit code. Absence of ``ok`` is not a state."""
     if not isinstance(raw, str):
-        return raw
+        return raw if raw is not None else _no_result()
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        return parsed if parsed is not None else _no_result()
     except ValueError:
         pass
     out = {"result_format": "text", "text": raw}
@@ -188,7 +228,9 @@ def _decode(raw, shape=None, tool=None):
         out.update(ok=False, status="UNSUPPORTED")
     elif raw.startswith(_TEXT_LIMITED_PREFIXES):
         out.update(ok=False, status="ANALYSIS_LIMITED")
-    elif tool is None and (shape is None or not all(shape.fullmatch(line) for line in raw.splitlines() if line)):
+    elif tool is not None:
+        out.update(_classify_tool_text(tool, raw))
+    elif shape is None or not all(shape.fullmatch(line) for line in raw.splitlines() if line):
         out.update(ok=False, status="FAILED", error="UNCLASSIFIED_OUTPUT",
                    message="The command returned text the CLI cannot classify as an answer or a known failure.")
     else:
@@ -204,18 +246,8 @@ def _decode(raw, shape=None, tool=None):
             out.update(ok=True, status="OK")
         if out["ok"] and raw.startswith(_TEXT_EMPTY_PREFIX):
             out["empty"] = True
-        if tool is not None:
-            if out["ok"] and ("empty" in out or "truncation" in out):
-                out["classified"] = True  # a tool-authored structural signal: the empty sentence or a consistent cap marker
-            elif out["ok"]:
-                out.update(ok=False, status="UNKNOWN", error="UNCLASSIFIED_OUTPUT", classified=False,
-                           message="The tool returned text with no known failure code and no structural signal of "
-                                   "success (empty-result sentence, consistent truncation marker). The CLI cannot tell "
-                                   "an answer from a failure written as prose, so it does not call it a success; read text.")
-            else:
-                out["classified"] = False
     if tool is not None and out.get("status") in ("UNSUPPORTED", "ANALYSIS_LIMITED"):
-        out["classified"] = True  # a recognised failure code
+        out.setdefault("classified", True)  # a recognised failure code
     return out
 
 
@@ -235,7 +267,22 @@ def _truncation(raw):
     return None
 
 
+def _dict_unreadable(payload):
+    """True when a dict result is neither a success nor a stated failure the CLI recognises.
+
+    A dict may carry no ``ok`` and no ``status`` at all (``hash_file`` returns only its digests; that is a
+    structured answer and stays one). What it may not do is say something the CLI cannot read: an ``ok`` that is
+    not a bool, ``ok: true`` next to ``failed: true``, or a bare ``failed: true`` / non-empty ``error`` with no
+    ``ok`` to say what it means."""
+    if "ok" in payload:
+        ok = payload["ok"]
+        return not isinstance(ok, bool) or (ok and payload.get("failed") is True)
+    return payload.get("failed") is True or bool(payload.get("error"))
+
+
 def _exit_code(payload):
+    if payload is None:
+        return EXIT_FAILED  # no result at all is not an answer (a tool that returned None, or JSON null)
     if not isinstance(payload, dict):
         return EXIT_OK
     status = str(payload.get("status") or "").upper()
@@ -245,6 +292,8 @@ def _exit_code(payload):
         return EXIT_USAGE
     if payload.get("ok") is False:
         return EXIT_REFUSED if payload.get("error") in _REFUSAL_ERRORS else EXIT_FAILED
+    if status in _FAILURE_STATUSES or _dict_unreadable(payload):
+        return EXIT_FAILED
     return EXIT_OK
 
 
