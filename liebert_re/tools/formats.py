@@ -27,15 +27,26 @@ def _sha256(p):
     return h.hexdigest()
 def _elf(head):
     if head[:4]!=b'\x7fELF': return None
-    cls={1:'32-bit',2:'64-bit'}.get(head[4],'unknown'); endian={1:'little',2:'big'}.get(head[5],'unknown'); order='<' if head[5]==1 else '>'
-    machine=struct.unpack(order+'H',head[18:20])[0] if len(head)>=20 else 0; et=struct.unpack(order+'H',head[16:18])[0] if len(head)>=18 else 0
-    return {'type':'ELF','subtype':{1:'relocatable',2:'executable',3:'shared_library',4:'core'}.get(et,'unknown'),'architecture':{3:'x86',62:'x86_64',40:'ARM',183:'ARM64',243:'RISC-V'}.get(machine,f'machine_{machine}'),'bits':cls,'endianness':endian,'runtime':'native'}
+    # A truncated header or an invalid EI_DATA byte leaves the e_type/e_machine
+    # fields undeterminable: report them as None with a reason, never as 0.
+    ei_class=head[4] if len(head)>4 else None; ei_data=head[5] if len(head)>5 else None
+    cls={1:'32-bit',2:'64-bit'}.get(ei_class,'unknown'); endian={1:'little',2:'big'}.get(ei_data,'unknown'); order='<' if ei_data==1 else '>'
+    lim=[]; machine=et=None
+    if ei_data not in (1,2): lim.append('ELF header byte order (EI_DATA) missing or invalid; e_type and e_machine could not be read')
+    else:
+        if len(head)>=18: et=struct.unpack(order+'H',head[16:18])[0]
+        else: lim.append('ELF header truncated before e_type; subtype unknown')
+        if len(head)>=20: machine=struct.unpack(order+'H',head[18:20])[0]
+        else: lim.append('ELF header truncated before e_machine; architecture unknown')
+    return {'type':'ELF','subtype':None if et is None else {1:'relocatable',2:'executable',3:'shared_library',4:'core'}.get(et,'unknown'),'architecture':None if machine is None else {3:'x86',62:'x86_64',40:'ARM',183:'ARM64',243:'RISC-V'}.get(machine,f'machine_{machine}'),'bits':cls,'endianness':endian,'runtime':'native','limitations':lim}
 def _macho(head):
     if len(head)<4:return None
     raw=head[:4]; thin={b'\xfe\xed\xfa\xce':('big',32),b'\xce\xfa\xed\xfe':('little',32),b'\xfe\xed\xfa\xcf':('big',64),b'\xcf\xfa\xed\xfe':('little',64)}; fat={b'\xca\xfe\xba\xbe':'fat32',b'\xbe\xba\xfe\xca':'fat32-swapped',b'\xca\xfe\xba\xbf':'fat64',b'\xbf\xba\xfe\xca':'fat64-swapped'}
     if raw in fat:return {'type':'MACHO','subtype':fat[raw],'architecture':'universal','runtime':'native'}
     if raw not in thin:return None
-    endian,bits=thin[raw]; order='<' if endian=='little' else '>'; cpu=struct.unpack(order+'I',head[4:8])[0]
+    endian,bits=thin[raw]; order='<' if endian=='little' else '>'
+    if len(head)<8: return {'type':'MACHO','subtype':'thin','architecture':None,'bits':bits,'endianness':endian,'runtime':'native','limitations':['Mach-O header truncated before cputype; architecture unknown']}
+    cpu=struct.unpack(order+'I',head[4:8])[0]
     return {'type':'MACHO','subtype':'thin','architecture':{7:'x86',12:'ARM',0x01000007:'x86_64',0x0100000c:'ARM64'}.get(cpu,f'cpu_{cpu}'),'bits':bits,'endianness':endian,'runtime':'native'}
 def file_identity(path):
     p=safe_path(path)
@@ -56,8 +67,11 @@ def file_identity(path):
         # all of them.
         return _json({'ok':False,'error':'FILE_NOT_ACCESSIBLE','error_type':type(exc).__name__,'path':str(path),'type':'UNKNOWN'})
     ext=p.suffix.lower(); info={'ok':True,'path':relative(p),'extension':ext,'size_bytes':st.st_size,'mtime':datetime.fromtimestamp(st.st_mtime,timezone.utc).isoformat(),'sha256':_sha256(p) if st.st_size<=MAX_IDENTITY_HASH_BYTES else None,'text':b'\x00' not in head and (not head or sum(b in (9,10,13) or 32<=b<127 for b in head)/len(head)>.80),'container':None,'type':'UNKNOWN','subtype':None,'architecture':None,'endianness':None,'runtime':None,'framework_indicators':[],'confidence':.35,'recommended_capabilities':[],'limitations':[]}
+    if info['sha256'] is None: info['limitations'].append(f'sha256 not computed: file is {st.st_size} bytes, over the {MAX_IDENTITY_HASH_BYTES}-byte identity hash limit')
     if head[:2]==b'MZ':
-        info.update(type='PE',runtime='native',confidence=.98)
+        # 'MZ' alone is only a signature claim: confidence stays low until the
+        # PE headers actually parse (raised at the end of the try below).
+        info.update(type='PE',runtime='native',confidence=.35)
         try:
             import pefile
             # Parse from an owned, bounded byte prefix -- not pefile.PE(str(p)) --
@@ -67,10 +81,10 @@ def file_identity(path):
             # fast_load=True actually needs (headers/section table), not the whole
             # image; a malformed/truncated read is handled by the except below.
             with p.open('rb') as f: pe_bytes=f.read(MAX_PE_IDENTITY_PREFIX_BYTES)
-            pe=pefile.PE(data=pe_bytes,fast_load=True); m=pe.FILE_HEADER.Machine; info['architecture']={0x14c:'x86',0x8664:'x86_64',0xaa64:'ARM64'}.get(m,hex(m)); info['subtype']='dll' if pe.FILE_HEADER.Characteristics&0x2000 else 'executable'; clr=len(pe.OPTIONAL_HEADER.DATA_DIRECTORY)>14 and pe.OPTIONAL_HEADER.DATA_DIRECTORY[14].VirtualAddress!=0; info['runtime']='dotnet' if clr else 'native'; info['recommended_capabilities']=['dotnet_inspect','decompile_dotnet'] if clr else ['native_inspect','ghidra_query']
-        except Exception as e: info['limitations'].append(f'PE parse failed: {type(e).__name__}')
-    elif (e:=_elf(head)): info.update(e,confidence=.99,recommended_capabilities=['native_inspect','ghidra_query'])
-    elif (m:=_macho(head)): info.update(m,confidence=.99,recommended_capabilities=['native_inspect','ghidra_query'])
+            pe=pefile.PE(data=pe_bytes,fast_load=True); m=pe.FILE_HEADER.Machine; info['architecture']={0x14c:'x86',0x8664:'x86_64',0xaa64:'ARM64'}.get(m,hex(m)); info['subtype']='dll' if pe.FILE_HEADER.Characteristics&0x2000 else 'executable'; clr=len(pe.OPTIONAL_HEADER.DATA_DIRECTORY)>14 and pe.OPTIONAL_HEADER.DATA_DIRECTORY[14].VirtualAddress!=0; info['runtime']='dotnet' if clr else 'native'; info['recommended_capabilities']=['dotnet_inspect','decompile_dotnet'] if clr else ['native_inspect','ghidra_query']; info['confidence']=.98
+        except Exception as e: info['limitations'].append(f'PE parse failed: {type(e).__name__}; MZ signature only, PE structure unverified')
+    elif (e:=_elf(head)): info['limitations'].extend(e.pop('limitations',[])); info.update(e,confidence=.6 if info['limitations'] else .99,recommended_capabilities=['native_inspect','ghidra_query'])
+    elif (m:=_macho(head)): info['limitations'].extend(m.pop('limitations',[])); info.update(m,confidence=.6 if info['limitations'] else .99,recommended_capabilities=['native_inspect','ghidra_query'])
     elif head[:4]==b'\x00asm': info.update(type='WASM',runtime='webassembly',confidence=.99,recommended_capabilities=['wasm_inspect']); info['limitations'].append('Structural WASM inspection only; compiler-grade semantics are unavailable')
     elif head[:4] in {b'\xd4\xc3\xb2\xa1',b'\xa1\xb2\xc3\xd4',b'\x4d\x3c\xb2\xa1',b'\xa1\xb2\x3c\x4d'}: info.update(type='PCAP',container='packet_capture',confidence=.99,recommended_capabilities=['pcap_analyzer'])
     elif head[:4]==b'\x0a\x0d\x0d\x0a': info.update(type='PCAPNG',container='packet_capture',confidence=.99,recommended_capabilities=['pcap_analyzer'])
