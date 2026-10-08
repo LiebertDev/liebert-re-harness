@@ -308,6 +308,16 @@ def _reg_assignment(text):
     return name.strip(), value.strip()
 
 
+def _address_int(text):
+    """An address written ``0x``-hex (base 16) or plain digits (base 10, so ``010`` is ten); nothing else."""
+    text = text.strip()
+    if re.fullmatch(r"0[xX][0-9a-fA-F]+", text):
+        return int(text, 16)
+    if re.fullmatch(r"[0-9]+", text):
+        return int(text, 10)
+    raise ValueError(text)
+
+
 def _mem_watch(text):
     """``START:END[:r|w|rw]`` (END exclusive) into a memory_watch range for ``emulate_range``."""
     parts = text.split(":")
@@ -315,13 +325,66 @@ def _mem_watch(text):
     if len(parts) not in (2, 3) or (len(parts) == 3 and parts[2] not in access):
         raise argparse.ArgumentTypeError("expected START:END or START:END:r|w|rw, for example 0x140002000:0x140002100:w")
     try:
-        start, end = int(parts[0], 0), int(parts[1], 0)
+        start, end = _address_int(parts[0]), _address_int(parts[1])
     except ValueError:
-        raise argparse.ArgumentTypeError("START and END must be integers, decimal or 0x-hex") from None
+        raise argparse.ArgumentTypeError("START and END must be integers: 0x-prefixed hex, otherwise decimal "
+                                         "(a leading zero does not mean octal)") from None
     return {"start": start, "end": end, "access": access[parts[2]] if len(parts) == 3 else "both"}
 
 
+def _emulate_inputs(a):
+    """``(keyword arguments for emulate_range, None)`` or ``(None, usage answer)`` from the input flags.
+
+    ``--input-file`` and ``--variants-file`` are read through the workspace sandbox and refused above the
+    input size bound before they are read; a variants file holds one hex buffer per line, a blank line is an
+    error (not an empty buffer)."""
+    emulate = importlib.import_module("liebert_re.recover.emulate")
+
+    def usage(message):
+        return None, {"ok": False, "status": "TOOL_USAGE", "error": "BAD_INPUT", "message": message}
+
+    def read(path, limit):
+        target = _load("liebert_re.workspace", "safe_path")(path)
+        if not target.is_file():
+            raise ValueError("%s is not a file" % path)
+        if target.stat().st_size > limit:
+            raise ValueError("%s is larger than %d bytes" % (path, limit))
+        return target.read_bytes()
+
+    given = [name for name, value in (("--input-hex", a.input_hex), ("--input-file", a.input_file),
+                                      ("--variants-file", a.variants_file)) if value is not None]
+    if not given:
+        if a.input_at is not None or a.total_timeout is not None:
+            return usage("--input-at and --total-timeout need --input-hex, --input-file or --variants-file")
+        return {}, None
+    if len(given) > 1:
+        return usage("give one of --input-hex, --input-file, --variants-file (got %s)" % ", ".join(given))
+    kwargs = {"input_at": a.input_at, "total_timeout_s": a.total_timeout}
+    try:
+        if a.input_hex is not None:
+            kwargs["input_data"] = a.input_hex
+        elif a.input_file is not None:
+            kwargs["input_data"] = read(a.input_file, emulate.MAX_INPUT_BYTES)
+        else:
+            lines = read(a.variants_file, 2 * emulate.MAX_VARIANT_INPUT_BYTES + 4096).decode("ascii").splitlines()
+            if any(not line.strip() for line in lines):
+                return usage("--variants-file has a blank line; every line is one hex buffer")
+            kwargs["input_variants"] = [line.strip() for line in lines]
+    except PermissionError:
+        raise
+    except UnicodeDecodeError:
+        return usage("the variants file is not ASCII hex")
+    except ValueError as exc:
+        return usage(str(exc))
+    except OSError as exc:
+        return usage("the input could not be read (%s)" % type(exc).__name__)
+    return kwargs, None
+
+
 def _emulate(a):
+    inputs, refused = _emulate_inputs(a)
+    if refused is not None:
+        return refused
     authorization = None
     if a.authorized_by or a.purpose:
         authorization = {"authorized_by": a.authorized_by, "purpose": a.purpose, "sample_sha256": a.sha256}
@@ -335,7 +398,7 @@ def _emulate(a):
         watch_writes=a.watch_writes, registers=dict(a.reg) or None, perm_mode=a.perm_mode,
         target_class=a.target_class, authorization=authorization, sample_sha256=a.sha256,
         allow_stubs=a.allow_stub or None, stub_options=stub_options or None,
-        memory_watch=a.mem_watch or None, memory_watch_limit=a.mem_watch_limit)
+        memory_watch=a.mem_watch or None, memory_watch_limit=a.mem_watch_limit, **inputs)
 
 
 def _sieve_status(a):
@@ -921,6 +984,21 @@ def _build_parser():
                          "ranges, each at most 0x10000000 bytes, no overlap); off by default. Lands in memory_trace")
     sp.add_argument("--mem-watch-limit", dest="mem_watch_limit", type=int, default=1000, metavar="N",
                     help="most memory-trace events kept (1-10000, default 1000); past it the run continues and memory_trace_truncated is set")
+    sp.add_argument("--input-hex", dest="input_hex", default=None, metavar="HEX",
+                    help="one input buffer, as hex (1 to 65536 bytes), placed before the first instruction at --input-at; "
+                         "only its SHA-256 and length are reported")
+    sp.add_argument("--input-file", dest="input_file", default=None, metavar="FILE",
+                    help="one input buffer read from a file inside the workspace (1 to 65536 bytes)")
+    sp.add_argument("--variants-file", dest="variants_file", default=None, metavar="FILE",
+                    help="run once per line of FILE, each line one hex buffer (at most 32 lines, 1 MiB together), each variant in a "
+                         "fresh emulator so none sees another's writes; --max-instructions and --timeout apply to each variant")
+    sp.add_argument("--input-at", dest="input_at", default=None, metavar="ADDR|reg:NAME",
+                    help="where the input goes: a mapped writable address (0x-hex or decimal), or reg:RCX (also RDX, R8, R9, "
+                         "any general register but RSP) to map a private region, write the buffer there and put its address in "
+                         "that register; required with an input, and the register may not also be set with --reg")
+    sp.add_argument("--total-timeout", dest="total_timeout", type=float, default=None, metavar="SECONDS",
+                    help="with --variants-file: seconds all variants may take together (above 0, at most 600; default "
+                         "--timeout times the variant count, capped at 600); a variant that would start after it is reported as not run")
     sp.add_argument("--stub-tick-count", dest="stub_tick_count", type=lambda t: int(t, 0), default=None, metavar="N",
                     help="the value GetTickCount / GetTickCount64 return (required when either is allowed)")
     sp.add_argument("--stub-heap-bytes", dest="stub_heap_bytes", type=lambda t: int(t, 0), default=None, metavar="N",

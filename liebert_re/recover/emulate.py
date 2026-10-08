@@ -47,6 +47,11 @@ in ``stubs.calls`` with ``"stubbed": true, "basis": "assumed"``, the result list
 whenever one was applied, and a name that is not listed, or has no stub, still ends the run as ``IMPORT_CALL``.
 Nothing here fakes a Windows environment beyond the minimal TEB/PEB declared in ``teb_peb_model`` and those stubs.
 
+An input buffer (``input_data``) can be injected before the first instruction, at a mapped address or in a private
+region whose address goes into a register (``input_at``), and ``input_variants`` runs the request once per buffer.
+Each variant is a FRESH emulator built from the same image, not a snapshot restore: there is no state that could leak
+from one variant to the next. Only the SHA-256 and length of an input are ever reported, never its content.
+
 The target gate (:class:`EmulationGate`) is a declaration plus a hash, and nothing more. ``target_class``
 is required: ``public_crackme`` (a challenge written to be solved) or ``owned_target`` (the caller owns
 it: an ``authorization`` object names who authorised the run and why, and its ``sample_sha256`` must
@@ -117,7 +122,17 @@ MAX_WATCH_EVENTS_CEILING = 10_000
 DEFAULT_WATCH_EVENTS = 1000
 WATCH_ACCESS = ("read", "write", "both")
 WATCH_WINDOW = 63               # an access may start this far below a range and still overlap it
-MAX_TRACE_VALUE_BYTES = 16      # a wider access is recorded without its value
+MAX_TRACE_VALUE_BYTES = 16      # a read wider than this is recorded without its value
+MAX_TRACE_WRITE_VALUE_BYTES = 8  # a write wider than this is recorded without its value (the engine passes <= 8)
+# Input injection (off unless the caller gives a buffer). A buffer is a few KiB at most, it is mapped (register
+# mode) or written (address mode) before the first instruction, and the mapping counts as emulated memory.
+INPUT_VA = 0x7FEC00000000
+MAX_INPUT_BYTES = 0x10000        # one buffer
+MAX_VARIANTS = 32
+MAX_VARIANT_INPUT_BYTES = 0x100000       # all buffers of one request together
+VARIANT_REGION_CAP = 32          # written regions listed per variant (the single run keeps MAX_REGIONS_REPORTED)
+VARIANT_STUB_CALLS_LISTED = 8
+INPUT_REGISTERS = ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15")
 TRAP_BASE = 0x7FEF00000000
 TRAP_STRIDE = 16
 
@@ -139,9 +154,14 @@ _TRACE_BASIS = ("accesses by the emulated code that overlap a watched range, in 
                 "them (a wide access may arrive as several narrower ones), recorded before the access completes: a "
                 "read is an attempt, and an access that faults is listed too (the run stops there; its value is null "
                 "for a read and what it tried to store for a write). pc is the instruction that made the access. "
-                "value is the little-endian integer of at most %d bytes; a wider access has value null. Accesses "
-                "made by a stub model are not listed here (see stubs.calls[].effects); neither are the memory "
-                "operands of instructions the VEX layer executed" % MAX_TRACE_VALUE_BYTES)
+                "value is a little-endian integer, recorded for a read of at most %d bytes and for a write of at most "
+                "%d bytes (the engine hands a write's value over only up to 8 bytes); an access the engine delivers "
+                "wider than that, and every faulting read, has value null. Measured on SSE, x87 80-bit and cmpxchg16b "
+                "accesses, the engine delivered nothing wider than 8 bytes (a 16-byte access arrives as two 8-byte "
+                "events), so the wider-than-limit case was not observed. Accesses made by a stub model are not listed "
+                "here (see stubs.calls[].effects); neither are the memory operands of instructions the VEX layer "
+                "executed"
+                % (MAX_TRACE_VALUE_BYTES, MAX_TRACE_WRITE_VALUE_BYTES))
 _TRACE_VEX_UNTRACED = {
     "code": "MEMORY_TRACE_INCOMPLETE",
     "detail": "the VEX layer executed instructions in this run, and the memory they read or wrote is not hooked: "
@@ -182,6 +202,21 @@ _COMPLETION_BASIS = ("completion is derived from stop_reason alone: RETURNED onl
                      "name (STOP_ADDRESS, SENTINEL_REACHED, INT3, INTERRUPT, HLT, PORT_IO, UNMODELLED_VEX, "
                      "ENGINE_ERROR, ENGINE_CRASH, MEMORY_LIMIT, UNKNOWN_STOP) is UNKNOWN, and null means no emulation "
                      "ran. ok only says a result record exists")
+_INPUT_BASIS = ("the input is caller-supplied data placed before the first instruction; only its SHA-256 and length are "
+                "recorded, never its content. Address mode writes it at the given address (which must be mapped, "
+                "writable and clear of the return slot, TEB and PEB); register mode maps a private region of "
+                "region_bytes at the stated address, writes it there and puts that address in the named register. "
+                "Bytes written into the image count as differences in section_diffs")
+_VARIANTS_BASIS = ("each variant is a fresh emulator built from the same gated image and request: nothing a variant "
+                   "wrote (memory, registers, flags, stub state, traces) is carried to the next, because there is "
+                   "no shared state to carry, not because it was reset. The instruction bound and the time bound "
+                   "apply to each variant; total_timeout_s bounds all of them together and a variant that would "
+                   "start after it is listed as not run. The memory limit is one ceiling on the emulator process, "
+                   "not an account kept per variant; each variant's mapped size is mapped_bytes")
+# What every variant shares, and so what a variants result states once at the top rather than per variant.
+_VARIANT_SHARED = ("image", "perm_mode", "perm_mode_note", "watch_writes", "teb_peb_model", "stack", "completion_basis",
+                   "instruction_count_basis", "registers_basis", "recent_rips_basis", "written_regions_basis",
+                   "memory_trace_basis")
 _IMPORT_UNREADABLE = {
     "code": "IMPORT_DIRECTORY_UNREADABLE",
     "detail": "the import directory could not be read, so no slot was trapped and the guarantee that a call into an "
@@ -253,8 +288,12 @@ def _int_value(value):
         return None
     if isinstance(value, int):
         return value
-    if isinstance(value, str) and re.fullmatch(r"\s*(?:0[xX][0-9a-fA-F]+|\d+)\s*", value):
-        return int(value.strip(), 0)
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"0[xX][0-9a-fA-F]+", text):
+            return int(text, 16)
+        if re.fullmatch(r"[0-9]+", text):
+            return int(text, 10)         # a leading zero is not octal
     return None
 
 
@@ -402,7 +441,8 @@ class _Runner:
 
     @staticmethod
     def validate(start_va, stop_at, max_instructions, timeout_s, watch_writes, registers, stack_size, perm_mode,
-                 allow_stubs=None, stub_options=None, memory_watch=None, memory_watch_limit=DEFAULT_WATCH_EVENTS):
+                 allow_stubs=None, stub_options=None, memory_watch=None, memory_watch_limit=DEFAULT_WATCH_EVENTS,
+                 input_data=None, input_at=None, input_variants=None, total_timeout_s=None):
         """``(params, None)`` or ``(None, usage dict)``."""
         start = _int_value(start_va)
         if start is None or not 0 <= start < 1 << 64:
@@ -452,10 +492,91 @@ class _Runner:
         watch, bad = _Runner.validate_watch(memory_watch, memory_watch_limit)
         if bad is not None:
             return None, bad
-        return {"start_va": start, "stop_at": sorted(set(stops)), "max_instructions": max_instructions,
+        injection, bad = _Runner.validate_input(input_data, input_at, input_variants, total_timeout_s, timeout_s,
+                                                regs, bool(watch), memory_watch_limit)
+        if bad is not None:
+            return None, bad
+        return {**injection, "start_va": start, "stop_at": sorted(set(stops)), "max_instructions": max_instructions,
                 "timeout_s": float(timeout_s), "watch_writes": watch_writes, "registers": regs,
                 "stack_size": size, "perm_mode": perm_mode, "allow_stubs": allowed, "stub_options": options,
                 "memory_watch": watch, "memory_watch_limit": memory_watch_limit}, None
+
+    @staticmethod
+    def input_bytes(value):
+        """The bytes of one buffer given as bytes or as a hex string, or None when it is neither."""
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value)
+        if isinstance(value, str) and re.fullmatch(r"(?:[0-9a-fA-F]{2})+", value.strip()):
+            return bytes.fromhex(value.strip())
+        return None
+
+    @staticmethod
+    def validate_input(input_data, input_at, input_variants, total_timeout_s, timeout_s, regs, watching, watch_limit):
+        """``(fields, None)`` or ``(None, usage dict)``. No buffer means no injection at all.
+
+        ``input_data`` is one buffer (a single run); ``input_variants`` is a list of buffers (one run each, from the
+        same start). Exactly one of them, and ``input_at``, are given together: a mapped address, or ``reg:NAME``,
+        which places the buffer in a region of the emulator's own and puts its address in that register."""
+        bad = _Runner.usage
+        none = {"inputs_hex": [], "input_target": None, "variant_mode": False, "total_timeout_s": None}
+        if input_data is None and input_variants is None:
+            if input_at is not None or total_timeout_s is not None:
+                return None, bad("BAD_INPUT", "input_at and total_timeout_s need input_data or input_variants")
+            return none, None
+        if input_data is not None and input_variants is not None:
+            return None, bad("BAD_INPUT", "give input_data (one run) or input_variants (several), not both")
+        if input_at is None:
+            return None, bad("BAD_INPUT", "input_at is required with an input: a mapped address, or reg:NAME")
+        variant_mode = input_variants is not None
+        if variant_mode:
+            if isinstance(input_variants, (str, bytes, bytearray, dict)) or not hasattr(input_variants, "__iter__"):
+                return None, bad("BAD_INPUT", "input_variants must be a list of buffers")
+            items = list(input_variants)
+            if not 1 <= len(items) <= MAX_VARIANTS:
+                return None, bad("BAD_INPUT", "input_variants holds 1 to %d buffers" % MAX_VARIANTS)
+        else:
+            items = [input_data]
+        buffers = []
+        for item in items:
+            blob = _Runner.input_bytes(item)
+            if blob is None:
+                return None, bad("BAD_INPUT", "every buffer is bytes or an even-length hex string")
+            if not 1 <= len(blob) <= MAX_INPUT_BYTES:
+                return None, bad("BAD_INPUT", "a buffer holds 1 to %d bytes" % MAX_INPUT_BYTES)
+            buffers.append(blob)
+        if sum(len(b) for b in buffers) > MAX_VARIANT_INPUT_BYTES:
+            return None, bad("BAD_INPUT", "all buffers together hold at most %d bytes" % MAX_VARIANT_INPUT_BYTES)
+        longest = max(len(b) for b in buffers)
+        if isinstance(input_at, str) and input_at.strip().lower().startswith("reg:"):
+            name = input_at.strip()[4:].strip().lower()
+            if name not in INPUT_REGISTERS:
+                return None, bad("BAD_INPUT", "reg: takes one of %s (rsp holds the return slot)"
+                                 % ", ".join(INPUT_REGISTERS))
+            if name in regs:
+                return None, bad("BAD_INPUT", "register %s is both set in registers and the input pointer" % name)
+            target = {"mode": "register", "register": name}
+        else:
+            address = _int_value(input_at)
+            if address is None or not 0 <= address or address + longest > 1 << 64:
+                return None, bad("BAD_INPUT", "input_at is an address (0x-hex or decimal) the longest buffer fits "
+                                 "below 2**64 from, or reg:NAME")
+            target = {"mode": "address", "address": address}
+        total = None
+        if total_timeout_s is not None:
+            if not variant_mode:
+                return None, bad("BAD_INPUT", "total_timeout_s bounds several variants; a single run uses timeout_s")
+            if isinstance(total_timeout_s, bool) or not isinstance(total_timeout_s, (int, float)) \
+                    or not 0 < total_timeout_s <= TIMEOUT_CEILING_SECONDS:
+                return None, bad("BAD_TIMEOUT", "total_timeout_s must be a number above 0 and at most %d"
+                                 % TIMEOUT_CEILING_SECONDS)
+            total = float(total_timeout_s)
+        elif variant_mode:
+            total = float(min(timeout_s * len(buffers), TIMEOUT_CEILING_SECONDS))
+        if variant_mode and watching and watch_limit * len(buffers) > MAX_WATCH_EVENTS_CEILING:
+            return None, bad("BAD_MEMORY_WATCH", "memory_watch_limit times the number of variants may not exceed %d "
+                             "(the result is one bounded line); lower the limit" % MAX_WATCH_EVENTS_CEILING)
+        return {"inputs_hex": [b.hex() for b in buffers], "input_target": target, "variant_mode": variant_mode,
+                "total_timeout_s": total}, None
 
     @staticmethod
     def validate_watch(memory_watch, limit):
@@ -543,6 +664,19 @@ class _Runner:
         return {key: os.environ[key] for key in keep if key in os.environ}
 
     @staticmethod
+    def input_request(params):
+        """What the record says about the injected input: where it goes and each buffer's hash and length. Never
+        the content."""
+        if not params["inputs_hex"]:
+            return None
+        target = params["input_target"]
+        return {"mode": target["mode"],
+                **({"address": _hx(target["address"])} if target["mode"] == "address" else {"register": target["register"]}),
+                "variants": params["variant_mode"], "content_omitted": True,
+                "buffers": [{"sha256": hashlib.sha256(bytes.fromhex(h)).hexdigest(), "length": len(h) // 2}
+                            for h in params["inputs_hex"]]}
+
+    @staticmethod
     def sha256_of(path):
         digest = hashlib.sha256()
         with open(path, "rb") as handle:
@@ -628,13 +762,17 @@ class _Runner:
                   "input": {"sha256": sha, "size": size, "name_omitted": True}, "gate": gate,
                   "bounds": {"max_instructions": params["max_instructions"], "timeout_s": params["timeout_s"],
                              "memory_bytes": DEFAULT_MAX_MEMORY_BYTES, "stack_size": params["stack_size"],
-                             "watch_writes": params["watch_writes"], "perm_mode": params["perm_mode"]},
+                             "watch_writes": params["watch_writes"], "perm_mode": params["perm_mode"],
+                             **({"total_timeout_s": params["total_timeout_s"], "max_variants": MAX_VARIANTS}
+                                if params["variant_mode"] else {}),
+                             **({"max_input_bytes": MAX_INPUT_BYTES} if params["inputs_hex"] else {})},
                   "request": {"start_va": _hx(params["start_va"]), "stop_at": [_hx(a) for a in params["stop_at"]],
                               "registers": {k: _hx(v) for k, v in params["registers"].items()},
                               "allow_stubs": list(params["allow_stubs"]), "stub_options": dict(params["stub_options"]),
                               "memory_watch": [{"start": _hx(r["start"]), "end": _hx(r["end"]), "access": r["access"]}
                                                for r in params["memory_watch"]],
-                              "memory_watch_limit": params["memory_watch_limit"]}}
+                              "memory_watch_limit": params["memory_watch_limit"],
+                              "input": _Runner.input_request(params)}}
         if not gate["ok"]:
             name = "%s_refused.json" % run_id
             record.update(status=gate["status"], detail=gate["detail"])
@@ -661,7 +799,9 @@ class _Runner:
         from liebert_re.bounded_subprocess import run_bounded_process
         try:
             outcome = run_bounded_process(
-                _Runner.child_command(run_dir / "job.json"), timeout_seconds=params["timeout_s"] + WALL_GRACE_SECONDS,
+                _Runner.child_command(run_dir / "job.json"),
+                timeout_seconds=(params["total_timeout_s"] + 2 * WALL_GRACE_SECONDS if params["variant_mode"]
+                                 else params["timeout_s"] + WALL_GRACE_SECONDS),
                 cwd=run_dir, environment=_Runner.child_environment(), max_memory_bytes=DEFAULT_MAX_MEMORY_BYTES,
                 max_output_chars=MAX_CHILD_OUTPUT_CHARS)
             result = _Runner.interpret(outcome, run_dir)
@@ -695,7 +835,8 @@ class _Runner:
 def emulate_range(path, start_va, *, stop_at=(), max_instructions=5_000_000, timeout_s=120,
                   watch_writes="image", registers=None, stack_size=0x100000, perm_mode="as_declared",
                   target_class=None, authorization=None, sample_sha256=None, allow_stubs=None, stub_options=None,
-                  memory_watch=None, memory_watch_limit=DEFAULT_WATCH_EVENTS):
+                  memory_watch=None, memory_watch_limit=DEFAULT_WATCH_EVENTS, input_data=None, input_at=None,
+                  input_variants=None, total_timeout_s=None):
     """Emulate a bounded range of a PE32+ (x86-64) image from ``start_va`` and report why and where it stopped.
 
     Runs inside the Unicorn engine in a separate interpreter (a process boundary, not a sandbox; nothing
@@ -717,6 +858,17 @@ def emulate_range(path, start_va, *, stop_at=(), max_instructions=5_000_000, tim
     ``memory_watch_limit`` events (default 1000, ceiling 10000) are kept; past that the run goes on, the trace is cut,
     ``memory_trace_truncated`` is true and ``memory_trace_skipped`` counts what was not kept.
 
+    ``input_data`` (bytes or a hex string, 1 to 65536 bytes) is placed before the first instruction at ``input_at``:
+    a mapped, writable address, or ``"reg:RCX"`` (any general register but rsp, not one also set in ``registers``),
+    which maps a private region of the emulator's own, writes the buffer there and puts its address in that register.
+    The result's ``input_injection`` carries the buffer's SHA-256 and length, never its content.
+    ``input_variants`` (a list of up to 32 such buffers, instead of ``input_data``) runs the same request once per
+    buffer, each in a fresh emulator so nothing a variant wrote reaches the next; ``variants`` lists, per variant, the
+    input hash, ``completion``, ``stop_reason``, the final registers, the optional ``memory_trace`` and the memory
+    it wrote. ``max_instructions`` and ``timeout_s`` apply to each variant; ``total_timeout_s`` (default
+    ``timeout_s`` times the variant count, at most 600) bounds them together, and a variant that would start after
+    it is listed with ``ran: false``.
+
     ``ok`` is true when the engine ran and reports a stop; ``stop_reason`` says which, and ``completion`` says
     whether the routine finished (``RETURNED``, ``STOPPED_AT_IMPORT``, ``STOPPED_AT_SYSCALL``, ``INSN_LIMIT``,
     ``TIMEOUT``, ``FAULT``, ``UNKNOWN``; ``null`` if nothing ran). ``limitations`` lists what weakens this run. Memory dumps are raw
@@ -730,7 +882,8 @@ def emulate_range(path, start_va, *, stop_at=(), max_instructions=5_000_000, tim
     try:
         params, bad = _Runner.validate(start_va, stop_at, max_instructions, timeout_s, watch_writes,
                                        registers, stack_size, perm_mode, allow_stubs, stub_options,
-                                       memory_watch, memory_watch_limit)
+                                       memory_watch, memory_watch_limit, input_data, input_at, input_variants,
+                                       total_timeout_s)
         if bad is not None:
             return _j(_Runner.finish(bad))
         params.update(_target_class=target_class, _authorization=authorization, _sample_sha256=sample_sha256)
@@ -1102,6 +1255,126 @@ class _Engine:
     # -- the run ----------------------------------------------------------
 
     def run(self):
+        job = self.job
+        run_dir = Path(job["dump_dir"])
+        data = (run_dir / job["input_file"]).read_bytes()
+        if hashlib.sha256(data).hexdigest() != job["input_sha256"]:
+            raise _Refusal("ANALYSIS_LIMITED", "INPUT_CHANGED", "the staged input does not match the gated sha256")
+        buffers = [bytes.fromhex(text) for text in job.get("inputs_hex", ())]
+        target = job.get("input_target")
+        if not job.get("variant_mode"):
+            return self._run_one(data, run_dir, buffers[0] if buffers else None, target, job["timeout_s"], "",
+                                 MAX_REGIONS_REPORTED)
+        return self._run_variants(data, run_dir, buffers, target)
+
+    # -- input injection and variants --------------------------------------------------------------------
+
+    @staticmethod
+    def inject(uc, ux, payload, target, rsp, mapped_size):
+        """Place ``payload`` before the first instruction. Returns the report (hash and length, never the content)
+        or raises :class:`_Refusal` and writes nothing."""
+        from unicorn import UC_PROT_WRITE, UcError
+
+        def refuse(error, detail):
+            raise _Refusal("TOOL_USAGE", error, detail)
+
+        report = {"length": len(payload), "sha256": hashlib.sha256(payload).hexdigest(), "content_omitted": True,
+                  "mode": target["mode"]}
+        if target["mode"] == "register":
+            name = target["register"]
+            try:
+                uc.mem_write(INPUT_VA, payload)
+                uc.reg_write(getattr(ux, "UC_X86_REG_" + name.upper()), INPUT_VA)
+            except UcError:
+                refuse("BAD_INPUT_ADDRESS", "the private input region could not be written")
+            report.update(register=name, buffer_address=_hx(INPUT_VA), region_bytes=mapped_size)
+            return report
+        lo = target["address"]
+        hi = lo + len(payload)
+        for label, begin, end in (("return slot", rsp, rsp + 8), ("TEB", TEB_VA, TEB_VA + TEB_SIZE),
+                                  ("PEB", PEB_VA, PEB_VA + PEB_SIZE), ("return sentinel", SENTINEL_VA, SENTINEL_VA + PAGE)):
+            if lo < end and begin < hi:
+                refuse("BAD_INPUT_ADDRESS", "the input would overlap the %s" % label)
+        cursor = lo
+        for begin, end, perms in sorted(uc.mem_regions()):
+            if begin <= cursor <= end and perms & UC_PROT_WRITE:
+                cursor = end + 1
+            if cursor >= hi:
+                break
+        if cursor < hi:
+            refuse("BAD_INPUT_ADDRESS", "the input does not lie wholly inside mapped, writable memory")
+        try:
+            uc.mem_write(lo, payload)
+        except UcError:
+            refuse("BAD_INPUT_ADDRESS", "the engine refused to write the input")
+        report.update(buffer_address=_hx(lo), region_bytes=None)
+        return report
+
+    def _run_variants(self, data, run_dir, buffers, target):
+        """One fresh emulator per buffer, in order, under a shared total time bound.
+
+        This is the "rebuild from a clean start" choice, not a snapshot restore: every variant maps the image anew
+        from the gated bytes, so nothing a variant wrote can reach the next (there is no state to reset and none to
+        forget). The cost is parsing and mapping once per variant, paid outside the per-variant time bound."""
+        import gc
+        job = self.job
+        total = job["total_timeout_s"]
+        began = time.monotonic()
+        rows, frame, files, limitations = [], None, [], []
+        for index, payload in enumerate(buffers):
+            row = {"index": index, "input": {"sha256": hashlib.sha256(payload).hexdigest(), "length": len(payload)}}
+            remaining = total - (time.monotonic() - began)
+            if remaining <= 0:
+                rows.append({**row, "ran": False, "completion": None, "stop_reason": None,
+                             "not_run_because": "TOTAL_TIME_BUDGET_EXHAUSTED"})
+                continue
+            budget = min(job["timeout_s"], remaining)
+            try:
+                full = self._run_one(data, run_dir, payload, target, budget, "v%02d_" % index, VARIANT_REGION_CAP)
+            except _Refusal as exc:
+                raise _Refusal(exc.status, exc.error, "variant %d: %s" % (index, exc.detail)) from None
+            if frame is None:
+                frame = {key: full[key] for key in _VARIANT_SHARED if key in full}
+            injected = dict(full["input_injection"])
+            changed = [r for r in full["section_diffs"] if r["changed_bytes"]]
+            stub_calls = full["stubs"]["calls"]
+            rows.append({
+                **row, "ran": True, "status": "OK", "input": injected, "stop_reason": full["stop_reason"],
+                "stop_detail": full["stop_detail"], "completion": full["completion"],
+                "instructions": full["instructions"], "rip": full["rip"], "registers": full["registers"],
+                "limitations": full["limitations"], "memory_trace": full["memory_trace"],
+                "memory_trace_truncated": full["memory_trace_truncated"],
+                "memory_trace_skipped": full["memory_trace_skipped"],
+                "written_regions": full["written_regions"], "written_regions_total": full["written_regions_total"],
+                "written_regions_truncated": full["written_regions_truncated"],
+                "sections_changed": changed, "sections_unchanged": len(full["section_diffs"]) - len(changed),
+                "dump_files": full["dump_files"],
+                "stubs": {**{k: v for k, v in full["stubs"].items() if k != "calls"},
+                          "calls": stub_calls[:VARIANT_STUB_CALLS_LISTED],
+                          "calls_omitted": max(len(stub_calls) - VARIANT_STUB_CALLS_LISTED, 0)},
+                "elapsed_s": full["elapsed_s"], "mapped_bytes": full["mapped_bytes"],
+                "budget_s": round(budget, 3), "budget_limited_by_total": budget < job["timeout_s"]})
+            files.extend(full["dump_files"])
+            for item in full["limitations"]:
+                if item["code"] not in {x["code"] for x in limitations}:
+                    limitations.append(item)
+            del full
+            gc.collect()
+        ran = [r for r in rows if r["ran"]]
+        injection = {"mode": target["mode"], "variants": len(buffers), "content_omitted": True, "basis": _INPUT_BASIS,
+                     **({"register": target["register"]} if target["mode"] == "register"
+                        else {"address": _hx(target["address"])})}
+        return {
+            "ok": True, "status": "OK", "stop_reason": None, "completion": None, "variant_mode": True,
+            **(frame or {}), "limitations": limitations, "dump_files": files, "input_injection": injection,
+            "variants": rows, "variants_total": len(rows), "variants_run": len(ran),
+            "variants_not_run": len(rows) - len(ran), "total_budget_s": total,
+            "total_budget_exhausted": len(ran) < len(rows),
+            "total_elapsed_s": round(time.monotonic() - began, 3), "variants_basis": _VARIANTS_BASIS}
+
+    def _run_one(self, data, run_dir, payload, target, budget, prefix, region_cap):
+        """One emulation from a clean start. ``payload`` (or None) is placed per ``target`` before the first
+        instruction; ``budget`` is this run's time bound in seconds; ``prefix`` names its dump files."""
         import numpy as np
         from unicorn import (UC_ARCH_X86, UC_HOOK_CODE, UC_HOOK_INSN, UC_HOOK_INSN_INVALID, UC_HOOK_INTR,
                              UC_HOOK_MEM_FETCH_PROT, UC_HOOK_MEM_FETCH_UNMAPPED, UC_HOOK_MEM_READ, UC_HOOK_MEM_READ_PROT,
@@ -1114,10 +1387,6 @@ class _Engine:
         from liebert_re.recover.vex import UnmodelledVex, VexLayer, _run_with_faulthandler_off
 
         job = self.job
-        run_dir = Path(job["dump_dir"])
-        data = (run_dir / job["input_file"]).read_bytes()
-        if hashlib.sha256(data).hexdigest() != job["input_sha256"]:
-            raise _Refusal("ANALYSIS_LIMITED", "INPUT_CHANGED", "the staged input does not match the gated sha256")
         info = self.parse_pe(data)
         base, image_end = info["base"], info["base"] + _align_up(info["size_of_image"], PAGE)
         flat = self.flat_image(data, info)
@@ -1132,6 +1401,9 @@ class _Engine:
                ("import traps", TRAP_BASE, TRAP_BASE + _align_up(TRAP_STRIDE * (len(trap_table) + 1), PAGE))]
         if book.heap_bytes:
             aux.append(("stub heap", STUB_HEAP_VA, STUB_HEAP_VA + book.heap_bytes))
+        input_region = _align_up(len(payload), PAGE) if payload is not None and target["mode"] == "register" else 0
+        if input_region:
+            aux.append(("input buffer", INPUT_VA, INPUT_VA + input_region))
         for label, lo, hi in aux:
             if lo < image_end and base < hi:
                 raise _Refusal("MAP_CONFLICT", "IMAGE_OVERLAPS_FIXED_REGION",
@@ -1165,6 +1437,8 @@ class _Engine:
         map_region(PEB_VA, PEB_SIZE, UC_PROT_READ | UC_PROT_WRITE)
         if book.heap_bytes:
             map_region(STUB_HEAP_VA, book.heap_bytes, UC_PROT_READ | UC_PROT_WRITE)
+        if input_region:
+            map_region(INPUT_VA, input_region, UC_PROT_READ | UC_PROT_WRITE)
         book.uc, book.ux = uc, UX
 
         # Minimal TEB/PEB. Only the fields listed in teb_peb_model are assigned; every other byte is zero.
@@ -1188,13 +1462,13 @@ class _Engine:
             raise _Refusal("TOOL_USAGE", "BAD_REGISTERS", "rsp does not point into writable mapped memory") from None
         for name, value in regs.items():
             uc.reg_write(getattr(UX, "UC_X86_REG_" + name.upper()), value)
+        injection = self.inject(uc, UX, payload, target, regs["rsp"], input_region) if payload is not None else None
         baseline = {s["index"]: bytes(flat[s["rva"]:s["rva"] + s["span"]]) for s in info["sections"]}
 
         layer = VexLayer(uc, 64)
         wlog = _WriteLog()
         stops = frozenset(job["stop_at"])
         max_n = job["max_instructions"]
-        budget = job["timeout_s"]
         t0 = time.monotonic()
         deadline = t0 + budget
         book.deadline = deadline
@@ -1349,7 +1623,7 @@ class _Engine:
                            "size": size, "value": _hx(seen)})
 
         def stored(value, size):
-            return value & ((1 << (8 * size)) - 1) if 0 < size <= 8 else None
+            return value & ((1 << (8 * size)) - 1) if 0 < size <= MAX_TRACE_WRITE_VALUE_BYTES else None
 
         def trace_fault(fault_kind, address, size, value):
             """An access that faulted never reaches the access hooks; the attempt is still listed, read value null."""
@@ -1484,7 +1758,7 @@ class _Engine:
         written = []
         regions = wlog.regions()
         total = len(regions)
-        for start, end, hit, first in regions[:MAX_REGIONS_REPORTED]:
+        for start, end, hit, first in regions[:region_cap]:
             written.append({"va": _hx(start), "size": end - start,
                             "sha256": hashlib.sha256(bytes(uc.mem_read(start, end - start))).hexdigest(),
                             "executed_after_write": hit, "first_executed_va": _hx(first)})
@@ -1498,7 +1772,7 @@ class _Engine:
                    "changed_bytes": changed, "final_sha256": hashlib.sha256(final).hexdigest(),
                    "baseline_sha256": hashlib.sha256(was).hexdigest(), "dump_file": None, "dump_sha256": None}
             if changed:
-                name = "section%02d_%s.bin" % (sec["index"], re.sub(r"[^A-Za-z0-9_]", "_", sec["name"]) or "x")
+                name = "%ssection%02d_%s.bin" % (prefix, sec["index"], re.sub(r"[^A-Za-z0-9_]", "_", sec["name"]) or "x")
                 (run_dir / name).write_bytes(final)
                 row.update(dump_file=name, dump_sha256=row["final_sha256"])
                 files.append(name)
@@ -1522,7 +1796,7 @@ class _Engine:
             "rip": _hx(rip), "registers": registers, "registers_basis": _REG_BASIS,
             "recent_rips": [_hx(a) for a in recent], "recent_rips_basis": _RIP_BASIS,
             "written_regions": written, "written_regions_total": total,
-            "written_regions_truncated": total > MAX_REGIONS_REPORTED,
+            "written_regions_truncated": total > region_cap,
             "written_regions_basis": ("writes by the emulated code to %s, merged where they touch; "
                                       "executed_after_write: an instruction was dispatched from inside the "
                                       "region after it was written" % ("the mapped image" if job["watch_writes"] == "image" else "all memory")),
@@ -1544,6 +1818,8 @@ class _Engine:
             "stack": {"low": _hx(stack_low), "high": _hx(STACK_HIGH), "initial_rsp": _hx(regs["rsp"]),
                       "return_sentinel": _hx(SENTINEL_VA)},
             "vex": {"instructions_executed_by_layer": layer.executed, "mnemonics": dict(layer.mnemonics)},
+            "input_injection": injection, "input_basis": _INPUT_BASIS if injection else None,
+            "mapped_bytes": sum(end - begin + 1 for begin, end, _perms in uc.mem_regions()),
             "elapsed_s": round(elapsed, 3),
             "instructions_per_second": int(executed / elapsed) if elapsed > 0 else None,
         }
