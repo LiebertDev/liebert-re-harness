@@ -260,7 +260,7 @@ class TestRealStatusProbes:
         _real(name)
         data = _call(name)
         assert (data["ok"], data["status"], data["runnable"]) == (True, "OK", True)
-        assert Path(data["binary"]).exists() or data["binary"]
+        assert data["binary"] and Path(data["binary"]).is_file()
         assert data["resolved_by"] in {"YARA_X_EXE", "YARA_X_HOME", "UPX_HOME", "IL2CPPDUMPER_EXE", "JADX_EXE",
                                        "PATH", "known_install", "bundled_fallback"}
         if name != "il2cpp" or os.name == "nt":

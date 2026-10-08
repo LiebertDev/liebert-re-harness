@@ -323,7 +323,10 @@ try {
         $out = @{ vm_id_from_kvp = $null; os_build = $null; vbs_status = $null; security_services_running = $null; errors = @(); categories = @() }
         try {
             $kvp = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters' -Name 'VirtualMachineId' -ErrorAction Stop
-            $out['vm_id_from_kvp'] = [string]$kvp.VirtualMachineId
+            # [string]$null is "", which would read as a value; a missing or empty id stays null and is an error.
+            $kvpRaw = $kvp.VirtualMachineId
+            if (($null -eq $kvpRaw) -or [string]::IsNullOrWhiteSpace([string]$kvpRaw)) { throw [System.InvalidOperationException]::new('lr:vm id null or empty') }
+            $out['vm_id_from_kvp'] = [string]$kvpRaw
         }
         catch { $out['errors'] += 'kvp:' + $_.Exception.GetType().FullName; $out['categories'] += 'kvp:' + $_.CategoryInfo.Category.ToString() }
         try {
@@ -347,7 +350,9 @@ try {
         try {
             $os = @(Get-CimInstance -ClassName 'Win32_OperatingSystem' -ErrorAction Stop)
             if ($os.Count -ne 1) { throw [System.InvalidOperationException]::new('lr:operating system class did not return exactly one record') }
-            $out['os_build'] = [string]$os[0].BuildNumber
+            $buildRaw = $os[0].BuildNumber
+            if (($null -eq $buildRaw) -or [string]::IsNullOrWhiteSpace([string]$buildRaw)) { throw [System.InvalidOperationException]::new('lr:os build null or empty') }
+            $out['os_build'] = [string]$buildRaw
         }
         catch { $out['errors'] += 'os:' + $_.Exception.GetType().FullName; $out['categories'] += 'os:' + $_.CategoryInfo.Category.ToString() }
         $out

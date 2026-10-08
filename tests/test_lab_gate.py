@@ -583,6 +583,27 @@ class TestIsolationFromAttestation:
         assert data["isolation"]["attestation"]["verdict"] == "UNKNOWN"
         assert reason in data["isolation"]["attestation"]["reasons"]
 
+    @pytest.mark.parametrize("payload", [
+        b'{"guest": {"ok": false}, "guest": {"ok": true}}',
+        b'{"guest": {"ok": false, "ok": true}}',
+        b'{"a": [{"x": 1, "x": 1}]}',
+    ])
+    def test_a_duplicate_key_at_any_level_is_unknown(self, child, image_sha, lab_open, tmp_path, payload):
+        path = tmp_path / "dup.json"
+        path.write_bytes(payload)
+        data = _isolated_gate(child.pid, str(path), sample_sha256=image_sha)
+        assert data["status"] == "ISOLATION_REQUIRED" and data["isolation_verified"] is False
+        assert data["isolation"]["attestation"]["verdict"] == "UNKNOWN"
+        assert "GUEST_MEASUREMENT_DUPLICATE_KEY" in data["isolation"]["attestation"]["reasons"]
+
+    def test_a_verified_document_with_a_duplicated_key_added_is_unknown(self, child, image_sha, lab_open, tmp_path):
+        text = json.dumps(_fresh(_ga_admissible()))
+        path = tmp_path / "dup2.json"
+        path.write_text(text[:-1] + ', "guest": {"ok": true}}', encoding="utf-8")
+        data = _isolated_gate(child.pid, str(path), sample_sha256=image_sha)
+        assert data["isolation_verified"] is False
+        assert "GUEST_MEASUREMENT_DUPLICATE_KEY" in data["isolation"]["attestation"]["reasons"]
+
     def test_a_missing_directory_or_oversized_file_is_unknown(self, child, image_sha, lab_open, tmp_path):
         data = _isolated_gate(child.pid, str(tmp_path / "nowhere.json"), sample_sha256=image_sha)
         assert data["isolation"]["attestation"]["reasons"] == ["GUEST_MEASUREMENT_UNREADABLE:FileNotFoundError"]

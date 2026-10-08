@@ -270,6 +270,12 @@ def test_device_guard_values_are_never_cast_from_null():
     assert "device guard status null or not numeric" in code
 
 
+def test_kvp_and_os_build_are_never_cast_from_null():
+    code = _code()
+    assert "[string]$kvp.VirtualMachineId" not in code and "[string]$os[0].BuildNumber" not in code
+    assert "lr:vm id null or empty" in code and "lr:os build null or empty" in code
+
+
 _DEVICE_GUARD_PROBE = r"""
 $ErrorActionPreference = 'Stop'
 $t = $null; $e = $null

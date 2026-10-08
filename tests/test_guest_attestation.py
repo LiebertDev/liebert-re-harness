@@ -280,6 +280,13 @@ def test_naive_or_malformed_timestamps_are_unknown():
     assert _evaluate(ok)["isolation_verified"] is True
 
 
+def test_empty_string_guest_vm_id_is_unknown():
+    result = _evaluate(_with(_measurement(), "guest.vm_id_from_kvp", ""))
+    iso = result["capabilities"]["isolated_guest"]
+    assert iso["status"] == "UNKNOWN" and "INVALID:guest.vm_id_from_kvp" in iso["reasons"]
+    assert result["isolation_verified"] is False
+
+
 def test_guest_and_host_vm_id_disagree():
     m = _with(_measurement(), "guest.vm_id_from_kvp", OTHER_VM_ID)
     result = _evaluate(m)
