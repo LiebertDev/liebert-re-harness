@@ -298,20 +298,43 @@ def _read_bounded(path: Path, limit: int):
     return raw.decode("utf-8", errors="replace"), None if not truncated else "TRUNCATED"
 
 
+def _strict_pairs(pairs):
+    seen = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        seen[key] = value
+    return seen
+
+
+def _strict_constant(name):
+    raise ValueError(f"non-finite JSON number {name}")
+
+
+def _strict_json_loads(text):
+    """``json.loads`` that refuses what Python quietly accepts: a repeated object key (last one
+    wins, so two readers can disagree about the value) and ``NaN`` / ``Infinity`` / ``-Infinity``.
+    Same two rules as the strict readers in ``dynamic/lab_gate.py`` and
+    ``dynamic/hyperv_transport.py`` (commit c01f2d8); kept here because the evidence layer must
+    not import from ``dynamic``. Raises ``ValueError`` (``RecursionError`` on absurd nesting)."""
+    return json.loads(text, object_pairs_hook=_strict_pairs, parse_constant=_strict_constant)
+
+
 def _record_resolves(record, evidence_id) -> bool:
     """The one rule for "this ``EvidenceIndex.record()`` answer resolves ``evidence_id``", shared by
     every consumer that cites evidence (claims, findings, dynamic validation). True only when the
     answer is a dict with a literal ``ok: True`` under that same ``evidence_uid``, the bytes on
     disk were read completely (no ``read_error``, so not TRUNCATED), the content is text and, for
-    a ``.json`` record, parses as JSON NOW. The index's cached metadata proves none of that."""
+    a ``.json`` record, parses as STRICT JSON NOW (no duplicate keys, no NaN/Infinity). The
+    index's cached metadata proves none of that."""
     if not (isinstance(record, dict) and record.get("ok") is True and record.get("evidence_uid") == evidence_id):
         return False
     if record.get("read_error") is not None or not isinstance(record.get("content"), str):
         return False
     if str(record.get("path") or "").lower().endswith(".json"):
         try:
-            json.loads(record["content"])
-        except ValueError:
+            _strict_json_loads(record["content"])
+        except (ValueError, RecursionError):
             return False
     return True
 
@@ -319,14 +342,28 @@ def _record_resolves(record, evidence_id) -> bool:
 def _record_target_hash(record):
     """The target SHA-256 the record's CURRENT JSON content states (lower case), or None. Read
     from the content just fetched, never from the cached ``target_hash`` column; None when the
-    record is not parseable JSON or carries no real hash."""
+    record is not strict JSON or its hash is not stated unambiguously. Every recognised target
+    field that is PRESENT (``target_sha256``, the ``sha256`` aliases, ``provenance.target_sha256``)
+    must be a real SHA-256 string, and all of them must agree: a malformed explicit field never
+    falls back to an alias, and conflicting fields give None rather than a pick."""
     if not (isinstance(record, dict) and isinstance(record.get("content"), str)):
         return None
     try:
-        payload = json.loads(record["content"])
-    except ValueError:
+        payload = _strict_json_loads(record["content"])
+    except (ValueError, RecursionError):
         return None
-    return _extract_target_hash(payload)
+    if not isinstance(payload, dict):
+        return None
+    stated = [payload[key] for key in ("target_sha256", "sha256", "program_sha256", "binary_sha256") if key in payload]
+    provenance = payload.get("provenance")
+    if isinstance(provenance, dict) and "target_sha256" in provenance:
+        stated.append(provenance["target_sha256"])
+    hashes = set()
+    for value in stated:
+        if not (isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value)):
+            return None
+        hashes.add(value.lower())
+    return hashes.pop() if len(hashes) == 1 else None
 
 
 def _parse_filename(stem: str):

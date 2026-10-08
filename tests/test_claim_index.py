@@ -1013,5 +1013,69 @@ class EvidenceRound3bResolutionTests(unittest.TestCase):
             self.assertEqual(self._prove(claims, uid)["status"], "PROVEN")
 
 
+class EvidenceRound3cTests(unittest.TestCase):
+    """Round 3c: an event whose fields have the wrong type or value is malformed, and strict JSON
+    (no duplicate keys, no NaN/Infinity) is what resolves evidence."""
+
+    @staticmethod
+    def _proven(tmp):
+        return EvidenceRound3ReplayAndPersistenceTests._proven(tmp)
+
+    def test_event_with_a_non_string_relation_is_malformed_and_re_earns_no_proven(self):
+        with TemporaryDirectory() as tmp:
+            _, claims, claim_uid, refute = self._proven(Path(tmp))
+            _write_json(
+                claims.events_root / "99990101T000000000000__x__evidence_linked.json",
+                {"event": "evidence_linked", "at": "2999-01-01T00:00:00+00:00", "claim_uid": claim_uid,
+                 "evidence_uid": refute, "relation": 1, "note": ""},
+            )
+            result = claims.rebuild_from_events()
+            self.assertEqual(result["malformed"], 1)
+            self.assertEqual(claims._current_status(claim_uid), "UNVERIFIED")
+            self.assertEqual(result["demotions"][0]["reason"], "EVENT_LOG_INCOMPLETE")
+
+    def test_events_with_unknown_enums_or_wrong_types_are_malformed(self):
+        with TemporaryDirectory() as tmp:
+            _, claims, claim_uid, refute = self._proven(Path(tmp))
+            at = "2999-01-01T00:00:00+00:00"
+            bad = [
+                {"event": "evidence_linked", "at": at, "claim_uid": claim_uid, "evidence_uid": refute, "relation": "MAYBE"},
+                {"event": "evidence_linked", "at": at, "claim_uid": claim_uid, "evidence_uid": 7, "relation": "SUPPORTS"},
+                {"event": "status_changed", "at": at, "claim_uid": claim_uid, "old_status": "PROVEN", "new_status": "PROVEN"},
+                {"event": "status_changed", "at": at, "claim_uid": ["x"], "new_status": "CONTRADICTED"},
+                {"event": "edge", "at": at, "from_claim_uid": claim_uid, "to_claim_uid": claim_uid, "relation": "LOVES"},
+                {"event": "claim_created", "at": at, "claim_uid": "CLM-z", "status": "CONTRADICTED", "inferred": "false"},
+            ]
+            for index, body in enumerate(bad):
+                _write_json(claims.events_root / f"9999010{index}T000000000000__x__bad.json", body)
+            self.assertEqual(claims.rebuild_from_events()["malformed"], len(bad))
+            self.assertEqual(claims._current_status(claim_uid), "UNVERIFIED")
+
+    def test_json_with_nan_cannot_back_proven(self):
+        for body in ('{"ok": true, "measurement": NaN}', '{"ok": Infinity}', '{"ok": true, "v": -Infinity}'):
+            with TemporaryDirectory() as tmp:
+                root, evidence_index, claims = _make_indices(Path(tmp))
+                (root / "s_1111111111_report_222222.json").write_text(body, encoding="utf-8")
+                evidence_index.refresh()
+                uid = evidence_index.record(path="s_1111111111_report_222222.json")["evidence_uid"]
+                with self.assertRaises(ClaimError, msg=body):
+                    claims.create_claim(
+                        "t", "function", "FUN_1", "root_cause", "v", status="PROVEN",
+                        initial_evidence=[{"evidence_uid": uid, "relation": "SUPPORTS"}],
+                    )
+
+    def test_json_with_a_duplicate_key_cannot_back_proven(self):
+        with TemporaryDirectory() as tmp:
+            root, evidence_index, claims = _make_indices(Path(tmp))
+            (root / "s_1111111111_report_222222.json").write_text('{"ok": true, "ok": false}', encoding="utf-8")
+            evidence_index.refresh()
+            uid = evidence_index.record(path="s_1111111111_report_222222.json")["evidence_uid"]
+            with self.assertRaises(ClaimError):
+                claims.create_claim(
+                    "t", "function", "FUN_1", "root_cause", "v", status="PROVEN",
+                    initial_evidence=[{"evidence_uid": uid, "relation": "SUPPORTS"}],
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

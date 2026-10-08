@@ -159,7 +159,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from liebert_re.evidence.index import EvidenceIndex, _normalize_anchor_value, _record_resolves
+from liebert_re.evidence.index import EvidenceIndex, _normalize_anchor_value, _record_resolves, _strict_json_loads
 from liebert_re.evidence.process_lock import DurableLock
 
 from liebert_re.workspace import PROJECT_ROOT as APP
@@ -468,6 +468,55 @@ class ClaimIndex:
                 (ev["from_claim_uid"], ev["at"], ev["to_claim_uid"]),
             )
 
+    @staticmethod
+    def _event_is_well_formed(ev):
+        """Type and enum check of the fields an event carries, applied before it is accepted: an
+        event with ``relation: 1``, an unknown status or a list for a UID is not "applied with
+        odd data", it is a damaged log, counted as malformed so replay cannot vouch for PROVEN.
+        Only fields that are PRESENT are checked; a missing required field still fails the
+        replay loudly (and rolls it back) when the event is applied. What a mutation writes is
+        the contract: ``claim_created`` carries an initial status, ``status_changed`` only ever
+        moves a claim to CONTRADICTED."""
+        def text(*names, nullable=False, nonempty=False):
+            for name in names:
+                if name not in ev:
+                    continue
+                value = ev[name]
+                if value is None and nullable:
+                    continue
+                if not isinstance(value, str) or (nonempty and not value.strip()):
+                    return False
+            return True
+
+        kind = ev.get("event")
+        if not text("at", "claim_uid", nonempty=True):
+            return False
+        if kind == "claim_created":
+            return (
+                text("target_raw", "target_identity", "target_identity_kind", "subject_kind", "subject_value",
+                     "predicate", "predicate_norm", "asserted_value", "asserted_value_norm", nonempty=True)
+                and text("statement", "source", nullable=True)
+                and ev.get("status", "CANDIDATE") in INITIAL_STATUSES
+                and isinstance(ev.get("inferred", False), bool)
+            )
+        if kind == "evidence_linked":
+            return (
+                text("evidence_uid", nonempty=True) and text("note", nullable=True)
+                and ev.get("relation", "SUPPORTS") in VALID_RELATIONS
+            )
+        if kind == "status_changed":
+            return (
+                text("reason", "caused_by", nullable=True)
+                and (ev.get("old_status") is None or ev.get("old_status") in VALID_STATUSES)
+                and ev.get("new_status", "CONTRADICTED") == "CONTRADICTED"
+            )
+        if kind == "edge":
+            return (
+                text("from_claim_uid", "to_claim_uid", nonempty=True) and text("note", nullable=True)
+                and ev.get("relation", "UNCOMPARABLE") in {"SUPERSEDES", "CONFLICTS_WITH", "UNCOMPARABLE"}
+            )
+        return False
+
     _APPLIERS = {
         "claim_created": "_apply_claim_created",
         "evidence_linked": "_apply_evidence_linked",
@@ -493,12 +542,12 @@ class ClaimIndex:
             logged_contradictions = {}
             for path in files:
                 try:
-                    ev = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
+                    ev = _strict_json_loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, RecursionError):
                     malformed += 1
                     continue
                 method_name = self._APPLIERS.get(ev.get("event")) if isinstance(ev, dict) else None
-                if not method_name:
+                if not method_name or not self._event_is_well_formed(ev):
                     malformed += 1
                     continue
                 events.append((method_name, ev))
