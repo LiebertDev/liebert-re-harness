@@ -297,9 +297,41 @@ def test_every_stop_reason_the_module_names_has_a_completion_that_is_never_a_gue
     assert emulate._completion("NO_SUCH_STOP") == "UNKNOWN"
     # Only RETURNED may claim the routine finished; a failed run must not read as a finished one.
     assert [k for k, v in emulate._COMPLETION.items() if v == "RETURNED"] == ["RETURNED"]
-    for unmapped in ("STOP_ADDRESS", "INT3", "INTERRUPT", "HLT", "PORT_IO", "UNMODELLED_VEX", "ENGINE_ERROR",
+    for unmapped in ("STOP_ADDRESS", "SENTINEL_REACHED", "INT3", "INTERRUPT", "HLT", "PORT_IO", "UNMODELLED_VEX", "ENGINE_ERROR",
                      "ENGINE_CRASH", "MEMORY_LIMIT", "UNKNOWN_STOP"):
         assert emulate._completion(unmapped) == "UNKNOWN"
+
+
+def test_reaching_the_sentinel_by_jmp_or_call_is_not_a_return(sandbox):
+    """Regression: completion was RETURNED whenever the sentinel was reached. A jmp (or call, or a push+ret that
+    leaves the stack unbalanced) into the sentinel is a stop at the sentinel, not a finished routine."""
+    for source in (f"mov rax, {SENTINEL}; jmp rax",
+                   f"mov rax, {SENTINEL}; call rax",
+                   f"mov rax, {SENTINEL}; push rax; ret"):
+        result = emulate_json(build(sandbox, asm(source)))
+        assert result["ok"] is True, source
+        assert result["stop_reason"] == "SENTINEL_REACHED", (source, result["stop_reason"])
+        assert result["completion"] == "UNKNOWN", source
+        assert result["stop_detail"]["not_verified_because"], source
+        assert result["rip"] == hex(SENTINEL)
+
+
+def test_a_ret_to_the_sentinel_is_still_a_return_with_or_without_prefixes_and_operand(sandbox):
+    for source in ("ret", "ret 8", "rep ret", "mov eax, 5; ret"):
+        result = emulate_json(build(sandbox, asm(source)))
+        assert (result["stop_reason"], result["completion"]) == ("RETURNED", "RETURNED"), source
+        assert "not_verified_because" not in result["stop_detail"]
+    assert emulate_json(build(sandbox, asm("ret 8")))["registers"]["rsp"] == hex(0x7FFC0000 - 0x100 + 8 + 8 + 8)
+
+
+def test_ret_check_reports_why_it_cannot_prove_a_return():
+    assert emulate._ret_check(b"", 0x1008, 0x1000) == "the last executed instruction could not be read"
+    assert emulate._ret_check(b"\xc3", 0x1008, 0x1000) is None
+    assert emulate._ret_check(b"\xc2\x10\x00", 0x1018, 0x1000) is None
+    assert emulate._ret_check(b"\xc3", 0x1000, 0x1000)                    # popped nothing
+    assert emulate._ret_check(b"\xff\xe0", 0x1008, 0x1000)                   # jmp rax
+    assert emulate._ret_check(b"\x66\xc3", 0x1008, 0x1000)                  # retw pops 2 bytes, not the sentinel
+    assert emulate._ret_check(b"\xc2", 0x1008, 0x1000)                 # truncated operand
 
 
 def test_a_run_that_never_started_has_no_completion(sandbox):

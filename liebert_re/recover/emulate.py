@@ -9,7 +9,11 @@ instructions run inside the emulator, in a separate interpreter. That interprete
 What stops a run (``stop_reason``). Every stop is a measurement, never a guess about what would have
 happened next:
 
-  ``RETURNED``          the entry routine returned to the sentinel return address pushed on the stack
+  ``RETURNED``          the entry routine returned to the sentinel return address pushed on the stack: the last
+                        instruction run was a ``ret`` and the stack pointer is where that ``ret`` leaves it
+  ``SENTINEL_REACHED``  control reached the sentinel address some other way (a ``jmp``, a ``call``, a ``ret`` with the
+                        stack elsewhere) or the last instruction could not be read; this is not a return, and
+                        ``stop_detail.not_verified_because`` says which check failed
   ``STOP_ADDRESS``      execution reached an address in ``stop_at`` (before executing it)
   ``IMPORT_CALL``       control reached an import slot's trap address; ``stop_detail.import`` is ``dll!name``
   ``SYSCALL``           a ``syscall`` or ``sysenter`` instruction (``stop_detail.number`` is RAX)
@@ -24,9 +28,11 @@ happened next:
   ``ENGINE_CRASH``      the emulator process died; whatever it had written is listed and ``unverified``
   ``UNKNOWN_STOP``      the engine returned and nothing explains why
 
-``ok`` only says a result record exists. ``completion`` says whether the routine finished: ``RETURNED``,
+``ok`` only says a result record exists. ``completion`` says whether the routine finished: ``RETURNED`` (only for a
+verified ``ret`` to the sentinel),
 ``STOPPED_AT_IMPORT``, ``STOPPED_AT_SYSCALL``, ``INSN_LIMIT``, ``TIMEOUT``, ``FAULT`` (a memory fault, a protection
-fault, ``UD2`` or an invalid encoding) or ``UNKNOWN`` (any other stop, including ``STOP_ADDRESS``); ``null`` when
+fault, ``UD2`` or an invalid encoding) or ``UNKNOWN`` (any other stop, including ``STOP_ADDRESS`` and
+``SENTINEL_REACHED``); ``null`` when
 nothing ran. ``limitations`` lists what weakens this particular run; an unreadable import directory is one (no slot
 is trapped, so the IMPORT_CALL guarantee is gone, and the run is kept because everything up to the call is still a
 real measurement).
@@ -123,15 +129,44 @@ _COMPLETION = {
     "UNMAPPED_READ": "FAULT", "UNMAPPED_WRITE": "FAULT", "UNMAPPED_FETCH": "FAULT", "READ_PROTECT": "FAULT",
     "WRITE_PROTECT": "FAULT", "FETCH_PROTECT": "FAULT", "INVALID_INSTRUCTION": "FAULT", "UD2": "FAULT",
 }
-_COMPLETION_BASIS = ("completion is derived from stop_reason alone: RETURNED only when control reached the sentinel "
-                     "return address; a stop this table does not name (STOP_ADDRESS, INT3, INTERRUPT, HLT, PORT_IO, "
-                     "UNMODELLED_VEX, ENGINE_ERROR, ENGINE_CRASH, MEMORY_LIMIT, UNKNOWN_STOP) is UNKNOWN, and null "
-                     "means no emulation ran. ok only says a result record exists")
+_COMPLETION_BASIS = ("completion is derived from stop_reason alone: RETURNED only when the last instruction run was a "
+                     "ret and it left the stack pointer where a return to the sentinel leaves it; reaching the sentinel "
+                     "by a jmp, a call or any other path is SENTINEL_REACHED, not a return; a stop this table does not "
+                     "name (STOP_ADDRESS, SENTINEL_REACHED, INT3, INTERRUPT, HLT, PORT_IO, UNMODELLED_VEX, "
+                     "ENGINE_ERROR, ENGINE_CRASH, MEMORY_LIMIT, UNKNOWN_STOP) is UNKNOWN, and null means no emulation "
+                     "ran. ok only says a result record exists")
 _IMPORT_UNREADABLE = {
     "code": "IMPORT_DIRECTORY_UNREADABLE",
     "detail": "the import directory could not be read, so no slot was trapped and the guarantee that a call into an "
               "import stops as IMPORT_CALL does not hold for this run; a call through an import slot ends as some "
               "other stop (usually an unmapped fetch) and cannot be told apart from a wild jump"}
+
+
+def _ret_check(code, rsp, slot):
+    """Why a fetch at the sentinel is not proven to be a ``ret`` returning to it, or None when it is proven.
+
+    ``code`` is the bytes of the last instruction run, ``rsp`` the stack pointer after it, ``slot`` the address of
+    the stack cell that held the sentinel at the start. Only ``ret`` / ``ret imm16`` (optionally after a REX or a
+    rep/bnd prefix) pops its target from the stack, and a pop of that cell leaves rsp at ``slot + 8 (+ imm16)``;
+    a ``jmp`` or ``call`` to the sentinel, or a ``ret`` that popped something else, fails one of the two."""
+    if not code:
+        return "the last executed instruction could not be read"
+    i = 0
+    if code[i] in (0xF2, 0xF3):
+        i += 1
+    if i < len(code) and 0x40 <= code[i] <= 0x4F:
+        i += 1
+    if i >= len(code):
+        return "the last executed instruction is not a ret"
+    if code[i] == 0xC3:
+        extra = 0
+    elif code[i] == 0xC2 and len(code) >= i + 3:
+        extra = code[i + 1] | (code[i + 2] << 8)
+    else:
+        return "the last executed instruction is not a ret"
+    if rsp != slot + 8 + extra:
+        return "the stack pointer is not where a ret that popped the sentinel slot leaves it"
+    return None
 
 
 def _completion(stop_reason):
@@ -1002,7 +1037,21 @@ class _Engine:
         if reason is None and fault:
             kind, address, size = fault[-1]
             if kind == "UNMAPPED_FETCH" and address == SENTINEL_VA:
-                reason, detail = "RETURNED", {"sentinel": _hx(SENTINEL_VA), "rax": _hx(uc.reg_read(UX.UC_X86_REG_RAX))}
+                try:
+                    last_code = bytes(uc.mem_read(last_addr, 16)) if executed else b""
+                except UcError:
+                    try:
+                        last_code = bytes(uc.mem_read(last_addr, 1)) if executed else b""
+                    except UcError:
+                        last_code = b""
+                detail = {"sentinel": _hx(SENTINEL_VA), "rax": _hx(uc.reg_read(UX.UC_X86_REG_RAX))}
+                why = _ret_check(last_code, uc.reg_read(UX.UC_X86_REG_RSP), regs["rsp"])
+                if why is None:
+                    reason = "RETURNED"
+                else:
+                    reason = "SENTINEL_REACHED"
+                    detail["not_verified_because"] = why
+                    detail["last_instruction_va"] = _hx(last_addr) if executed else None
             elif kind == "UNMAPPED_FETCH" and address in trap_table:
                 rsp = uc.reg_read(UX.UC_X86_REG_RSP)
                 try:
