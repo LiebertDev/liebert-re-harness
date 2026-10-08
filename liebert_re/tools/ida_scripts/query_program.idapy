@@ -130,11 +130,56 @@ def _job():
     return job, None
 
 
-def _safe(callable_, default=None):
+# ---- lookup errors and the query status ---------------------------------------------------------
+# Every answer says which of four things it is (``status``): ``OK``, ``NOT_FOUND`` (the lookup ran and found
+# nothing), ``UNRESOLVED`` (the name or address could not be resolved to anything to look at) and
+# ``QUERY_FAILED`` (the lookup itself did not run to the end). ``lookup_errors`` lists each sub-step that
+# raised, as ``STEP: ExceptionClass: short message`` (no path, at most ``_ERROR_MESSAGE_MAX`` characters);
+# an answer that still carries something while some sub-step failed is ``OK`` with ``partial: true``.
+# ``_safe`` records into one collector that ``_run`` resets before and reads after each operation.
+_ERROR_MESSAGE_MAX = 120
+_LOOKUP_ERRORS_MAX = 50
+_LOOKUP_ERRORS = {}
+
+
+def _error_entry(step, exc):
+    """``STEP: ExceptionClass: message`` with the message flattened, cut and stripped of anything path-like."""
+    words = ["<path>" if ("/" in word or "\\" in word) else word for word in str(exc).split()]
+    message = " ".join(words)[:_ERROR_MESSAGE_MAX]
+    return "%s: %s%s" % (step, type(exc).__name__, (": " + message) if message else "")
+
+
+def _record_lookup_error(step, exc=None, text=None):
+    entry = text if text is not None else _error_entry(step, exc)
+    _LOOKUP_ERRORS[entry] = _LOOKUP_ERRORS.get(entry, 0) + 1
+
+
+def _merged_lookup_errors(operation_errors):
+    """The operation's own entries, then the ones ``_safe`` collected; repeats are folded into ``(xN)``."""
+    counts = {}
+    for entry in list(operation_errors or []) + [e for e, n in _LOOKUP_ERRORS.items() for _ in range(n)]:
+        counts[entry] = counts.get(entry, 0) + 1
+    merged = [entry + (" (x%d)" % n if n > 1 else "") for entry, n in counts.items()]
+    if len(merged) > _LOOKUP_ERRORS_MAX:
+        merged = merged[:_LOOKUP_ERRORS_MAX] + ["LOOKUP_ERRORS_TRUNCATED: %d more" % (len(merged) - _LOOKUP_ERRORS_MAX)]
+    return merged
+
+
+def _safe(callable_, default=None, step="FIELD_READ", record=True):
+    """``callable_()``, or ``default`` when it raises. The failure is NOT silent: it is recorded under ``step``
+    in ``lookup_errors`` (``record=False`` only for a field whose absence is reported some other way)."""
     try:
         return callable_()
-    except Exception:  # noqa: BLE001 - one unavailable field never fails the query
+    except Exception as exc:  # noqa: BLE001 - one unavailable field never fails the query
+        if record:
+            _record_lookup_error(step, exc)
         return default
+
+
+def _bool_or_none(callable_, step):
+    """``bool(callable_())``, or None (never False) when the call raised: unknown stays unknown."""
+    value = _safe(callable_, None, step)
+    return None if value is None else bool(value)
 
 
 def _hex(value):
@@ -225,13 +270,13 @@ def _op_summary(result, query, max_results, offset):
     result["analysis_passes"] = passes
     result["analysis_unstable"] = unstable
     result["segment_count"] = sum(1 for _ in idautils.Segments())
-    result["hexrays_available"] = bool(_safe(ida_hexrays.init_hexrays_plugin, False))
-    result["hexrays_version"] = _safe(ida_hexrays.get_hexrays_version) if result["hexrays_available"] else None
-    result["processor"] = _safe(ida_ida.inf_get_procname)
-    result["is_64bit"] = _safe(ida_ida.inf_is_64bit)
-    result["file_type"] = _safe(ida_loader.get_file_type_name)
-    result["image_base"] = _hex(_safe(ida_nalt.get_imagebase))
-    result["ida_kernel_version"] = _safe(idaapi.get_kernel_version)
+    result["hexrays_available"] = bool(_safe(ida_hexrays.init_hexrays_plugin, False, "HEXRAYS_PLUGIN_INIT"))
+    result["hexrays_version"] = _safe(ida_hexrays.get_hexrays_version, None, "HEXRAYS_VERSION") if result["hexrays_available"] else None
+    result["processor"] = _safe(ida_ida.inf_get_procname, None, "PROCESSOR_NAME")
+    result["is_64bit"] = _safe(ida_ida.inf_is_64bit, None, "BITNESS")
+    result["file_type"] = _safe(ida_loader.get_file_type_name, None, "FILE_TYPE_NAME")
+    result["image_base"] = _hex(_safe(ida_nalt.get_imagebase, None, "IMAGE_BASE"))
+    result["ida_kernel_version"] = _safe(idaapi.get_kernel_version, None, "KERNEL_VERSION")
 
 
 def _op_list_functions(result, query, max_results, offset):
@@ -333,14 +378,22 @@ def _find_imports(name, budget, errors):
             if state["stop"]:
                 break
     except Exception as exc:  # noqa: BLE001
-        errors.append("IMPORT_LOOKUP_FAILED: %s: %s" % (type(exc).__name__, exc))
+        errors.append(_error_entry("IMPORT_LOOKUP_FAILED", exc))
     return found
 
 
 def _demangled_matches(query, budget, errors):
     """Addresses whose demangled name (short or long form) equals ``query``."""
     matches = []
-    forms = [f for f in (_safe(lambda: ida_name.MNG_SHORT_FORM), _safe(lambda: ida_name.MNG_LONG_FORM)) if f is not None]
+    forms = []
+    for label in ("MNG_SHORT_FORM", "MNG_LONG_FORM"):
+        try:
+            form = getattr(ida_name, label)
+        except Exception as exc:  # noqa: BLE001 - a missing form is a failed lookup, not "no demangled match"
+            errors.append(_error_entry("DEMANGLE_FORM_UNAVAILABLE", exc))
+            continue
+        if form is not None:
+            forms.append(form)
     try:
         for ea, mangled in idautils.Names():
             if budget.tick():
@@ -352,7 +405,7 @@ def _demangled_matches(query, budget, errors):
                     matches.append((ea, mangled))
                     break
     except Exception as exc:  # noqa: BLE001
-        errors.append("DEMANGLE_LOOKUP_FAILED: %s: %s" % (type(exc).__name__, exc))
+        errors.append(_error_entry("DEMANGLE_LOOKUP_FAILED", exc))
     return matches
 
 
@@ -419,15 +472,18 @@ def _op_xrefs_to(result, query, max_results, offset):
     result["candidate_count"] = len(candidates)
     result["candidates_truncated"] = len(candidates) > len(shown)
     result["ambiguous"] = len(candidates) > 1
-    if errors:
-        result["lookup_errors"] = errors
     if budget.tripped:
         result.update(budget.as_limited())
     call_types = (ida_xref.fl_CF, ida_xref.fl_CN)  # call far / call near; jumps are not calls
     refs = []
     for candidate in shown:
-        for xref in idautils.XrefsTo(candidate["ea"]):
-            refs.append((candidate["ea"], xref))
+        try:
+            for xref in idautils.XrefsTo(candidate["ea"]):
+                refs.append((candidate["ea"], xref))
+        except Exception as exc:  # noqa: BLE001 - a failed walk is not "no references"
+            errors.append(_error_entry("XREFS_ENUMERATION_FAILED", exc))
+    if errors:
+        result["lookup_errors"] = errors
     result["total_xref_count"] = len(refs)
     for target, xref in refs[offset:offset + max_results]:
         func = ida_funcs.get_func(xref.frm)
@@ -436,7 +492,7 @@ def _op_xrefs_to(result, query, max_results, offset):
             "to": hex(target),
             "from_function": ida_name.get_name(func.start_ea) if func else None,
             "type": xref.type,
-            "type_name": _safe(lambda: idautils.XrefTypeName(xref.type)),
+            "type_name": _safe(lambda: idautils.XrefTypeName(xref.type), None, "XREF_TYPE_NAME"),
             "kind": _kind(xref),
             "is_call": bool(xref.iscode) and xref.type in call_types,
         })
@@ -461,30 +517,42 @@ def _op_xrefs_from(result, query, max_results, offset):
     function_scope = bool(func) and func.start_ea == ea
     result["resolved_address"] = hex(ea)
     result["scope"] = "function" if function_scope else "address"
-    sources = list(idautils.FuncItems(ea)) if function_scope else [ea]
+    errors = []
+    sources = [ea]
+    if function_scope:
+        try:
+            sources = list(idautils.FuncItems(ea))
+        except Exception as exc:  # noqa: BLE001 - the fallback is stated: only the start address is scanned
+            errors.append(_error_entry("FUNCITEMS_ENUMERATION_FAILED", exc))
+            result["scope"] = "address"
     call_types = (ida_xref.fl_CF, ida_xref.fl_CN)
     budget = _Budget("xrefs_from")
     seen = 0
     for source in sources:
-        for xref in idautils.XrefsFrom(source, 0):
-            if xref.type == ida_xref.fl_F:
-                continue
-            if seen >= offset and len(result["items"]) < max_results:
-                result["items"].append({
-                    "from": hex(xref.frm),
-                    "to": hex(xref.to),
-                    "to_name": ida_name.get_name(xref.to) or None,
-                    "to_segment": idc.get_segm_name(xref.to) or None,
-                    "type": xref.type,
-                    "type_name": _safe(lambda: idautils.XrefTypeName(xref.type)),
-                    "kind": _kind(xref),
-                    "is_call": bool(xref.iscode) and xref.type in call_types,
-                })
-            seen += 1
-            if budget.tick():
-                break
+        try:
+            for xref in idautils.XrefsFrom(source, 0):
+                if xref.type == ida_xref.fl_F:
+                    continue
+                if seen >= offset and len(result["items"]) < max_results:
+                    result["items"].append({
+                        "from": hex(xref.frm),
+                        "to": hex(xref.to),
+                        "to_name": ida_name.get_name(xref.to) or None,
+                        "to_segment": idc.get_segm_name(xref.to) or None,
+                        "type": xref.type,
+                        "type_name": _safe(lambda: idautils.XrefTypeName(xref.type), None, "XREF_TYPE_NAME"),
+                        "kind": _kind(xref),
+                        "is_call": bool(xref.iscode) and xref.type in call_types,
+                    })
+                seen += 1
+                if budget.tick():
+                    break
+        except Exception as exc:  # noqa: BLE001 - a failed walk is not "no references"
+            errors.append(_error_entry("XREFS_ENUMERATION_FAILED", exc))
         if budget.tripped:
             break
+    if errors:
+        result["lookup_errors"] = errors
     result["total_xref_count"] = seen
     result["offset"] = offset
     following = offset + len(result["items"])
@@ -526,7 +594,7 @@ def _op_callers_of_import(result, query, max_results, offset):
             return
         seen.add(key)
         func = ida_funcs.get_func(frm)
-        mnemonic = _safe(lambda: idc.print_insn_mnem(frm))
+        mnemonic = _safe(lambda: idc.print_insn_mnem(frm), None, "INSN_MNEMONIC")
         rows.append({
             "_sort": (frm, entry["ea"]),
             "function_address": hex(func.start_ea) if func else None,
@@ -535,26 +603,32 @@ def _op_callers_of_import(result, query, max_results, offset):
             "mnemonic": mnemonic or None,
             "is_call": bool(mnemonic) and mnemonic.lower().startswith("call"),
             "kind": _kind(xref),
-            "type_name": _safe(lambda: idautils.XrefTypeName(xref.type)),
+            "type_name": _safe(lambda: idautils.XrefTypeName(xref.type), None, "XREF_TYPE_NAME"),
             "import_module": entry["module"],
             "import_slot": hex(entry["ea"]),
             "via_thunk": via_thunk,
         })
 
     for entry in used:
-        for xref in idautils.XrefsTo(entry["ea"]):
-            if budget.tick():
-                break
-            func = ida_funcs.get_func(xref.frm)
-            if func and (func.flags & ida_funcs.FUNC_THUNK):
-                thunk = {"address": hex(func.start_ea), "name": ida_name.get_name(func.start_ea) or None}
-                add_row(entry, xref.frm, xref)
-                for outer in idautils.XrefsTo(func.start_ea):
-                    if budget.tick():
-                        break
-                    add_row(entry, outer.frm, outer, thunk)
-            else:
-                add_row(entry, xref.frm, xref)
+        try:
+            for xref in idautils.XrefsTo(entry["ea"]):
+                if budget.tick():
+                    break
+                func = ida_funcs.get_func(xref.frm)
+                if func and (func.flags & ida_funcs.FUNC_THUNK):
+                    thunk = {"address": hex(func.start_ea), "name": ida_name.get_name(func.start_ea) or None}
+                    add_row(entry, xref.frm, xref)
+                    try:
+                        for outer in idautils.XrefsTo(func.start_ea):
+                            if budget.tick():
+                                break
+                            add_row(entry, outer.frm, outer, thunk)
+                    except Exception as exc:  # noqa: BLE001 - the thunk's own callers are one level deeper
+                        errors.append(_error_entry("THUNK_XREFS_ENUMERATION_FAILED", exc))
+                else:
+                    add_row(entry, xref.frm, xref)
+        except Exception as exc:  # noqa: BLE001 - a failed walk is not "no references"
+            errors.append(_error_entry("XREFS_ENUMERATION_FAILED", exc))
         if budget.tripped:
             break
     rows.sort(key=lambda r: r["_sort"])
@@ -698,15 +772,24 @@ def _op_strings(result, query, max_results, offset):
     budget = _Budget("strings")
     needle = (query or "").lower()
     scanned = matched = 0
+    errors = []
     try:
-        listing = idautils.Strings()
-    except Exception:  # noqa: BLE001
-        listing = []
-    for entry in listing:
+        listing = iter(idautils.Strings())
+    except Exception as exc:  # noqa: BLE001 - an enumeration that did not start is not "no strings"
+        errors.append(_error_entry("STRINGS_ENUMERATION_FAILED", exc))
+        listing = iter(())
+    while True:
+        try:
+            entry = next(listing)
+        except StopIteration:
+            break
+        except Exception as exc:  # noqa: BLE001 - what was read so far stays, the cut is stated
+            errors.append(_error_entry("STRINGS_ENUMERATION_FAILED", exc))
+            break
         if not needle and len(result["items"]) >= max_results:
             break
         scanned += 1
-        value = _safe(lambda: str(entry))
+        value = _safe(lambda: str(entry), None, "STRING_DECODE")
         if not needle or (value is not None and needle in value.lower()):
             matched += 1
             if matched > offset and len(result["items"]) < max_results:
@@ -718,6 +801,11 @@ def _op_strings(result, query, max_results, offset):
                 })
         if budget.tick():
             break
+    if errors:
+        result["lookup_errors"] = errors
+        if not scanned:
+            result["ok"] = False
+            result["error"] = "STRINGS_ENUMERATION_FAILED"
     result["items_scanned"] = scanned
     result["items_matched"] = matched
     result["offset"] = offset
@@ -771,7 +859,7 @@ def _op_type_member_offset(result, query, max_results, offset):
         if index is None or index < 0:
             listed = []
             for i in range(min(member_count, _MEMBER_NAME_LIST_LIMIT)):
-                listed.append(_safe(lambda: tif.get_udm(i)[1].name))
+                listed.append(_safe(lambda: tif.get_udm(i)[1].name, None, "TYPE_MEMBER_NAME_LIST"))
             result["ok"] = False
             result["error"] = "MEMBER_NOT_FOUND"
             result["resolved_type_name"] = name
@@ -792,9 +880,9 @@ def _op_type_member_offset(result, query, max_results, offset):
         result["byte_aligned"] = bits % 8 == 0
         result["member_size_bits"] = member.size
         result["member_size_bytes"] = (member.size // 8) if member.size and member.size % 8 == 0 else None
-        result["member_type"] = _safe(lambda: str(member.type))
-        result["is_bitfield"] = bool(_safe(member.is_bitfield, False))
-        result["struct_size_bytes"] = _safe(tif.get_size)
+        result["member_type"] = _safe(lambda: str(member.type), None, "MEMBER_TYPE")
+        result["is_bitfield"] = _bool_or_none(member.is_bitfield, "MEMBER_IS_BITFIELD")
+        result["struct_size_bytes"] = _safe(tif.get_size, None, "STRUCT_SIZE")
         result["member_count"] = member_count
         return
     result["ok"] = False
@@ -1206,7 +1294,7 @@ def _import_slots(errors):
                 errors.append("IMPORT_SLOT_WALK_LIMIT")
                 break
     except Exception as exc:  # noqa: BLE001
-        errors.append("IMPORT_LOOKUP_FAILED: %s: %s" % (type(exc).__name__, exc))
+        errors.append(_error_entry("IMPORT_LOOKUP_FAILED", exc))
     return slots
 
 
@@ -1348,8 +1436,23 @@ def _frame_landmark(name, func):
     by_address = getattr(ida_frame, name + "_ea", None)
     try:
         return int(by_address(func.start_ea)) if by_address is not None else int(getattr(ida_frame, name)(func))
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - recorded: a region left null is explained by this entry
+        _record_lookup_error("STACK_FRAME_LANDMARK_" + name.upper(), exc)
         return None
+
+
+def _udm_at(tif, index, step):
+    """``tif.get_udm(index)`` as ``(index, udm)``, or None. Why it is None (an exception, or no member at that
+    index) is recorded in ``lookup_errors``; the caller must not read a skipped member as an absent one."""
+    try:
+        found = tif.get_udm(index)
+    except Exception as exc:  # noqa: BLE001
+        _record_lookup_error(step, exc)
+        return None
+    if not found or len(found) < 2 or found[1] is None:
+        _record_lookup_error(step, text="%s: get_udm returned no member" % step)
+        return None
+    return found
 
 
 def _member_json(index, udm):
@@ -1358,8 +1461,8 @@ def _member_json(index, udm):
     return {
         "index": index, "offset": bits // 8, "offset_bits": bits, "byte_aligned": bits % 8 == 0,
         "name": udm.name or None, "size": (size_bits // 8) if size_bits and size_bits % 8 == 0 else None,
-        "size_bits": size_bits, "type_str": _safe(lambda: str(udm.type)),
-        "is_bitfield": bool(_safe(udm.is_bitfield, False)),
+        "size_bits": size_bits, "type_str": _safe(lambda: str(udm.type), None, "MEMBER_TYPE"),
+        "is_bitfield": _bool_or_none(udm.is_bitfield, "MEMBER_IS_BITFIELD"),
     }
 
 
@@ -1387,7 +1490,7 @@ def _op_stack_frame(result, query, max_results, offset):
     args = _frame_landmark("frame_off_args", func)
     members = []
     for index in range(tif.get_udt_nmembers()):
-        found = _safe(lambda i=index: tif.get_udm(i))
+        found = _udm_at(tif, index, "STACK_FRAME_MEMBER_UNREADABLE")
         if not found:
             continue
         entry = _member_json(index, found[1])
@@ -1407,10 +1510,10 @@ def _op_stack_frame(result, query, max_results, offset):
         entry["offset_from_return_address"] = (position - retaddr) if retaddr is not None else None
         members.append(entry)
     result["function"] = {"address": hex(func.start_ea), "name": ida_name.get_name(func.start_ea) or None}
-    result["frame_size"] = _safe(lambda: int(ida_frame.get_frame_size_ea(func.start_ea)))
-    result["locals_size"] = _safe(lambda: int(func.frsize))
-    result["saved_registers_size"] = _safe(lambda: int(func.frregs))
-    result["arguments_size"] = _safe(lambda: int(func.argsize))
+    result["frame_size"] = _safe(lambda: int(ida_frame.get_frame_size_ea(func.start_ea)), None, "FRAME_SIZE")
+    result["locals_size"] = _safe(lambda: int(func.frsize), None, "FRAME_LOCALS_SIZE")
+    result["saved_registers_size"] = _safe(lambda: int(func.frregs), None, "FRAME_SAVED_REGISTERS_SIZE")
+    result["arguments_size"] = _safe(lambda: int(func.argsize), None, "FRAME_ARGUMENTS_SIZE")
     result["landmarks"] = {"saved_registers_offset": saved, "return_address_offset": retaddr, "arguments_offset": args}
     result["landmarks_note"] = ("offsets are bytes from the start of the frame as IDA numbers it; `frame_size` is IDA's "
                                 "locals + saved registers + return address; `arguments_size` is what IDA recorded "
@@ -1419,27 +1522,27 @@ def _op_stack_frame(result, query, max_results, offset):
 
 
 def _mreg_name(reg, width):
-    return _safe(lambda: ida_hexrays.get_mreg_name(reg, width)) or None
+    return _safe(lambda: ida_hexrays.get_mreg_name(reg, width), None, "REGISTER_NAME") or None
 
 
 def _lvar_location(lvar):
     loc = lvar.location
-    width = _safe(lambda: int(lvar.width), 0) or 0
-    if _safe(loc.is_stkoff, False):
-        return {"kind": "stack", "stack_offset": _safe(loc.stkoff),
+    width = _safe(lambda: int(lvar.width), 0, "LVAR_WIDTH") or 0
+    if _safe(loc.is_stkoff, False, "LVAR_LOCATION_KIND"):
+        return {"kind": "stack", "stack_offset": _safe(loc.stkoff, None, "LVAR_STACK_OFFSET"),
                 "basis": "Hex-Rays' own stack offset for the variable, not translated to IDA's frame offset"}
-    if _safe(loc.is_reg1, False):
-        return {"kind": "register", "register": _mreg_name(loc.reg1(), width), "register_number": _safe(loc.reg1),
-                "register_offset": _safe(loc.regoff)}
-    if _safe(loc.is_reg2, False):
+    if _safe(loc.is_reg1, False, "LVAR_LOCATION_KIND"):
+        return {"kind": "register", "register": _mreg_name(loc.reg1(), width), "register_number": _safe(loc.reg1, None, "LVAR_REGISTER"),
+                "register_offset": _safe(loc.regoff, None, "LVAR_REGISTER_OFFSET")}
+    if _safe(loc.is_reg2, False, "LVAR_LOCATION_KIND"):
         half = (width // 2) or width
         return {"kind": "register_pair", "registers": [_mreg_name(loc.reg1(), half), _mreg_name(loc.reg2(), half)]}
-    if _safe(loc.is_scattered, False):
+    if _safe(loc.is_scattered, False, "LVAR_LOCATION_KIND"):
         return {"kind": "scattered"}
-    if _safe(loc.is_rrel, False):
+    if _safe(loc.is_rrel, False, "LVAR_LOCATION_KIND"):
         return {"kind": "register_relative"}
-    if _safe(loc.is_ea, False):
-        return {"kind": "static", "address": _hex(_safe(loc.get_ea))}
+    if _safe(loc.is_ea, False, "LVAR_LOCATION_KIND"):
+        return {"kind": "static", "address": _hex(_safe(loc.get_ea, None, "LVAR_ADDRESS"))}
     return {"kind": "unknown"}
 
 
@@ -1467,8 +1570,8 @@ def _op_local_variables(result, query, max_results, offset):
     rows = []
     for index, lvar in enumerate(cfunc.lvars):
         rows.append({
-            "index": index, "name": lvar.name or None, "type": _safe(lambda v=lvar: str(v.type())),
-            "is_arg": bool(lvar.is_arg_var), "size": _safe(lambda v=lvar: int(v.width)),
+            "index": index, "name": lvar.name or None, "type": _safe(lambda v=lvar: str(v.type()), None, "LVAR_TYPE"),
+            "is_arg": bool(lvar.is_arg_var), "size": _safe(lambda v=lvar: int(v.width), None, "LVAR_SIZE"),
             "location": _lvar_location(lvar),
         })
     result["decompiler"] = "hexrays"
@@ -1595,7 +1698,7 @@ def _op_find_immediate(result, query, max_results, offset):
 
 
 def _tinfo_size(tif):
-    size = _safe(tif.get_size)
+    size = _safe(tif.get_size, None, "STRUCT_SIZE")
     return None if size is None or size == _U64 else size
 
 
@@ -1618,14 +1721,14 @@ def _op_list_structs(result, query, max_results, offset):
         tif = ida_typeinf.tinfo_t()
         if not tif.get_numbered_type(til, ordinal) or not tif.is_udt():
             continue
-        name = _safe(tif.get_type_name)
+        name = _safe(tif.get_type_name, None, "STRUCT_NAME")
         if needle and needle not in (name or "").lower():
             continue
         matched += 1
         if matched > offset and len(result["items"]) < max_results:
             result["items"].append({
                 "name": name, "ordinal": ordinal, "kind": "union" if tif.is_union() else "struct",
-                "size": _tinfo_size(tif), "member_count": _safe(tif.get_udt_nmembers),
+                "size": _tinfo_size(tif), "member_count": _safe(tif.get_udt_nmembers, None, "STRUCT_MEMBER_COUNT"),
             })
     result["total_struct_count"] = matched
     result["offset"] = offset
@@ -1659,7 +1762,7 @@ def _op_get_struct(result, query, max_results, offset):
             continue
         members = []
         for index in range(tif.get_udt_nmembers()):
-            found = _safe(lambda i=index: tif.get_udm(i))
+            found = _udm_at(tif, index, "STRUCT_MEMBER_UNREADABLE")
             if found:
                 members.append(_member_json(index, found[1]))
         result["resolved_type_name"] = candidate
@@ -1681,17 +1784,17 @@ def _op_flirt_signatures(result, query, max_results, offset):
         return _fail(result, "UNEXPECTED_QUERY", "flirt_signatures takes no query.")
     states = {}
     for label in ("APPLIED", "PLANNED", "CURRENT"):
-        value = _safe(lambda l=label: getattr(ida_funcs, "IDASGN_" + l))
+        value = _safe(lambda l=label: getattr(ida_funcs, "IDASGN_" + l), None, "FLIRT_STATE_CONSTANT")
         if value is not None:
             states[value] = label.lower()
     rows = []
     for index in range(ida_funcs.get_idasgn_qty()):
-        desc = _safe(lambda i=index: ida_funcs.get_idasgn_desc_with_matches(i))
+        desc = _safe(lambda i=index: ida_funcs.get_idasgn_desc_with_matches(i), None, "FLIRT_DESCRIPTION")
         name = desc[0] if desc else None
-        state = _safe(lambda i=index: ida_funcs.calc_idasgn_state(i))
+        state = _safe(lambda i=index: ida_funcs.calc_idasgn_state(i), None, "FLIRT_STATE")
         rows.append({
             "index": index, "name": name,
-            "title": _safe(lambda n=name: ida_funcs.get_idasgn_title(n)) if name else None,
+            "title": _safe(lambda n=name: ida_funcs.get_idasgn_title(n), None, "FLIRT_TITLE") if name else None,
             "optional_libraries": (desc[1] or None) if desc else None,
             "matched_function_count": desc[2] if desc and len(desc) > 2 else None,
             "state": (states.get(state, "UNKNOWN")) if state is not None else None,
@@ -1769,17 +1872,80 @@ def _discard_session_changes():
         return False
 
 
+# ---- the query status ---------------------------------------------------------------------------
+# An error code that means the name or address could not be resolved to anything to look at.
+_UNRESOLVED_ERRORS = frozenset({
+    "SYMBOL_NOT_FOUND", "IMPORT_NOT_FOUND", "FUNCTION_NOT_FOUND", "TYPE_NOT_FOUND", "TYPE_NOT_STRUCT_OR_UNION",
+    "ADDRESS_NOT_MAPPED", "SEGMENT_NOT_FOUND",
+})
+# The target resolved and the lookup ran, and it holds no such thing.
+_NOT_FOUND_ERRORS = frozenset({"MEMBER_NOT_FOUND", "NO_STACK_FRAME"})
+# Where an answer's size is counted, per operation. An operation that is not listed (a summary, a byte read, a
+# decompile, a call graph that always holds its root) is never called NOT_FOUND. A count the operation did not
+# set is not read as zero.
+_ANSWER_COUNT_KEYS = {
+    "list_functions": "total_function_count", "segments": "total_segment_count", "xrefs_to": "total_xref_count",
+    "strings": "items_matched", "xrefs_from": "total_xref_count", "callers_of_import": "total_caller_count",
+    "disasm_range": "total_row_count", "basic_blocks": "total_block_count", "stack_frame": "total_member_count",
+    "local_variables": "total_variable_count", "find_bytes": "matches_seen", "find_immediate": "matches_seen",
+    "list_structs": "total_struct_count", "get_struct": "total_member_count",
+    "flirt_signatures": "total_signature_count",
+}
+
+
+def _answer_is_empty(result, operation):
+    if operation == "imports_exports":
+        return not result.get("items") and not result.get("exports") and not result.get("offset")
+    key = _ANSWER_COUNT_KEYS.get(operation)
+    count = result.get(key) if key else None
+    return isinstance(count, int) and not isinstance(count, bool) and count == 0
+
+
+def _apply_status(result, operation):
+    """Set ``status`` (OK / NOT_FOUND / UNRESOLVED / QUERY_FAILED), ``partial`` and ``lookup_errors`` (always a
+    list). A lookup that raised never reads as "not found": a not-found answer with errors recorded for the
+    lookup itself is QUERY_FAILED, and a successful empty answer with errors is an incomplete lookup. Fields the
+    operation already set are kept."""
+    operation_errors = list(result.get("lookup_errors") or [])
+    errors = _merged_lookup_errors(operation_errors)
+    result["lookup_errors"] = errors
+    error = result.get("error")
+    if not result.get("ok"):
+        if operation_errors and error in (_UNRESOLVED_ERRORS | _NOT_FOUND_ERRORS):
+            status = "QUERY_FAILED"      # the resolution step itself raised: "not found" would be a guess
+        elif error in _UNRESOLVED_ERRORS:
+            status = "UNRESOLVED"
+        elif error in _NOT_FOUND_ERRORS:
+            status = "NOT_FOUND"
+        else:
+            status = "QUERY_FAILED"
+        result["status"], result["partial"] = status, False
+        return
+    if _answer_is_empty(result, operation):
+        if errors:
+            result["ok"] = False
+            result["error"] = "LOOKUP_INCOMPLETE"
+            result["detail"] = ("The answer is empty but a sub-step of the lookup failed (see lookup_errors), so "
+                                "'nothing found' is not established.")
+            result["status"], result["partial"] = "QUERY_FAILED", False
+        else:
+            result["status"], result["partial"] = "NOT_FOUND", False
+        return
+    result["status"], result["partial"] = "OK", bool(errors)
+
+
 def _stamp_input_identity(result):
     """What idat says it analysed. The wrapper compares this with the hash of
     the file the caller named, so a cache slot whose bytes drifted from its
     name cannot return a result computed over the wrong file."""
-    result["engine_input_sha256"] = _hexdigest(_safe(ida_nalt.retrieve_input_file_sha256))
-    result["engine_input_md5"] = _hexdigest(_safe(ida_nalt.retrieve_input_file_md5))
+    result["engine_input_sha256"] = _hexdigest(_safe(ida_nalt.retrieve_input_file_sha256, None, "INPUT_SHA256", record=False))
+    result["engine_input_md5"] = _hexdigest(_safe(ida_nalt.retrieve_input_file_md5, None, "INPUT_MD5", record=False))
 
 
 def _run(job):
     operation = str(job.get("operation") or "")
     result = {"ok": True, "tool": "ida_query", "operation": operation, "items": []}
+    _LOOKUP_ERRORS.clear()
     try:
         if operation not in _DISPATCH:
             result["ok"] = False
@@ -1806,10 +1972,13 @@ def _run(job):
                 offset = max(0, int(job.get("offset") or 0))
                 _DISPATCH[operation](result, str(job.get("query") or ""), max_results, offset)
                 result["count"] = len(result["items"])
-    except Exception:  # noqa: BLE001
+        _apply_status(result, operation)
+    except Exception as exc:  # noqa: BLE001
         discarded = result.get("database_changes_discarded")
         result = {"ok": False, "tool": "ida_query", "operation": operation,
-                  "error": "IDAPYTHON_SCRIPT_EXCEPTION", "traceback": traceback.format_exc()}
+                  "error": "IDAPYTHON_SCRIPT_EXCEPTION", "traceback": traceback.format_exc(),
+                  "status": "QUERY_FAILED", "partial": False,
+                  "lookup_errors": _merged_lookup_errors([_error_entry("QUERY_EXCEPTION", exc)])}
         if discarded is not None:
             result["database_changes_discarded"] = discarded  # the signal outlives the failure
     _stamp_input_identity(result)
@@ -1838,7 +2007,7 @@ def main():
             # every other operation from a second, reopen-mode session, so the
             # cached database is the pristine analysis. The wrapper promotes
             # the file only after every success signal agrees.
-            _safe(lambda: ida_loader.save_database("", 0))
+            _safe(lambda: ida_loader.save_database("", 0), None, "SAVE_DATABASE", record=False)
         return 0
     except Exception:  # noqa: BLE001
         traceback.print_exc()

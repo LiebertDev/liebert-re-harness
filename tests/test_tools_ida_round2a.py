@@ -408,6 +408,16 @@ class TypeMemberOffsetTests(Round2aCase):
         self.assertTrue((self.ev_type / data["internal_evidence_name"]).is_file())     # a refusal leaves evidence too
         self.assertEqual(self.t()["database_cache"], "HIT")                            # and the cache is intact
 
+    def test_the_workers_lookup_status_is_carried_beside_the_run_status_not_over_it(self):
+        self.fake.type_result = "member_missing"
+        original = self.fake._body
+        self.fake._body = lambda job, sha: {**original(job, sha), "status": "NOT_FOUND", "partial": False,
+                                            "lookup_errors": []}
+        data = self.t(member="Nope")
+        self.assertEqual((data["ok"], data["status"]), (False, "ANALYSIS_LIMITED"))
+        self.assertEqual(data["query_result"], {"status": "NOT_FOUND", "partial": False, "lookup_errors": []})
+        self.assertNotIn("partial", data)
+
     @pytest.mark.contract
     def test_a_result_without_integer_offsets_is_not_an_answer(self):
         self.fake.type_result = "incomplete"

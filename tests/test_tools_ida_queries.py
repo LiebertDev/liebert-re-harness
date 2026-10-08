@@ -24,6 +24,11 @@ The second half of the file covers the ten read-only listing operations (`disasm
 indirect calls are counted and never resolved, a missing frame or decompiler is an error, every
 listing is bounded and paged, the wrapper and the worker refuse the same requests, and the new
 worker code calls nothing that writes.
+
+The last section pins the difference between "not found" and "could not look": every answer carries
+`status` (OK / NOT_FOUND / UNRESOLVED / QUERY_FAILED), `partial` and `lookup_errors`, an error inside a
+lookup is never read as an empty result, an unknown bitfield flag is null, and the wrapper carries all of it
+upward as `query_result` without touching its own run-level `status`.
 """
 from __future__ import annotations
 
@@ -1416,3 +1421,436 @@ class ListingWrapperTests(IdaCase):
         self.assertLess(len(data["items"]), 300)
         self.assertEqual(data["next_offset"], len(data["items"]))
         self.assertLessEqual(len(json.dumps(data)), 6200)
+
+
+# ===========================================================================
+# "not found" is told apart from "could not look": status / partial / lookup_errors
+#
+# Every answer carries `status` (OK / NOT_FOUND / UNRESOLVED / QUERY_FAILED), `partial` and a
+# `lookup_errors` list. These cases run the worker's `_run` (which sets them) against the same stubs;
+# the cases above call the operation functions directly and so see none of the three.
+# ===========================================================================
+def _status_run(module, operation, query="", max_results=200, offset=0):
+    return module._run({"operation": operation, "query": query, "max_results": max_results, "offset": offset,
+                        "mode": "idalib"})
+
+
+def _boom(message="boom"):
+    def raiser(*args, **kwargs):
+        raise RuntimeError(message)
+    return raiser
+
+
+def _shape(result):
+    return result["status"], result["ok"], result["partial"]
+
+
+# ---- xrefs_to ----
+def test_xrefs_to_a_successful_empty_answer_is_not_found(worker):
+    module, _ida, db = worker
+    db.names["t"] = 0x1100
+    r = _status_run(module, "xrefs_to", "t")
+    assert _shape(r) == ("NOT_FOUND", True, False) and r["lookup_errors"] == [] and r["items"] == []
+
+
+def test_xrefs_to_with_references_is_ok_and_not_partial(worker):
+    module, _ida, db = worker
+    db.names["t"] = 0x1100
+    db.refs_to[0x1100] = [_xref(0x1010, 0x1100, 17, True)]
+    r = _status_run(module, "xrefs_to", "t")
+    assert _shape(r) == ("OK", True, False) and r["lookup_errors"] == []
+
+
+def test_xrefs_to_an_unresolvable_name_is_unresolved(worker):
+    module, _ida, _db = worker
+    r = _status_run(module, "xrefs_to", "NoSuchThing")
+    assert _shape(r) == ("UNRESOLVED", False, False) and r["error"] == "SYMBOL_NOT_FOUND" and r["lookup_errors"] == []
+
+
+def test_xrefs_to_a_raising_reference_walk_is_query_failed_never_not_found(worker):
+    module, ida, db = worker
+    db.names["t"] = 0x1100
+    ida["idautils"].XrefsTo.side_effect = _boom("walk died in D:\\scratch\\run\\x.dll")
+    r = _status_run(module, "xrefs_to", "t")
+    assert (r["status"], r["ok"]) == ("QUERY_FAILED", False) and r["error"] == "LOOKUP_INCOMPLETE"
+    assert r["lookup_errors"] == ["XREFS_ENUMERATION_FAILED: RuntimeError: walk died in <path>"]
+    assert "scratch" not in json.dumps(r["lookup_errors"])
+
+
+def test_xrefs_to_one_failing_candidate_leaves_the_other_listed_as_partial(worker):
+    module, ida, db = worker
+    db.names["Open"] = 0x1500
+    db.imports = [("K", "Open", None, 0x4010)]
+    db.refs_to[0x1500] = [_xref(0x1010, 0x1500, 17, True)]
+
+    def walk(ea, flags=0):
+        if ea == 0x4010:
+            raise RuntimeError("slot walk died")
+        return iter(db.refs_to.get(ea, []))
+
+    ida["idautils"].XrefsTo.side_effect = walk
+    r = _status_run(module, "xrefs_to", "Open")
+    assert _shape(r) == ("OK", True, True) and [i["from"] for i in r["items"]] == ["0x1010"]
+    assert r["lookup_errors"] == ["XREFS_ENUMERATION_FAILED: RuntimeError: slot walk died"]
+
+
+def test_xrefs_to_a_name_that_did_not_resolve_because_a_lookup_raised_is_query_failed(worker):
+    """The silent-empty bug: a broken import-table walk used to end as a plain "not found"."""
+    module, _ida, db = worker
+    db.imports = [("K", "x", None, 0x4010)]
+    db.import_enum_error = RuntimeError("enum broke")
+    r = _status_run(module, "xrefs_to", "target")
+    assert _shape(r) == ("QUERY_FAILED", False, False) and r["error"] == "SYMBOL_NOT_FOUND"
+    assert r["lookup_errors"] == ["IMPORT_LOOKUP_FAILED: RuntimeError: enum broke"]
+
+
+def test_xrefs_to_a_missing_demangle_form_is_a_lookup_error_not_a_no_match(worker):
+    module, ida, db = worker
+    db.names["?Run@@YAXXZ"] = 0x1100
+    db.mangled["?Run@@YAXXZ"] = "Run(void)"
+    del ida["ida_name"].MNG_SHORT_FORM
+    r = _status_run(module, "xrefs_to", "Nope(void)")
+    assert r["status"] == "QUERY_FAILED"
+    assert any(e.startswith("DEMANGLE_FORM_UNAVAILABLE: AttributeError") for e in r["lookup_errors"])
+
+
+def test_xrefs_to_an_empty_answer_beside_a_failed_lookup_is_not_a_not_found(worker):
+    module, _ida, db = worker
+    db.names["target"] = 0x1100
+    db.imports = [("K", "x", None, 0x4010)]
+    db.import_enum_error = RuntimeError("enum broke")
+    r = _status_run(module, "xrefs_to", "target")
+    assert (r["status"], r["ok"], r["error"]) == ("QUERY_FAILED", False, "LOOKUP_INCOMPLETE")
+    assert r["lookup_errors"] == ["IMPORT_LOOKUP_FAILED: RuntimeError: enum broke"]
+
+
+def test_xrefs_to_an_unexpected_exception_is_query_failed_with_the_exception_class(worker):
+    module, ida, db = worker
+    db.names["t"] = 0x1100
+    ida["idc"].get_name_ea_simple.side_effect = KeyError("internal")
+    r = _status_run(module, "xrefs_to", "t")
+    assert (r["status"], r["ok"], r["error"]) == ("QUERY_FAILED", False, "IDAPYTHON_SCRIPT_EXCEPTION")
+    assert r["lookup_errors"] == ["QUERY_EXCEPTION: KeyError: 'internal'"] and r["partial"] is False
+
+
+def test_a_repeated_failure_is_folded_into_one_counted_entry(worker):
+    module, ida, db = worker
+    db.names["t"] = 0x1100
+    db.refs_to[0x1100] = [_xref(0x1000 + i, 0x1100, 17, True) for i in range(3)]
+    ida["idautils"].XrefTypeName.side_effect = _boom("no name")
+    r = _status_run(module, "xrefs_to", "t")
+    assert _shape(r) == ("OK", True, True) and r["lookup_errors"] == ["XREF_TYPE_NAME: RuntimeError: no name (x3)"]
+    assert [i["type_name"] for i in r["items"]] == [None, None, None]
+
+
+# ---- xrefs_from ----
+def test_xrefs_from_empty_unresolved_and_failed(worker):
+    module, ida, db = worker
+    db.names["lone"] = 0x1000
+    r = _status_run(module, "xrefs_from", "lone")
+    assert _shape(r) == ("NOT_FOUND", True, False)
+    assert _shape(_status_run(module, "xrefs_from", "nope")) == ("UNRESOLVED", False, False)
+    ida["idautils"].XrefsFrom.side_effect = _boom("from died")
+    r = _status_run(module, "xrefs_from", "lone")
+    assert (r["status"], r["error"]) == ("QUERY_FAILED", "LOOKUP_INCOMPLETE")
+    assert r["lookup_errors"] == ["XREFS_ENUMERATION_FAILED: RuntimeError: from died"]
+
+
+def test_xrefs_from_a_failed_function_item_walk_falls_back_to_the_address_and_says_so(worker):
+    module, ida, db = worker
+    _function_with_refs(db)
+    db.refs_from[0x1000] = [_xref(0x1000, 0x3000, 1, False)]
+    ida["idautils"].FuncItems.side_effect = _boom("items died")
+    r = _status_run(module, "xrefs_from", "func")
+    assert _shape(r) == ("OK", True, True) and r["scope"] == "address" and [i["to"] for i in r["items"]] == ["0x3000"]
+    assert r["lookup_errors"] == ["FUNCITEMS_ENUMERATION_FAILED: RuntimeError: items died"]
+
+
+# ---- callers_of_import ----
+def test_callers_of_import_empty_unresolved_and_failed(worker):
+    module, ida, db = worker
+    db.imports = [("K", "CreateFileW", None, 0x4010)]
+    assert _shape(_status_run(module, "callers_of_import", "CreateFileW")) == ("NOT_FOUND", True, False)
+    r = _status_run(module, "callers_of_import", "Nope")
+    assert _shape(r) == ("UNRESOLVED", False, False) and r["error"] == "IMPORT_NOT_FOUND"
+    ida["idautils"].XrefsTo.side_effect = _boom("callers died")
+    r = _status_run(module, "callers_of_import", "CreateFileW")
+    assert (r["status"], r["error"]) == ("QUERY_FAILED", "LOOKUP_INCOMPLETE")
+    assert r["lookup_errors"] == ["XREFS_ENUMERATION_FAILED: RuntimeError: callers died"]
+
+
+def test_callers_of_import_a_broken_import_walk_is_query_failed_not_import_not_found(worker):
+    module, _ida, db = worker
+    db.imports = [("K", "x", None, 0x4010)]
+    db.import_enum_error = RuntimeError("enum broke")
+    r = _status_run(module, "callers_of_import", "CreateFileW")
+    assert (r["status"], r["error"]) == ("QUERY_FAILED", "IMPORT_NOT_FOUND")
+    assert r["lookup_errors"] == ["IMPORT_LOOKUP_FAILED: RuntimeError: enum broke"]
+
+
+# ---- strings ----
+class _Str:
+    def __init__(self, ea, text):
+        self.ea, self.length, self.strtype, self.text = ea, len(text or ""), 0, text
+
+    def __str__(self):
+        if self.text is None:
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad byte")
+        return self.text
+
+
+def _strings_world(ida):
+    ida["idaapi"].get_fileregion_offset.return_value = 0x200
+    ida["ida_nalt"].get_imagebase.return_value = 0x400000
+
+
+def test_strings_empty_is_not_found_and_a_raising_enumeration_is_query_failed(worker):
+    module, ida, _db = worker
+    _strings_world(ida)
+    ida["idautils"].Strings.side_effect = lambda: iter(())
+    r = _status_run(module, "strings", "")
+    assert _shape(r) == ("NOT_FOUND", True, False) and r["items_scanned"] == 0
+    ida["idautils"].Strings.side_effect = _boom("strings died")
+    r = _status_run(module, "strings", "")
+    assert (r["status"], r["ok"], r["error"]) == ("QUERY_FAILED", False, "STRINGS_ENUMERATION_FAILED")
+    assert r["lookup_errors"] == ["STRINGS_ENUMERATION_FAILED: RuntimeError: strings died"]
+
+
+def test_strings_a_walk_that_dies_midway_keeps_what_it_read_as_partial(worker):
+    module, ida, _db = worker
+    _strings_world(ida)
+
+    def listing():
+        yield _Str(0x3000, "alpha")
+        raise RuntimeError("walk died")
+
+    ida["idautils"].Strings.side_effect = listing
+    r = _status_run(module, "strings", "")
+    assert _shape(r) == ("OK", True, True) and [i["value"] for i in r["items"]] == ["alpha"]
+    assert r["lookup_errors"] == ["STRINGS_ENUMERATION_FAILED: RuntimeError: walk died"]
+
+
+def test_strings_an_undecodable_entry_has_a_null_value_and_a_lookup_error(worker):
+    module, ida, _db = worker
+    _strings_world(ida)
+    ida["idautils"].Strings.side_effect = lambda: iter([_Str(0x3000, "ok"), _Str(0x3010, None)])
+    r = _status_run(module, "strings", "")
+    assert _shape(r) == ("OK", True, True) and [i["value"] for i in r["items"]] == ["ok", None]
+    assert r["lookup_errors"][0].startswith("STRING_DECODE: UnicodeDecodeError")
+
+
+def test_strings_a_filter_with_no_match_over_a_clean_walk_is_not_found(worker):
+    module, ida, _db = worker
+    _strings_world(ida)
+    ida["idautils"].Strings.side_effect = lambda: iter([_Str(0x3000, "alpha")])
+    r = _status_run(module, "strings", "zzz")
+    assert _shape(r) == ("NOT_FOUND", True, False) and r["items_scanned"] == 1
+
+
+# ---- stack_frame / get_struct / bitfields ----
+class _UnreadableMember:
+    def __iter__(self):
+        raise RuntimeError("udm died")
+
+
+def test_stack_frame_no_frame_is_not_found_and_an_unknown_function_is_unresolved(w2):
+    _frame(w2)
+    r = _status_run(w2.module, "stack_frame", "h")
+    assert (r["status"], r["error"], r["ok"]) == ("NOT_FOUND", "NO_STACK_FRAME", False)
+    assert _shape(_status_run(w2.module, "stack_frame", "nope")) == ("UNRESOLVED", False, False)
+
+
+def test_stack_frame_a_member_that_cannot_be_read_is_recorded_not_dropped_silently(w2):
+    _frame(w2)
+    w2.types.frames[0x1000]["members"][1] = _UnreadableMember()
+    r = _status_run(w2.module, "stack_frame", "g")
+    assert _shape(r) == ("OK", True, True)
+    assert [i["name"] for i in r["items"]] == ["var_68", "__saved", "__return_address", "arg_20"]
+    assert "STACK_FRAME_MEMBER_UNREADABLE: RuntimeError: udm died" in r["lookup_errors"]   # the fake function also has no frsize etc.
+
+
+def test_stack_frame_a_member_ida_returns_nothing_for_is_recorded_too(w2):
+    _frame(w2)
+    base = sys.modules["ida_typeinf"].tinfo_t
+
+    class Tif(base):
+        def get_udm(self, index):
+            return (-1, None) if index == 0 else super().get_udm(index)
+
+    sys.modules["ida_typeinf"].tinfo_t = Tif
+    r = _status_run(w2.module, "stack_frame", "g")
+    assert r["partial"] is True and r["total_member_count"] == 4
+    assert "STACK_FRAME_MEMBER_UNREADABLE: get_udm returned no member" in r["lookup_errors"]
+
+
+def test_stack_frame_a_failed_landmark_is_recorded_beside_its_null_region(w2):
+    _frame(w2)
+    w2.types.landmarks.pop(0x1000)
+    r = _status_run(w2.module, "stack_frame", "g")
+    assert r["partial"] is True and all(i["region"] is None for i in r["items"])
+    assert any(e.startswith("STACK_FRAME_LANDMARK_FRAME_OFF_SAVREGS: KeyError") for e in r["lookup_errors"])
+
+
+def _raising_bitfield():
+    base = sys.modules["ida_typeinf"].tinfo_t
+
+    class Tif(base):
+        def get_udm(self, index):
+            found, udm = super().get_udm(index)
+            udm.is_bitfield = _boom("no bitfield info")
+            return found, udm
+
+    sys.modules["ida_typeinf"].tinfo_t = Tif
+
+
+def test_an_unknown_bitfield_flag_is_null_not_false(w2):
+    _types(w2)
+    _raising_bitfield()
+    r = _status_run(w2.module, "get_struct", "_GUID")
+    assert _shape(r) == ("OK", True, True) and [i["is_bitfield"] for i in r["items"]] == [None, None]
+    assert r["lookup_errors"] == ["MEMBER_IS_BITFIELD: RuntimeError: no bitfield info (x2)"]
+
+
+def test_a_known_bitfield_flag_stays_a_bool(w2):
+    _types(w2)
+    r = _status_run(w2.module, "get_struct", "Flags")
+    assert [i["is_bitfield"] for i in r["items"]] == [True, True] and r["partial"] is False
+
+
+def test_get_struct_not_found_unresolved_and_failed(w2):
+    _types(w2)
+    assert _shape(_status_run(w2.module, "get_struct", "Nope")) == ("UNRESOLVED", False, False)
+    assert _status_run(w2.module, "get_struct", "Color")["status"] == "UNRESOLVED"
+    w2.types.named["Empty"] = FakeTypes.type_("Empty", [], size=0)
+    assert _shape(_status_run(w2.module, "get_struct", "Empty")) == ("NOT_FOUND", True, False)
+
+
+# ---- every other query ----
+@pytest.mark.parametrize("operation", ["function_at_address", "decompile_function", "stack_frame", "basic_blocks",
+                                       "local_variables", "callgraph", "xrefs_from"])
+def test_an_internal_exception_is_query_failed_for_every_function_query(w2, operation):
+    w2.db.names["g"] = 0x1000
+    w2.ida["ida_funcs"].get_func.side_effect = _boom("func lookup died")
+    r = _status_run(w2.module, operation, "g")
+    assert (r["status"], r["ok"], r["error"]) == ("QUERY_FAILED", False, "IDAPYTHON_SCRIPT_EXCEPTION")
+    assert r["lookup_errors"] == ["QUERY_EXCEPTION: RuntimeError: func lookup died"]
+
+
+@pytest.mark.parametrize("operation, query", [
+    ("function_at_address", "nope"), ("decompile_function", "nope"), ("basic_blocks", "nope"),
+    ("local_variables", "nope"), ("callgraph", "nope"), ("disasm_range", "0x10 2"), ("read_bytes", "0x10 4"),
+    ("find_bytes", '{"pattern": "90", "segment": ".no"}')])
+def test_an_unresolvable_target_is_unresolved_for_every_query(w2, operation, query):
+    r = _status_run(w2.module, operation, query)
+    assert _shape(r) == ("UNRESOLVED", False, False) and r["lookup_errors"] == []
+
+
+def test_find_bytes_and_find_immediate_empty_are_not_found_and_a_hit_is_ok(w2):
+    w2.model.add_insn(0x1000, 2, "nop", data=[0x90, 0x90])
+    assert _shape(_status_run(w2.module, "find_bytes", "CC CC")) == ("NOT_FOUND", True, False)
+    assert _shape(_status_run(w2.module, "find_bytes", "90 90")) == ("OK", True, False)
+    assert _shape(_status_run(w2.module, "find_immediate", "0x1234")) == ("NOT_FOUND", True, False)
+
+
+def test_listings_that_are_empty_are_not_found(w2):
+    w2.ida["idautils"].Functions.side_effect = lambda: iter(())
+    assert _shape(_status_run(w2.module, "list_functions")) == ("NOT_FOUND", True, False)
+    assert _shape(_status_run(w2.module, "list_structs")) == ("NOT_FOUND", True, False)
+    w2.ida["ida_funcs"].get_idasgn_qty.return_value = 0
+    assert _shape(_status_run(w2.module, "flirt_signatures")) == ("NOT_FOUND", True, False)
+
+
+def test_a_page_past_the_end_of_a_non_empty_listing_is_ok_not_not_found(worker):
+    module, _ida, db = worker
+    db.names["t"] = 0x1100
+    db.refs_to[0x1100] = [_xref(0x1010, 0x1100, 17, True)]
+    r = _status_run(module, "xrefs_to", "t", offset=5)
+    assert _shape(r) == ("OK", True, False) and r["items"] == [] and r["total_xref_count"] == 1
+
+
+def test_summary_records_a_field_it_could_not_read_instead_of_defaulting_silently(worker):
+    module, ida, _db = worker
+    ida["ida_hexrays"].init_hexrays_plugin.side_effect = _boom("no decompiler")
+    ida["idaapi"].get_kernel_version.side_effect = _boom("no version")
+    ida["idautils"].Functions.side_effect = lambda: iter(())
+    ida["idautils"].Segments.side_effect = lambda: iter(())
+    r = _status_run(module, "summary")
+    assert _shape(r) == ("OK", True, True) and r["hexrays_available"] is False and r["ida_kernel_version"] is None
+    assert sorted(e.split(":")[0] for e in r["lookup_errors"]) == ["HEXRAYS_PLUGIN_INIT", "KERNEL_VERSION"]
+
+
+def test_the_unknown_operation_and_a_clean_summary_have_a_status_too(worker):
+    module, ida, _db = worker
+    ida["idautils"].Functions.side_effect = lambda: iter([0x1000])
+    ida["idautils"].Segments.side_effect = lambda: iter([0x1000])
+    clean = _status_run(module, "summary")
+    assert _shape(clean) == ("OK", True, False) and clean["lookup_errors"] == []
+    assert _shape(_status_run(module, "bogus")) == ("QUERY_FAILED", False, False)
+
+
+def test_the_collector_does_not_leak_from_one_run_into_the_next(worker):
+    module, ida, db = worker
+    db.names["t"] = 0x1100
+    db.refs_to[0x1100] = [_xref(0x1010, 0x1100, 17, True)]
+    ida["idautils"].XrefTypeName.side_effect = _boom("no name")
+    assert _status_run(module, "xrefs_to", "t")["partial"] is True
+    ida["idautils"].XrefTypeName.side_effect = lambda t: "Code_Near_Call"
+    again = _status_run(module, "xrefs_to", "t")
+    assert (again["partial"], again["lookup_errors"]) == (False, [])
+
+
+def test_a_long_message_is_cut_and_a_path_in_it_is_replaced():
+    module, _ida = _load_worker()
+    entry = module._error_entry("STEP", OSError("cannot open /scratch/run/x.i64 because " + "y" * 400))
+    assert entry.startswith("STEP: OSError: cannot open <path> because yyy")
+    assert len(entry) <= len("STEP: OSError: ") + module._ERROR_MESSAGE_MAX
+
+
+# ---- the wrapper carries them upward unchanged ----
+class QueryStatusWrapperTests(IdaCase):
+    def test_the_worker_outcome_is_carried_under_query_result_beside_the_run_status(self):
+        self.fake.fields["strings"] = dict(status="NOT_FOUND", partial=False, lookup_errors=[], items_scanned=0,
+                                           items_matched=0, offset=0)
+        data = self.q("strings", "needle")
+        self.assertEqual(data["status"], "OK")                     # the run completed: its status is untouched
+        self.assertEqual(data["query_result"], {"status": "NOT_FOUND", "partial": False, "lookup_errors": []})
+        self.assertNotIn("partial", data)
+
+    def test_a_partial_lookup_makes_the_run_partial_and_keeps_the_errors_verbatim(self):
+        errors = ["IMPORT_LOOKUP_FAILED: RuntimeError: enum broke", "XREF_TYPE_NAME: RuntimeError: no name (x3)"]
+        self.fake.fields["xrefs_to"] = dict(status="OK", partial=True, lookup_errors=errors)
+        data = self.q("xrefs_to", "start")
+        self.assertEqual(data["status"], "PARTIAL")
+        self.assertEqual(data["query_result"], {"status": "OK", "partial": True, "lookup_errors": errors})
+        self.assertEqual(data["lookup_errors"], errors)
+        self.assertTrue(any("2 sub-step(s)" in text for text in data["limitations"]))
+
+    def test_a_worker_refusal_keeps_its_query_status_and_the_run_status_stays_the_wrappers(self):
+        sha, md5 = self.sha, self.md5
+
+        def body(job, _sha):
+            return {"ok": False, "tool": "ida_query", "operation": job["operation"], "items": [],
+                    "error": "SYMBOL_NOT_FOUND", "status": "UNRESOLVED", "partial": False, "lookup_errors": [],
+                    "engine_input_sha256": sha, "engine_input_md5": md5, "script_completed": True}
+
+        self.fake._body = body
+        data = self.q("xrefs_to", "nothing")
+        self.assertEqual((data["ok"], data["status"], data["error"]), (False, "ANALYSIS_LIMITED", "SYMBOL_NOT_FOUND"))
+        self.assertEqual(data["query_result"]["status"], "UNRESOLVED")
+        self.assertNotIn("partial", data)
+
+    def test_a_result_that_carries_no_status_is_unknown_not_ok(self):
+        data = self.q("xrefs_to", "start")
+        self.assertEqual(data["query_result"], {"status": "UNKNOWN", "partial": None, "lookup_errors": []})
+
+    def test_the_wrappers_own_failure_paths_are_query_failed(self):
+        data = self.q("bogus_operation", "")
+        self.assertEqual((data["ok"], data["error"]), (False, "UNKNOWN_OPERATION"))
+        self.assertEqual(data["query_result"], {"status": "QUERY_FAILED", "partial": False,
+                                                "lookup_errors": ["IDA_QUERY_WRAPPER: UNKNOWN_OPERATION"]})
+        self.fake.behaviour = "timeout"
+        data = self.q("xrefs_to", "start")
+        self.assertEqual((data["ok"], data["status"]), (False, "TIMEOUT"))
+        self.assertEqual(data["query_result"]["status"], "QUERY_FAILED")
+        self.assertEqual(data["query_result"]["lookup_errors"],
+                         ["IDA_QUERY_WRAPPER: IDA_TIMEOUT_PROCESS_TREE_TERMINATED"])

@@ -372,6 +372,38 @@ _PDB_LOOKUP_DECLARED = {
 }
 
 _WORKER_BOOKKEEPING = {"ok", "tool", "script_completed", "engine_input_sha256", "engine_input_md5"}
+# The worker's own outcome of the lookup. `status` would collide with the response's run-level `status`
+# (OK / PARTIAL / TIMEOUT ...), so the response carries both under `query_result` and the worker's `status`
+# and `partial` are not copied to the top level. `lookup_errors` stays at the top level as well.
+_WORKER_QUERY_FIELDS = {"status", "partial"}
+_QUERY_STATUSES = ("OK", "NOT_FOUND", "UNRESOLVED", "QUERY_FAILED")
+
+
+def _query_result(data):
+    """{"status", "partial", "lookup_errors"} as the worker reported them, carried over unchanged. A result that
+    carries no (or an unknown) status is "UNKNOWN", never a guessed OK."""
+    status = data.get("status")
+    errors = data.get("lookup_errors")
+    return {
+        "status": status if status in _QUERY_STATUSES else "UNKNOWN",
+        "partial": data.get("partial") if isinstance(data.get("partial"), bool) else None,
+        "lookup_errors": [str(e) for e in errors] if isinstance(errors, list) else [],
+    }
+
+
+def _tag_query_failure(text):
+    """A failed `ida_query` response that carries no `query_result` (the question never reached the worker, or
+    the run around it failed) gets `QUERY_FAILED` with the wrapper's own error code as the lookup error."""
+    try:
+        body = json.loads(text)
+    except (TypeError, ValueError):
+        return text
+    if not isinstance(body, dict) or body.get("ok") is not False or "query_result" in body:
+        return text
+    reason = body.get("error") or body.get("status") or "FAILED"
+    body["query_result"] = {"status": "QUERY_FAILED", "partial": False,
+                            "lookup_errors": ["IDA_QUERY_WRAPPER: %s" % reason]}
+    return _j(body)
 # Operations whose `offset` indexes the result sequence, so a response that
 # had to be trimmed can report where to resume.
 _PAGED_OPERATIONS = {"list_functions", "segments", "xrefs_to", "imports_exports", "strings",
@@ -1398,9 +1430,18 @@ def _walk_limit_text(walk_limit):
 
 
 def _success_response(tool, p, sha256, md5, operation, data, *, cache_state, signals, invocation,
-                      max_chars, evidence, note=None, omit_path=False):
+                      max_chars, evidence, note=None, omit_path=False, query_worker=False):
     body = {k: v for k, v in data.items() if k not in _WORKER_BOOKKEEPING}
     limitations = []
+    if query_worker:
+        for key in _WORKER_QUERY_FIELDS:
+            body.pop(key, None)
+        body["query_result"] = _query_result(data)
+        if body["query_result"]["partial"]:
+            limitations.append(
+                f"{len(body['query_result']['lookup_errors'])} sub-step(s) of the lookup failed (see lookup_errors); "
+                "what is listed is what could be read, and an absent entry is not proof of absence"
+            )
     walk_limit = body.get("walk_limit")
     if walk_limit:
         limitations.append(_walk_limit_text(walk_limit))
@@ -1561,6 +1602,14 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
     the question); later calls run one.
     `max_chars` bounds the response without breaking its JSON.
 
+    `query_result` says what the LOOKUP found, apart from the run-level `status` below: `status` is `OK`,
+    `NOT_FOUND` (the lookup ran to the end and found nothing), `UNRESOLVED` (the name or address could not be
+    resolved to anything to look at) or `QUERY_FAILED` (a step of the lookup raised, or the run failed), and
+    `UNKNOWN` when the worker did not say. `partial` is true when something is listed but a sub-step failed;
+    `lookup_errors` (also at the top level) names each failed sub-step and exception class, without paths.
+    An empty `items` with no `NOT_FOUND` status is not a finding. A field IDA could not be asked is null
+    (`is_bitfield` included), never a default.
+
     Status vocabulary matches the repo's other static-tool wrappers: OK,
     PARTIAL (a walk limit or the response bound cut the answer short; says
     which), TOOL_MISSING, PATH_REFUSED, NOT_FOUND, TIMEOUT, CANCELLED,
@@ -1584,9 +1633,9 @@ def ida_query(path, operation="summary", query="", max_results=200, offset=0,
     """
     choice = _choose_backend(backend)
     if choice["failure"] is not None:
-        return _tag_backend(_j(choice["failure"]), choice["info"])
-    return _tag_backend(_ida_query(path, operation, query, max_results, offset, timeout_seconds, max_chars,
-                                   cancellation_token, choice), choice["info"])
+        return _tag_query_failure(_tag_backend(_j(choice["failure"]), choice["info"]))
+    return _tag_query_failure(_tag_backend(_ida_query(path, operation, query, max_results, offset, timeout_seconds,
+                                                      max_chars, cancellation_token, choice), choice["info"]))
 
 
 def _ida_query(path, operation, query, max_results, offset, timeout_seconds, max_chars, cancellation_token, choice):
@@ -2371,13 +2420,18 @@ def _answer_from_worker(tool, p, sha256, md5, slot, operation, data, signals, pr
     that answered "no" (unknown symbol, decompiler refused) is a named refusal, an answer that is not
     labelled the way the call asked is withheld, otherwise the evidence file is written and the response
     is shaped. `slot` is only used to redact scratch paths out of exception text."""
+    # The shared query worker reports a lookup outcome (`status`, `partial`, `lookup_errors`); the
+    # microcode and patch-plan workers are their own scripts and do not.
+    query_worker = not profile.get("worker")
     if data.get("ok") is False:
         # The worker ran and answered "no" (unknown symbol, decompiler refused). The database is fine.
         refusal = {
             "ok": False, "tool": tool,
             "status": (profile.get("error_status") or {}).get(data.get("error"), "ANALYSIS_LIMITED"),
             "error": data.get("error", "UNKNOWN_ERROR"),
-            **{k: v for k, v in data.items() if k not in _WORKER_BOOKKEEPING and k not in ("error", "items", "traceback")},
+            **{k: v for k, v in data.items() if k not in _WORKER_BOOKKEEPING and k not in ("error", "items", "traceback")
+               and not (query_worker and k in _WORKER_QUERY_FIELDS)},
+            **({"query_result": _query_result(data)} if query_worker else {}),
             "path": relative(p), "target_sha256": sha256, "database_cache": cache_state,
             "invocation": invocation, "provenance": provenance,
             "traceback": _redact(data.get("traceback", ""), work=slot, target=p) or None,
@@ -2416,7 +2470,7 @@ def _answer_from_worker(tool, p, sha256, md5, slot, operation, data, signals, pr
     return _success_response(
         tool, p, sha256, md5, operation, data, cache_state=cache_state, signals=signals,
         invocation=invocation, max_chars=max_chars, evidence=evidence, note=profile.get("note"),
-        omit_path=bool(profile.get("omit_path")),
+        omit_path=bool(profile.get("omit_path")), query_worker=query_worker,
     )
 
 
