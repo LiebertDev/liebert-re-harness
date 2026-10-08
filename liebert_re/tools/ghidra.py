@@ -49,6 +49,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
+from liebert_re import strict_json
 from liebert_re.bounded_subprocess import run_bounded_process
 from liebert_re.workspace import safe_path, relative
 
@@ -511,8 +512,11 @@ def _read_result(result_path, contract_keys=None):
     except OSError:
         return None, "GHIDRA_RESULT_UNREADABLE"
     try:
-        data = json.loads(raw)
-    except ValueError:
+        data = strict_json.loads(raw)
+    except strict_json.StrictJSONError as exc:
+        if exc.reason != strict_json.MALFORMED:
+            # It is JSON that cannot be trusted (repeated key, NaN/Infinity, overflow, absurd nesting).
+            return None, "GHIDRA_RESULT_NOT_STRICT_JSON_" + exc.reason
         return None, "GHIDRA_RESULT_NOT_JSON"
     if not isinstance(data, dict):
         return None, "GHIDRA_RESULT_NOT_AN_OBJECT"

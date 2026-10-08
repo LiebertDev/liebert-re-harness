@@ -556,3 +556,17 @@ class TestLiveScanOfOwnProcess:
         # No PID, "all": refused with nothing started, whatever is installed.
         assert json.loads(ps.pe_sieve_scan(None))["status"] == "PID_REQUIRED"
         assert json.loads(ps.pe_sieve_scan("all"))["status"] == "PID_REQUIRED"
+
+
+@pytest.mark.parametrize("report,reason", [
+    ('{"scan_report": {}, "scan_report": {"pid": 4242}}', "DUPLICATE_KEY"),
+    ('{"scan_report": {"pid": NaN}}', "NON_FINITE"),
+    ('{"scan_report": {"total": 1e999}}', "NON_FINITE"),
+    ('{"scan_report": ' + "[" * 300 + "]" * 300 + "}", "TOO_DEEP"),
+])
+def test_report_that_is_not_strict_json_is_a_named_failure_never_a_clean_scan(scanner, report, reason):
+    scanner.return_value = _done(report, code=0)
+    data = _scan()
+    assert data["ok"] is False and data["status"] == "RESULT_PARSE_FAILED"
+    assert data["error"] == "NON_STRICT_JSON_RESULT" and data["reason"] == reason
+    assert "anomalies_found" not in data and "verdict" not in data

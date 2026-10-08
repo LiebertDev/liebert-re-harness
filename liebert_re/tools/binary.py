@@ -1,4 +1,5 @@
 import hashlib, json, math, re, sys
+from liebert_re import strict_json
 from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.workspace import safe_path, relative, skipped, _limit_marker
 
@@ -581,10 +582,14 @@ def _authenticode_fields(stdout):
     Every field comes from that JSON object; one that is absent, null or not a string is None
     ("UNKNOWN"), never a guess. ``raw`` is the stdout text unchanged. Output that is not a JSON
     object is an ANALYSIS_LIMITED failure carrying the raw text, not a half-filled success."""
+    reason=None
     try:
-        data=json.loads(stdout)
-    except ValueError:
+        data=strict_json.loads(stdout)
+    except strict_json.StrictJSONError as exc:
         data=None
+        if exc.reason!=strict_json.MALFORMED:reason=exc.reason
+    if reason is not None:
+        return {"ok":False,"status":"ANALYSIS_LIMITED","error":"NON_STRICT_JSON_RESULT","reason":reason,"raw":stdout}
     if not isinstance(data,dict):
         return {"ok":False,"status":"ANALYSIS_LIMITED","error":"AUTHENTICODE_OUTPUT_UNPARSEABLE","raw":stdout}
     def field(key):

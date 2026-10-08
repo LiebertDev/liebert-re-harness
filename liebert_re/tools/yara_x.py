@@ -57,6 +57,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
+from liebert_re import strict_json
 from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.workspace import safe_path, relative
 
@@ -365,11 +366,11 @@ def yara_x_scan(
 
     stdout = cp.stdout or ""
     try:
-        raw = json.loads(stdout)
-    except Exception as exc:  # noqa: BLE001
+        raw = strict_json.loads(stdout)
+    except strict_json.StrictJSONError as exc:
         return _j({
             "ok": False, "tool": "yara_x_scan", "status": "RESULT_PARSE_FAILED",
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": f"{type(exc).__name__}: {exc}", "reason": exc.reason,
             "stdout_tail": stdout[-2000:],
             "stderr_tail": (cp.stderr or "")[-2000:],
         })

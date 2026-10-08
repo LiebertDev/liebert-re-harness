@@ -48,6 +48,7 @@ import shutil
 import uuid
 from pathlib import Path
 
+from liebert_re import strict_json
 from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.workspace import safe_path, relative
 
@@ -213,11 +214,11 @@ def _parse_json(cp, tool):
             "stderr_tail": (cp.stderr or "")[-2000:],
         })
     try:
-        raw = json.loads(stdout[start:end + 1])
-    except Exception as exc:  # noqa: BLE001
+        raw = strict_json.loads(stdout[start:end + 1])
+    except strict_json.StrictJSONError as exc:
         return None, _j({
             "ok": False, "tool": tool, "status": "RESULT_PARSE_FAILED",
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": f"{type(exc).__name__}: {exc}", "reason": exc.reason,
             "output_truncated": cp.output_truncated,
         })
     if not isinstance(raw, dict):

@@ -47,6 +47,7 @@ import re
 import shutil
 import uuid
 
+from liebert_re import strict_json
 from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.dynamic.lab_gate import LabGate
 
@@ -239,16 +240,18 @@ class _PeSieve:
 
     @staticmethod
     def extract_report(stdout):
-        """The JSON object pe-sieve prints, or None. Never raises."""
+        """``(report_or_None, reason_or_None)``. ``reason`` is the strict_json code when the span IS
+        JSON that cannot be trusted (repeated key, NaN/Infinity, overflow, absurd nesting); then no
+        report is returned. Never raises."""
         start = (stdout or "").find("{")
         end = (stdout or "").rfind("}")
         if start == -1 or end <= start:
-            return None
+            return None, None
         try:
-            raw = json.loads(stdout[start:end + 1])
-        except ValueError:
-            return None
-        return raw if isinstance(raw, dict) else None
+            raw = strict_json.loads(stdout[start:end + 1])
+        except strict_json.StrictJSONError as exc:
+            return None, (exc.reason if exc.reason != strict_json.MALFORMED else None)
+        return (raw if isinstance(raw, dict) else None), None
 
     @staticmethod
     def save_evidence(pid, raw):
@@ -389,7 +392,7 @@ class _PeSieve:
                        "scanner_message": message, "text_derived": True,
                        "detail": "The scanner's bitness does not match the target's. Any report-shaped "
                                  "output that accompanied this is not a scan of the process."})
-        raw = _PeSieve.extract_report(cp.stdout)
+        raw, untrusted = _PeSieve.extract_report(cp.stdout)
         report = raw.get("scan_report") if raw else None
         if "could not open the process" in low and not isinstance(report, dict):
             denied = "access is denied" in low or "access denied" in low
@@ -397,6 +400,11 @@ class _PeSieve:
                        "exit_code": exit_code, "scanner_message": message, "text_derived": True,
                        "detail": "pe-sieve could not open the process (it has exited, does not exist, or "
                                  "needs higher privileges). This is NOT a finding that the process is clean."})
+        if untrusted is not None:
+            return _j({**base, "ok": False, "status": "RESULT_PARSE_FAILED", "error": "NON_STRICT_JSON_RESULT",
+                       "reason": untrusted, "exit_code": exit_code, "output_truncated": cp.output_truncated,
+                       "detail": "pe-sieve printed a JSON report that is not strict JSON; it is not trusted and "
+                                 "is not a finding about the process."})
         if raw is None:
             return _j({**base, "ok": False, "status": "ANALYSIS_LIMITED", "error": "PE_SIEVE_NO_JSON_OUTPUT",
                        "exit_code": exit_code, "output_truncated": cp.output_truncated, "scanner_message": message})
