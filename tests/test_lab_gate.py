@@ -82,6 +82,20 @@ def _confirmed_dead(pid, birth=None):
         return True
 
 
+def _await_confirmed_dead(pid, birth=None, timeout=10.0):
+    """`_confirmed_dead`, allowed a bounded time to become true. The process has already been waited on, but the
+    OS releases the process object a moment later (measured on a loaded Windows runner: a teardown that asked
+    once, right after `wait()`, was told the pid still existed). Still False after `timeout` seconds is a
+    failure, with the last answer's inputs in the message."""
+    deadline = time.time() + timeout
+    while True:
+        if _confirmed_dead(pid, birth):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
 @pytest.fixture()
 def child():
     """A process THIS test started: console, no window, always killed and confirmed dead."""
@@ -97,7 +111,7 @@ def child():
         proc.kill()
         proc.wait(timeout=10)
         assert proc.poll() is not None
-        assert _confirmed_dead(proc.pid, birth)
+        assert _await_confirmed_dead(proc.pid, birth), "the child is still reported alive 10 s after it was killed and waited on"
 
 
 @pytest.fixture()
@@ -203,7 +217,7 @@ class TestRefusals:
             deadline = time.time() + 10
             while time.time() < deadline and any(psutil.pid_exists(p) for p in victims):
                 time.sleep(0.1)
-            assert all(_confirmed_dead(p, births.get(p)) for p in victims)
+            assert all(_await_confirmed_dead(p, births.get(p)) for p in victims)
 
     def test_a_missing_or_nonexistent_process_is_refused(self, lab_open):
         assert _gate(None, authorization=_auth(1), sample_sha256="0" * 64)["status"] == "PID_REQUIRED"
