@@ -6,6 +6,7 @@ from collections import Counter
 from datetime import datetime,timezone
 from pathlib import Path,PurePosixPath
 from urllib.parse import urlsplit
+from liebert_re import strict_json
 from liebert_re.workspace import safe_path,relative,skipped,text_of
 
 MAX_IDENTITY_HASH_BYTES=512_000_000; MAX_STRUCTURED_BYTES=64_000_000; MAX_ARCHIVE_MEMBERS=500
@@ -448,13 +449,18 @@ def _load_structured(p,notes=None):
     A bad JSONL line costs only that line: its number is listed and the other lines are kept."""
     if p.stat().st_size>MAX_STRUCTURED_BYTES:raise ValueError('STRUCTURED_FILE_TOO_LARGE')
     ext=p.suffix.lower(); text=text_of(p)
-    if ext=='.json':return json.loads(text)
+    if ext=='.json':
+        try:return strict_json.loads(text)
+        except strict_json.StrictJSONError as e:
+            # MALFORMED keeps the parser's own message; any other reason is named so it is not read as a syntax error.
+            raise ValueError(str(e) if e.reason==strict_json.MALFORMED else 'NON_STRICT_JSON: %s: %s'%(e.reason,e)) from None
     if ext=='.jsonl':
         rows=[]; bad=[]; skipped=0
         for n,x in enumerate(text.splitlines(),1):
             if not x.strip():continue
             if len(rows)>=MAX_STRUCTURED_ROWS:skipped+=1;continue
-            try:rows.append(json.loads(x))
+            try:rows.append(strict_json.loads(x))
+            except strict_json.StrictJSONError as e:bad.append({'line':n,'reason':e.reason,'error':('%s: %s'%(e.reason,e))[:100]})
             except ValueError as e:bad.append({'line':n,'error':str(e)[:100]})
         if notes is not None:
             notes.update(row_limit=MAX_STRUCTURED_ROWS,rows_returned=len(rows),unread_lines_past_limit=skipped,
@@ -553,7 +559,8 @@ def har_inspect(path,operation='summary',query='',index=0,max_results=100):
         try:import ijson  # noqa: F401
         except ImportError:return _json({'ok':False,'status':'ANALYSIS_LIMITED','error':'HAR_TOO_LARGE','limitations':['ijson (streaming JSON parser) is not installed; falling back to the bounded whole-file limit']})
         return _har_stream(p,operation,query,index,max(1,min(int(max_results),5000)))
-    try:har=json.loads(text_of(p)); log=har.get('log',{}); entries=log.get('entries',[])
+    try:har=strict_json.loads(text_of(p)); log=har.get('log',{}); entries=log.get('entries',[])
+    except strict_json.StrictJSONError as e:return _json({'ok':False,'error':f'MALFORMED_HAR: {e.reason}: {e}','reason':e.reason})
     except Exception as e:return _json({'ok':False,'error':f'MALFORMED_HAR: {e}'})
     items=[_har_entry_item(i,e) for i,e in enumerate(entries)]; hosts=Counter(x['host'] for x in items if x['host']); statuses=Counter(str(x['status']) for x in items); methods=Counter(x['method'] for x in items)
     base={'ok':True,'tool':'har_inspect','path':relative(p),'entry_count':len(entries),'page_count':len(log.get('pages',[])),'hosts':dict(hosts.most_common(100)),'status_distribution':dict(statuses),'method_distribution':dict(methods),'total_time_ms':round(sum(float(x['time_ms'] or 0) for x in items),2)}

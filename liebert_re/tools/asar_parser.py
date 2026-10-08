@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path, PurePosixPath
 
+from liebert_re import strict_json
+
 MAX_ASAR_BYTES = 64 * 1024 * 1024
 MAX_HEADER_BYTES = 8 * 1024 * 1024
 MAX_JSON_BYTES = 4 * 1024 * 1024
@@ -137,8 +139,11 @@ def parse_asar(path: str | Path | None = None, *, data: bytes | None = None) -> 
     json_size = detected["json_size"]
     header_bytes = detected["header_bytes"]
     try:
-        header_obj = json.loads(data[8:8 + json_size].decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as exc:
+        header_obj = strict_json.loads(data[8:8 + json_size].decode("utf-8"))
+    except strict_json.StrictJSONError as exc:
+        # A repeated key or NaN/Infinity: two readers would disagree about the tree, so no inventory.
+        return _fail("MALFORMED_HEADER_JSON", detail=f"{exc.reason}: {exc}"[:200])
+    except UnicodeError as exc:
         return _fail("MALFORMED_HEADER_JSON", detail=str(exc)[:200])
     if not isinstance(header_obj, dict):
         return _fail("UNEXPECTED_FIELD_TYPE", field="root")

@@ -89,6 +89,7 @@ from __future__ import annotations
 
 import json
 
+from liebert_re import strict_json
 from liebert_re.workspace import safe_path, relative
 
 TOOL_NAME = "image_address_map"
@@ -154,11 +155,13 @@ def _resolve_live_base(raw, label="live_module_base"):
         s = raw.strip()
         if not s:
             raise ValueError(f"{label} must not be an empty string")
-        try:
-            parsed = json.loads(s)
-        except (json.JSONDecodeError, ValueError):
-            parsed = None
-        if isinstance(parsed, (dict, list)):
+        if s[0] in "{[":
+            # JSON-shaped: read it strictly. A repeated key or NaN would let two readers pick different
+            # bases, and a malformed one must not be reported as a bad hex/decimal string.
+            try:
+                parsed = strict_json.loads(s)
+            except strict_json.StrictJSONError as exc:
+                raise ValueError(f"{label} looks like JSON but is not strict JSON ({exc.reason}): {exc}") from None
             return _resolve_live_base(parsed, label)
         return _to_int(s, label), "explicit hex/decimal string"
     if isinstance(raw, dict):

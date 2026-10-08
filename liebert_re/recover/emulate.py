@@ -1888,10 +1888,13 @@ class _Engine:
 def _child_main(job_path):
     """Entry point of the emulator process: read the job, run it, print one JSON line."""
     try:
-        job = json.loads(Path(job_path).read_text(encoding="utf-8"))
+        job = strict_json.loads(Path(job_path).read_text(encoding="utf-8"))
         result = _Engine(job).run()
     except _Refusal as exc:
         result = {"ok": False, "status": exc.status, "error": exc.error, "detail": exc.detail, "stop_reason": None}
+    except strict_json.StrictJSONError as exc:  # the job file is not strict JSON: no run, and the reason is named
+        result = {"ok": False, "status": "ANALYSIS_LIMITED", "error": "EMULATOR_PROCESS_ERROR",
+                  "detail": f"StrictJSONError:{exc.reason}"}
     except Exception as exc:  # noqa: BLE001 - reported, never swallowed
         result = {"ok": False, "status": "ANALYSIS_LIMITED", "error": "EMULATOR_PROCESS_ERROR",
                   "detail": type(exc).__name__}

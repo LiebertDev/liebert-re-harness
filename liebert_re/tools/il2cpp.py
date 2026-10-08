@@ -9,6 +9,7 @@ is the real engine; this is a thin, bounded, JSON-normalizing wrapper."""
 from __future__ import annotations
 import json, os, shutil, tempfile
 from pathlib import Path
+from liebert_re import strict_json
 from liebert_re.bounded_subprocess import launch_failure, run_bounded_process
 from liebert_re.workspace import safe_path, relative
 
@@ -61,7 +62,19 @@ def il2cpp_mapper(binary_path, metadata_path, operation="summary", query="", max
                 "ok": False, "tool": "il2cpp_mapper", "error": "IL2CPPDUMPER_NO_OUTPUT",
                 "stdout_tail": (cp.stdout or "")[-2000:], "stderr_tail": (cp.stderr or "")[-2000:],
             })
-        script = json.loads(script_path.read_text(encoding="utf-8"))
+        try:
+            script = strict_json.loads(script_path.read_text(encoding="utf-8"))
+        except strict_json.StrictJSONError as exc:
+            if exc.reason == strict_json.MALFORMED:
+                return _j({"ok": False, "tool": "il2cpp_mapper", "error": "IL2CPPDUMPER_SCRIPT_JSON_MALFORMED",
+                           "detail": str(exc)[:200]})
+            return _j({"ok": False, "tool": "il2cpp_mapper", "error": "IL2CPPDUMPER_SCRIPT_JSON_NOT_STRICT",
+                       "reason": exc.reason, "detail": str(exc)[:200]})
+        except (OSError, UnicodeError) as exc:
+            return _j({"ok": False, "tool": "il2cpp_mapper", "error": "IL2CPPDUMPER_SCRIPT_JSON_UNREADABLE",
+                       "detail": type(exc).__name__})
+        if not isinstance(script, dict):
+            return _j({"ok": False, "tool": "il2cpp_mapper", "error": "IL2CPPDUMPER_SCRIPT_JSON_NOT_OBJECT"})
         methods = script.get("ScriptMethod", []) or []
         strings = script.get("ScriptString", []) or []
         metadata_defs = script.get("ScriptMetadata", []) or []
