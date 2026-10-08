@@ -25,7 +25,7 @@ established is a refusal, never a pass):
   No proof is ``PROCESS_NOT_OWNED``; a host that cannot answer is ``OWNERSHIP_UNVERIFIABLE``.
   The registry is a local file: it shows the harness registered the process, it is not tamper
   proof against someone who can write to it.
-* BOUNDS. A positive timeout and a memory limit are required, and the memory monitor that
+* BOUNDS. A finite positive timeout (not NaN, not infinity) and a memory limit are required, and the memory monitor that
   enforces the limit must work on this host (``RESOURCE_LIMIT_UNAVAILABLE`` otherwise). The
   caller passes both to ``bounded_subprocess.run_bounded_process``.
 * EVIDENCE. Environment, user and elevation, the target's identity, every check, the exact
@@ -63,6 +63,7 @@ from __future__ import annotations
 import getpass
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -416,7 +417,7 @@ class LabGate:
                           "the declared sha256 does not match the image the process was started from")
         passed("sample_hash", "declared sha256 equals the sha256 of the process image on disk")
         timeout_ok = (not isinstance(timeout_seconds, bool) and isinstance(timeout_seconds, (int, float))
-                      and timeout_seconds > 0)
+                      and math.isfinite(timeout_seconds) and timeout_seconds > 0)
         memory_ok = (not isinstance(max_memory_bytes, bool) and isinstance(max_memory_bytes, int)
                      and max_memory_bytes > 0)
         if not (timeout_ok and memory_ok):

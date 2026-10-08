@@ -201,6 +201,8 @@ class TestRefusals:
     def test_bounds_are_required_and_the_memory_monitor_must_work(self, child, image_sha, lab_open):
         assert _gate(child.pid, sample_sha256=image_sha, timeout_seconds=0)["status"] == "BOUNDS_REQUIRED"
         assert _gate(child.pid, sample_sha256=image_sha, max_memory_bytes=None)["status"] == "BOUNDS_REQUIRED"
+        for bad in (float("inf"), float("-inf"), float("nan"), True, "30", None):
+            assert _gate(child.pid, sample_sha256=image_sha, timeout_seconds=bad)["status"] == "BOUNDS_REQUIRED", bad
         with mock.patch("liebert_re.bounded_subprocess._memory_monitor_usable", return_value=False):
             data = _gate(child.pid, sample_sha256=image_sha)
         assert data["status"] == "RESOURCE_LIMIT_UNAVAILABLE"

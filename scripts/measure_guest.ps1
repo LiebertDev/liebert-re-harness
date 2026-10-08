@@ -20,6 +20,10 @@
 # Every step has its own try/catch. A failed step becomes { ok: false, error: ... } and
 # the script carries on, so a partial file is still a truthful file. An empty list from a
 # query that succeeded is { ok: true, items: [] } and is distinct from a failed query.
+# The network sections (adapters, switches, host_adapters, switch_peers) are read a second
+# time at the end; a section whose two readings differ, or whose second reading fails, is
+# ok: false with error_category InconsistentMeasurement. A null or non-numeric Device Guard
+# value in the guest is an error and is recorded as null, never as 0.
 # Error text is the exception type name only; messages can carry paths and account names.
 # Each failed step also carries error_category: the ErrorRecord category (for example
 # PermissionDenied or ObjectNotFound) and, only when it is a bare identifier, the error id
@@ -325,9 +329,18 @@ try {
         try {
             $dg = @(Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName 'Win32_DeviceGuard' -ErrorAction Stop)
             if ($dg.Count -ne 1) { throw [System.InvalidOperationException]::new('lr:device guard class did not return exactly one record') }
-            $out['vbs_status'] = [int]$dg[0].VirtualizationBasedSecurityStatus
+            # A null or non-numeric value is an error and stays null; [int]$null would be 0, which reads as a real status.
+            $numTypes = @([byte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
+            $vbsRaw = $dg[0].VirtualizationBasedSecurityStatus
+            if (($null -eq $vbsRaw) -or -not ($numTypes -contains $vbsRaw.GetType())) { throw [System.InvalidOperationException]::new('lr:device guard status null or not numeric') }
+            $svcRaw = $dg[0].SecurityServicesRunning
+            if ($null -eq $svcRaw) { throw [System.InvalidOperationException]::new('lr:device guard services null') }
             $running = @()
-            foreach ($r in @($dg[0].SecurityServicesRunning)) { $running += [int]$r }
+            foreach ($r in @($svcRaw)) {
+                if (($null -eq $r) -or -not ($numTypes -contains $r.GetType())) { throw [System.InvalidOperationException]::new('lr:device guard service entry null or not numeric') }
+                $running += [int]$r
+            }
+            $out['vbs_status'] = [int]$vbsRaw
             $out['security_services_running'] = $running
         }
         catch { $out['errors'] += 'vbs:' + $_.Exception.GetType().FullName; $out['categories'] += 'vbs:' + $_.CategoryInfo.Category.ToString() }
@@ -362,6 +375,103 @@ catch {
         os_build = $null
         vbs_status = $null
         security_services_running = $null
+    }
+}
+
+# Second reading of the network topology. The sections above were read one after another, so a
+# change in between would leave them describing different moments. Adapters, switches, the host's
+# management adapters and the other VMs' adapters are read again here; a section whose second
+# reading differs from its first, or cannot be made, is reported ok: false. Equal readings show
+# the topology was the same at both reads, not that nothing changed between them.
+$sigBefore = @{}
+foreach ($sec in @('adapters', 'switches', 'host_adapters', 'switch_peers')) {
+    $parts = @()
+    if ($result[$sec]['ok'] -eq $true) {
+        foreach ($it in @($result[$sec]['items'])) {
+            $fields = @()
+            foreach ($v in $it.Values) { $fields += [string]$v }
+            $parts += ($fields -join '|')
+        }
+        if ($sec -eq 'host_adapters') { foreach ($i in @($hostAdapterIds)) { $parts += ('id:' + $i) } }
+        $arr = [string[]]@($parts)
+        [System.Array]::Sort($arr)
+        $sigBefore[$sec] = ($arr -join ';')
+    }
+    else { $sigBefore[$sec] = $null }
+}
+
+$sigAfter = @{ adapters = $null; switches = $null; host_adapters = $null; switch_peers = $null }
+$hostIdsAfter = $null
+try {
+    if ($null -eq $vmObj) { throw [System.InvalidOperationException]::new('lr:vm not resolved') }
+    $parts = @()
+    foreach ($a in @(Get-VMNetworkAdapter -VMName $VMName -ErrorAction Stop)) {
+        $switchId = $null
+        if (($a.SwitchId -is [guid]) -and ($a.SwitchId -ne [guid]::Empty)) { $switchId = $a.SwitchId.ToString() }
+        $switchName = if ([string]::IsNullOrEmpty($a.SwitchName)) { $null } else { $a.SwitchName }
+        $connected = if ($null -eq $a.Connected) { $null } else { [bool]$a.Connected }
+        $parts += ($a.Id.ToString() + '|' + [string]$switchId + '|' + [string]$switchName + '|' + [string]$connected)
+    }
+    $arr = [string[]]@($parts)
+    [System.Array]::Sort($arr)
+    $sigAfter['adapters'] = ($arr -join ';')
+}
+catch { $sigAfter['adapters'] = $null }
+try {
+    $parts = @()
+    foreach ($s in @(Get-VMSwitch -ErrorAction Stop)) {
+        $switchType = if ($null -eq $s.SwitchType) { $null } else { $s.SwitchType.ToString() }
+        $parts += ($s.Id.ToString() + '|' + [string]$s.Name + '|' + [string]$switchType)
+    }
+    $arr = [string[]]@($parts)
+    [System.Array]::Sort($arr)
+    $sigAfter['switches'] = ($arr -join ';')
+}
+catch { $sigAfter['switches'] = $null }
+try {
+    $parts = @()
+    $ids = @()
+    foreach ($h in @(Get-VMNetworkAdapter -ManagementOS -ErrorAction Stop)) {
+        $ids += $h.Id.ToString()
+        $parts += ('id:' + $h.Id.ToString())
+        if (-not (($h.SwitchId -is [guid]) -and ($h.SwitchId -ne [guid]::Empty))) { continue }
+        $parts += ($h.SwitchId.ToString() + '|host_management')
+    }
+    $hostIdsAfter = @($ids)
+    $arr = [string[]]@($parts)
+    [System.Array]::Sort($arr)
+    $sigAfter['host_adapters'] = ($arr -join ';')
+}
+catch { $sigAfter['host_adapters'] = $null }
+try {
+    if ($null -eq $vmObj) { throw [System.InvalidOperationException]::new('lr:vm not resolved') }
+    if ($null -eq $hostIdsAfter) { throw [System.InvalidOperationException]::new('lr:host adapters not measured') }
+    $parts = @()
+    foreach ($p in @(Get-VMNetworkAdapter -All -ErrorAction Stop)) {
+        if (($null -ne $p.VMId) -and ($p.VMId.ToString() -eq $vmObj.VMId.ToString())) { continue }
+        if (($hostIdsAfter -contains $p.Id.ToString()) -or ($p.IsManagementOs -eq $true)) { continue }
+        if (-not (($p.SwitchId -is [guid]) -and ($p.SwitchId -ne [guid]::Empty))) { continue }
+        $peerVm = if ($null -eq $p.VMId) { $null } else { $p.VMId.ToString() }
+        $parts += ($p.SwitchId.ToString() + '|' + [string]$peerVm)
+    }
+    $arr = [string[]]@($parts)
+    [System.Array]::Sort($arr)
+    $sigAfter['switch_peers'] = ($arr -join ';')
+}
+catch { $sigAfter['switch_peers'] = $null }
+
+foreach ($sec in @('adapters', 'switches', 'host_adapters', 'switch_peers')) {
+    if ($null -eq $sigBefore[$sec]) { continue }   # already ok: false from its first reading
+    $problem = $null
+    if ($null -eq $sigAfter[$sec]) { $problem = 'second reading of the topology failed' }
+    elseif ($sigAfter[$sec] -cne $sigBefore[$sec]) { $problem = 'topology differs between the two readings' }
+    if ($null -ne $problem) {
+        $result[$sec] = [ordered]@{
+            ok = $false
+            error = $problem
+            error_category = 'InconsistentMeasurement'
+            items = @()
+        }
     }
 }
 

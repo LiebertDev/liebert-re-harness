@@ -147,11 +147,12 @@ def test_ast_commands_match_allowlist():
 
 
 def test_network_adapter_calls_are_the_three_read_forms():
-    # The allowlist is by cmdlet name; this pins the parameter sets of the one cmdlet used three ways.
+    # The allowlist is by cmdlet name; this pins the parameter sets of the one cmdlet used three ways,
+    # each read twice (the second reading is the topology consistency check).
     calls = [ln.strip() for ln in _code().splitlines() if "Get-VMNetworkAdapter" in ln]
-    assert len(calls) == 3, calls
+    assert len(calls) == 6, calls
     flags = sorted(next(f for f in ("-ManagementOS", "-All", "-VMName") if f in c) for c in calls)
-    assert flags == ["-All", "-ManagementOS", "-VMName"]
+    assert flags == ["-All", "-All", "-ManagementOS", "-ManagementOS", "-VMName", "-VMName"]
     assert all("-ErrorAction Stop" in c for c in calls)
 
 
@@ -250,3 +251,134 @@ def test_errinfo_reports_category_and_never_a_message(tmp_path):
         assert out["own"] == {"error": "vm not resolved", "category": "OperationStopped"}
         assert out["foreign"]["error"] == "System.InvalidOperationException"
         assert "zzz" not in proc.stdout and "leak" not in proc.stdout
+
+
+def test_network_reads_are_taken_twice_and_compared():
+    code = _code()
+    # first reading + second reading of: own adapters, management adapters, all adapters
+    assert code.count("Get-VMSwitch") == 2
+    assert "InconsistentMeasurement" in code
+    assert "$sigBefore" in code and "$sigAfter" in code
+    # the comparison happens after every measurement and before the file is written
+    assert code.index("$result['guest'] = $null") < code.index("$sigBefore = @{}") < code.index("ConvertTo-Json")
+
+
+def test_device_guard_values_are_never_cast_from_null():
+    code = _code()
+    assert "[int]$dg[0]" not in code, "a bare [int] cast turns a null Device Guard value into 0"
+    assert "$null -eq $vbsRaw" in code and "$null -eq $svcRaw" in code
+    assert "device guard status null or not numeric" in code
+
+
+_DEVICE_GUARD_PROBE = r"""
+$ErrorActionPreference = 'Stop'
+$t = $null; $e = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:MEASURE_GUEST_SCRIPT, [ref]$t, [ref]$e)
+$try = $ast.Find({ param($n) ($n -is [System.Management.Automation.Language.TryStatementAst]) -and ($n.Extent.Text.Contains('Win32_DeviceGuard')) -and (-not $n.Extent.Text.Contains('Win32_OperatingSystem')) }, $true)
+if ($null -eq $try) { throw 'device guard try block not found' }
+$cases = Get-Content -Raw -LiteralPath $env:MEASURE_GUEST_CASES | ConvertFrom-Json
+$results = @()
+foreach ($case in $cases) {
+    $global:dgRecord = $case
+    function Get-CimInstance { param($Namespace, $ClassName, $ErrorAction) $rec = $global:dgRecord; [pscustomobject]@{ VirtualizationBasedSecurityStatus = $rec.status; SecurityServicesRunning = $rec.services } }
+    $out = @{ vm_id_from_kvp = $null; os_build = $null; vbs_status = $null; security_services_running = $null; errors = @(); categories = @() }
+    Invoke-Expression $try.Extent.Text
+    $results += [ordered]@{ status = $out['vbs_status']; services = $out['security_services_running']; errors = @($out['errors']) }
+}
+ConvertTo-Json -InputObject @($results) -Depth 5 -Compress
+"""
+
+
+def test_device_guard_null_or_invalid_is_an_error_and_null_not_zero(tmp_path):
+    shells = _shells()
+    if not shells:
+        pytest.skip("no pwsh or powershell on PATH: the Device Guard block cannot be exercised here")
+    cases = [
+        {"status": 2, "services": [1, 2]},      # 0: valid
+        {"status": 1, "services": []},          # 1: valid, no services running
+        {"status": None, "services": [1]},      # 2: null status
+        {"status": 2, "services": None},        # 3: null service list
+        {"status": 2, "services": [1, None]},   # 4: null entry
+        {"status": "abc", "services": [1]},     # 5: non-numeric status
+        {"status": 2, "services": ["x"]},       # 6: non-numeric entry
+    ]
+    probe = tmp_path / "probe.ps1"
+    probe.write_text(_DEVICE_GUARD_PROBE, encoding="utf-8")
+    cases_file = tmp_path / "cases.json"
+    cases_file.write_text(json.dumps(cases), encoding="utf-8")
+    env = dict(os.environ, MEASURE_GUEST_SCRIPT=str(SCRIPT), MEASURE_GUEST_CASES=str(cases_file))
+    for shell in shells:
+        proc = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+                               str(probe)], capture_output=True, text=True, timeout=120, env=env, check=False)
+        assert proc.returncode == 0, f"{Path(shell).name}: {proc.stderr.strip()[:300]}"
+        out = json.loads(proc.stdout)
+        assert out[0]["status"] == 2 and out[0]["services"] == [1, 2] and out[0]["errors"] == []
+        assert out[1]["status"] == 1 and out[1]["services"] in ([], None) and out[1]["errors"] == []
+        for bad in out[2:]:
+            assert bad["status"] is None and bad["services"] is None, bad
+            assert bad["errors"] == ["vbs:System.InvalidOperationException"], bad
+
+
+_TOPOLOGY_PROBE = r"""
+$ErrorActionPreference = 'Stop'
+$global:vmG = [guid]'11111111-1111-1111-1111-111111111111'
+$global:peerG = [guid]'22222222-2222-2222-2222-222222222222'
+$global:swA = [guid]'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+$global:swB = [guid]'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+$global:mode = $env:MEASURE_GUEST_MODE
+$global:nAdapters = 0; $global:nSwitches = 0; $global:nAll = 0
+function Get-VM { param($Name, $ErrorAction) [pscustomobject]@{ VMId = $global:vmG; Name = $Name; State = 'Off'; Generation = 2; AutomaticCheckpointsEnabled = $false; ParentCheckpointId = $null } }
+function Get-VMSnapshot { param($VMName, $ErrorAction) }
+function Get-VMIntegrationService { param($VMName, $ErrorAction) }
+function Get-VMSecurity { param($VMName, $ErrorAction) [pscustomobject]@{ TpmEnabled = $false; Shielded = $false } }
+function Get-VMSwitch { param($ErrorAction)
+    $global:nSwitches++
+    [pscustomobject]@{ Id = $global:swA; Name = 'A'; SwitchType = 'Private' }
+    if (($global:mode -eq 'switch_drift') -and ($global:nSwitches -ge 2)) { [pscustomobject]@{ Id = $global:swB; Name = 'B'; SwitchType = 'Private' } }
+}
+function Get-VMNetworkAdapter { param($VMName, [switch]$All, [switch]$ManagementOS, $ErrorAction)
+    if ($ManagementOS) { return }
+    if ($All) {
+        $global:nAll++
+        [pscustomobject]@{ Id = 'own'; VMId = $global:vmG; SwitchId = $global:swA; IsManagementOs = $false }
+        if (-not (($global:mode -eq 'peer_drift') -and ($global:nAll -ge 2))) {
+            [pscustomobject]@{ Id = 'peer'; VMId = $global:peerG; SwitchId = $global:swA; IsManagementOs = $false }
+        }
+        return
+    }
+    $global:nAdapters++
+    $sw = $global:swA
+    if (($global:mode -eq 'adapter_drift') -and ($global:nAdapters -ge 2)) { $sw = $global:swB }
+    [pscustomobject]@{ Id = 'own'; SwitchId = $sw; SwitchName = 'A'; Connected = $true }
+}
+& $env:MEASURE_GUEST_SCRIPT -VMName 'probevm' -OutFile $env:MEASURE_GUEST_OUT | Out-Null
+"""
+
+
+@pytest.mark.parametrize("mode,bad", [
+    ("same", set()),
+    ("adapter_drift", {"adapters"}),
+    ("switch_drift", {"switches"}),
+    ("peer_drift", {"switch_peers"}),
+])
+def test_topology_that_changes_between_the_two_reads_is_not_ok(tmp_path, mode, bad):
+    shells = _shells()
+    if not shells:
+        pytest.skip("no pwsh or powershell on PATH: the script cannot be run against mocks here")
+    probe = tmp_path / "probe.ps1"
+    probe.write_text(_TOPOLOGY_PROBE, encoding="utf-8")
+    out_file = tmp_path / "out.json"
+    env = dict(os.environ, MEASURE_GUEST_SCRIPT=str(SCRIPT), MEASURE_GUEST_OUT=str(out_file), MEASURE_GUEST_MODE=mode)
+    proc = subprocess.run([shells[0], "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+                           str(probe)], capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert proc.returncode == 0, f"{Path(shells[0]).name}: {proc.stderr.strip()[:300]}"
+    doc = json.loads(out_file.read_text(encoding="utf-8-sig"))
+    for name in ("adapters", "switches", "host_adapters", "switch_peers"):
+        section = doc[name]
+        if name in bad:
+            assert section["ok"] is False and section["error_category"] == "InconsistentMeasurement", (name, section)
+            assert section["items"] == []
+        else:
+            assert section["ok"] is True and section["error"] is None, (name, section)
+    peers = [i["vm_id"] for i in doc["switch_peers"]["items"]]
+    assert peers == ([] if "switch_peers" in bad else ["22222222-2222-2222-2222-222222222222"])
