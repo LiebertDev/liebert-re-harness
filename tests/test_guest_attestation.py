@@ -577,3 +577,193 @@ def test_category_on_an_ok_section_is_a_contradiction():
         _evaluate(m)["capabilities"]["network_control"]["reasons"]
     absent = _without(_measurement(), "host_adapters.error_category")
     assert _evaluate(absent)["capabilities"]["network_control"]["status"] == "VERIFIED"
+
+
+# ---------------------------------------------------------------------------------------------
+# GuestAttestation.admit: the one VERIFIED / UNKNOWN / FAILED answer the lab gate reads.
+# ---------------------------------------------------------------------------------------------
+
+def _admissible(**overrides):
+    """A fully VERIFIED measurement: the isolated fixture plus Memory Integrity running in the guest."""
+    return _with(_measurement(**overrides), "guest.security_services_running", [1, 2])
+
+
+def _admit(m, **kw):
+    kw.setdefault("now_utc", NOW)
+    kw.setdefault("local_vm_id", VM_ID)
+    return GuestAttestation.admit(m, **kw)
+
+
+def test_admit_verifies_a_complete_fresh_measurement_and_leaks_no_identity():
+    result = _admit(_admissible())
+    assert result["verdict"] == "VERIFIED" and result["reasons"] == []
+    assert all(v is True for v in result["conditions"].values()) and result["conditions"]
+    assert result["spoofable"] is True and result["not_covered"]
+    assert {c["status"] for c in result["capabilities"].values()} == {"VERIFIED"}
+    text = json.dumps(result)
+    for secret in (VM_ID, CHECKPOINT_ID, SWITCH_ID, HOST_HASH, "lab-vm", "lab-private"):
+        assert secret not in text
+
+
+def test_admit_accepts_a_measured_absence_of_adapters():
+    m = _with(_admissible(), "adapters.items", [])
+    result = _admit(m)
+    assert result["verdict"] == "VERIFIED" and result["notes"] == ["measured absence of adapters"]
+
+
+# (case id, mutation of the VERIFIED fixture, expected verdict, a reason that must be present)
+_ADMIT_CASES = [
+    # measured violations in a trustworthy file -> FAILED
+    ("hvci_off", lambda m: _with(m, "guest.security_services_running", [1]), "FAILED", "HVCI_NOT_RUNNING"),
+    ("hvci_list_empty", lambda m: _with(m, "guest.security_services_running", []), "FAILED", "HVCI_NOT_RUNNING"),
+    ("checkpoint_not_standard", lambda m: _with(m, "checkpoints.items.0.type", "Production"), "FAILED",
+     "NO_STANDARD_CHECKPOINT"),
+    ("no_checkpoints_measured", lambda m: _with(m, "checkpoints.items", []), "FAILED", "NO_STANDARD_CHECKPOINT"),
+    ("standard_checkpoint_of_another_vm", lambda m: _with(m, "checkpoints.items.0.vm_id", OTHER_VM_ID), "UNKNOWN",
+     "NO_STANDARD_CHECKPOINT"),  # the parent checkpoint also contradicts: the file is not trusted
+    ("switch_external", lambda m: _with(m, "switches.items.0.switch_type", "External"), "FAILED",
+     "SWITCH_NOT_PRIVATE"),
+    ("switch_internal", lambda m: _with(m, "switches.items.0.switch_type", "Internal"), "FAILED",
+     "SWITCH_NOT_PRIVATE"),
+    ("host_adapter_on_external_switch",
+     lambda m: _with(_with(m, "switches.items.0.switch_type", "External"), "host_adapters.items",
+                     [{"switch_id": SWITCH_ID, "kind": "host_management"}]),
+     "FAILED", "SWITCH_SHARED_WITH_HOST"),
+    ("peer_vm_on_switch", lambda m: _with(m, "switch_peers.items", [{"switch_id": SWITCH_ID, "vm_id": OTHER_VM_ID}]),
+     "FAILED", "PEER_VM_ON_SWITCH"),
+    ("vm_not_running", lambda m: _with(m, "vm.state", "Off"), "FAILED", "VM_NOT_RUNNING"),
+    ("guest_service_interface_enabled",
+     lambda m: _with(m, "integration_services.items.0.enabled", True), "FAILED", "GUEST_SERVICE_INTERFACE_ENABLED"),
+    # missing or unreadable facts -> UNKNOWN, never FAILED and never VERIFIED
+    ("hvci_list_absent", lambda m: _without(m, "guest.security_services_running"), "UNKNOWN",
+     "MISSING:guest.security_services_running"),
+    ("hvci_list_null", lambda m: _with(m, "guest.security_services_running", None), "UNKNOWN",
+     "MISSING:guest.security_services_running"),
+    ("hvci_list_malformed", lambda m: _with(m, "guest.security_services_running", ["2"]), "UNKNOWN",
+     "INVALID:guest.security_services_running"),
+    ("hvci_list_a_string", lambda m: _with(m, "guest.security_services_running", "2"), "UNKNOWN",
+     "INVALID:guest.security_services_running"),
+    ("guest_unreached", lambda m: _with(_with(m, "guest.ok", False), "guest.error", "x"), "UNKNOWN",
+     "HVCI_NOT_MEASURED"),
+    ("guest_section_absent", lambda m: _without(m, "guest"), "UNKNOWN", "MISSING:guest"),
+    ("guest_section_wrong_type", lambda m: _with(m, "guest", "ok"), "UNKNOWN", "HVCI_NOT_MEASURED"),
+    ("checkpoint_type_absent", lambda m: _without(m, "checkpoints.items.0.type"), "UNKNOWN",
+     "MISSING:checkpoints.type"),
+    ("checkpoint_type_not_a_string", lambda m: _with(m, "checkpoints.items.0.type", 1), "UNKNOWN",
+     "MISSING:checkpoints.type"),
+    ("checkpoints_section_absent", lambda m: _without(m, "checkpoints"), "UNKNOWN", "MISSING:checkpoints"),
+    ("checkpoints_query_failed", lambda m: _with(_with(m, "checkpoints.ok", False), "checkpoints.error", "x"),
+     "UNKNOWN", "SECTION_NOT_OK:checkpoints"),
+    ("adapters_section_absent", lambda m: _without(m, "adapters"), "UNKNOWN", "MISSING:adapters"),
+    ("switches_section_absent", lambda m: _without(m, "switches"), "UNKNOWN", "MISSING:switches"),
+    ("host_adapters_section_absent", lambda m: _without(m, "host_adapters"), "UNKNOWN", "MISSING:host_adapters"),
+    ("switch_type_absent", lambda m: _without(m, "switches.items.0.switch_type"), "UNKNOWN",
+     "MISSING:switches.switch_type"),
+    ("vm_section_absent", lambda m: _without(m, "vm"), "UNKNOWN", "MISSING:vm"),
+    ("vm_state_absent", lambda m: _without(m, "vm.state"), "UNKNOWN", "MISSING:vm.state"),
+    ("measured_at_absent", lambda m: _without(m, "measured_at_utc"), "UNKNOWN", "MISSING:measured_at_utc"),
+    ("measured_at_malformed", lambda m: _with(m, "measured_at_utc", "yesterday"), "UNKNOWN",
+     "INVALID:measured_at_utc"),
+    ("measured_at_naive", lambda m: _with(m, "measured_at_utc", "2030-01-01T11:59:00"), "UNKNOWN",
+     "INVALID:measured_at_utc"),
+    # a file that cannot be trusted proves nothing: UNKNOWN, even when it also states a violation
+    ("stale", lambda m: _with(m, "measured_at_utc", _stamp(NOW - timedelta(seconds=901))), "UNKNOWN",
+     "STALE_MEASUREMENT"),
+    ("stale_and_hvci_off",
+     lambda m: _with(_with(m, "measured_at_utc", _stamp(NOW - timedelta(days=3))),
+                     "guest.security_services_running", []), "UNKNOWN", "STALE_MEASUREMENT"),
+    ("from_the_future", lambda m: _with(m, "measured_at_utc", _stamp(NOW + timedelta(minutes=10))), "UNKNOWN",
+     "CONTRADICTION:measured_at_utc"),
+    ("schema_superseded", lambda m: _with(m, "schema_version", "liebert-re.guest-measurement/1"), "UNKNOWN",
+     "SCHEMA_SUPERSEDED"),
+    ("schema_unknown", lambda m: _with(m, "schema_version", "something/9"), "UNKNOWN", "SCHEMA_MISMATCH"),
+    ("schema_absent", lambda m: _without(m, "schema_version"), "UNKNOWN", "SCHEMA_MISMATCH"),
+    ("guest_reports_another_vm", lambda m: _with(m, "guest.vm_id_from_kvp", OTHER_VM_ID), "UNKNOWN",
+     "CONTRADICTION:guest.vm_id_from_kvp"),
+    ("violation_plus_contradiction",
+     lambda m: _with(_with(m, "guest.security_services_running", []), "guest.vm_id_from_kvp", OTHER_VM_ID),
+     "UNKNOWN", "CONTRADICTION:guest.vm_id_from_kvp"),
+    ("private_switch_with_host_adapter",
+     lambda m: _with(m, "host_adapters.items", [{"switch_id": SWITCH_ID, "kind": "host_management"}]), "UNKNOWN",
+     "CONTRADICTION:host_adapters"),
+    ("duplicate_checkpoint_ids", lambda m: _with(m, "checkpoints.items", m["checkpoints"]["items"] * 2), "UNKNOWN",
+     "CONTRADICTION:checkpoints.id"),
+]
+
+
+@pytest.mark.parametrize("case_id,mutate,verdict,reason", _ADMIT_CASES, ids=[c[0] for c in _ADMIT_CASES])
+def test_admit_breaks_on_every_condition(case_id, mutate, verdict, reason):
+    result = _admit(mutate(_admissible()))
+    assert result["verdict"] == verdict, result["reasons"]
+    assert result["verdict"] != "VERIFIED" and reason in result["reasons"], result["reasons"]
+    assert result["spoofable"] is True
+    json.dumps(result)
+
+
+@pytest.mark.parametrize("measurement", [None, [], "x", 7, 1.5, True, {}, {"schema_version": GuestAttestation.SCHEMA}])
+def test_admit_of_a_non_measurement_is_unknown(measurement):
+    result = _admit(measurement)
+    assert result["verdict"] == "UNKNOWN" and result["reasons"]
+
+
+@pytest.mark.parametrize("path", ["schema_version", "measured_at_utc", "script_version", "elevated", "host", "vm",
+                                  "checkpoints", "adapters", "switches", "switch_peers", "host_adapters",
+                                  "integration_services", "guest", "vm.id", "vm.state", "vm.parent_checkpoint_id",
+                                  "host.identity_sha256", "guest.vm_id_from_kvp", "guest.ok", "checkpoints.ok",
+                                  "adapters.items", "adapters.items.0.connected", "adapters.items.0.switch_id",
+                                  "switches.items.0.id", "switches.items.0.name"])
+def test_admit_is_never_verified_when_a_required_field_is_missing(path):
+    assert _admit(_without(_admissible(), path))["verdict"] != "VERIFIED"
+
+
+def test_admit_freshness_threshold_is_a_parameter():
+    m = _admissible()  # measured 60 s before NOW
+    assert _admit(m, max_age_s=120)["verdict"] == "VERIFIED"
+    assert _admit(m, max_age_s=60)["verdict"] == "VERIFIED"  # exactly at the limit is still fresh
+    result = _admit(m, max_age_s=59)
+    assert result["verdict"] == "UNKNOWN" and "STALE_MEASUREMENT" in result["reasons"]
+    assert result["conditions"]["measurement_fresh"] is False
+
+
+@pytest.mark.parametrize("bad", [0, -5, None, True, "900", float("nan")])
+def test_admit_refuses_an_unusable_age_threshold(bad):
+    result = _admit(_admissible(), max_age_s=bad)
+    assert result["verdict"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize("bad", [None, "", "not-a-guid", 7, OTHER_VM_ID])
+def test_admit_needs_a_measurement_about_the_machine_it_runs_on(bad):
+    assert _admit(_admissible(), local_vm_id=bad)["verdict"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize("now", [None, "2030-01-01", 7, datetime(2030, 1, 1)])
+def test_admit_needs_a_timezone_aware_clock(now):
+    assert _admit(_admissible(), now_utc=now)["verdict"] == "UNKNOWN"
+
+
+def test_admit_conditions_say_which_fact_broke():
+    off = _admit(_with(_admissible(), "guest.security_services_running", []))
+    assert off["conditions"]["guest_memory_integrity"] is False and off["conditions"]["standard_checkpoint"] is True
+    public = _admit(_with(_admissible(), "switches.items.0.switch_type", "External"))
+    assert public["conditions"]["network_private_only"] is False
+    shared = _admit(_with(_with(_admissible(), "switches.items.0.switch_type", "External"), "host_adapters.items",
+                          [{"switch_id": SWITCH_ID, "kind": "host_management"}]))
+    assert shared["conditions"]["no_host_adapter_on_switch"] is False
+    nockpt = _admit(_with(_admissible(), "checkpoints.items.0.type", "Production"))
+    assert nockpt["conditions"]["standard_checkpoint"] is False
+    unknown = _admit(_without(_admissible(), "guest.security_services_running"))
+    assert unknown["conditions"]["guest_memory_integrity"] is None
+
+
+def test_admit_never_raises_on_hostile_nesting():
+    hostile = _admissible()
+    hostile["checkpoints"]["items"] = [[], None, 3, {"id": {}}]
+    hostile["adapters"]["items"] = "x"
+    hostile["guest"]["security_services_running"] = [object()]
+    result = _admit(hostile)
+    assert result["verdict"] == "UNKNOWN" and result["reasons"]
+
+
+def test_admit_ignores_the_operator_assertion():
+    m = _with(_with(_admissible(), "guest.security_services_running", []), "isolation_asserted_by_operator", True)
+    assert _admit(m)["verdict"] == "FAILED"

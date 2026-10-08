@@ -23,6 +23,10 @@ import liebert_re.cli as cli
 import liebert_re.tools.pe_sieve as ps
 from liebert_re.bounded_subprocess import BoundedProcessResult
 import liebert_re.dynamic.lab_gate as lg
+from tests.test_guest_attestation import VM_ID as _GA_VM_ID
+from tests.test_guest_attestation import _admissible as _ga_admissible
+from tests.test_guest_attestation import _with as _ga_with
+from tests.test_guest_attestation import _without as _ga_without
 
 pytestmark = pytest.mark.contract
 
@@ -465,3 +469,201 @@ class TestCli:
         code, body = self._run("labgate", "--operation", "pe_sieve_scan", "--pid", str(child.pid),
                                "--authorization", json.dumps(_auth(child.pid)), "--sample-sha256", image_sha)
         assert code == 0 and body["status"] == "GATE_PASSED"
+
+
+# ---------------------------------------------------------------------------------------------
+# NEEDS_ISOLATION operations open only for a VERIFIED guest attestation, read from a named file.
+# ---------------------------------------------------------------------------------------------
+
+def _fresh(measurement, age_s=60):
+    """The measurement stamped `age_s` seconds before the real clock (the gate reads the real clock)."""
+    from datetime import datetime, timedelta, timezone
+    moment = datetime.now(timezone.utc) - timedelta(seconds=age_s)
+    earlier = moment - timedelta(days=1)
+    return _ga_with(_ga_with(measurement, "measured_at_utc", moment.strftime("%Y-%m-%dT%H:%M:%SZ")),
+                    "checkpoints.items.0.created_utc", earlier.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+
+def _measurement_file(tmp_path, measurement, name="measurement.json"):
+    path = tmp_path / name
+    path.write_text(json.dumps(measurement), encoding="utf-8")
+    return str(path)
+
+
+def _isolated_gate(pid, path, operation="frida_trace", **kw):
+    kw.setdefault("local_vm_id", _GA_VM_ID)
+    return _gate(pid, operation=operation, guest_measurement_path=path, **kw)
+
+
+class TestIsolationFromAttestation:
+    @pytest.mark.parametrize("operation", sorted(lg.NEEDS_ISOLATION))
+    def test_a_verified_attestation_opens_only_the_isolation_check(self, child, image_sha, lab_open, tmp_path, operation):
+        path = _measurement_file(tmp_path, _fresh(_ga_admissible()))
+        data = _isolated_gate(child.pid, path, operation=operation, sample_sha256=image_sha)
+        assert data["ok"] is True, (data["status"], data.get("detail"))
+        assert data["status"] == "GATE_PASSED" and data["decision"] == "ALLOW"
+        assert data["isolation_verified"] is True and data["isolation"]["verified"] is True
+        assert data["isolation"]["unmet_prerequisites"] == [] and data["isolation"]["required_for_operation"] is True
+        att = data["isolation"]["attestation"]
+        assert att["verdict"] == "VERIFIED" and att["spoofable"] is True and att["not_covered"]
+        assert data["invoked_argv"] is None and data["result"] is None  # the gate starts nothing
+        results = {c["check"]: c["result"] for c in data["checks"]}
+        assert results["isolation_requirement"] == "passed" and set(results.values()) == {"passed"}
+
+    def test_the_other_checks_still_apply_after_a_verified_attestation(self, child, image_sha, tmp_path):
+        path = _measurement_file(tmp_path, _fresh(_ga_admissible()))
+        with mock.patch.dict(os.environ):
+            os.environ.pop(lg.ENABLE_ENV, None)
+            data = _isolated_gate(child.pid, path, sample_sha256=image_sha)
+        assert data["status"] == "AUTHORIZATION_REQUIRED" and data["error"] == "LAB_SWITCH_OFF"
+        with mock.patch.dict(os.environ, OPEN):
+            data = _isolated_gate(child.pid, path, sample_sha256="0" * 64)
+            assert data["status"] == "SAMPLE_HASH_MISMATCH"
+            data = _isolated_gate(child.pid, path, sample_sha256=image_sha, authorization=_auth(child.pid, "other"))
+            assert data["status"] == "AUTHORIZATION_REQUIRED"
+            data = _isolated_gate(child.pid, path, sample_sha256=image_sha, timeout_seconds=0)
+            assert data["status"] == "BOUNDS_REQUIRED"
+
+    def test_no_measurement_path_is_refused_as_before(self, child, image_sha, lab_open):
+        data = _gate(child.pid, operation="frida_trace", sample_sha256=image_sha)
+        assert data["status"] == "ISOLATION_REQUIRED" and data["error"] == "ISOLATED_GUEST_NOT_VERIFIABLE"
+        assert data["isolation_verified"] is False and data["isolation"]["attestation"]["verdict"] == "UNKNOWN"
+        assert data["isolation"]["attestation"]["reasons"] == ["GUEST_MEASUREMENT_NOT_SUPPLIED"]
+        assert len(data["isolation"]["unmet_prerequisites"]) == 3
+
+    def test_no_environment_variable_or_default_location_supplies_a_measurement(self, child, image_sha, lab_open,
+                                                                               tmp_path, monkeypatch):
+        _measurement_file(tmp_path, _fresh(_ga_admissible()), name="measure-guest.json")
+        monkeypatch.chdir(tmp_path)
+        for name in ("LIEBERT_RE_GUEST_MEASUREMENT", "LIEBERT_RE_MEASUREMENT", "GUEST_MEASUREMENT"):
+            monkeypatch.setenv(name, str(tmp_path / "measure-guest.json"))
+        data = _gate(child.pid, operation="frida_trace", sample_sha256=image_sha, local_vm_id=_GA_VM_ID)
+        assert data["status"] == "ISOLATION_REQUIRED" and data["isolation_verified"] is False
+
+    @pytest.mark.parametrize("label,mutate,verdict,error", [
+        ("stale", lambda m: _fresh(m, age_s=100000), "UNKNOWN", "ISOLATED_GUEST_NOT_VERIFIABLE"),
+        ("hvci_off", lambda m: _ga_with(m, "guest.security_services_running", []), "FAILED",
+         "ISOLATED_GUEST_ATTESTATION_FAILED"),
+        ("no_standard_checkpoint", lambda m: _ga_with(m, "checkpoints.items.0.type", "Production"), "FAILED",
+         "ISOLATED_GUEST_ATTESTATION_FAILED"),
+        ("public_switch", lambda m: _ga_with(m, "switches.items.0.switch_type", "External"), "FAILED",
+         "ISOLATED_GUEST_ATTESTATION_FAILED"),
+        ("guest_missing", lambda m: _ga_without(m, "guest"), "UNKNOWN", "ISOLATED_GUEST_NOT_VERIFIABLE"),
+        ("field_missing", lambda m: _ga_without(m, "vm.state"), "UNKNOWN", "ISOLATED_GUEST_NOT_VERIFIABLE"),
+        ("old_schema", lambda m: _ga_with(m, "schema_version", "liebert-re.guest-measurement/1"), "UNKNOWN",
+         "ISOLATED_GUEST_NOT_VERIFIABLE"),
+    ])
+    def test_anything_but_verified_is_refused_with_its_reasons(self, child, image_sha, lab_open, tmp_path,
+                                                               label, mutate, verdict, error):
+        path = _measurement_file(tmp_path, mutate(_fresh(_ga_admissible())))
+        data = _isolated_gate(child.pid, path, sample_sha256=image_sha)
+        assert data["ok"] is False and data["status"] == "ISOLATION_REQUIRED" and data["error"] == error
+        assert data["isolation_verified"] is False and data["isolation"]["verified"] is False
+        att = data["isolation"]["attestation"]
+        assert att["verdict"] == verdict and att["reasons"]
+        assert all(reason in data["detail"] for reason in att["reasons"])
+        assert len(data["isolation"]["unmet_prerequisites"]) == 3
+
+    @pytest.mark.parametrize("label,payload,reason", [
+        ("not_json", b"{not json", "GUEST_MEASUREMENT_NOT_JSON"),
+        ("empty", b"", "GUEST_MEASUREMENT_NOT_JSON"),
+        ("not_utf8", b"\xff\xfe\x00bad", "GUEST_MEASUREMENT_NOT_JSON"),
+        ("nan_constant", b'{"schema_version": NaN}', "GUEST_MEASUREMENT_NOT_JSON"),
+        ("array", b"[]", "MEASUREMENT_NOT_AN_OBJECT"),
+        ("scalar", b"7", "MEASUREMENT_NOT_AN_OBJECT"),
+        ("deeply_nested", b"[" * 5000 + b"]" * 5000, "GUEST_MEASUREMENT_NOT_JSON"),
+    ])
+    def test_a_broken_file_is_unknown(self, child, image_sha, lab_open, tmp_path, label, payload, reason):
+        path = tmp_path / "broken.json"
+        path.write_bytes(payload)
+        data = _isolated_gate(child.pid, str(path), sample_sha256=image_sha)
+        assert data["status"] == "ISOLATION_REQUIRED" and data["isolation_verified"] is False
+        assert data["isolation"]["attestation"]["verdict"] == "UNKNOWN"
+        assert reason in data["isolation"]["attestation"]["reasons"]
+
+    def test_a_missing_directory_or_oversized_file_is_unknown(self, child, image_sha, lab_open, tmp_path):
+        data = _isolated_gate(child.pid, str(tmp_path / "nowhere.json"), sample_sha256=image_sha)
+        assert data["isolation"]["attestation"]["reasons"] == ["GUEST_MEASUREMENT_UNREADABLE:FileNotFoundError"]
+        data = _isolated_gate(child.pid, str(tmp_path), sample_sha256=image_sha)
+        assert data["isolation"]["attestation"]["verdict"] == "UNKNOWN"
+        big = tmp_path / "big.json"
+        big.write_bytes(b" " * (lg._MAX_MEASUREMENT_BYTES + 1))
+        data = _isolated_gate(child.pid, str(big), sample_sha256=image_sha)
+        assert data["isolation"]["attestation"]["reasons"] == ["GUEST_MEASUREMENT_TOO_LARGE"]
+        for value in ("", "  ", 7, [], {}, None):
+            data = _isolated_gate(child.pid, value, sample_sha256=image_sha)
+            assert data["isolation"]["attestation"]["reasons"] == ["GUEST_MEASUREMENT_NOT_SUPPLIED"]
+
+    def test_the_measurement_must_be_about_the_machine_the_gate_runs_on(self, child, image_sha, lab_open, tmp_path):
+        path = _measurement_file(tmp_path, _fresh(_ga_admissible()))
+        for vm_id in (None, "not-a-guid", "99999999-9999-4999-8999-999999999999"):
+            data = _isolated_gate(child.pid, path, sample_sha256=image_sha, local_vm_id=vm_id)
+            assert data["status"] == "ISOLATION_REQUIRED" and data["isolation"]["attestation"]["verdict"] == "UNKNOWN"
+
+    def test_the_age_limit_is_a_parameter(self, child, image_sha, lab_open, tmp_path):
+        path = _measurement_file(tmp_path, _fresh(_ga_admissible(), age_s=600))
+        assert _isolated_gate(child.pid, path, sample_sha256=image_sha, max_age_s=900)["status"] == "GATE_PASSED"
+        data = _isolated_gate(child.pid, path, sample_sha256=image_sha, max_age_s=300)
+        assert data["status"] == "ISOLATION_REQUIRED" and "STALE_MEASUREMENT" in data["isolation"]["attestation"]["reasons"]
+        for bad in (0, -1, None, "900", True):
+            data = _isolated_gate(child.pid, path, sample_sha256=image_sha, max_age_s=bad)
+            assert data["status"] == "ISOLATION_REQUIRED"
+
+    def test_observation_does_not_read_the_measurement(self, child, image_sha, lab_open, tmp_path):
+        data = _isolated_gate(child.pid, str(tmp_path / "nowhere.json"), operation="pe_sieve_scan",
+                              sample_sha256=image_sha)
+        assert data["status"] == "GATE_PASSED" and data["isolation_verified"] is False
+        assert data["isolation"]["attestation"] is None and len(data["isolation"]["unmet_prerequisites"]) == 3
+
+    def test_the_record_keeps_the_file_hash_and_no_path_or_identity(self, child, image_sha, lab_open, tmp_path):
+        measurement = _fresh(_ga_admissible())
+        path = _measurement_file(tmp_path, measurement, name="needle_dir_name.json")
+        data = _isolated_gate(child.pid, path, sample_sha256=image_sha)
+        att = data["isolation"]["attestation"]
+        assert att["measurement_sha256"] == _sha(path) and att["measurement_bytes"] == os.path.getsize(path)
+        text = (lg.EVIDENCE / data["evidence_name"]).read_text(encoding="utf-8")
+        for secret in (str(tmp_path), "needle_dir_name", _GA_VM_ID, "lab-vm", "lab-private"):
+            assert secret not in text
+        assert json.loads(text)["isolation"]["attestation"]["verdict"] == "VERIFIED"
+
+    def test_a_bom_prefixed_file_as_written_by_windows_powershell_is_read(self, child, image_sha, lab_open, tmp_path):
+        path = tmp_path / "bom.json"
+        path.write_bytes(b"\xef\xbb\xbf" + json.dumps(_fresh(_ga_admissible())).encode("utf-8"))
+        assert _isolated_gate(child.pid, str(path), sample_sha256=image_sha)["status"] == "GATE_PASSED"
+
+    def test_hostile_attestation_arguments_never_raise(self):
+        for value in (object(), 1.5, float("nan"), [], {}, b"x", "\x00", 10 ** 30, True):
+            out = lg.dynamic_lab_gate("frida_trace", 1, None, None, 1, 1, value, value, value)
+            assert isinstance(json.loads(out), dict)
+
+
+class TestIsolationCli:
+    def _run(self, *argv):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = cli.main(list(argv))
+        return code, json.loads(buf.getvalue())
+
+    def _args(self, child, image_sha, path, *more):
+        return ("labgate", "--operation", "frida_trace", "--pid", str(child.pid),
+                "--authorization", json.dumps(_auth(child.pid, "frida_trace")), "--sample-sha256", image_sha,
+                "--guest-measurement", path, *more)
+
+    def test_a_verified_measurement_passes_the_gate_from_the_command_line(self, child, image_sha, lab_open, tmp_path):
+        path = _measurement_file(tmp_path, _fresh(_ga_admissible()))
+        code, body = self._run(*self._args(child, image_sha, path, "--local-vm-id", _GA_VM_ID))
+        assert code == 0 and body["status"] == "GATE_PASSED" and body["isolation_verified"] is True
+
+    def test_the_command_line_refuses_without_the_vm_id_and_when_stale(self, child, image_sha, lab_open, tmp_path):
+        path = _measurement_file(tmp_path, _fresh(_ga_admissible()))
+        code, body = self._run(*self._args(child, image_sha, path))
+        assert code == 3 and body["status"] == "ISOLATION_REQUIRED"
+        assert "MISSING:local_vm_id" in body["isolation"]["attestation"]["reasons"]
+        code, body = self._run(*self._args(child, image_sha, path, "--local-vm-id", _GA_VM_ID, "--max-age-s", "5"))
+        assert code == 3 and "STALE_MEASUREMENT" in body["isolation"]["attestation"]["reasons"]
+
+    def test_the_command_line_has_no_default_for_the_measurement(self, child, image_sha, lab_open):
+        code, body = self._run("labgate", "--operation", "frida_trace", "--pid", str(child.pid),
+                               "--authorization", json.dumps(_auth(child.pid, "frida_trace")),
+                               "--sample-sha256", image_sha, "--local-vm-id", _GA_VM_ID)
+        assert code == 3 and body["isolation"]["attestation"]["reasons"] == ["GUEST_MEASUREMENT_NOT_SUPPLIED"]

@@ -43,13 +43,20 @@ established is a refusal, never a pass):
   started (``TARGET_IDENTITY_DRIFTED``). The same check after the run is kept and reported. The
   window between the last check and the start is narrowed, not closed.
 
-NOT ENFORCED, and reported as not verified every time (``isolation_verified: false``): an
-isolated, single-use guest; a known snapshot and rollback path; network off or allow-listed.
-Nothing in this harness can attest to those today. So an operation that EXECUTES a sample or
-instruments a process (``execute_sample``, ``launch_sample``, ``frida_trace``,
-``frida_attach``, ``frida_spawn``) is refused with ``ISOLATION_REQUIRED`` whatever else is
-supplied. Only read-only observation of a harness-owned live process (``pe_sieve_scan``) is
-allowed without isolation, and the response says that is the reason.
+NOT ENFORCED by the gate itself, and reported as not verified (``isolation_verified: false``)
+unless an attestation says otherwise: an isolated, single-use guest; a known snapshot and
+rollback path; network off or allow-listed. An operation that EXECUTES a sample or instruments a
+process (``execute_sample``, ``launch_sample``, ``frida_trace``, ``frida_attach``,
+``frida_spawn``) is refused with ``ISOLATION_REQUIRED`` whatever else is supplied, UNLESS the
+caller names a measurement file (``guest_measurement_path``, an explicit argument: no environment
+variable, no default location) and ``liebert_re.dynamic.guest_attestation.GuestAttestation.admit``
+judges it ``VERIFIED``: fresh, the VM's adapters only on Private switches with no host adapter, a
+Standard checkpoint, Memory Integrity running in the guest, the guest reached, and the file
+measured about the machine the gate runs on (``local_vm_id``). ``UNKNOWN`` and ``FAILED`` refuse
+with the reasons. That opens only this one check: authorization, ownership, sample hash, bounds and
+evidence still apply, and the measurement is a spoofable file (see its ``not_covered`` list). This
+gate starts nothing. Only read-only observation of a harness-owned live process (``pe_sieve_scan``)
+is allowed without isolation, and the response says that is the reason.
 """
 from __future__ import annotations
 
@@ -62,7 +69,9 @@ import re
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 
+from liebert_re.dynamic.guest_attestation import GuestAttestation
 from liebert_re.workspace import PROJECT_ROOT as APP_DIR
 
 EVIDENCE = APP_DIR / "dataset" / "evidence" / "dynamic_lab_gate"
@@ -73,15 +82,16 @@ DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_MAX_MEMORY_BYTES = 2 * 1024 ** 3
 _MAX_IMAGE_BYTES = 1024 ** 3
 _MAX_PID = 0xFFFFFFFF
+_MAX_MEASUREMENT_BYTES = 1024 ** 2
 
 # What each operation does to a live process. Anything not listed is refused.
 OBSERVE_OWNED = frozenset({"pe_sieve_scan"})
 NEEDS_ISOLATION = frozenset({"execute_sample", "launch_sample", "frida_trace", "frida_attach", "frida_spawn"})
 
 _UNVERIFIED = {
-    "isolated_guest": "no guest attestation exists in this harness; a single-use, verified isolated guest cannot be confirmed",
-    "snapshot_and_rollback": "no snapshot or rollback path is known to or checked by this harness",
-    "network_control": "network off or allow-listed cannot be confirmed from here",
+    "isolated_guest": "no VERIFIED guest attestation was supplied; a single-use, verified isolated guest cannot be confirmed",
+    "snapshot_and_rollback": "no VERIFIED guest attestation was supplied; no snapshot or rollback path is checked",
+    "network_control": "no VERIFIED guest attestation was supplied; network off or allow-listed cannot be confirmed from here",
 }
 _CHECKS = ("operation_known", "isolation_requirement", "operator_switch", "pid", "authorization",
            "ownership", "sample_hash", "bounds", "evidence_writable")
@@ -254,9 +264,51 @@ class LabGate:
             return {"type": type(exc).__name__, "errno": exc.errno, "strerror": exc.strerror or type(exc).__name__}
 
     @staticmethod
+    def admission(path, local_vm_id, max_age_s):
+        """Read the measurement file the caller NAMED and judge it; never raises. The path is an
+        explicit argument: no environment variable and no default location is consulted. The result
+        is ``GuestAttestation.admit``'s, plus the file's size and SHA-256 (never its path, which
+        can carry a user name). An unreadable or non-JSON file is UNKNOWN with a reason code."""
+        def unknown(reason, **extra):
+            return {"schema_version": GuestAttestation.SCHEMA, "verdict": "UNKNOWN", "reasons": [reason],
+                    "notes": [], "conditions": {}, "capabilities": {}, "spoofable": True,
+                    "measurement_sha256": None, "measurement_bytes": None, **extra}
+
+        if not isinstance(path, (str, os.PathLike)) or not str(path).strip():
+            return unknown("GUEST_MEASUREMENT_NOT_SUPPLIED")
+        try:
+            size = os.path.getsize(path)
+            if size > _MAX_MEASUREMENT_BYTES:
+                return unknown("GUEST_MEASUREMENT_TOO_LARGE", measurement_bytes=size)
+            with open(path, "rb") as handle:
+                raw = handle.read(_MAX_MEASUREMENT_BYTES + 1)
+        except (OSError, ValueError) as exc:
+            return unknown(f"GUEST_MEASUREMENT_UNREADABLE:{type(exc).__name__}")
+        digest, count = hashlib.sha256(raw).hexdigest(), len(raw)
+        if count > _MAX_MEASUREMENT_BYTES:
+            return unknown("GUEST_MEASUREMENT_TOO_LARGE", measurement_sha256=digest, measurement_bytes=count)
+
+        def refuse_constant(name):
+            raise ValueError(name)
+
+        try:
+            document = json.loads(raw.decode("utf-8-sig"), parse_constant=refuse_constant)
+        except (ValueError, RecursionError):
+            return unknown("GUEST_MEASUREMENT_NOT_JSON", measurement_sha256=digest, measurement_bytes=count)
+        result = GuestAttestation.admit(document, now_utc=datetime.now(timezone.utc),
+                                        local_vm_id=local_vm_id, max_age_s=max_age_s)
+        result.update(measurement_sha256=digest, measurement_bytes=count)
+        return result
+
+    @staticmethod
     def check(operation, pid=None, authorization=None, sample_sha256=None,
-              timeout_seconds=DEFAULT_TIMEOUT_SECONDS, max_memory_bytes=DEFAULT_MAX_MEMORY_BYTES):
-        """The gate decision as a dict. Never raises. ``ok`` is True only if every check passed."""
+              timeout_seconds=DEFAULT_TIMEOUT_SECONDS, max_memory_bytes=DEFAULT_MAX_MEMORY_BYTES,
+              guest_measurement_path=None, local_vm_id=None, max_age_s=GuestAttestation.DEFAULT_MAX_AGE_S):
+        """The gate decision as a dict. Never raises. ``ok`` is True only if every check passed.
+
+        The last three arguments matter only to an operation in ``NEEDS_ISOLATION``: they name the
+        measurement file, the VM id of the machine the gate runs on, and the oldest measurement
+        (seconds) that still counts."""
         started = time.time()
         known = isinstance(operation, str) and (operation in OBSERVE_OWNED or operation in NEEDS_ISOLATION)
         needs_isolation = isinstance(operation, str) and operation in NEEDS_ISOLATION
@@ -264,10 +316,11 @@ class LabGate:
         decision = {
             "tool": "dynamic_lab_gate", "operation": operation if isinstance(operation, str) else None,
             "gate_scope": "single-host MVP: enforces authorization, sample hash, PID ownership, bounds and evidence; "
-                          "does NOT verify an isolated guest, snapshots or network control",
+                          "isolated guest, snapshots and network control count as verified only through a VERIFIED "
+                          "guest attestation (a spoofable measurement file), otherwise they are not verified",
             "isolation_verified": False,
             "isolation": {
-                "verified": False, "required_for_operation": needs_isolation if known else None,
+                "verified": False, "attestation": None, "required_for_operation": needs_isolation if known else None,
                 "reason_not_required": None if needs_isolation or not known else
                     "read-only observation of a process this harness started; nothing is executed or modified",
                 "unmet_prerequisites": [{"prerequisite": k, "verified": False, "reason": v} for k, v in _UNVERIFIED.items()],
@@ -297,11 +350,28 @@ class LabGate:
                           "the gate does not know this operation, so it is refused; nothing was started")
         passed("operation_known", f"{operation} is a registered operation")
         if needs_isolation:
-            return refuse("isolation_requirement", "ISOLATION_REQUIRED", "ISOLATED_GUEST_NOT_VERIFIABLE",
-                          f"{operation} executes or instruments a process and needs a verified isolated guest "
-                          "with a snapshot and controlled network; none of these can be verified here, so it is "
-                          "refused whatever else was supplied")
-        passed("isolation_requirement", "observation only: isolation is not required, and is reported as not verified")
+            attestation = LabGate.admission(guest_measurement_path, local_vm_id, max_age_s)
+            decision["isolation"]["attestation"] = attestation
+            if attestation["verdict"] != "VERIFIED":
+                failed = attestation["verdict"] == "FAILED"
+                detail = (f"{operation} executes or instruments a process and needs a verified isolated guest "
+                          "with a snapshot and controlled network. ")
+                if attestation["reasons"] == ["GUEST_MEASUREMENT_NOT_SUPPLIED"]:
+                    detail += ("No guest measurement was supplied, so none of these can be verified here; it is "
+                               "refused whatever else was supplied")
+                else:
+                    detail += (f"The guest attestation is {attestation['verdict']} "
+                               f"({', '.join(attestation['reasons'])}); it is refused whatever else was supplied")
+                return refuse("isolation_requirement", "ISOLATION_REQUIRED",
+                              "ISOLATED_GUEST_ATTESTATION_FAILED" if failed else "ISOLATED_GUEST_NOT_VERIFIABLE", detail)
+            decision["isolation_verified"] = True
+            decision["isolation"].update(
+                verified=True, unmet_prerequisites=[], basis="attested_measurement",
+                caveat="the measurement is a file: spoofable, and it does not cover what attestation['not_covered'] lists")
+            passed("isolation_requirement",
+                   "guest attestation VERIFIED from a fresh measurement (spoofable; see isolation.attestation.not_covered)")
+        else:
+            passed("isolation_requirement", "observation only: isolation is not required, and is reported as not verified")
         if os.environ.get(ENABLE_ENV, "").strip() != ENABLE_VALUE:
             return refuse("operator_switch", "AUTHORIZATION_REQUIRED", "LAB_SWITCH_OFF",
                           f"the operator has not opened the dynamic lab on this machine ({ENABLE_ENV} is not "
@@ -430,7 +500,9 @@ class LabGate:
 
 
 def dynamic_lab_gate(operation=None, pid=None, authorization=None, sample_sha256=None,
-                     timeout_seconds=DEFAULT_TIMEOUT_SECONDS, max_memory_bytes=DEFAULT_MAX_MEMORY_BYTES):
+                     timeout_seconds=DEFAULT_TIMEOUT_SECONDS, max_memory_bytes=DEFAULT_MAX_MEMORY_BYTES,
+                     guest_measurement_path=None, local_vm_id=None,
+                     max_age_s=GuestAttestation.DEFAULT_MAX_AGE_S):
     """Evaluate the gate for one operation on one process and write the decision to evidence.
 
     Returns JSON. ``status`` is ``GATE_PASSED`` or one of ``UNKNOWN_OPERATION``,
@@ -440,12 +512,15 @@ def dynamic_lab_gate(operation=None, pid=None, authorization=None, sample_sha256
     ``ANALYSIS_LIMITED`` (with ``environment_error``). An operation that runs behind the gate adds
     ``TARGET_IDENTITY_DRIFTED`` (re-check before the start failed; nothing started) and
     ``EVIDENCE_FINALIZE_FAILED`` (it ran, the final record could not be written, result withheld). Every response carries ``checks`` (each
-    check passed, failed or not_evaluated), ``enforced``, ``isolation_verified`` (always false
-    today) and ``isolation.unmet_prerequisites``. A pass here authorizes nothing by itself; the
+    check passed, failed or not_evaluated), ``enforced``, ``isolation_verified`` (false unless a
+    VERIFIED guest attestation was supplied for an operation that needs one) and
+    ``isolation.unmet_prerequisites``. ``guest_measurement_path``, ``local_vm_id`` and ``max_age_s``
+    feed the attestation (see the module docstring). A pass here authorizes nothing by itself; the
     operation re-runs the gate before it starts.
     """
     try:
-        return _j(LabGate.check(operation, pid, authorization, sample_sha256, timeout_seconds, max_memory_bytes))
+        return _j(LabGate.check(operation, pid, authorization, sample_sha256, timeout_seconds, max_memory_bytes,
+                                guest_measurement_path, local_vm_id, max_age_s))
     except Exception as exc:  # noqa: BLE001 - the contract is a JSON string, never an exception
         return _j({"ok": False, "tool": "dynamic_lab_gate", "decision": "REFUSE", "status": "ANALYSIS_LIMITED",
                    "error": "GATE_UNEXPECTED_ERROR", "isolation_verified": False,
