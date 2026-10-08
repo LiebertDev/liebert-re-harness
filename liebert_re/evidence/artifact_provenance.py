@@ -6,6 +6,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from liebert_re import strict_json
 from liebert_re.workspace import PROJECT_ROOT as APP
 PRODUCER_VERSION = "p0.5.0"
 DATASET_SCHEMA_VERSION = 3
@@ -150,8 +151,8 @@ def stale_status(manifest: str | Path, inputs) -> dict:
     if not path.is_file():
         return {"status": "MISSING", "manifest": path.name, "current_input_digest": combined_hash(current)}
     try:
-        saved = json.loads(path.read_text(encoding="utf-8")).get("input_hashes", {})
-    except (OSError, json.JSONDecodeError):
+        saved = strict_json.loads(path.read_text(encoding="utf-8")).get("input_hashes", {})
+    except (OSError, ValueError):  # StrictJSONError is a ValueError: a repeated key or NaN is INVALID
         return {"status": "INVALID", "manifest": path.name}
     return {
         "status": "CURRENT" if saved == current else "STALE",

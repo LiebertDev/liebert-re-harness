@@ -39,6 +39,8 @@ import sys
 import time
 from pathlib import Path
 
+from liebert_re import strict_json
+
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_REFUSED = 0, 1, 2, 3
 
 # The refusal statuses. All but PATH_REFUSED are members of the vocabulary that
@@ -219,8 +221,18 @@ def _decode(raw, shape=None, tool=None):
     if not isinstance(raw, str):
         return raw if raw is not None else _no_result()
     try:
-        parsed = json.loads(raw)
+        parsed = strict_json.loads(raw)
         return parsed if parsed is not None else _no_result()
+    except strict_json.StrictJSONError as exc:
+        if exc.reason != strict_json.MALFORMED:
+            # It IS a JSON document, one that cannot be trusted (a repeated key, NaN/Infinity, absurd
+            # nesting). Never an answer, and not prose for the text rules either: a failure, text kept.
+            out = {"result_format": "text", "text": raw}
+            if tool is not None:
+                out = {"tool": tool, **out}
+            out.update(ok=False, status="FAILED", error="NON_STRICT_JSON_RESULT", reason=exc.reason,
+                       message="The command returned a JSON document that is not strict JSON (%s); it is not trusted." % exc.reason)
+            return out
     except ValueError:
         pass
     out = {"result_format": "text", "text": raw}
@@ -834,8 +846,8 @@ def _tool_prepare(a):
     if a.name in declared:
         return {"ok": False, "status": "UNSUPPORTED", "error": "PYTHON_ONLY", "tool": a.name, "reason": declared[a.name]}
     try:
-        kwargs = json.loads(a.args)
-    except ValueError as exc:
+        kwargs = strict_json.loads(a.args)
+    except ValueError as exc:  # StrictJSONError (repeated key, NaN) included
         return _tool_usage("BAD_ARGS_JSON", f"--args is not valid JSON: {exc}")
     if not isinstance(kwargs, dict):
         return _tool_usage("ARGS_NOT_OBJECT", "--args must be a JSON object of keyword arguments")

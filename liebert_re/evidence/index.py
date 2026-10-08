@@ -419,7 +419,7 @@ def _parse_jsonl(text, truncated):
             continue
         non_blank += 1
         try:
-            records.append(json.loads(line))
+            records.append(strict_json.loads(line))
         except ValueError as exc:
             bad.append((number, f"{type(exc).__name__}: {exc}"[:120]))
     return {"records": records, "non_blank": non_blank, "bad": bad, "dropped_tail": dropped_tail}
@@ -831,12 +831,12 @@ class EvidenceIndex:
                 body_excerpt = text
                 try:
                     # a size-capped read can cut a valid JSON document mid-
-                    # token; only trust json.loads on a read that wasn't
+                    # token; only trust strict_json.loads on a read that wasn't
                     # truncated, otherwise this is an honest MALFORMED_OR_
                     # TRUNCATED rather than a false "matches its schema".
                     if read_error == "TRUNCATED":
                         raise ValueError("content read was truncated before parsing")
-                    payload = json.loads(text)
+                    payload = strict_json.loads(text)
                 except Exception as exc:  # noqa: BLE001 - any malformed/partial write must be skipped, not fatal
                     status = "json_malformed"
                     parse_error = f"{type(exc).__name__}: {exc}"[:300]

@@ -83,6 +83,7 @@ import time
 import uuid
 from pathlib import Path
 
+from liebert_re import strict_json
 from liebert_re.workspace import PROJECT_ROOT as APP_DIR
 from liebert_re.workspace import safe_path
 
@@ -333,8 +334,8 @@ class EmulationGate:
             return None, ("AUTHORIZATION_REQUIRED", "owned_target needs an authorization object")
         if isinstance(value, str):
             try:
-                value = json.loads(value)
-            except ValueError:
+                value = strict_json.loads(value)
+            except ValueError:  # StrictJSONError (repeated key, NaN) included
                 return None, ("AUTHORIZATION_REQUIRED", "the authorization is not valid JSON")
         if not isinstance(value, dict):
             return None, ("AUTHORIZATION_REQUIRED", "the authorization must be an object")
@@ -719,7 +720,7 @@ class _Runner:
         body = None
         if outcome.returncode == 0 and lines:
             try:
-                parsed = json.loads(lines[-1])
+                parsed = strict_json.loads(lines[-1])
                 body = parsed if isinstance(parsed, dict) else None
             except ValueError:
                 body = None

@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from liebert_re import strict_json
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -181,7 +183,7 @@ class DurableLock:
 
     def _read_holder(self) -> dict | None:
         try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
+            return strict_json.loads(self.path.read_text(encoding="utf-8"))
         except Exception:
             return None
 

@@ -257,8 +257,8 @@ class LabGate:
         for name in sorted(names):
             try:
                 with open(folder / name, encoding="utf-8") as handle:
-                    entry = json.load(handle)
-            except (OSError, ValueError):
+                    entry = strict_json.loads(handle.read())
+            except (OSError, ValueError):  # StrictJSONError is a ValueError: a repeated key or NaN registers nothing
                 continue
             if (isinstance(entry, dict) and entry.get("pid") == identity["pid"]
                     and entry.get("create_time") == identity["create_time"]

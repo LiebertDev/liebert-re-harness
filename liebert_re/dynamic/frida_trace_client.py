@@ -260,6 +260,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from liebert_re import strict_json
+
 # Well-known Windows process exit codes this launcher can decode WITHOUT
 # guessing -- NTSTATUS-shaped values (the 0xC0000000+ STATUS_SEVERITY_ERROR
 # range) a crashed, killed, or anti-analysis-self-terminated process's exit
@@ -463,8 +465,8 @@ def _parse_agent_params(raw: Optional[str]) -> Any:
     else:
         text = raw
     try:
-        return json.loads(text)
-    except json.JSONDecodeError as exc:
+        return strict_json.loads(text)
+    except ValueError as exc:  # JSONDecodeError and StrictJSONError (repeated key, NaN) are both ValueErrors
         raise ValueError(f"--agent-params value is neither an existing JSON file nor parseable JSON text: {exc}") from exc
 
 
