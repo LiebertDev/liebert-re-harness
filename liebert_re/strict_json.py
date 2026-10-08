@@ -21,6 +21,8 @@ caller reports.
 from __future__ import annotations
 
 import json
+import math
+import re
 from typing import Any
 
 DUPLICATE_KEY = "DUPLICATE_KEY"
@@ -28,9 +30,12 @@ NON_FINITE = "NON_FINITE"
 TOO_LARGE = "TOO_LARGE"
 TOO_DEEP = "TOO_DEEP"
 MALFORMED = "MALFORMED"
+# Nesting deeper than this is TOO_DEEP whatever the interpreter's recursion limit is. Real documents
+# (reports, evidence, IR) nest a few dozen levels; 256 leaves room and stays far below that limit.
+DEFAULT_MAX_DEPTH = 256
 REASONS = (DUPLICATE_KEY, NON_FINITE, TOO_LARGE, TOO_DEEP, MALFORMED)
 
-__all__ = ["StrictJSONError", "loads", "REASONS", *REASONS]
+__all__ = ["StrictJSONError", "loads", "REASONS", "DEFAULT_MAX_DEPTH", *REASONS]
 
 
 class StrictJSONError(ValueError):
@@ -54,6 +59,31 @@ def _refuse_constant(name: str) -> Any:
     raise StrictJSONError(NON_FINITE, f"non-finite JSON number {name}")
 
 
+def _finite_float(literal: str) -> float:
+    """A number with a fraction or exponent that does not fit a double (``1e999``, a 5000-digit
+    decimal) becomes ``inf``; that is the same non-number as the ``Infinity`` literal."""
+    value = float(literal)
+    if not math.isfinite(value):
+        raise StrictJSONError(NON_FINITE, "JSON number does not fit a finite double")
+    return value
+
+
+# A string (skipped whole, escapes included) or a bracket. Brackets inside strings are not nesting.
+_NESTING = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}]')
+
+
+def _check_depth(text: str, max_depth: int) -> None:
+    depth = 0
+    for match in _NESTING.finditer(text):
+        char = match.group()
+        if char in "[{":
+            depth += 1
+            if depth > max_depth:
+                raise StrictJSONError(TOO_DEEP, f"JSON nesting is deeper than {max_depth}")
+        elif char in "]}":
+            depth -= 1
+
+
 def _text(data: Any, max_bytes: int | None) -> str:
     if isinstance(data, (bytes, bytearray)):
         if max_bytes is not None and len(data) > max_bytes:
@@ -72,18 +102,23 @@ def _text(data: Any, max_bytes: int | None) -> str:
     raise TypeError(f"strict_json.loads wants str or bytes, not {type(data).__name__}")
 
 
-def loads(data: str | bytes | bytearray, *, max_bytes: int | None = None) -> Any:
+def loads(data: str | bytes | bytearray, *, max_bytes: int | None = None, max_depth: int = DEFAULT_MAX_DEPTH) -> Any:
     """Parse ``data`` as strict JSON; raise :class:`StrictJSONError` (a ``ValueError``) otherwise.
 
     Duplicate object keys are refused at every depth (DUPLICATE_KEY), as are ``NaN`` /
-    ``Infinity`` / ``-Infinity`` (NON_FINITE); there is no switch to allow them. Over-large input is
-    TOO_LARGE (exactly ``max_bytes`` is accepted), nesting deeper than the interpreter's recursion
-    limit is TOO_DEEP, and anything else unparsable is MALFORMED. A non-str/bytes argument is a
+    ``Infinity`` / ``-Infinity`` (NON_FINITE), and so is any number that overflows a double
+    (``1e999``, a 5000-digit decimal); there is no switch to allow them. Over-large input is
+    TOO_LARGE (exactly ``max_bytes`` is accepted), nesting deeper than ``max_depth`` (default
+    :data:`DEFAULT_MAX_DEPTH`; counted over ``[`` / ``{`` outside strings, before parsing) is
+    TOO_DEEP, as is a ``RecursionError`` at any point (a very low interpreter limit), and anything
+    else unparsable is MALFORMED. A non-str/bytes argument is a
     ``TypeError``: that is a caller bug, not a bad document.
     """
-    text = _text(data, max_bytes)
     try:
-        return json.loads(text, object_pairs_hook=_no_duplicate_keys, parse_constant=_refuse_constant)
+        text = _text(data, max_bytes)
+        _check_depth(text, max_depth)
+        return json.loads(text, object_pairs_hook=_no_duplicate_keys, parse_constant=_refuse_constant,
+                          parse_float=_finite_float)
     except StrictJSONError:
         raise
     except RecursionError:

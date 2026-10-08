@@ -283,3 +283,34 @@ def test_cli_json_result_with_a_repeated_key_or_nan_is_a_failure_never_an_answer
     assert tooled["tool"] == "get_file_info" and tooled["error"] == "NON_STRICT_JSON_RESULT"
     # Prose that is merely not JSON still takes the text path it always took.
     assert cli._decode("not json at all")["error"] == "UNCLASSIFIED_OUTPUT"
+
+
+# -- strict_json review findings: overflowing floats, decode outside the guard, an explicit depth bound -----------
+
+def test_a_number_that_overflows_to_infinity_is_non_finite():
+    for text in ("1e999", "-1e999", "[1e999]", '{"a": {"b": -1E400}}', "1" * 5000 + ".0", "1" * 400 + "e300"):
+        assert _reason(text) == strict_json.NON_FINITE, text[:20]
+    # Finite extremes, big integers and underflow stay numbers.
+    assert loads("1e308") == 1e308 and loads("1e-999") == 0.0 and loads("1" + "0" * 400) == 10 ** 400
+    assert loads("1.7976931348623157e308") == 1.7976931348623157e308
+
+
+def test_a_recursion_error_while_reading_the_input_is_too_deep(monkeypatch):
+    def boom(data, max_bytes):
+        raise RecursionError
+
+    monkeypatch.setattr(strict_json, "_text", boom)
+    assert _reason("{}") == strict_json.TOO_DEEP
+
+
+def test_nesting_is_bounded_by_an_explicit_depth_not_the_interpreter_limit():
+    limit = strict_json.DEFAULT_MAX_DEPTH
+    assert loads("[" * limit + "]" * limit) is not None
+    assert _reason("[" * (limit + 1) + "]" * (limit + 1)) == strict_json.TOO_DEEP
+    assert _reason('{"a":' * (limit + 1) + "1" + "}" * (limit + 1)) == strict_json.TOO_DEEP
+    # Brackets inside strings are not nesting.
+    assert loads('"' + "[" * (limit * 4) + '"') == "[" * (limit * 4)
+    assert loads('{"k": "\\"[[[[", "j": 1}') == {"k": '"[[[[', "j": 1}
+    assert loads("[[[]]]", max_depth=3) == [[[]]]
+    assert _reason("[[[]]]", max_depth=2) == strict_json.TOO_DEEP
+    assert loads("1", max_depth=0) == 1
