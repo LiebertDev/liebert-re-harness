@@ -11,6 +11,7 @@ the import trap, the minimal TEB/PEB, VEX instructions through the layer in ``re
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import shutil
@@ -1316,3 +1317,29 @@ def test_an_access_that_faults_is_listed_once_as_the_last_event(sandbox):
     unfiltered = watched(sandbox, asm("mov rbx, 0x10000000; mov rax, qword ptr [rbx]; ret"),
                          [rng(0x10000000, 0x10001000, "write")])
     assert unfiltered["stop_reason"] == "UNMAPPED_READ" and unfiltered["memory_trace"] == []
+
+
+def test_a_mem_watch_address_is_hex_with_0x_and_decimal_otherwise(sandbox):
+    """A leading zero is not octal and not an error: ``010`` is ten. The rule is 0x means base 16, else base 10."""
+    assert cli._mem_watch("010:020") == {"start": 10, "end": 20, "access": "both"}
+    assert cli._mem_watch("0x10:0X20:w") == {"start": 16, "end": 32, "access": "write"}
+    assert cli._mem_watch("00:0x0A:r") == {"start": 0, "end": 10, "access": "read"}
+    for bad in ("0x:1", "-1:5", "1_0:20", "0b11:20", "0o7:9", " :5", "1.5:9", "0xZZ:5"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            cli._mem_watch(bad)
+
+
+def test_wide_accesses_arrive_in_pieces_of_at_most_8_bytes_each_with_a_value_and_the_basis_says_what_was_measured(sandbox):
+    """A 16-byte SSE access and an 80-bit x87 store reach the hook as pieces the engine splits, each with its value;
+    the basis names the limits (16 bytes read, 8 written) and that nothing wider was ever delivered."""
+    code = asm(f"mov rax, {DATA}; movups xmm0, xmmword ptr [rax + 0x20]; movups xmmword ptr [rax], xmm0; "
+               "fld1; fstp tbyte ptr [rax + 0x10]; ret")
+    result = watched(sandbox, code, [rng(DATA, DATA + 0x30)], patches=[(0x100 + 0x20, bytes(range(1, 17)))])
+    assert result["stop_reason"] == "RETURNED"
+    assert [(e["kind"], e["size"]) for e in result["memory_trace"]] == [
+        ("read", 8), ("read", 8), ("write", 8), ("write", 8), ("write", 8), ("write", 2)]
+    assert all(e["value"] is not None for e in result["memory_trace"])
+    assert result["memory_trace"][0]["value"] == hex(int.from_bytes(bytes(range(1, 9)), "little"))
+    basis = result["memory_trace_basis"]
+    assert "read of at most 16 bytes" in basis and "write of at most 8 bytes" in basis
+    assert "nothing wider than 8 bytes" in basis and "was not observed" in basis

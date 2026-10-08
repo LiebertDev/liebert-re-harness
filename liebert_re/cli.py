@@ -308,6 +308,16 @@ def _reg_assignment(text):
     return name.strip(), value.strip()
 
 
+def _address_int(text):
+    """An address written ``0x``-hex (base 16) or plain digits (base 10, so ``010`` is ten); nothing else."""
+    text = text.strip()
+    if re.fullmatch(r"0[xX][0-9a-fA-F]+", text):
+        return int(text, 16)
+    if re.fullmatch(r"[0-9]+", text):
+        return int(text, 10)
+    raise ValueError(text)
+
+
 def _mem_watch(text):
     """``START:END[:r|w|rw]`` (END exclusive) into a memory_watch range for ``emulate_range``."""
     parts = text.split(":")
@@ -315,9 +325,10 @@ def _mem_watch(text):
     if len(parts) not in (2, 3) or (len(parts) == 3 and parts[2] not in access):
         raise argparse.ArgumentTypeError("expected START:END or START:END:r|w|rw, for example 0x140002000:0x140002100:w")
     try:
-        start, end = int(parts[0], 0), int(parts[1], 0)
+        start, end = _address_int(parts[0]), _address_int(parts[1])
     except ValueError:
-        raise argparse.ArgumentTypeError("START and END must be integers, decimal or 0x-hex") from None
+        raise argparse.ArgumentTypeError("START and END must be integers: 0x-prefixed hex, otherwise decimal "
+                                         "(a leading zero does not mean octal)") from None
     return {"start": start, "end": end, "access": access[parts[2]] if len(parts) == 3 else "both"}
 
 

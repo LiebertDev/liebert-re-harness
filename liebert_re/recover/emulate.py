@@ -117,7 +117,8 @@ MAX_WATCH_EVENTS_CEILING = 10_000
 DEFAULT_WATCH_EVENTS = 1000
 WATCH_ACCESS = ("read", "write", "both")
 WATCH_WINDOW = 63               # an access may start this far below a range and still overlap it
-MAX_TRACE_VALUE_BYTES = 16      # a wider access is recorded without its value
+MAX_TRACE_VALUE_BYTES = 16      # a read wider than this is recorded without its value
+MAX_TRACE_WRITE_VALUE_BYTES = 8  # a write wider than this is recorded without its value (the engine passes <= 8)
 TRAP_BASE = 0x7FEF00000000
 TRAP_STRIDE = 16
 
@@ -139,9 +140,14 @@ _TRACE_BASIS = ("accesses by the emulated code that overlap a watched range, in 
                 "them (a wide access may arrive as several narrower ones), recorded before the access completes: a "
                 "read is an attempt, and an access that faults is listed too (the run stops there; its value is null "
                 "for a read and what it tried to store for a write). pc is the instruction that made the access. "
-                "value is the little-endian integer of at most %d bytes; a wider access has value null. Accesses "
-                "made by a stub model are not listed here (see stubs.calls[].effects); neither are the memory "
-                "operands of instructions the VEX layer executed" % MAX_TRACE_VALUE_BYTES)
+                "value is a little-endian integer, recorded for a read of at most %d bytes and for a write of at most "
+                "%d bytes (the engine hands a write's value over only up to 8 bytes); an access the engine delivers "
+                "wider than that, and every faulting read, has value null. Measured on SSE, x87 80-bit and cmpxchg16b "
+                "accesses, the engine delivered nothing wider than 8 bytes (a 16-byte access arrives as two 8-byte "
+                "events), so the wider-than-limit case was not observed. Accesses made by a stub model are not listed "
+                "here (see stubs.calls[].effects); neither are the memory operands of instructions the VEX layer "
+                "executed"
+                % (MAX_TRACE_VALUE_BYTES, MAX_TRACE_WRITE_VALUE_BYTES))
 _TRACE_VEX_UNTRACED = {
     "code": "MEMORY_TRACE_INCOMPLETE",
     "detail": "the VEX layer executed instructions in this run, and the memory they read or wrote is not hooked: "
@@ -1349,7 +1355,7 @@ class _Engine:
                            "size": size, "value": _hx(seen)})
 
         def stored(value, size):
-            return value & ((1 << (8 * size)) - 1) if 0 < size <= 8 else None
+            return value & ((1 << (8 * size)) - 1) if 0 < size <= MAX_TRACE_WRITE_VALUE_BYTES else None
 
         def trace_fault(fault_kind, address, size, value):
             """An access that faulted never reaches the access hooks; the attempt is still listed, read value null."""
