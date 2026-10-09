@@ -109,6 +109,8 @@ class CrackApiHashKnownExportRoundTripTests(unittest.TestCase):
         # correctly end to end, independent of which one this test suite
         # spot-checks above.
         for algo_name, fn in ALGORITHMS.items():
+            if algo_name == "xxh3_64":
+                pytest.importorskip("xxhash")
             h = fn(b"ExitProcess")
             result = crack_api_hash(h, dll_path=str(KERNEL32), algorithms=[algo_name],
                                      case_variants=("as_is",), append_null=(False,))
@@ -157,6 +159,86 @@ class DeclaredNameIsDefinedTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class XXH3ApiHashTests(unittest.TestCase):
+    def test_xxh3_recovers_synthetic_export_name_and_variant(self):
+        pytest.importorskip("xxhash")
+        from unittest.mock import patch
+
+        # xxhash 4.0.1: xxh3_64_intdigest(b"HashTarget", seed=0)
+        value = 0xC80667E62B8B585D
+        with patch("liebert_re.recover.api_hash_recover._read_export_names",
+                   return_value=(["HashTarget"], None, True)):
+            result = crack_api_hash(value, algorithms=["xxh3_64"],
+                                    case_variants=("as_is",), append_null=(False,))
+        self.assertTrue(result["ok"])
+        hit = next(m for m in result["matches"] if m["export_name"] == "HashTarget")
+        self.assertEqual(hit["algorithm"], "xxh3_64")
+        self.assertEqual(hit["case_variant"], "as_is")
+        self.assertFalse(hit["null_terminator_included"])
+        self.assertEqual(hit["seed"], 0)
+        self.assertEqual(hit["matched_hash_value"], "0xc80667e62b8b585d")
+
+    def test_seeded_xxh3_matches_only_with_the_right_seed(self):
+        pytest.importorskip("xxhash")
+        from unittest.mock import patch
+
+        # xxhash 4.0.1: xxh3_64_intdigest(b"HashTarget", seed=12345)
+        value = 0x1164141A9533819F
+        with patch("liebert_re.recover.api_hash_recover._read_export_names",
+                   return_value=(["HashTarget"], None, True)):
+            right = crack_api_hash(value, algorithms=["xxh3_64"], seed=12345,
+                                   case_variants=("as_is",), append_null=(False,))
+            wrong = crack_api_hash(value, algorithms=["xxh3_64"], seed=0,
+                                   case_variants=("as_is",), append_null=(False,))
+        self.assertEqual(right["match_count"], 1)
+        self.assertEqual(right["matches"][0]["seed"], 12345)
+        self.assertEqual(wrong["matches"], [])
+
+    def test_wide_value_does_not_alias_32_bit_hash(self):
+        from unittest.mock import patch
+
+        with patch("liebert_re.recover.api_hash_recover._read_export_names",
+                   return_value=(["A"], None, True)):
+            expected = ALGORITHMS["crc32"](b"A")
+            result = crack_api_hash(expected + (1 << 32), algorithms=["crc32"],
+                                    case_variants=("as_is",), append_null=(False,))
+        self.assertEqual(result["matches"], [])
+
+    def test_missing_xxhash_is_a_structured_fail_closed_result(self):
+        from unittest.mock import patch
+
+        real_import_module = __import__("importlib").import_module
+
+        def missing(name, *args, **kwargs):
+            if name == "xxhash":
+                raise ImportError("simulated missing optional dependency")
+            return real_import_module(name, *args, **kwargs)
+
+        with patch("liebert_re.recover.api_hash_recover.importlib.import_module", side_effect=missing):
+            result = crack_api_hash(0x2D06800538D394C2, algorithms=["xxh3_64"])
+            legacy = crack_api_hash(0xD3D99E8B, algorithms=["crc32"],
+                                    case_variants=("as_is",), append_null=(False,))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "ANALYSIS_LIMITED")
+        self.assertEqual(result["error"], "OPTIONAL_DEPENDENCY_MISSING")
+        self.assertEqual(result["dependency"], "xxhash")
+        self.assertTrue(legacy["ok"])
+
+    def test_32_bit_match_shape_is_unchanged(self):
+        from unittest.mock import patch
+
+        value = _fnv1a_32(b"HashTarget")
+        with patch("liebert_re.recover.api_hash_recover._read_export_names",
+                   return_value=(["HashTarget"], None, True)):
+            result = crack_api_hash(value, algorithms=["fnv1a_32"],
+                                    case_variants=("as_is",), append_null=(False,))
+        self.assertEqual(result["matches"][0], {
+            "hash_input": hex(value), "matched_hash_value": hex(value),
+            "export_name": "HashTarget", "case_variant": "as_is",
+            "null_terminator_included": False, "algorithm": "fnv1a_32",
+        })
 
 
 def _pe_without_exports(directory: Path) -> Path:

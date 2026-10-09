@@ -1,6 +1,5 @@
-"""Generic Windows API-hashing cracker: given one 32-bit integer
-constant found in a binary (values wider than 32 bits are masked to their
-low 32 bits; 64-bit hashes are not supported), tries every common shellcode/malware API-hash
+"""Generic Windows API-hashing cracker: given one integer
+constant found in a binary, tries every common shellcode/malware API-hash
 algorithm against every export name of a chosen system DLL (default
 ntoskrnl.exe for kernel targets, but any local PE export table works) and
 reports which (algorithm, export name) pair reproduces the constant.
@@ -31,6 +30,7 @@ never touched by this module; only a system DLL's export table is read).
 from __future__ import annotations
 
 import zlib
+import importlib
 from pathlib import Path
 
 DEFAULT_SYSTEM_DLL = r"C:\Windows\System32\ntoskrnl.exe"
@@ -95,6 +95,12 @@ def _hash_add_mul(name: bytes) -> int:
     return h
 
 
+def _hash_xxh3_64(name: bytes, seed: int = 0) -> int:
+    """Compute XXH3-64 via the optional xxhash package, importing it on demand."""
+    xxhash = importlib.import_module("xxhash")
+    return xxhash.xxh3_64_intdigest(name, seed=seed)
+
+
 ALGORITHMS = {
     "ror13_add": _hash_ror13_add,
     "rol7_xor": _hash_rol7_xor,
@@ -103,7 +109,9 @@ ALGORITHMS = {
     "djb2_xor": _hash_djb2_xor,
     "crc32": _hash_crc32,
     "add_mul": _hash_add_mul,
+    "xxh3_64": _hash_xxh3_64,
 }
+ALGORITHM_WIDTHS = {name: (64 if name == "xxh3_64" else 32) for name in ALGORITHMS}
 
 
 # status values reuse the vocabulary of liebert_re/tools/binary.py
@@ -143,7 +151,7 @@ def _read_export_names(dll_path):
 
 
 def crack_api_hash(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None,
-                    case_variants=("as_is", "lower", "upper"), append_null=(False, True)):
+                    case_variants=("as_is", "lower", "upper"), append_null=(False, True), seed=0):
     """Given one or more candidate hash constants, brute-force every
     (algorithm, case-variant, null-terminator-included-or-not) combination
     against every exported name of ``dll_path`` and report exact matches.
@@ -159,13 +167,35 @@ def crack_api_hash(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None,
     """
     if isinstance(hash_values, int):
         hash_values = [hash_values]
-    hash_set = {int(v) & 0xFFFFFFFF: int(v) for v in hash_values}
+    try:
+        raw_values = [int(v) for v in hash_values]
+    except (TypeError, ValueError):
+        return {"ok": False, "status": STATUS_USAGE, "error": "INVALID_HASH_VALUE"}
+    # Negative constants retain the historical 32-bit unsigned interpretation.
+    # Positive wide values stay wide so they can be matched by 64-bit algorithms,
+    # and can never alias a 32-bit result through truncation.
+    hash_inputs = {v if v >= 0 else v & 0xFFFFFFFF: v for v in raw_values}
 
-    algo_set = {k: v for k, v in ALGORITHMS.items() if not algorithms or k in algorithms}
+    # Keep the default search compatible with installs that do not have the
+    # optional package; XXH3 is selected explicitly by its algorithm name.
+    selected_algorithms = algorithms if algorithms else [
+        name for name in ALGORITHMS if ALGORITHM_WIDTHS[name] == 32
+    ]
+    algo_set = {k: ALGORITHMS[k] for k in selected_algorithms if k in ALGORITHMS}
     unknown = [a for a in (algorithms or []) if a not in ALGORITHMS]
     if unknown:
         return {"ok": False, "status": STATUS_USAGE, "error": "UNKNOWN_ALGORITHM", "unknown": unknown,
                 "available": sorted(ALGORITHMS)}
+
+    if "xxh3_64" in algo_set:
+        if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 0xFFFFFFFFFFFFFFFF:
+            return {"ok": False, "status": STATUS_USAGE, "error": "INVALID_SEED"}
+        try:
+            importlib.import_module("xxhash")
+        except ImportError:
+            return {"ok": False, "status": STATUS_NOT_LOOKED,
+                    "error": "OPTIONAL_DEPENDENCY_MISSING", "dependency": "xxhash",
+                    "algorithm": "xxh3_64"}
 
     names, err, directory_present = _read_export_names(dll_path)
     if names is None:
@@ -187,13 +217,17 @@ def crack_api_hash(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None,
             for null in append_null:
                 candidate = text.encode("ascii", errors="ignore") + (b"\x00" if null else b"")
                 for algo_name, fn in algo_set.items():
-                    h = fn(candidate)
-                    if h in hash_set:
-                        matches.append({
-                            "hash_input": hex(hash_set[h]), "matched_hash_value": hex(h),
+                    width = ALGORITHM_WIDTHS[algo_name]
+                    h = fn(candidate, seed=seed) if width == 64 else fn(candidate)
+                    if h in hash_inputs and h < (1 << width):
+                        match = {
+                            "hash_input": hex(hash_inputs[h]), "matched_hash_value": hex(h),
                             "export_name": name, "case_variant": variant,
                             "null_terminator_included": null, "algorithm": algo_name,
-                        })
+                        }
+                        if width == 64:
+                            match["seed"] = seed
+                        matches.append(match)
     return {
         "ok": True,
         "status": STATUS_OK,
@@ -202,7 +236,7 @@ def crack_api_hash(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None,
         "algorithms_tried": sorted(algo_set),
         "case_variants_tried": list(case_variants),
         "null_terminator_variants_tried": list(append_null),
-        "hash_values_searched": [hex(v) for v in hash_set.values()],
+        "hash_values_searched": [hex(v) for v in hash_inputs.values()],
         "match_count": len(matches),
         "matches": matches,
     }
@@ -216,7 +250,12 @@ def self_test_round_trip(dll_path=DEFAULT_SYSTEM_DLL, sample_export="IoCreateDev
     """
     results = {}
     for algo_name, fn in ALGORITHMS.items():
-        h = fn(sample_export.encode("ascii"))
+        try:
+            h = fn(sample_export.encode("ascii"))
+        except ImportError:
+            results[algo_name] = {"status": STATUS_NOT_LOOKED,
+                                  "error": "OPTIONAL_DEPENDENCY_MISSING", "dependency": "xxhash"}
+            continue
         cracked = crack_api_hash(h, dll_path=dll_path, algorithms=[algo_name],
                                   case_variants=("as_is",), append_null=(False,))
         found = any(m["export_name"] == sample_export for m in cracked.get("matches", []))
@@ -224,7 +263,7 @@ def self_test_round_trip(dll_path=DEFAULT_SYSTEM_DLL, sample_export="IoCreateDev
     return results
 
 
-def api_hash_recover_tool(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None) -> str:
+def api_hash_recover_tool(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None, seed=0) -> str:
     """MCP/tool-callable wrapper around crack_api_hash: JSON string in,
     JSON string out, matching this project's other tool-layer conventions.
     dll_path is intentionally NOT workspace-restricted -- this
@@ -239,7 +278,7 @@ def api_hash_recover_tool(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=N
         values = hash_values
         if isinstance(values, str):
             values = [int(v, 0) for v in values.replace(",", " ").split()]
-        result = crack_api_hash(values, dll_path=dll_path, algorithms=algorithms)
+        result = crack_api_hash(values, dll_path=dll_path, algorithms=algorithms, seed=seed)
     except (ValueError, TypeError) as exc:
         # An unparsable hash constant is the caller's input, not a failure to look.
         result = {"ok": False, "status": STATUS_USAGE, "error": type(exc).__name__, "detail": str(exc)}
@@ -248,7 +287,7 @@ def api_hash_recover_tool(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=N
     return json.dumps(result, ensure_ascii=False)
 
 
-def api_hash_recover(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None) -> str:
+def api_hash_recover(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None, seed=0) -> str:
     """The published tool name (FAMILIES["crypto"]) for this capability.
 
     A thin surface: it only forwards to ``api_hash_recover_tool`` (JSON string
@@ -256,4 +295,4 @@ def api_hash_recover(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None) 
     here, so every refusal (``UNKNOWN_ALGORITHM``, an unreadable DLL) and every
     exception report passes through unchanged.
     """
-    return api_hash_recover_tool(hash_values, dll_path=dll_path, algorithms=algorithms)
+    return api_hash_recover_tool(hash_values, dll_path=dll_path, algorithms=algorithms, seed=seed)

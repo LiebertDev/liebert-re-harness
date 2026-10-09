@@ -64,6 +64,9 @@ frida = ["frida"]
 # fails closed with a structured TOOL_MISSING result when it is absent, so it is
 # an extra rather than a required dependency. CI installs it so those tests run.
 lattice = ["mpmath"]
+# api_hash_recover's XXH3-64 path imports this only when selected; without it the
+# other hash algorithms remain available and XXH3 reports a structured refusal.
+xxhash = ["xxhash>=4.0.1"]
 # Optional wrappers. Each module returns a structured TOOL_MISSING result naming the
 # package when its extra is not installed, so none of these is a core dependency.
 # Bounds are lower bounds only except UnityPy: its own README warns that breaking
