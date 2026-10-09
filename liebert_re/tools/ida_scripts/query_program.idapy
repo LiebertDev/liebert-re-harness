@@ -1975,7 +1975,7 @@ def _stamp_input_identity(result):
 
 
 # Operations that answer with one record in named fields rather than a list of rows.
-_RECORD_OPERATIONS = frozenset({"read_bytes"})
+_RECORD_OPERATIONS = frozenset({"read_bytes", "summary", "type_member_offset"})
 
 
 def _run(job):

@@ -2003,3 +2003,29 @@ def test_listing_operations_keep_items_and_count_consistent(worker):
     module, _ida, db = worker
     r = module._run({"operation": "segments", "query": ""})
     assert isinstance(r["items"], list) and r["count"] == len(r["items"])
+
+
+def test_summary_carries_no_empty_items_or_zero_count(worker):
+    module, _ida, _db = worker
+    r = module._run({"operation": "summary", "query": ""})
+    assert "items" not in r and "count" not in r
+
+
+def test_type_member_offset_carries_no_empty_items_or_zero_count(w2, monkeypatch):
+    _types(w2)
+    typeinf = sys.modules["ida_typeinf"]
+    base = typeinf.tinfo_t
+
+    class Tif(base):
+        def find_udm(self, udm, how):
+            return -1
+
+        def get_udm(self, index):
+            raise RuntimeError("member list died")
+
+    monkeypatch.setattr(typeinf, "tinfo_t", Tif)
+    monkeypatch.setattr(typeinf, "udm_t", SimpleNamespace, raising=False)
+    monkeypatch.setattr(typeinf, "STRMEM_NAME", 1, raising=False)
+    r = _status_run(w2.module, "type_member_offset", json.dumps({"struct_name": "_GUID", "member_name": "NoSuch"}))
+    assert r["error"] == "MEMBER_NOT_FOUND"      # the worker's own answer, not the exception rebuild
+    assert "items" not in r and "count" not in r
