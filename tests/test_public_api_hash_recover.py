@@ -216,7 +216,9 @@ class XXH3ApiHashTests(unittest.TestCase):
                 raise ImportError("simulated missing optional dependency")
             return real_import_module(name, *args, **kwargs)
 
-        with patch("liebert_re.recover.api_hash_recover.importlib.import_module", side_effect=missing):
+        with patch("liebert_re.recover.api_hash_recover.importlib.import_module", side_effect=missing), \
+             patch("liebert_re.recover.api_hash_recover._read_export_names",
+                   return_value=(["A"], None, True)):
             result = crack_api_hash(0x2D06800538D394C2, algorithms=["xxh3_64"])
             legacy = crack_api_hash(0xD3D99E8B, algorithms=["crc32"],
                                     case_variants=("as_is",), append_null=(False,))
@@ -225,20 +227,109 @@ class XXH3ApiHashTests(unittest.TestCase):
         self.assertEqual(result["error"], "OPTIONAL_DEPENDENCY_MISSING")
         self.assertEqual(result["dependency"], "xxhash")
         self.assertTrue(legacy["ok"])
+        self.assertEqual(legacy["matches"][0]["export_name"], "A")
+
+    def test_explicit_seed_is_rejected_without_a_seeded_algorithm(self):
+        from unittest.mock import patch
+        from liebert_re.recover.api_hash_recover import api_hash_recover, api_hash_recover_tool
+        import json
+
+        with patch("liebert_re.recover.api_hash_recover._read_export_names",
+                   return_value=(["A"], None, True)) as read_exports:
+            for algorithms in (["djb2"], None):
+                for seed in (0, 1, 0xFFFFFFFFFFFFFFFF):
+                    with self.subTest(algorithms=algorithms, seed=seed):
+                        result = crack_api_hash(177638, algorithms=algorithms, seed=seed)
+                        self.assertEqual(result, {
+                            "ok": False, "status": "INVALID_INPUT", "error": "UNSUPPORTED_SEED",
+                        })
+            for wrapper in (api_hash_recover, api_hash_recover_tool):
+                result = json.loads(wrapper(177638, algorithms=["djb2"], seed=0))
+                self.assertEqual(result["error"], "UNSUPPORTED_SEED")
+            read_exports.assert_not_called()
+            unseeded = crack_api_hash(177638, algorithms=["djb2"],
+                                     case_variants=("as_is",), append_null=(False,))
+        self.assertTrue(unseeded["ok"])
+        self.assertEqual(unseeded["match_count"], 1)
+
+    def test_invalid_seed_is_rejected_for_every_algorithm_selection(self):
+        from unittest.mock import patch
+        from liebert_re.recover.api_hash_recover import api_hash_recover, api_hash_recover_tool
+        import json
+
+        with patch("liebert_re.recover.api_hash_recover._read_export_names") as read_exports:
+            for algorithms in (None, ["djb2"], ["xxh3_64"], ["djb2", "xxh3_64"]):
+                for seed in (-1, 1 << 64, True, False, 1.0, "1", None):
+                    for surface in (crack_api_hash, api_hash_recover, api_hash_recover_tool):
+                        with self.subTest(algorithms=algorithms, seed=seed, surface=surface.__name__):
+                            result = surface(177638, algorithms=algorithms, seed=seed)
+                            if isinstance(result, str):
+                                result = json.loads(result)
+                            self.assertEqual(result, {
+                                "ok": False, "status": "INVALID_INPUT", "error": "INVALID_SEED",
+                            })
+            read_exports.assert_not_called()
+
+    def test_missing_xxhash_mixed_search_returns_matches_and_limitation(self):
+        from unittest.mock import patch
+
+        with patch("liebert_re.recover.api_hash_recover._read_export_names",
+                   return_value=(["A"], None, True)) as read_exports, \
+             patch("liebert_re.recover.api_hash_recover.importlib.import_module",
+                   side_effect=ImportError("simulated missing optional dependency")):
+            for value, expected_count in ((65, 1), (66, 0)):
+                with self.subTest(value=value):
+                    result = crack_api_hash(value, algorithms=["xxh3_64", "ror13_add"],
+                                            case_variants=("as_is",), append_null=(False,))
+                    self.assertFalse(result["ok"])
+                    self.assertEqual(result["status"], "ANALYSIS_LIMITED")
+                    self.assertEqual(result["error"], "OPTIONAL_DEPENDENCY_MISSING")
+                    self.assertEqual(result["dependency"], "xxhash")
+                    self.assertEqual(result["algorithms_not_searched"], ["xxh3_64"])
+                    self.assertEqual(result["algorithms_tried"], ["ror13_add"])
+                    self.assertEqual(result["export_count_searched"], 1)
+                    self.assertEqual(result["match_count"], expected_count)
+                    self.assertEqual(len(result["matches"]), expected_count)
+                    if expected_count:
+                        self.assertEqual(result["matches"][0]["export_name"], "A")
+                        self.assertEqual(result["matches"][0]["algorithm"], "ror13_add")
+            self.assertEqual(read_exports.call_count, 2)
+
+    def test_match_order_follows_registry_not_request_order(self):
+        from unittest.mock import patch
+
+        with patch("liebert_re.recover.api_hash_recover._read_export_names",
+                   return_value=(["A"], None, True)):
+            result = crack_api_hash([177638, 65], algorithms=["djb2", "ror13_add"],
+                                    case_variants=("as_is",), append_null=(False,))
+        self.assertTrue(result["ok"])
+        self.assertEqual([m["algorithm"] for m in result["matches"]], ["ror13_add", "djb2"])
+        self.assertEqual(result["hash_values_searched"], ["0x2b5e6", "0x41"])
+
+    def test_optional_formats_ci_covers_xxh3_without_skips(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text()
+        job = workflow.split("  optional-formats:", 1)[1].split("\n  lint:", 1)[0]
+        install = next(line for line in job.splitlines() if 'pip install -e ".[' in line)
+        self.assertIn("xxhash", install.split("[", 1)[1].split("]", 1)[0].split(","))
+        self.assertIn("tests/test_public_api_hash_recover.py::XXH3ApiHashTests", job)
+        self.assertIn("Fail on any skip", job)
 
     def test_32_bit_match_shape_is_unchanged(self):
         from unittest.mock import patch
 
-        value = _fnv1a_32(b"HashTarget")
         with patch("liebert_re.recover.api_hash_recover._read_export_names",
-                   return_value=(["HashTarget"], None, True)):
-            result = crack_api_hash(value, algorithms=["fnv1a_32"],
+                   return_value=(["A"], None, True)):
+            result = crack_api_hash(-4294967231, algorithms=["ror13_add"],
                                     case_variants=("as_is",), append_null=(False,))
-        self.assertEqual(result["matches"][0], {
-            "hash_input": hex(value), "matched_hash_value": hex(value),
-            "export_name": "HashTarget", "case_variant": "as_is",
-            "null_terminator_included": False, "algorithm": "fnv1a_32",
-        })
+            wide = crack_api_hash(0x100000041, algorithms=["ror13_add"],
+                                  case_variants=("as_is",), append_null=(False,))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["matches"], [{
+            "hash_input": "-0xffffffbf", "matched_hash_value": "0x41",
+            "export_name": "A", "case_variant": "as_is",
+            "null_terminator_included": False, "algorithm": "ror13_add",
+        }])
+        self.assertEqual(wide["matches"], [])
 
 
 def _pe_without_exports(directory: Path) -> Path:

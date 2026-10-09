@@ -34,6 +34,7 @@ import importlib
 from pathlib import Path
 
 DEFAULT_SYSTEM_DLL = r"C:\Windows\System32\ntoskrnl.exe"
+_SEED_UNSET = object()
 
 
 def _ror(value, bits, width=32):
@@ -151,7 +152,7 @@ def _read_export_names(dll_path):
 
 
 def crack_api_hash(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None,
-                    case_variants=("as_is", "lower", "upper"), append_null=(False, True), seed=0):
+                    case_variants=("as_is", "lower", "upper"), append_null=(False, True), seed=_SEED_UNSET):
     """Given one or more candidate hash constants, brute-force every
     (algorithm, case-variant, null-terminator-included-or-not) combination
     against every exported name of ``dll_path`` and report exact matches.
@@ -164,7 +165,20 @@ def crack_api_hash(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None,
     Returns a structured dict; never raises. A caller with zero matches gets
     ``matches: []`` plus the exact algorithm/variant/export space searched,
     not a silent empty return.
+
+    A supplied seed must be an unsigned 64-bit integer and requires a selected
+    algorithm that accepts it (currently XXH3); omitted XXH3 seeds use zero.
+    Missing xxhash leaves mixed searches partial: available algorithms' matches
+    are returned with ``ok: False``, ``ANALYSIS_LIMITED`` and an explicit
+    limitation identifying the unsearched algorithm. XXH3-only searches fail
+    closed without reading exports.
     """
+    seed_supplied = seed is not _SEED_UNSET
+    if seed_supplied:
+        if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 0xFFFFFFFFFFFFFFFF:
+            return {"ok": False, "status": STATUS_USAGE, "error": "INVALID_SEED"}
+    else:
+        seed = 0
     if isinstance(hash_values, int):
         hash_values = [hash_values]
     try:
@@ -181,25 +195,32 @@ def crack_api_hash(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None,
     selected_algorithms = algorithms if algorithms else [
         name for name in ALGORITHMS if ALGORITHM_WIDTHS[name] == 32
     ]
-    algo_set = {k: ALGORITHMS[k] for k in selected_algorithms if k in ALGORITHMS}
+    algo_set = {k: fn for k, fn in ALGORITHMS.items() if k in selected_algorithms}
     unknown = [a for a in (algorithms or []) if a not in ALGORITHMS]
     if unknown:
         return {"ok": False, "status": STATUS_USAGE, "error": "UNKNOWN_ALGORITHM", "unknown": unknown,
                 "available": sorted(ALGORITHMS)}
 
+    if seed_supplied and "xxh3_64" not in algo_set:
+        return {"ok": False, "status": STATUS_USAGE, "error": "UNSUPPORTED_SEED"}
+
+    missing_dependency = {}
+    search_limitations = {}
     if "xxh3_64" in algo_set:
-        if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 0xFFFFFFFFFFFFFFFF:
-            return {"ok": False, "status": STATUS_USAGE, "error": "INVALID_SEED"}
         try:
             importlib.import_module("xxhash")
         except ImportError:
-            return {"ok": False, "status": STATUS_NOT_LOOKED,
-                    "error": "OPTIONAL_DEPENDENCY_MISSING", "dependency": "xxhash",
-                    "algorithm": "xxh3_64"}
+            missing_dependency = {"error": "OPTIONAL_DEPENDENCY_MISSING", "dependency": "xxhash",
+                                  "algorithm": "xxh3_64"}
+            del algo_set["xxh3_64"]
+            if not algo_set:
+                return {"ok": False, "status": STATUS_NOT_LOOKED, **missing_dependency}
+            search_limitations = {"algorithms_not_searched": ["xxh3_64"],
+                                  "limitations": [missing_dependency]}
 
     names, err, directory_present = _read_export_names(dll_path)
     if names is None:
-        return {"ok": False, "status": STATUS_NOT_LOOKED, "error": err}
+        return {"ok": False, "status": STATUS_NOT_LOOKED, "error": err, **search_limitations}
     if not names:
         # Zero names to hash against is not "searched, found nothing": the
         # question's domain is empty, so nothing was measured. A directory that
@@ -208,7 +229,8 @@ def crack_api_hash(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None,
         # same place, so both get this code; export_directory_present tells them apart.
         return {"ok": False, "status": STATUS_NOT_LOOKED, "error": "NO_EXPORT_DIRECTORY",
                 "dll_path": str(dll_path), "export_directory_present": directory_present,
-                "message": "The file has no named exports, so no hash was compared; this is not a search that found nothing."}
+                "message": "The file has no named exports, so no hash was compared; this is not a search that found nothing.",
+                **search_limitations}
 
     matches = []
     for name in names:
@@ -229,8 +251,8 @@ def crack_api_hash(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None,
                             match["seed"] = seed
                         matches.append(match)
     return {
-        "ok": True,
-        "status": STATUS_OK,
+        "ok": not bool(missing_dependency),
+        "status": STATUS_NOT_LOOKED if missing_dependency else STATUS_OK,
         "dll_path": str(dll_path),
         "export_count_searched": len(names),
         "algorithms_tried": sorted(algo_set),
@@ -239,6 +261,8 @@ def crack_api_hash(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None,
         "hash_values_searched": [hex(v) for v in hash_inputs.values()],
         "match_count": len(matches),
         "matches": matches,
+        **missing_dependency,
+        **search_limitations,
     }
 
 
@@ -263,7 +287,7 @@ def self_test_round_trip(dll_path=DEFAULT_SYSTEM_DLL, sample_export="IoCreateDev
     return results
 
 
-def api_hash_recover_tool(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None, seed=0) -> str:
+def api_hash_recover_tool(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None, seed=_SEED_UNSET) -> str:
     """MCP/tool-callable wrapper around crack_api_hash: JSON string in,
     JSON string out, matching this project's other tool-layer conventions.
     dll_path is intentionally NOT workspace-restricted -- this
@@ -287,7 +311,7 @@ def api_hash_recover_tool(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=N
     return json.dumps(result, ensure_ascii=False)
 
 
-def api_hash_recover(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None, seed=0) -> str:
+def api_hash_recover(hash_values, dll_path=DEFAULT_SYSTEM_DLL, algorithms=None, seed=_SEED_UNSET) -> str:
     """The published tool name (FAMILIES["crypto"]) for this capability.
 
     A thin surface: it only forwards to ``api_hash_recover_tool`` (JSON string

@@ -58,7 +58,8 @@ jobs:
 
   # The `test` job installs no optional format extras, so the tests that need py7zr, androguard,
   # dpkt or UnityPy skip there and say so. This job installs exactly those extras and runs only
-  # the two files that use them, and it fails if even one test in them is skipped: a skip here
+  # the format files and the platform-independent API-hash tests with the xxhash extra,
+  # and it fails if even one test is skipped: a skip here
   # would mean an extra stopped installing or stopped being detected, and the format would go
   # unchecked while CI stayed green.
   optional-formats:
@@ -75,13 +76,13 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,lattice,7z,android,pcap,unity]"
+          pip install -e ".[dev,lattice,7z,android,pcap,unity,xxhash]"
 
       - name: Test with the extras installed
         shell: bash
         run: |
           set -o pipefail
-          pytest -q -rs tests/test_decompression_bounds.py tests/test_public_format_probes.py | tee optional-formats.log
+          pytest -q -rs tests/test_decompression_bounds.py tests/test_public_format_probes.py tests/test_public_api_hash_recover.py::XXH3ApiHashTests | tee optional-formats.log
 
       - name: Fail on any skip
         run: |
