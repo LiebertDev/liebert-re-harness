@@ -533,7 +533,27 @@ def mark_closed(target: Path, status: str) -> None:
 
 
 CLOSED_STATUSES = ("solved", "abandoned")
-OPEN_STATUSES = ("open", "active")
+# Canonical lifecycle names are the policy's: active, solved, abandoned (AGENTS.md rule 6,
+# CASE_POLICY.md). `open` is the word older markers (and `init` before this change) carry; it
+# is read as exactly `active`, protected the same way, and reported as legacy. Any other word
+# is unrecognised and never leads to a deletion.
+ACTIVE_STATUS = "active"
+LEGACY_ACTIVE_ALIASES = ("open",)
+OPEN_STATUSES = (ACTIVE_STATUS,) + LEGACY_ACTIVE_ALIASES
+
+
+def canonical_status(st):
+    """`active` for `active` and the legacy `open`; solved/abandoned as is; else None."""
+    if st in LEGACY_ACTIVE_ALIASES:
+        return ACTIVE_STATUS
+    return st if st in CLOSED_STATUSES + (ACTIVE_STATUS,) else None
+
+
+def display_status(st) -> str:
+    """The status as `list` shows it: a legacy alias is named as such, never silently renamed."""
+    if st in LEGACY_ACTIVE_ALIASES:
+        return f"{ACTIVE_STATUS} (legacy {st!r})"
+    return st if isinstance(st, str) and canonical_status(st) else f"UNRECOGNISED {st!r}"
 
 
 def case_status(target: Path):
@@ -565,8 +585,11 @@ def _require_closeable(target: Path, name: str, reason: str) -> None:
                              f"refusing to purge, nothing was touched")
         return
     if st not in CLOSED_STATUSES:
+        if canonical_status(st) is None:
+            raise ScopeError(f"case {name!r}: unrecognised status {st!r} in {MARKER}; "
+                             f"refusing to purge, nothing was touched")
         raise ScopeError(
-            f"case {name!r} is {st!r}, not solved or abandoned; refusing to purge, nothing "
+            f"case {name!r} is {display_status(st)}, not solved or abandoned; refusing to purge, nothing "
             f"was touched. Close it with a 'case: solved {name}' or 'case: abandoned {name}' "
             f"commit line, or run 'purge {name} --reason solved|abandoned' once its report "
             f"is written.")
@@ -751,7 +774,7 @@ def _fmt_age(sec: float) -> str:
 
 
 ADOPT_HINT = ('  To adopt one, create cases/<name>/' + MARKER + ' containing\n'
-              '  {"liebert_case": 1, "name": "<name>", "status": "open"}'
+              '  {"liebert_case": 1, "name": "<name>", "status": "active"}'
               '  (this tool will not do it for you)')
 
 
@@ -964,7 +987,7 @@ def do_init(repo_arg, name) -> int:
     t = repo / CASES_DIRNAME / name
     t.mkdir(parents=True, exist_ok=False)
     (t / MARKER).write_text(json.dumps({"liebert_case": MARKER_VERSION, "name": name,
-                                        "status": "open",
+                                        "status": ACTIVE_STATUS,
                                         "created": time.strftime("%Y-%m-%dT%H:%M:%S")},
                                        indent=2) + "\n", encoding="utf-8")
     (t / "knowledge").mkdir()
@@ -983,7 +1006,8 @@ def do_list(repo_arg) -> int:
             _, target = resolve_case_target(repo, p.name)
             plan = build_plan(target)
             meta = json.loads((target / MARKER).read_text(encoding="utf-8"))
-            print(f"{p.name:30} {meta.get('status', '?'):8} purgeable: "
+            shown = display_status(meta.get("status")) if "status" in meta else "?"
+            print(f"{p.name:30} {shown:8} purgeable: "
                   f"{len(plan.purge)} files, {human(plan.purge_bytes)}")
         except ScopeError as e:
             print(f"{p.name:30} SKIPPED ({e})")

@@ -1987,3 +1987,19 @@ class QueryStatusWrapperTests(IdaCase):
         self.assertEqual(data["query_result"]["status"], "QUERY_FAILED")
         self.assertEqual(data["query_result"]["lookup_errors"],
                          ["IDA_QUERY_WRAPPER: IDA_TIMEOUT_PROCESS_TREE_TERMINATED"])
+
+
+def test_read_bytes_envelope_carries_no_empty_items_or_zero_count(worker):
+    """The data of read_bytes is in bytes_hex / loaded_ranges; `items: []` with `count: 0` beside it
+    reads as 'found nothing'. The worker's whole answer must not carry either key."""
+    module, _ida, db = worker
+    db.loaded.update({0x1000 + i: 0x41 + i for i in range(4)})
+    r = module._run({"operation": "read_bytes", "query": "0x1000 4"})
+    assert r["ok"] and r["bytes_hex"] == "41424344"
+    assert "items" not in r and "count" not in r
+
+
+def test_listing_operations_keep_items_and_count_consistent(worker):
+    module, _ida, db = worker
+    r = module._run({"operation": "segments", "query": ""})
+    assert isinstance(r["items"], list) and r["count"] == len(r["items"])

@@ -553,7 +553,7 @@ def test_manual_purge_does_not_change_status(env):
 def test_list_reflects_closed_status(env):
     repo, _ = env
     _, out, _ = _run(repo, "list")
-    assert "open" in out
+    assert "active (legacy 'open')" in out
     _run(repo, "purge", "beta", "--execute", "--yes", "--reason", "abandoned")
     _, out, _ = _run(repo, "list")
     alpha = [ln for ln in out.splitlines() if ln.startswith("alpha")][0]
@@ -620,3 +620,40 @@ def test_commit_marker_close_of_an_open_case_still_works(env):
     rc, _, _ = _run(repo, "from-commit", "--execute")
     assert rc == 0 and not (c / "notes.txt").exists() and (c / "knowledge" / "k.md").exists()
     assert _meta(c)["status"] == "solved"
+
+
+# ------------------------------------- one vocabulary: active / solved / abandoned
+def test_init_writes_the_policy_word_active(env):
+    repo, _ = env
+    rc, _, _ = _run(repo, "init", "delta")
+    assert rc == 0 and _meta(repo / "cases" / "delta")["status"] == "active"
+
+
+def test_a_fresh_init_case_is_refused_for_manual_purge_and_survives(env):
+    repo, _ = env
+    _run(repo, "init", "delta")
+    _w(repo / "cases" / "delta" / "notes.txt", b"live work")
+    before = _snap(repo)
+    rc, _, err = _run(repo, "purge", "delta", "--execute", "--yes")
+    assert rc == 3 and "active" in err and _snap(repo) == before
+
+
+def test_legacy_open_is_read_as_active_and_listed_as_legacy(env):
+    repo, _ = env
+    _open_case_with_work(repo, "gamma")
+    _, out, _ = _run(repo, "list")
+    line = [ln for ln in out.splitlines() if ln.startswith("gamma")][0]
+    assert "active (legacy 'open')" in line
+    assert cp.canonical_status("open") == "active" == cp.canonical_status("active")
+    assert cp.canonical_status("banana") is None and cp.canonical_status("") is None
+
+
+def test_unrecognised_status_is_named_unrecognised_in_list_and_manual_refusal(env):
+    repo, _ = env
+    c = _open_case_with_work(repo, "gamma")
+    (c / ".liebert-case").write_text(
+        '{"liebert_case": 1, "name": "gamma", "status": "banana"}\n', encoding="utf-8")
+    _, out, _ = _run(repo, "list")
+    assert "UNRECOGNISED" in [ln for ln in out.splitlines() if ln.startswith("gamma")][0]
+    rc, _, err = _run(repo, "purge", "gamma", "--execute", "--yes")
+    assert rc == 3 and "unrecognised status" in err

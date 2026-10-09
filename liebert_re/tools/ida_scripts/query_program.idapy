@@ -1974,6 +1974,10 @@ def _stamp_input_identity(result):
     result["engine_input_md5"] = _hexdigest(_safe(ida_nalt.retrieve_input_file_md5, None, "INPUT_MD5", record=False))
 
 
+# Operations that answer with one record in named fields rather than a list of rows.
+_RECORD_OPERATIONS = frozenset({"read_bytes"})
+
+
 def _run(job):
     operation = str(job.get("operation") or "")
     result = {"ok": True, "tool": "ida_query", "operation": operation, "items": []}
@@ -2003,7 +2007,12 @@ def _run(job):
                 max_results = max(1, min(int(job.get("max_results") or 200), 1000))
                 offset = max(0, int(job.get("offset") or 0))
                 _DISPATCH[operation](result, str(job.get("query") or ""), max_results, offset)
-                result["count"] = len(result["items"])
+                if operation in _RECORD_OPERATIONS:
+                    # One record, not a listing: `items: []` / `count: 0` would read as "found nothing"
+                    # beside real data, so the keys are absent (the data is in the operation's own fields).
+                    result.pop("items", None)
+                else:
+                    result["count"] = len(result["items"])
         _apply_status(result, operation)
     except Exception as exc:  # noqa: BLE001
         discarded = result.get("database_changes_discarded")

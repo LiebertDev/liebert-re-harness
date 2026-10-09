@@ -57,7 +57,7 @@ There is no list of purgeable extensions to fall behind. Only the case being clo
 touched; a case that was not named in the close is never read for deletion.
 `REPORT.md` is kept at the case root only.
 
-- **Open:** `python scripts/case_purge.py init <name>` — creates the directory and
+- **Open:** `python scripts/case_purge.py init <name>` — creates the directory (status `active`; the older word `open` is read as `active` and listed as legacy) and
   the marker. A `cases/` directory without a marker is invisible to the purge and
   is reported at session start as unmarked.
 - **Close:** put `case: solved <name>` or `case: abandoned <name>` in the commit
