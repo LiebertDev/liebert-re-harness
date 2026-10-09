@@ -9,6 +9,7 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -657,3 +658,35 @@ def test_unrecognised_status_is_named_unrecognised_in_list_and_manual_refusal(en
     assert "UNRECOGNISED" in [ln for ln in out.splitlines() if ln.startswith("gamma")][0]
     rc, _, err = _run(repo, "purge", "gamma", "--execute", "--yes")
     assert rc == 3 and "unrecognised status" in err
+
+
+# ------------------------------------- one strict reader for the marker
+@pytest.mark.parametrize("status", [" Active ", "ACTIVE", "Open", " solved", "Solved ", "Abandoned", "active\n"])
+def test_a_status_that_is_not_written_exactly_is_unrecognised_everywhere(env, status):
+    repo, _ = env
+    c = _open_case_with_work(repo)
+    (c / ".liebert-case").write_text(
+        json.dumps({"liebert_case": 1, "name": "gamma", "status": status}) + "\n", encoding="utf-8")
+    _, out, _ = _run(repo, "list")
+    assert "UNRECOGNISED" in [ln for ln in out.splitlines() if ln.startswith("gamma")][0]
+    before = _snap(repo)
+    for reason in ("manual", "solved", "abandoned"):
+        rc, _, err = _run(repo, "purge", "gamma", "--execute", "--yes", "--reason", reason)
+        assert rc == 3 and "refusing to purge" in err, (status, reason)
+        assert _snap(repo) == before, (status, reason)
+
+
+@pytest.mark.parametrize("marker", [
+    '{"liebert_case": 1, "name": "gamma", "status": "banana", "status": "solved"}\n',
+    '{"liebert_case": 1, "name": "gamma", "status": "solved", "status": "active"}\n',
+    '{"liebert_case": 1, "name": "gamma", "status": "solved", "x": NaN}\n',
+    '{"liebert_case": 1, "name": "gamma", "name": "gamma", "status": "solved"}\n'])
+def test_a_marker_with_a_repeated_key_or_nan_is_unreadable_and_nothing_is_purged(env, marker):
+    repo, _ = env
+    c = _open_case_with_work(repo)
+    (c / ".liebert-case").write_text(marker, encoding="utf-8")
+    before = _snap(repo)
+    for reason in ("manual", "solved", "abandoned"):
+        rc, _, err = _run(repo, "purge", "gamma", "--execute", "--yes", "--reason", reason)
+        assert rc == 3, (marker, reason)
+        assert _snap(repo) == before, (marker, reason)

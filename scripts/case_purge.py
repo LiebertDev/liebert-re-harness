@@ -54,6 +54,28 @@ CASES_DIRNAME = "cases"
 MARKER = ".liebert-case"
 MARKER_VERSION = 1
 
+
+_STRICT = None
+
+
+def marker_loads(text):
+    """Parse a marker as strict JSON (liebert_re/strict_json.py: a repeated key or NaN/Infinity is
+    refused). Raises ValueError for anything not strict. If the strict reader itself cannot be
+    loaded the marker is unreadable: this fails closed, it never falls back to json.loads."""
+    global _STRICT
+    if _STRICT is None:
+        import importlib.util
+        src = Path(__file__).resolve().parent.parent / "liebert_re" / "strict_json.py"
+        try:
+            spec = importlib.util.spec_from_file_location("_liebert_strict_json", str(src))
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["_liebert_strict_json"] = module
+            spec.loader.exec_module(module)
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"strict JSON reader unavailable ({type(e).__name__}); marker treated as unreadable") from None
+        _STRICT = module
+    return _STRICT.loads(text)
+
 # ---------------------------------------------------------------------------
 # SCOPE FENCE
 # ---------------------------------------------------------------------------
@@ -155,7 +177,7 @@ def resolve_case_target(repo_arg, name) -> tuple[Path, Path]:
     try:
         if is_reparse(marker) or not marker.is_file():
             raise ScopeError(f"missing or non-regular {MARKER} in case dir")
-        meta = json.loads(marker.read_text(encoding="utf-8"))
+        meta = marker_loads(marker.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise ScopeError(f"{target} has no {MARKER} marker; refusing (not a harness case)") from None
     except (OSError, ValueError) as e:
@@ -524,7 +546,7 @@ def mark_closed(target: Path, status: str) -> None:
         return
     path = target / MARKER
     raw = path.read_bytes()
-    meta = json.loads(raw.decode("utf-8"))
+    meta = marker_loads(raw.decode("utf-8"))
     meta["status"] = status
     meta["closed"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     eol = "\r\n" if b"\r\n" in raw else "\n"
@@ -557,13 +579,13 @@ def display_status(st) -> str:
 
 
 def case_status(target: Path):
-    """The marker's status string, or None when it cannot be read as one."""
+    """The marker's status string exactly as written, or None when it cannot be read as one."""
     try:
-        meta = json.loads((target / MARKER).read_text(encoding="utf-8"))
+        meta = marker_loads((target / MARKER).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     st = meta.get("status") if isinstance(meta, dict) else None
-    return st.strip().lower() if isinstance(st, str) else None
+    return st if isinstance(st, str) else None      # exact: no strip, no case folding
 
 
 def _require_closeable(target: Path, name: str, reason: str) -> None:
@@ -1005,7 +1027,7 @@ def do_list(repo_arg) -> int:
         try:
             _, target = resolve_case_target(repo, p.name)
             plan = build_plan(target)
-            meta = json.loads((target / MARKER).read_text(encoding="utf-8"))
+            meta = marker_loads((target / MARKER).read_text(encoding="utf-8"))
             shown = display_status(meta.get("status")) if "status" in meta else "?"
             print(f"{p.name:30} {shown:8} purgeable: "
                   f"{len(plan.purge)} files, {human(plan.purge_bytes)}")
